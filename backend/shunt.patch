@@ -1,0 +1,1787 @@
+diff --git a/README.ja.md b/README.ja.md
+index dcfcc41..0adb0b1 100644
+--- a/README.ja.md
++++ b/README.ja.md
+@@ -191,7 +191,7 @@ OpenAI の Thibault Sottiaux は、他のコーディングハーネスを通じ
+ 
+ | 機能 | 有効化 | ドキュメント |
+ | :-- | :-- | :-- |
+-| Anthropic マルチアカウントプーリング — スティッキーセッション、クォータを考慮したローテーション、予測的回避、プールがキャップで尽きたときにアカウントを除外して次のアップストリームへフェイルオーバーするウィンドウ別ハードキャップ（`max_utilization*`） | アカウント 2 つ以上の `auth = "claude_oauth"`（`[server.pool]` は任意のチューニング） | [ガイド](https://shunt.sh/ja/guides/anthropic-multi-account/) |
++| Anthropic マルチアカウントプーリング — 組織別の識別と契約プランのキャッシュ,  スティッキーセッション、クォータを考慮したローテーション、予測的回避、プールがキャップで尽きたときにアカウントを除外して次のアップストリームへフェイルオーバーするウィンドウ別ハードキャップ（`max_utilization*`） | アカウント 2 つ以上の `auth = "claude_oauth"`（`[server.pool]` は任意のチューニング） | [ガイド](https://shunt.sh/ja/guides/anthropic-multi-account/) |
+ | Codex マルチアカウントプーリング — `x-codex-*` ウィンドウの追跡、スロースタートのランプ、再プローブ、プールがキャップで尽きたときにアカウントを除外して次のアップストリームへフェイルオーバーするウィンドウ別ハードキャップ（`max_utilization*`） | アカウント 2 つ以上の `auth = "chatgpt_oauth"`（`[server.pool]` は任意のチューニング） | [ガイド](https://shunt.sh/ja/guides/codex-multi-account/) |
+ | 学習済みプリフィルルーティング (`type = "prefill_router"`) | コンパイル時のオプトイン — `cargo build --release --features prefill-router`（**既定で無効**。リリースバイナリと Homebrew formula は `--features ui` でビルドされるため含まれません）。加えて `type = "prefill_router"` を指定した `[models.router]` テーブル、ディスク上のルーターチェックポイント、`torch` と `transformers` が入った Python 環境が必要です | [リファレンス](https://shunt.sh/ja/reference/configuration/#type--prefill_router) |
+ | 受信 Codex エンドポイント — **Codex CLI** 自体を HTTP/SSE または WebSocket で shunt に向けて同じプールに載せ、モデル単位のルーティングも選択可能 | `[server.codex_endpoint]` | [ガイド](https://shunt.sh/ja/guides/inbound-codex-endpoint/) |
+diff --git a/README.ko.md b/README.ko.md
+index 15e621e..7e6b2d4 100644
+--- a/README.ko.md
++++ b/README.ko.md
+@@ -192,7 +192,7 @@ OpenAI의 Thibault Sottiaux는 다른 코딩 하네스를 통해 Codex를 실행
+ 
+ | 기능 | 활성화 키 | 문서 |
+ | :-- | :-- | :-- |
+-| Anthropic 멀티 계정 풀링 — 스티키 세션, 쿼터 인식 로테이션, 예측 회피, 풀이 캡으로 모두 막히면 계정을 제외하고 다음 업스트림으로 페일오버하는 윈도우별 하드 캡(`max_utilization*`) | 계정 2개 이상인 `auth = "claude_oauth"`; `[server.pool]`은 선택적 튜닝 | [가이드](https://shunt.sh/ko/guides/anthropic-multi-account/) |
++| Anthropic 멀티 계정 풀링 — 조직별 아이덴티티와 구독 플랜 캐시,  스티키 세션, 쿼터 인식 로테이션, 예측 회피, 풀이 캡으로 모두 막히면 계정을 제외하고 다음 업스트림으로 페일오버하는 윈도우별 하드 캡(`max_utilization*`) | 계정 2개 이상인 `auth = "claude_oauth"`; `[server.pool]`은 선택적 튜닝 | [가이드](https://shunt.sh/ko/guides/anthropic-multi-account/) |
+ | Codex 멀티 계정 풀링 — `x-codex-*` 윈도우 추적, 슬로우 스타트 램프, 재프로브, 풀이 캡으로 모두 막히면 계정을 제외하고 다음 업스트림으로 페일오버하는 윈도우별 하드 캡(`max_utilization*`) | 계정 2개 이상인 `auth = "chatgpt_oauth"`; `[server.pool]`은 선택적 튜닝 | [가이드](https://shunt.sh/ko/guides/codex-multi-account/) |
+ | 학습형 프리필 라우팅 (`type = "prefill_router"`) | 컴파일 타임 옵트인 — `cargo build --release --features prefill-router` (**기본 꺼짐** — 릴리스 바이너리와 Homebrew 포뮬러는 `--features ui`로 빌드되므로 들어 있지 않습니다). 여기에 `type = "prefill_router"`를 지정한 `[models.router]` 테이블, 디스크에 놓인 라우터 체크포인트, `torch`와 `transformers`가 설치된 Python 환경이 필요합니다 | [레퍼런스](https://shunt.sh/ko/reference/configuration/#type--prefill_router) |
+ | 인바운드 Codex 엔드포인트 — **Codex CLI**를 HTTP/SSE나 WebSocket으로 shunt에 연결해 같은 풀에 태우고, 모델별 라우팅도 선택할 수 있음 | `[server.codex_endpoint]` | [가이드](https://shunt.sh/ko/guides/inbound-codex-endpoint/) |
+diff --git a/README.md b/README.md
+index 05c1e0f..693a87a 100644
+--- a/README.md
++++ b/README.md
+@@ -191,7 +191,7 @@ Unless a row says otherwise, these are **off by default** — absent its config
+ 
+ | Feature | Enable with | Documentation |
+ | :-- | :-- | :-- |
+-| Anthropic multi-account pooling — sticky sessions, quota-aware rotation, predictive avoidance, per-window hard caps (`max_utilization*`) that exclude an account and fail over to the next upstream when the pool is capped out | `auth = "claude_oauth"` with two or more accounts; `[server.pool]` is optional tuning | [How-to](https://shunt.sh/guides/anthropic-multi-account/) |
++| Anthropic multi-account pooling — organization-scoped identity and plan caching,  sticky sessions, quota-aware rotation, predictive avoidance, per-window hard caps (`max_utilization*`) that exclude an account and fail over to the next upstream when the pool is capped out | `auth = "claude_oauth"` with two or more accounts; `[server.pool]` is optional tuning | [How-to](https://shunt.sh/guides/anthropic-multi-account/) |
+ | Codex multi-account pooling — `x-codex-*` window tracking, slow-start ramp, re-probing, per-window hard caps (`max_utilization*`) that exclude an account and fail over to the next upstream when the pool is capped out | `auth = "chatgpt_oauth"` with two or more accounts; `[server.pool]` is optional tuning | [How-to](https://shunt.sh/guides/codex-multi-account/) |
+ | Inbound Codex endpoint — point the **Codex CLI** at shunt over HTTP/SSE or WebSocket and pool it, with opt-in per-model routing | `[server.codex_endpoint]` | [How-to](https://shunt.sh/guides/inbound-codex-endpoint/) |
+ | Learned prefill routing (`type = "prefill_router"`) | compile-time opt-in — `cargo build --release --features prefill-router` (**off by default**; not in release binaries or the Homebrew formula, which are built `--features ui`), plus a `[models.router]` table with `type = "prefill_router"`, a router checkpoint on disk, and a Python environment carrying `torch` and `transformers` | [Reference](https://shunt.sh/reference/configuration/#type--prefill_router) |
+diff --git a/README.zh-CN.md b/README.zh-CN.md
+index 5aa7210..4d1d65e 100644
+--- a/README.zh-CN.md
++++ b/README.zh-CN.md
+@@ -189,7 +189,7 @@ OpenAI 的 Thibault Sottiaux 已公开欢迎通过其他编码 harness 运行 Co
+ 
+ | 功能 | 启用方式 | 文档 |
+ | :-- | :-- | :-- |
+-| Anthropic 多账号池化 —— 粘性会话、配额感知轮换、预测性规避、按窗口设置的硬上限(`max_utilization*`,会剔除账号,并在池被上限耗尽时故障转移到下一个上游) | 拥有两个及以上账号的 `auth = "claude_oauth"`；`[server.pool]` 只是可选调优 | [指南](https://shunt.sh/zh-cn/guides/anthropic-multi-account/) |
++| Anthropic 多账号池化 —— 组织范围标识及订阅方案缓存,  粘性会话、配额感知轮换、预测性规避、按窗口设置的硬上限(`max_utilization*`,会剔除账号,并在池被上限耗尽时故障转移到下一个上游) | 拥有两个及以上账号的 `auth = "claude_oauth"`；`[server.pool]` 只是可选调优 | [指南](https://shunt.sh/zh-cn/guides/anthropic-multi-account/) |
+ | Codex 多账号池化 —— `x-codex-*` 窗口跟踪、慢启动爬坡、重新探测、按窗口设置的硬上限(`max_utilization*`,会剔除账号,并在池被上限耗尽时故障转移到下一个上游) | 拥有两个及以上账号的 `auth = "chatgpt_oauth"`；`[server.pool]` 只是可选调优 | [指南](https://shunt.sh/zh-cn/guides/codex-multi-account/) |
+ | 学习型 prefill 路由 (`type = "prefill_router"`) | 编译期选择启用 —— `cargo build --release --features prefill-router`(**默认关闭**;发布二进制和 Homebrew formula 都以 `--features ui` 构建,因此不包含它),此外还需要一个带 `type = "prefill_router"` 的 `[models.router]` 表、磁盘上的路由检查点,以及装有 `torch` 和 `transformers` 的 Python 环境 | [参考](https://shunt.sh/zh-cn/reference/configuration/#type--prefill_router) |
+ | 入站 Codex 端点 —— 把 **Codex CLI** 通过 HTTP/SSE 或 WebSocket 指向 shunt 并纳入同一个池,还可按模型选择性路由 | `[server.codex_endpoint]` | [指南](https://shunt.sh/zh-cn/guides/inbound-codex-endpoint/) |
+diff --git a/docs/m8-anthropic-multi-account.md b/docs/m8-anthropic-multi-account.md
+index 7451527..1188e3a 100644
+--- a/docs/m8-anthropic-multi-account.md
++++ b/docs/m8-anthropic-multi-account.md
+@@ -65,6 +65,7 @@ Each account has these fields:
+ | `credentials` | no | Path to a Claude Code `.credentials.json`-shaped file. shunt reads `claudeAiOauth`, refreshes near expiry, and writes refreshed tokens back atomically. |
+ | `token_env` | no | Environment variable containing a setup token. The value is used verbatim and is not refreshed. |
+ | `uuid` | no | Anthropic account UUID used for the request-body rewrite described below. |
++| `organization_uuid` | no | Optional organization UUID for pool-state isolation; does not replace the user UUID sent upstream. |
+ | `threshold` | no | Per-account soft quota threshold in `[0.0, 1.0]`, applied to every window that has no per-window value (issue #135). |
+ | `threshold_5h` / `threshold_7d` / `threshold_fable` | no | Per-window soft thresholds; each takes precedence over `threshold` for its window. |
+ | `max_utilization` | no | Per-account hard cap in `[0.0, 1.0]`, applied to every window that has no per-window value. An account whose observed utilization in a governing window is at or above the cap is excluded from selection (not merely reordered). Works without `[server.pool]`. |
+@@ -171,7 +172,7 @@ shunt classifies the upstream response before streaming its body. It never retri
+ | 2xx | Relay immediately and mark the selected account healthy. |
+ | 429 with `anthropic-ratelimit-unified-7d_oi-status: rejected` while neither `-5h-status` nor `-7d-status` is `rejected`, on a Fable request | Treat as Fable quota exhaustion, cool the account only for Fable requests for numeric `retry-after` (default 60 seconds, clamped to 1–3600 seconds), and rotate. Non-Fable requests remain eligible to use the account. For a non-Fable request, the same `7d_oi`-only rejection creates an account-wide cooldown. |
+ | 429 with `anthropic-ratelimit-unified-5h-status: rejected` or `-7d-status: rejected` (including a response that also rejects `7d_oi`) | Treat as account-wide quota exhaustion, cool the account for numeric `retry-after` (default 60 seconds, clamped to 1–3600 seconds), and rotate for every model. |
+-| Plain 429 without a rejected quota status | Treat as transient throttling, sleep for numeric `retry-after` (default 1 second, capped at 300 seconds), retry the same account once, then relay that retry response. If the retry is still unsuccessful, cool the account for that retry's numeric `retry-after` (falling back to the initial delay, clamped to 1–300 seconds) so the next request can prefer another account. |
++| Plain 429 without a rejected quota status | Treat as transient throttling, sleep for numeric `retry-after` (default 1 second, capped at 300 seconds), retry the same account once. A repeated 429, 401, or 5xx cools that account and continues to the next account in the same request; success and other client errors relay normally. |
+ | 401 from a `credentials` account | Force-refresh the credentials file even if its token has not expired, retry the same account once, then cool it for five minutes and rotate if it is still 401. |
+ | 401 from a `token_env` or store-managed setup-token account | It cannot be refreshed; cool it for five minutes and rotate. |
+ | 5xx | Cool the account for 30 seconds and rotate. |
+@@ -213,3 +214,13 @@ Storm control—ramping concurrency after switching to a fresh account—shipped
+ ## Account store
+ 
+ Phase 3 store-managed accounts and the three-way `shunt login claude` flow are implemented. Each login writes one Claude Code-compatible JSON file under `~/.shunt/accounts/claude/`. Name-only entries select those files explicitly; an empty configured account list scans the directory. Full-OAuth and imported logins retain a refresh token and are refreshed through the existing `ClaudeAuthStore`; setup-token accounts are static until their one-year token expires or receives a 401. The optional M9 admin surface can provision full-OAuth or setup-token accounts through a manual-paste browser flow; importing an existing host credential remains CLI-only.
++
++## Organization scope
++
++When `organization_uuid` is present, pool identity is the pair of Anthropic user UUID and organization UUID. Personal and Team subscriptions for the same user then keep separate quotas, cooldowns, pauses, relogin state, refresh locks, and subscription-plan caches. Aliases for the same pair still share state. Store-managed accounts read `shuntOrganizationUuid`; OAuth provisioning saves it when the token exchange returns an organization. Existing accounts without this metadata retain their previous identity. The raw user `uuid` remains the value sent in `metadata.user_id.account_uuid`.
++
++The local `x-shunt-session-account` request header prefers a configured account name for a Claude OAuth Messages request. It only reorders eligible accounts: pauses, hard caps, quota thresholds, and reactive failover still apply. Shunt consumes the header and never sends it upstream.
++
++Aggregate `anthropic-ratelimit-unified-status: rejected` also triggers quota rotation. When `anthropic-ratelimit-unified-representative-claim` identifies `five_hour`, `seven_day`, or `seven_day_oi`, its status and `anthropic-ratelimit-unified-reset` are recorded for that window without inventing utilization. A null polling reading does not clear an unexpired rejection. The aggregate expires at its own reported reset (or the existing bounded lifetime when absent). `overage-status: rejected` alone never exhausts subscription quota. Admin account snapshots expose `status_5h`, `status_7d`, and `status_7d_oi` separately from percentages. Exhausted-pool errors retain the last attempted account name in `x-shunt-account`.
++
++When admission skips a busy identity and the remaining candidates only report quota rejection, the pool returns a retryable `503 api_error` with `retry-after: 1`, rather than presenting the last account's weekly limit as pool-wide exhaustion.
+diff --git a/site/src/content/docs/guides/anthropic-multi-account.mdx b/site/src/content/docs/guides/anthropic-multi-account.mdx
+index dba501b..9c379c9 100644
+--- a/site/src/content/docs/guides/anthropic-multi-account.mdx
++++ b/site/src/content/docs/guides/anthropic-multi-account.mdx
+@@ -92,7 +92,8 @@ A successful refresh can return a replacement refresh token and invalidate the p
+ | `name` | yes | Unique label containing only lowercase letters, digits, and hyphens. Without another source field, resolves the matching shunt store file. |
+ | `credentials` | one usable source | Claude Code `.credentials.json`-shaped file. `~/` is expanded. shunt refreshes near expiry and atomically writes refreshed tokens back. |
+ | `token_env` | one usable source | Environment variable containing a setup token. The value is used verbatim and cannot be refreshed after a 401. |
+-| `uuid` | no | Selected account's Anthropic UUID for rewriting an existing `metadata.user_id.account_uuid`, and the stable identity used to coalesce aliases in the pool. A name-only entry (resolved by a store scan) is filled in automatically from the store's `shuntAccountUuid` before selection runs; a `credentials`- or `token_env`-configured entry's identity is its `uuid` when set, else its `name`, and it coalesces with another alias whenever that identity equals the other alias's explicit `uuid` or name-fallback identity — set a matching nonblank `uuid` on both entries for a clear, intentional coalesce (shunt also warns on an accidental cross `uuid`/`name` collision). |
++| `uuid` | no | Anthropic user UUID used for the request-body rewrite. Pool state also includes `organization_uuid` when supplied; see Organization scope below. |
++| `organization_uuid` | no | Optional organization UUID for pool-state isolation; does not replace the user UUID sent upstream. |
+ | `threshold` | no | Per-account soft quota threshold in `[0.0, 1.0]` for every window without a per-window value. A low value marks a backup account that rotates out early. |
+ | `threshold_5h` / `threshold_7d` / `threshold_fable` | no | Per-window soft thresholds; each beats `threshold` for its window. |
+ | `max_utilization` | no | Per-account hard cap in `[0.0, 1.0]` for every window without a per-window value. An account at or above it in a governing window is excluded from selection (see [Hard caps](#hard-caps-max_utilization)). Works without `[server.pool]`. |
+@@ -208,7 +209,7 @@ The file is a best-effort cache, not a source of truth — quota is re-derived f
+ | 2xx | Relay and mark healthy. |
+ | 429 with only `anthropic-ratelimit-unified-7d_oi-status: rejected`, on a Fable request | Fable quota exhausted: cooldown applies only to Fable requests using numeric `retry-after` (default 60s, clamped to 1–3600s), then rotate. Non-Fable requests can still use the account. For a non-Fable request, the same `7d_oi`-only rejection creates an account-wide cooldown. |
+ | 429 with `anthropic-ratelimit-unified-5h-status: rejected` or `-7d-status: rejected` | Shared quota exhausted: account-wide cooldown using numeric `retry-after` (default 60s, clamped to 1–3600s), then rotate for every model. This remains account-wide when `7d_oi` is also rejected. |
+-| Plain 429 | Transient throttle: wait using numeric `retry-after` (default 1s, cap 300s), retry the **same** account once, then relay that retry response. |
++| Plain 429 | Transient throttle: wait using numeric `retry-after` (default 1s, cap 300s), retry the **same** account once; a repeated 429, 401, or 5xx continues to the next account in this request. Success and other client errors relay normally. |
+ | 401 with `credentials` | Force-refresh, retry the same account once; if still 401, cooldown 5 minutes and rotate. |
+ | 401 with `token_env` or a store-managed setup token | Cannot refresh: cooldown 5 minutes and rotate. |
+ | 5xx or transport failure | Cooldown 30 seconds and rotate. |
+@@ -303,3 +304,13 @@ These startup checks prevent an OAuth bearer from being sent off-origin or over
+ Setting `[server.pool] ramp_initial_concurrency` (off by default) gates concurrent admissions per account identity with a slow-start ramp, so a failover switch cannot stampede the freshly selected account with every in-flight request at once. An identity that just started taking traffic admits at most the configured number of concurrent requests; each successful response doubles the allowance, a failover restarts the ramp, and a denied request spills to the next account in selection order (the last candidate is always attempted). See [`[server.pool]`](/reference/configuration/#serverpool-optional).
+ 
+ The implementation behavior was informed by [KarpelesLab/teamclaude](https://github.com/KarpelesLab/teamclaude) and the shipped Claude Code binary. shunt has no runtime dependency on teamclaude.
++
++## Organization scope
++
++When `organization_uuid` is present, pool identity is the pair of Anthropic user UUID and organization UUID. Personal and Team subscriptions for the same user then keep separate quotas, cooldowns, pauses, relogin state, refresh locks, and subscription-plan caches. Aliases for the same pair still share state. Store-managed accounts read `shuntOrganizationUuid`; OAuth provisioning saves it when the token exchange returns an organization. Existing accounts without this metadata retain their previous identity. The raw user `uuid` remains the value sent in `metadata.user_id.account_uuid`.
++
++The local `x-shunt-session-account` request header prefers a configured account name for a Claude OAuth Messages request. It only reorders eligible accounts: pauses, hard caps, quota thresholds, and reactive failover still apply. Shunt consumes the header and never sends it upstream.
++
++A rejected aggregate quota claim records its window and reset even when utilization is unreported. Null polling readings preserve unexpired rejections; overage rejection alone does not block subscription usage. Admin snapshots expose `status_5h`, `status_7d`, and `status_7d_oi` independently of percentages.
++
++When a usable identity is busy and the remaining attempted accounts reject quota, a retryable 503 prevents the last account’s weekly error from being presented as pool-wide exhaustion. The final usable candidate retains the existing forced-admission fallback. Failed-account identity is preserved in `x-shunt-account`.
+diff --git a/site/src/content/docs/ja/guides/anthropic-multi-account.mdx b/site/src/content/docs/ja/guides/anthropic-multi-account.mdx
+index 890ee7e..99b2872 100644
+--- a/site/src/content/docs/ja/guides/anthropic-multi-account.mdx
++++ b/site/src/content/docs/ja/guides/anthropic-multi-account.mdx
+@@ -92,7 +92,8 @@ Full OAuth は新しいリフレッシュ可能な credential を作成します
+ | `name` | はい | 小文字・数字・ハイフンのみからなる一意のラベル。他のソースフィールドがない場合、名前が一致する shunt ストアファイルを解決します。 |
+ | `credentials` | 使用可能なソースのいずれか 1 つ | Claude Code の `.credentials.json` 形式のファイル。`~/` は展開されます。shunt は期限が近づくとリフレッシュし、リフレッシュ済みトークンをアトミックに書き戻します。 |
+ | `token_env` | 使用可能なソースのいずれか 1 つ | setup トークンを含む環境変数。値はそのまま使われ、401 の後にリフレッシュできません。 |
+-| `uuid` | いいえ | 既存の `metadata.user_id.account_uuid` を書き換えるための、選択されたアカウントの Anthropic UUID。プールでエイリアスを統合する際の安定したアイデンティティとしても使われます。名前のみのエントリ(ストアスキャンで解決)は選択が行われる前にストアの `shuntAccountUuid` から自動的に埋められます。`credentials` または `token_env` で設定されたエントリのアイデンティティは、空白だけでない `uuid` が設定されていればその値、そうでなければ `name` となり、そのアイデンティティが他のエイリアスの明示的な `uuid` または名前フォールバックのアイデンティティと一致するたびに統合されます。明確で意図的な統合のためには両方のエントリに一致する空白だけでない `uuid` を設定してください(shunt は明示的な `uuid` が別のアカウントの名前フォールバックのアイデンティティと偶然一致した場合も警告します)。 |
++| `uuid` | いいえ | リクエスト本文に使う Anthropic ユーザー UUID。`organization_uuid` があればプールの状態には組織も含めます。下記の組織のスコープを参照してください。 |
++| `organization_uuid` | いいえ | プールの状態を組織ごとに分離する任意の組織 UUID。上流に送るユーザー UUID は置き換えません。 |
+ | `threshold` | いいえ | ウィンドウ別の値を持たないすべてのウィンドウに適用される、アカウント単位のソフトなクォータしきい値（`[0.0, 1.0]`）。低い値を設定すると、早めにローテーションで外れるバックアップアカウントになります。 |
+ | `threshold_5h` / `threshold_7d` / `threshold_fable` | いいえ | ウィンドウ別のソフトしきい値。それぞれ対応するウィンドウで `threshold` より優先されます。 |
+ | `max_utilization` | いいえ | ウィンドウ別の値を持たないすべてのウィンドウに適用される、アカウント単位のハードキャップ（`[0.0, 1.0]`）。対象ウィンドウで使用率がこの値以上のアカウントは選択から除外されます（[ハードキャップ](#ハードキャップmax_utilization)を参照）。`[server.pool]` がなくても機能します。 |
+@@ -208,7 +209,7 @@ max_utilization_fable = 0.5        # Fable はこのアカウントの Fable 週
+ | 2xx | 中継し、健全としてマークします。 |
+ | Fable リクエストで `anthropic-ratelimit-unified-7d_oi-status: rejected` だけの 429 | Fable のクォータ枯渇：数値の `retry-after` で Fable リクエストのみに効くクールダウン（デフォルト 60 秒、1〜3600 秒にクランプ）を適用し、その後ローテーションします。Fable 以外のリクエストは引き続きそのアカウントを使えます。Fable 以外のリクエストで同じ `7d_oi` のみの拒否を受けた場合は、アカウント全体のクールダウンを適用します。 |
+ | 429 かつ `anthropic-ratelimit-unified-5h-status: rejected` または `-7d-status: rejected` | 共有クォータの枯渇：数値の `retry-after` でアカウント全体をクールダウン（デフォルト 60 秒、1〜3600 秒にクランプ）し、すべてのモデルについてローテーションします。`7d_oi` も同時に `rejected` の場合もアカウント全体のクールダウンです。 |
+-| 単なる 429 | 一時的なスロットル：数値の `retry-after` の分だけ待機（デフォルト 1 秒、上限 300 秒）し、**同じ**アカウントを 1 回リトライして、そのリトライのレスポンスを中継します。 |
++| 単なる 429 | 一時的な制限：数値の `retry-after` 分待機して同じアカウントを一度再試行します。再度 429、401、5xx なら同じリクエスト内で次のアカウントへ進みます。成功とその他のクライアントエラーは中継します。 |
+ | `credentials` での 401 | 強制リフレッシュして同じアカウントを 1 回リトライ。まだ 401 なら 5 分クールダウンしてローテーションします。 |
+ | `token_env` またはストア管理の setup トークンでの 401 | リフレッシュ不可：5 分クールダウンしてローテーションします。 |
+ | 5xx またはトランスポート障害 | 30 秒クールダウンしてローテーションします。 |
+@@ -303,3 +304,13 @@ Claude Code は、文字列値の `metadata.user_id` の中にアカウントメ
+ `[server.pool] ramp_initial_concurrency`（デフォルトは無効）を設定すると、アカウントアイデンティティごとの並行受け入れをスロースタートのランプでゲートします。これにより、フェイルオーバーの切り替えで、進行中のすべてのリクエストが切り替え直後のアカウントに一度に殺到することを防げます。トラフィックを受け始めたばかりのアイデンティティは、設定された数までの並行リクエストしか受け入れません。成功レスポンスごとに許容量が倍増し、フェイルオーバーはランプをリセットし、拒否されたリクエストは選択順で次のアカウントに回されます（最後の候補は常に試行されます）。[`[server.pool]`](/ja/reference/configuration/#serverpoolオプション) を参照してください。
+ 
+ 実装の挙動は [KarpelesLab/teamclaude](https://github.com/KarpelesLab/teamclaude) と、出荷されている Claude Code バイナリを参考にしています。shunt は teamclaude へのランタイム依存を持ちません。
++
++## 組織のスコープ
++
++`organization_uuid` がある場合、Anthropic のユーザー UUID と組織 UUID の組でプールのアカウントを識別します。同じユーザーの個人契約と Team 契約は、クォータ、クールダウン、一時停止、再ログイン状態、更新ロック、契約プランのキャッシュを別々に保持します。同じ組の別名は状態を共有します。ストアのアカウントは `shuntOrganizationUuid` を読み、OAuth のトークン応答に組織が含まれる場合は保存します。この情報がない既存のアカウントの識別方法は変わりません。上流の `metadata.user_id.account_uuid` には元のユーザー `uuid` を送ります。
++
++ローカルのリクエストヘッダー `x-shunt-session-account` は Claude OAuth Messages リクエストで設定済みのアカウント名を優先します。選択可能なアカウントの順序だけを変更し、一時停止、ハードキャップ、クォータのしきい値、フェイルオーバーは引き続き適用します。このヘッダーは上流に送信しません。
++
++集約クォータの拒否では使用率が未報告でも対象期間とリセット時刻を記録します。null の取得結果で有効な拒否を消去せず、超過利用の拒否だけではサブスクリプションを停止しません。管理スナップショットは使用率と別に `status_5h`、`status_7d`、`status_7d_oi` を公開します。
++
++利用可能なアカウントが使用中で残りの候補がクォータを拒否した場合、再試行可能な 503 を返し、最後のアカウントの週間制限をプール全体の枯渇として表示しません。最後の利用可能な候補には既存の強制受付フォールバックを適用します。失敗したアカウントは `x-shunt-account` に保持します。
+diff --git a/site/src/content/docs/ja/reference/configuration.md b/site/src/content/docs/ja/reference/configuration.md
+index b66c7b1..7226002 100644
+--- a/site/src/content/docs/ja/reference/configuration.md
++++ b/site/src/content/docs/ja/reference/configuration.md
+@@ -1328,3 +1328,9 @@ policy = { type = "target_selector", selector = "/target" }
+ ターゲットです。ルーター id を指定した厳密一致のエントリは参照されず、ロード時に警告が
+ 出ます。`[[route_prefixes]]` のエントリは影響を受けません。ルーターがその接頭辞から
+ 取り去るのは自身の id だけです。
++
++### 組織のスコープ
++
++`organization_uuid` がある場合、Anthropic のユーザー UUID と組織 UUID の組でプールのアカウントを識別します。同じユーザーの個人契約と Team 契約は、クォータ、クールダウン、一時停止、再ログイン状態、更新ロックを別々に保持します。同じ組の別名は状態を共有します。ストアのアカウントは `shuntOrganizationUuid` を読み、OAuth のトークン応答に組織が含まれる場合は保存します。この情報がない既存のアカウントの識別方法は変わりません。上流の `metadata.user_id.account_uuid` には元のユーザー `uuid` を送ります。
++
++ローカルのリクエストヘッダー `x-shunt-session-account` は Claude OAuth Messages リクエストで設定済みのアカウント名を優先します。選択可能なアカウントの順序だけを変更し、一時停止、ハードキャップ、クォータのしきい値、フェイルオーバーは引き続き適用します。このヘッダーは上流に送信しません。
+diff --git a/site/src/content/docs/ko/guides/anthropic-multi-account.mdx b/site/src/content/docs/ko/guides/anthropic-multi-account.mdx
+index 1d94876..30186a7 100644
+--- a/site/src/content/docs/ko/guides/anthropic-multi-account.mdx
++++ b/site/src/content/docs/ko/guides/anthropic-multi-account.mdx
+@@ -92,7 +92,8 @@ Full OAuth는 새로운 갱신 가능 credential을 만듭니다. import는 현
+ | `name` | 예 | 소문자, 숫자, 하이픈만 포함하는 고유 레이블. 다른 소스 필드가 없으면 이름이 일치하는 shunt 스토어 파일을 사용합니다. |
+ | `credentials` | 사용 가능한 소스 중 하나 | Claude Code `.credentials.json` 형태의 파일. `~/`가 확장됩니다. shunt는 만료가 가까워지면 갱신하고 갱신된 토큰을 원자적으로 다시 써 넣습니다. |
+ | `token_env` | 사용 가능한 소스 중 하나 | setup token이 들어 있는 환경 변수. 값은 그대로 사용되며 401 이후 갱신할 수 없습니다. |
+-| `uuid` | 아니요 | 기존 `metadata.user_id.account_uuid`를 다시 쓰기 위한, 선택된 계정의 Anthropic UUID이자, 풀에서 별칭을 통합하는 데 쓰이는 안정적인 아이덴티티. 이름만 있는 항목(스토어 스캔으로 해석됨)은 선택이 일어나기 전에 스토어의 `shuntAccountUuid`로부터 자동으로 채워집니다. `credentials` 또는 `token_env`로 설정된 항목의 아이덴티티는 `uuid`가 설정되어 있으면 그 값, 없으면 `name`이며, 그 아이덴티티가 다른 별칭의 명시적 `uuid` 또는 이름 폴백 아이덴티티와 일치할 때마다 통합됩니다. 명확하고 의도적인 통합을 위해서는 두 항목 모두에 일치하는 비어 있지 않은 `uuid`를 설정하세요(shunt는 명시적 `uuid`가 다른 계정의 이름 폴백 아이덴티티와 우연히 일치하는 경우도 경고합니다). |
++| `uuid` | 아니요 | 요청 본문에 쓰는 Anthropic 사용자 UUID. `organization_uuid`가 있으면 풀 상태에 조직도 포함합니다. 아래 조직 범위를 참고하세요. |
++| `organization_uuid` | 아니요 | 풀 상태를 조직별로 분리하는 선택적 조직 UUID. 업스트림에 보내는 사용자 UUID를 대체하지 않습니다. |
+ | `threshold` | 아니요 | 창(window)별 값이 없는 모든 창에 적용되는 계정별 소프트 쿼터 임계값, `[0.0, 1.0]` 범위. 낮은 값은 일찍 로테이션되는 백업 계정을 나타냅니다. |
+ | `threshold_5h` / `threshold_7d` / `threshold_fable` | 아니요 | 창별 소프트 임계값; 각각 해당 창에서 `threshold`보다 우선합니다. |
+ | `max_utilization` | 아니요 | 창별 값이 없는 모든 창에 적용되는 계정별 하드 캡, `[0.0, 1.0]` 범위. 적용되는 창에서 사용률이 이 값 이상인 계정은 선택에서 제외됩니다([하드 캡](#하드-캡-max_utilization) 참고). `[server.pool]` 없이도 동작합니다. |
+@@ -206,7 +207,7 @@ max_utilization_fable = 0.5        # Fable은 이 계정의 Fable 주간 버킷
+ | 2xx | 릴레이하고 정상으로 표시합니다. |
+ | Fable 요청에서 `anthropic-ratelimit-unified-7d_oi-status: rejected`만 있는 429 | Fable 쿼터 소진: 숫자 `retry-after`로 Fable 요청에만 적용되는 쿨다운(기본 60초, 1–3600초로 클램프)을 건 뒤 로테이션합니다. non-Fable 요청은 계속 그 계정을 쓸 수 있습니다. non-Fable 요청에서 같은 `7d_oi` 단독 거부가 발생하면 계정 전체 쿨다운을 적용합니다. |
+ | 429 + `anthropic-ratelimit-unified-5h-status: rejected` 또는 `-7d-status: rejected` | 공유 쿼터 소진: 숫자 `retry-after`로 계정 전체 쿨다운(기본 60초, 1–3600초로 클램프)한 뒤 모든 모델에 대해 로테이션합니다. `7d_oi`도 함께 `rejected`인 경우에도 계정 전체 쿨다운입니다. |
+-| 일반 429 | 일시적 스로틀: 숫자 `retry-after`만큼 대기(기본 1초, 상한 300초)하고 **같은** 계정을 한 번 재시도한 뒤, 그 재시도 응답을 릴레이합니다. |
++| 일반 429 | 일시적 제한: 숫자 `retry-after`만큼 대기한 뒤 같은 계정을 한 번 재시도합니다. 다시 429, 401 또는 5xx가 반환되면 이번 요청에서 다음 계정으로 이동합니다. 성공 및 다른 클라이언트 오류는 그대로 전달합니다. |
+ | `credentials`에서의 401 | 강제 갱신 후 같은 계정을 한 번 재시도; 여전히 401이면 5분 쿨다운 후 로테이션합니다. |
+ | `token_env` 또는 스토어 관리 setup token에서의 401 | 갱신 불가: 5분 쿨다운 후 로테이션합니다. |
+ | 5xx 또는 전송 실패 | 30초 쿨다운 후 로테이션합니다. |
+@@ -301,3 +302,13 @@ Claude Code는 문자열 값인 `metadata.user_id` 안에 계정 메타데이터
+ `[server.pool] ramp_initial_concurrency`(기본값 꺼짐)를 설정하면 계정 아이덴티티별 동시 허용(admission)을 슬로 스타트 램프로 제어하므로, 페일오버 전환이 방금 선택된 계정에 진행 중인 모든 요청을 한꺼번에 몰아넣지 못합니다. 방금 트래픽을 받기 시작한 아이덴티티는 최대 구성된 개수만큼의 동시 요청만 허용하며, 성공 응답마다 허용치가 두 배로 늘고(슬로 스타트), 페일오버는 램프를 다시 시작하며, 거부된 요청은 선택 순서상 다음 계정으로 넘어갑니다(마지막 후보는 항상 시도됩니다). [`[server.pool]`](/ko/reference/configuration/)를 참고하세요.
+ 
+ 구현 동작은 [KarpelesLab/teamclaude](https://github.com/KarpelesLab/teamclaude)와 배포된 Claude Code 바이너리를 참고했습니다. shunt는 teamclaude에 대한 런타임 의존성이 없습니다.
++
++## 조직 범위
++
++`organization_uuid`가 있으면 Anthropic 사용자 UUID와 조직 UUID의 쌍으로 풀 계정을 식별합니다. 같은 사용자의 개인 구독과 Team 구독은 쿼터, 쿨다운, 일시 중지, 재로그인 상태, 갱신 잠금과 구독 플랜 캐시를 별도로 유지합니다. 같은 쌍의 별칭은 상태를 공유합니다. 스토어 계정은 `shuntOrganizationUuid`를 읽고, OAuth 토큰 응답에 조직이 있으면 저장합니다. 이 메타데이터가 없는 기존 계정의 식별 방식은 유지됩니다. 업스트림의 `metadata.user_id.account_uuid`에는 원래 사용자 `uuid`를 보냅니다.
++
++로컬 요청 헤더 `x-shunt-session-account`는 Claude OAuth Messages 요청에서 구성된 계정 이름을 우선합니다. 선택 가능한 계정의 순서만 바꾸므로 일시 중지, 하드 캡, 쿼터 임계값과 페일오버는 계속 적용됩니다. 이 헤더는 업스트림에 전달하지 않습니다.
++
++집계 할당량 거부는 사용률이 없어도 해당 기간과 초기화 시각을 기록합니다. null 조회 결과는 유효한 거부를 지우지 않으며, 초과 사용 거부만으로 구독 사용을 차단하지 않습니다. 관리자 스냅샷은 `status_5h`, `status_7d`, `status_7d_oi`를 사용률과 별도로 제공합니다.
++
++사용 가능한 계정이 사용 중이고 나머지 계정이 할당량을 거부하면 재시도 가능한 503을 반환하여 마지막 계정의 주간 제한을 전체 풀 소진으로 표시하지 않습니다. 마지막 사용 가능한 계정에는 기존 강제 허용 방식이 유지됩니다. 실패 계정은 `x-shunt-account`로 식별합니다.
+diff --git a/site/src/content/docs/ko/reference/configuration.md b/site/src/content/docs/ko/reference/configuration.md
+index 9844f04..edeac69 100644
+--- a/site/src/content/docs/ko/reference/configuration.md
++++ b/site/src/content/docs/ko/reference/configuration.md
+@@ -1319,3 +1319,9 @@ policy = { type = "target_selector", selector = "/target" }
+ 라우터 id를 지정한 정확 일치 항목은 조회되지 않으며 로드 시점에 경고가 남습니다.
+ `[[route_prefixes]]` 항목은 영향을 받지 않습니다. 라우터는 그 접두사에서 자신의 id 하나만
+ 가져갈 뿐입니다.
++
++### 조직 범위
++
++`organization_uuid`가 있으면 Anthropic 사용자 UUID와 조직 UUID의 쌍으로 풀 계정을 식별합니다. 같은 사용자의 개인 구독과 Team 구독은 쿼터, 쿨다운, 일시 중지, 재로그인 상태와 갱신 잠금을 별도로 유지합니다. 같은 쌍의 별칭은 상태를 공유합니다. 스토어 계정은 `shuntOrganizationUuid`를 읽고, OAuth 토큰 응답에 조직이 있으면 저장합니다. 이 메타데이터가 없는 기존 계정의 식별 방식은 유지됩니다. 업스트림의 `metadata.user_id.account_uuid`에는 원래 사용자 `uuid`를 보냅니다.
++
++로컬 요청 헤더 `x-shunt-session-account`는 Claude OAuth Messages 요청에서 구성된 계정 이름을 우선합니다. 선택 가능한 계정의 순서만 바꾸므로 일시 중지, 하드 캡, 쿼터 임계값과 페일오버는 계속 적용됩니다. 이 헤더는 업스트림에 전달하지 않습니다.
+diff --git a/site/src/content/docs/reference/configuration.md b/site/src/content/docs/reference/configuration.md
+index d8fab3f..4f03bd1 100644
+--- a/site/src/content/docs/reference/configuration.md
++++ b/site/src/content/docs/reference/configuration.md
+@@ -616,6 +616,7 @@ token_env = "CLAUDE_BACKUP_OAUTH_TOKEN"
+ | `credentials` | one usable source | Path to a Claude Code `.credentials.json`-shaped file. `~/` is expanded. shunt refreshes near expiry and atomically writes refreshed tokens back. |
+ | `token_env` | one usable source | Environment variable holding a setup token. Used verbatim and not refreshable. Mutually exclusive with `credentials`. Its own value can also be written as `${VAR}` / `${file:...}` (see [Secret references](#secret-references)). |
+ | `uuid` | no | Replaces an existing `metadata.user_id.account_uuid` in requests selected for this account. |
++| `organization_uuid` | no | Optional organization UUID for pool-state isolation; does not replace the user UUID sent upstream. |
+ | `threshold` | no | Per-account soft quota threshold in `[0.0, 1.0]`, for every window without a per-window value. A low value marks a backup account that rotates out early. |
+ | `threshold_5h` / `threshold_7d` / `threshold_fable` | no | Per-window soft thresholds; each beats `threshold` for its window. See [`[server.pool]`](#serverpool-optional) for the full resolution order. |
+ | `max_utilization` | no | Per-account hard cap in `[0.0, 1.0]` for every window without a per-window value. An account at or above it in a governing window is excluded from selection, not merely reordered. Works without `[server.pool]`. |
+@@ -1527,3 +1528,9 @@ resolves **that target** through the rest of the ladder — so the target, not t
+ router id, is what a `[[routes]]` entry should name. An exact entry naming the
+ router id is never consulted and warns at load. A `[[route_prefixes]]` entry is
+ unaffected: the router takes only its own id out of that prefix's reach.
++
++### Organization scope
++
++When `organization_uuid` is present, pool identity is the pair of Anthropic user UUID and organization UUID. Personal and Team subscriptions for the same user then keep separate quotas, cooldowns, pauses, relogin state, and refresh locks. Aliases for the same pair still share state. Store-managed accounts read `shuntOrganizationUuid`; OAuth provisioning saves it when the token exchange returns an organization. Existing accounts without this metadata retain their previous identity. The raw user `uuid` remains the value sent in `metadata.user_id.account_uuid`.
++
++The local `x-shunt-session-account` request header prefers a configured account name for a Claude OAuth Messages request. It only reorders eligible accounts: pauses, hard caps, quota thresholds, and reactive failover still apply. Shunt consumes the header and never sends it upstream.
+diff --git a/site/src/content/docs/zh-cn/guides/anthropic-multi-account.mdx b/site/src/content/docs/zh-cn/guides/anthropic-multi-account.mdx
+index 7d07e18..bfaa752 100644
+--- a/site/src/content/docs/zh-cn/guides/anthropic-multi-account.mdx
++++ b/site/src/content/docs/zh-cn/guides/anthropic-multi-account.mdx
+@@ -92,7 +92,8 @@ Full OAuth 创建一个新的可刷新 credential;import 把当前的 `~/.claude
+ | `name` | 是 | 只含小写字母、数字和连字符的唯一标签。若没有其他来源字段,则解析同名的 shunt 存储文件。 |
+ | `credentials` | 可用来源之一 | Claude Code `.credentials.json` 形态的文件。`~/` 会被展开。shunt 在临近过期时刷新,并将刷新后的 token 原子性地写回。 |
+ | `token_env` | 可用来源之一 | 包含 setup token 的环境变量。其值按原样使用,401 之后无法刷新。 |
+-| `uuid` | 否 | 所选账户的 Anthropic UUID,用于改写已存在的 `metadata.user_id.account_uuid`,同时也是池中用于合并别名的稳定身份。仅有名称的条目(通过存储扫描解析)会在选择发生前自动从存储的 `shuntAccountUuid` 填充。通过 `credentials` 或 `token_env` 配置的条目,其身份在设置了 `uuid` 时为该值,否则为 `name`;只要该身份与另一别名显式的 `uuid` 或名称回退身份相等,就会与之合并——为清晰、有意的合并,请在两个条目上设置匹配且非空的 `uuid`(当某个显式 `uuid` 意外匹配另一账户的名称回退身份时,shunt 也会发出警告)。 |
++| `uuid` | 否 | 用于重写请求体的 Anthropic 用户 UUID。提供 `organization_uuid` 时，账号池状态也包含组织范围，见下文。 |
++| `organization_uuid` | 否 | 可选的组织 UUID，用于隔离账号池状态，不会替换发给上游的用户 UUID。 |
+ | `threshold` | 否 | `[0.0, 1.0]` 范围内的按账户软配额阈值,适用于所有没有按窗口取值的窗口。较低的取值把该账户标记为提前轮换出去的后备账户。 |
+ | `threshold_5h` / `threshold_7d` / `threshold_fable` | 否 | 按窗口的软阈值;各自在其窗口上优先于 `threshold`。 |
+ | `max_utilization` | 否 | `[0.0, 1.0]` 范围内的按账户硬上限,适用于所有没有按窗口取值的窗口。在某个起作用的窗口里使用率达到或超过它的账户会被移出选择(见[硬上限](#硬上限max_utilization))。没有 `[server.pool]` 时同样生效。 |
+@@ -208,7 +209,7 @@ max_utilization_fable = 0.5        # Fable 用到该账户 Fable 周桶约 50% 
+ | 2xx | 中继并标记为健康。 |
+ | Fable 请求上仅 `anthropic-ratelimit-unified-7d_oi-status: rejected` 的 429 | Fable 配额耗尽:按数值 `retry-after` 施加仅对 Fable 请求生效的冷却(默认 60 秒,钳制到 1–3600 秒),然后轮换。非 Fable 请求仍可使用该账户。对于非 Fable 请求,同样仅拒绝 `7d_oi` 的响应会触发账户级冷却。 |
+ | 429 且 `anthropic-ratelimit-unified-5h-status: rejected` 或 `-7d-status: rejected` | 共享配额耗尽:按数值 `retry-after` 施加账户级冷却(默认 60 秒,钳制到 1–3600 秒),然后对所有模型轮换。即使 `7d_oi` 同时被 `rejected`,仍是账户级冷却。 |
+-| 普通 429 | 瞬时限流:按数值 `retry-after` 等待(默认 1 秒,上限 300 秒),对**同一**账户重试一次,然后中继该重试的响应。 |
++| 普通 429 | 临时限流：按数字 `retry-after` 等待并重试同一账户一次；若再次返回 429、401 或 5xx，则在本次请求中尝试下一个账户。成功和其他客户端错误正常转发。 |
+ | 使用 `credentials` 时的 401 | 强制刷新,对同一账户重试一次;若仍是 401,冷却 5 分钟并轮换。 |
+ | 使用 `token_env` 或存储管理的 setup token 时的 401 | 无法刷新:冷却 5 分钟并轮换。 |
+ | 5xx 或传输失败 | 冷却 30 秒并轮换。 |
+@@ -303,3 +304,13 @@ Claude Code 可能把账户元数据以 JSON 形式编码在字符串值的 `met
+ 设置 `[server.pool] ramp_initial_concurrency`(默认关闭)会按账户身份以 slow-start 逐步放行(ramp)并发准入,这样一次故障转移切换就不会用所有在途请求同时冲垮刚选中的账户。刚开始承接流量的身份最多准入所配置数量的并发请求;每次成功响应把额度翻倍,一次故障转移会重启该 ramp,被拒绝的请求则顺延到选择顺序中的下一个账户(最后一个候选始终会被尝试)。参见 [`[server.pool]`](/zh-cn/reference/configuration/#serverpool可选)。
+ 
+ 实现行为参考了 [KarpelesLab/teamclaude](https://github.com/KarpelesLab/teamclaude) 与随产品发布的 Claude Code 二进制。shunt 对 teamclaude 没有运行时依赖。
++
++## 组织范围
++
++设置 `organization_uuid` 后，账号池以 Anthropic 用户 UUID 和组织 UUID 的组合标识账号。同一用户的个人订阅和 Team 订阅分别维护配额、冷却、暂停、重新登录状态、刷新锁和订阅方案缓存。同一组合的别名仍共享状态。存储账号读取 `shuntOrganizationUuid`；OAuth 令牌响应包含组织时会保存该字段。没有该元数据的现有账号保持原有标识方式。发给上游的 `metadata.user_id.account_uuid` 仍使用原始用户 `uuid`。
++
++本地请求头 `x-shunt-session-account` 为 Claude OAuth Messages 请求优先选择已配置的账号名。它只调整可用账号的顺序；暂停、硬上限、配额阈值和故障转移仍然生效。Shunt 消费该请求头，不会发送给上游。
++
++汇总配额拒绝会记录对应窗口及重置时间，即使使用率未提供。null 查询结果不会清除尚未过期的拒绝；仅超额使用被拒绝不会阻止订阅使用。管理快照独立提供 `status_5h`、`status_7d` 和 `status_7d_oi`，不虚构使用率。
++
++可用账户正忙且其余候选账户拒绝配额时，返回可重试的 503，避免将最后一个账户的周限额误报为整个池耗尽。最后一个可用候选账户保留现有的强制接纳回退机制。失败账户标识保留在 `x-shunt-account` 中。
+diff --git a/site/src/content/docs/zh-cn/reference/configuration.md b/site/src/content/docs/zh-cn/reference/configuration.md
+index 5e38f2b..fd51452 100644
+--- a/site/src/content/docs/zh-cn/reference/configuration.md
++++ b/site/src/content/docs/zh-cn/reference/configuration.md
+@@ -1248,3 +1248,9 @@ policy = { type = "target_selector", selector = "/target" }
+ 应答，路由器选定档位后再把**那个目标**交给其余的解析链。因此 `[[routes]]` 或
+ 条目应当写目标，而不是路由器 id。写了路由器 id 的精确条目永远不会被查询，并会在加载时
+ 发出警告。`[[route_prefixes]]` 条目不受影响：路由器只从该前缀中取走自己的 id。
++
++### 组织范围
++
++设置 `organization_uuid` 后，账号池以 Anthropic 用户 UUID 和组织 UUID 的组合标识账号。同一用户的个人订阅和 Team 订阅分别维护配额、冷却、暂停、重新登录状态和刷新锁。同一组合的别名仍共享状态。存储账号读取 `shuntOrganizationUuid`；OAuth 令牌响应包含组织时会保存该字段。没有该元数据的现有账号保持原有标识方式。发给上游的 `metadata.user_id.account_uuid` 仍使用原始用户 `uuid`。
++
++本地请求头 `x-shunt-session-account` 为 Claude OAuth Messages 请求优先选择已配置的账号名。它只调整可用账号的顺序；暂停、硬上限、配额阈值和故障转移仍然生效。Shunt 消费该请求头，不会发送给上游。
+diff --git a/src/accounts.rs b/src/accounts.rs
+index 51a67a2..ffc831f 100644
+--- a/src/accounts.rs
++++ b/src/accounts.rs
+@@ -231,6 +231,8 @@ pub struct QuotaState {
+     /// boot time when a surviving aggregate is unstamped.
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub observed_at_status: Option<u64>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub reset_at_status: Option<u64>,
+ }
+ 
+ impl QuotaState {
+@@ -484,6 +486,8 @@ pub struct AccountSnapshot {
+     /// `[server.pool]` is configured and the projection is finite: positive
+     /// means the account survives to its tightest reset at the current pace.
+     pub headroom_secs: Option<i64>,
++    /// Unix seconds of the latest five-hour quota observation.
++    pub observed_at_5h: Option<u64>,
+     pub utilization_5h: Option<f64>,
+     pub reset_5h: Option<u64>,
+     pub utilization_7d: Option<f64>,
+@@ -501,6 +505,9 @@ pub struct AccountSnapshot {
+     /// `max_utilization_5h`.
+     pub max_utilization_fable: Option<f64>,
+     pub status: Option<String>,
++    pub status_5h: Option<String>,
++    pub status_7d: Option<String>,
++    pub status_7d_oi: Option<String>,
+     /// Grouped model-family quota windows from the Antigravity `retrieveUserQuotaSummary` poll,
+     /// when present. Omitted when empty. Unlike the 5h/7d utilization fields
+     /// above, these carry no account-wide window — each bucket names its own
+@@ -567,6 +574,7 @@ impl AccountSnapshot {
+             disabled: account.disabled,
+             paused,
+             headroom_secs: None,
++            observed_at_5h: None,
+             utilization_5h: None,
+             reset_5h: None,
+             utilization_7d: None,
+@@ -577,6 +585,9 @@ impl AccountSnapshot {
+             max_utilization_7d,
+             max_utilization_fable,
+             status: None,
++            status_5h: None,
++            status_7d: None,
++            status_7d_oi: None,
+             quota_buckets: Vec::new(),
+             needs_relogin,
+             requests_attempted: requests.attempted(),
+@@ -1293,6 +1304,40 @@ impl AccountPool {
+     }
+ 
+     pub fn note_quota(&self, provider: &str, account: &AccountConfig, headers: &HeaderMap) {
++        let mut headers = headers.clone();
++        // A rejection can identify its window without publishing a percentage.
++        if headers
++            .get("anthropic-ratelimit-unified-status")
++            .is_some_and(|v| v == "rejected")
++        {
++            let window = match headers
++                .get("anthropic-ratelimit-unified-representative-claim")
++                .and_then(|v| v.to_str().ok())
++            {
++                Some("five_hour") => Some((
++                    QUOTA_STATUS_HEADERS[0],
++                    "anthropic-ratelimit-unified-5h-reset",
++                )),
++                Some("seven_day") => Some((
++                    QUOTA_STATUS_HEADERS[1],
++                    "anthropic-ratelimit-unified-7d-reset",
++                )),
++                Some("seven_day_oi") => Some((
++                    QUOTA_STATUS_HEADERS[2],
++                    "anthropic-ratelimit-unified-7d_oi-reset",
++                )),
++                _ => None,
++            };
++            if let Some((status, reset)) = window {
++                headers
++                    .entry(status)
++                    .or_insert("rejected".parse().expect("static header"));
++                if let Some(value) = headers.get("anthropic-ratelimit-unified-reset").cloned() {
++                    headers.entry(reset).or_insert(value);
++                }
++            }
++        }
++        let headers = &headers;
+         {
+             let mut entries = self.entries.lock().expect("account health lock poisoned");
+             let health = self.health_entry(&mut entries, account_key(provider, account));
+@@ -1377,6 +1422,8 @@ impl AccountPool {
+             }
+             if wrote_status {
+                 quota.observed_at_status = Some(now);
++                quota.reset_at_status =
++                    header_value::<u64>(headers, "anthropic-ratelimit-unified-reset");
+             }
+ 
+             // The post-lock dirty mark below covers both this observation and
+@@ -1623,15 +1670,19 @@ impl AccountPool {
+             expire_stale_quota(quota, now);
+             if clear_five_hour {
+                 quota.utilization_5h = None;
+-                quota.reset_5h = None;
+-                quota.status_5h = None;
+                 quota.observed_at_5h = None;
++                if quota.status_5h.as_deref() != Some("rejected") {
++                    quota.reset_5h = None;
++                    quota.status_5h = None;
++                }
+             }
+             if clear_seven_day {
+                 quota.utilization_7d = None;
+-                quota.reset_7d = None;
+-                quota.status_7d = None;
+                 quota.observed_at_7d = None;
++                if quota.status_7d.as_deref() != Some("rejected") {
++                    quota.reset_7d = None;
++                    quota.status_7d = None;
++                }
+             }
+             if let Some(window) = &usage.five_hour {
+                 quota.utilization_5h = Some(window.utilization);
+@@ -2395,10 +2446,12 @@ impl AccountPool {
+                     // `store_marked` short-circuits first, so the steady state
+                     // (an empty side table) scans nothing.
+                     let store_backed = account.credentials.is_none() && account.token_env.is_none();
++                    let identity = account_identity(account);
+                     let account_uuid = account
+                         .uuid
+                         .as_deref()
+-                        .filter(|uuid| !uuid.trim().is_empty());
++                        .filter(|uuid| !uuid.trim().is_empty())
++                        .map(|_| identity.as_ref());
+                     let store_condemned = store_marked
+                         && store_backed
+                         && store_relogin.iter().any(|marked| {
+@@ -2455,12 +2508,12 @@ impl AccountPool {
+                     AccountSnapshot {
+                         name: account.name.clone(),
+                         has_state: true,
+-                        available: !account.disabled
+-                            && !health.paused_providers.contains(provider)
+-                            && !cooling
+-                            && !quota.near
+-                            && !capped
+-                            && !(is_fable && capped_fable),
++                        available: !(account.disabled
++                            || health.paused_providers.contains(provider)
++                            || cooling
++                            || quota.near
++                            || capped
++                            || (is_fable && capped_fable)),
+                         near_quota: quota.near,
+                         capped,
+                         capped_fable,
+@@ -2475,6 +2528,7 @@ impl AccountPool {
+                         paused: health.paused_providers.contains(provider),
+                         headroom_secs: (pool.is_some() && quota.headroom.is_finite())
+                             .then_some(quota.headroom as i64),
++                        observed_at_5h: health.quota.observed_at_5h,
+                         utilization_5h: health.quota.utilization_5h,
+                         reset_5h: health.quota.reset_5h,
+                         utilization_7d: health.quota.utilization_7d,
+@@ -2485,6 +2539,9 @@ impl AccountPool {
+                         max_utilization_7d,
+                         max_utilization_fable,
+                         status: health.quota.status.clone(),
++                        status_5h: health.quota.status_5h.clone(),
++                        status_7d: health.quota.status_7d.clone(),
++                        status_7d_oi: health.quota.status_7d_oi.clone(),
+                         quota_buckets: health.quota_buckets.clone(),
+                         // The entry's own mark *or* the side table's, because
+                         // the set cannot always reach the entry: a verdict
+@@ -2773,10 +2830,19 @@ impl Drop for AdmissionGuard {
+ /// A blank (empty or all-whitespace) `uuid` is treated the same as a missing
+ /// one — otherwise every account configured with `uuid = ""` would coalesce
+ /// into a single shared identity instead of falling back to its own name.
+-pub(crate) fn account_identity(account: &AccountConfig) -> &str {
+-    match account.uuid.as_deref() {
+-        Some(uuid) if !uuid.trim().is_empty() => uuid,
+-        _ => &account.name,
++pub(crate) fn account_identity(account: &AccountConfig) -> std::borrow::Cow<'_, str> {
++    match account.uuid.as_deref().filter(|id| !id.trim().is_empty()) {
++        Some(uuid) => match account
++            .organization_uuid
++            .as_deref()
++            .filter(|id| !id.trim().is_empty())
++        {
++            Some(org) => std::borrow::Cow::Owned(
++                serde_json::to_string(&(uuid, org)).expect("string pair serializes"),
++            ),
++            None => std::borrow::Cow::Borrowed(uuid),
++        },
++        None => std::borrow::Cow::Borrowed(&account.name),
+     }
+ }
+ 
+@@ -2814,10 +2880,9 @@ fn backed_by_same_store_account(
+     }
+     sibling.store_family == key.store_family
+         && match &sibling.identity {
+-            AccountStateIdentity::Verified { id } => account
+-                .uuid
+-                .as_deref()
+-                .is_some_and(|uuid| !uuid.trim().is_empty() && uuid == id),
++            AccountStateIdentity::Verified { id } => account.uuid.as_deref().is_some_and(|uuid| {
++                !uuid.trim().is_empty() && account_identity(account).as_ref() == id
++            }),
+             AccountStateIdentity::StoreEntry { name }
+             | AccountStateIdentity::UpstreamInline { name, .. } => *name == account.name,
+         }
+@@ -2855,7 +2920,9 @@ fn purge_store_relogin(
+         account
+             .uuid
+             .as_deref()
+-            .filter(|uuid| !uuid.trim().is_empty()),
++            .filter(|uuid| !uuid.trim().is_empty())
++            .map(|_| account_identity(account))
++            .as_deref(),
+     );
+ }
+ 
+@@ -2957,7 +3024,9 @@ pub(crate) fn account_key(upstream: &str, account: &AccountConfig) -> AccountKey
+         }
+     });
+     let identity = match account.uuid.as_deref().filter(|id| !id.trim().is_empty()) {
+-        Some(id) => AccountStateIdentity::Verified { id: id.to_string() },
++        Some(_) => AccountStateIdentity::Verified {
++            id: account_identity(account).into_owned(),
++        },
+         None if account.store_entry => AccountStateIdentity::StoreEntry {
+             name: account.name.clone(),
+         },
+@@ -3554,6 +3623,7 @@ fn expire_stale_quota(quota: &mut QuotaState, now: u64) -> bool {
+         let had_signal = quota.status.is_some() || quota.observed_at_status.is_some();
+         quota.status = None;
+         quota.observed_at_status = None;
++        quota.reset_at_status = None;
+         expired |= had_signal;
+     }
+     // Unconditional aggregate cap, independent of the per-window sweep above.
+@@ -3565,13 +3635,15 @@ fn expire_stale_quota(quota: &mut QuotaState, now: u64) -> bool {
+     // would leave a stale aggregate rejection with no expiry path at all —
+     // the poller writes utilization/reset every cycle, so the per-window
+     // sweep above never fires, and `status` would never clear on its own.
+-    if quota
+-        .observed_at_status
+-        .is_some_and(|at| at.saturating_add(WINDOW_7D_SECS) <= now)
++    if reset_expired(quota.reset_at_status)
++        || quota
++            .observed_at_status
++            .is_some_and(|at| at.saturating_add(WINDOW_7D_SECS) <= now)
+     {
+         let had_signal = quota.status.is_some() || quota.observed_at_status.is_some();
+         quota.status = None;
+         quota.observed_at_status = None;
++        quota.reset_at_status = None;
+         expired |= had_signal;
+     }
+     expired
+@@ -3694,8 +3766,9 @@ fn normalize_signal_metadata(quota: &mut QuotaState) -> bool {
+         corrected |= quota.observed_at_status_7d_oi.take().is_some();
+         corrected |= quota.reset_at_status_7d_oi.take().is_some();
+     }
+-    if quota.status.is_none() && quota.observed_at_status.take().is_some() {
+-        corrected = true;
++    if quota.status.is_none() {
++        corrected |= quota.observed_at_status.take().is_some();
++        corrected |= quota.reset_at_status.take().is_some();
+     }
+     corrected
+ }
+@@ -3728,13 +3801,23 @@ const QUOTA_STATUS_HEADERS: [&str; 3] = [
+     "anthropic-ratelimit-unified-7d_oi-status",
+ ];
+ 
++fn quota_rejected(headers: &HeaderMap) -> bool {
++    QUOTA_STATUS_HEADERS
++        .iter()
++        .chain(std::iter::once(&"anthropic-ratelimit-unified-status"))
++        .any(|name| headers.get(*name).is_some_and(|value| value == "rejected"))
++}
++
+ /// True when only the Fable weekly quota status rejects the response. A 5-hour
+ /// or shared-weekly rejection makes the failure account-wide instead.
+ pub fn is_fable_scoped_rejection(headers: &HeaderMap) -> bool {
+     let rejected = |name: &str| headers.get(name).is_some_and(|value| value == "rejected");
+-    rejected(QUOTA_STATUS_HEADERS[2])
++    let claim = headers.get("anthropic-ratelimit-unified-representative-claim");
++    let aggregate = rejected("anthropic-ratelimit-unified-status");
++    (rejected(QUOTA_STATUS_HEADERS[2]) || (aggregate && claim.is_some_and(|v| v == "seven_day_oi")))
+         && !rejected(QUOTA_STATUS_HEADERS[0])
+         && !rejected(QUOTA_STATUS_HEADERS[1])
++        && !(aggregate && claim.is_some_and(|v| v == "five_hour" || v == "seven_day"))
+ }
+ 
+ /// Low-cardinality pool-rotation reason for an upstream response that moves off
+@@ -3746,10 +3829,7 @@ pub fn is_fable_scoped_rejection(headers: &HeaderMap) -> bool {
+ /// separately from transient ones.
+ pub fn rotation_reason(status: StatusCode, headers: &HeaderMap) -> &'static str {
+     if status == StatusCode::TOO_MANY_REQUESTS {
+-        if QUOTA_STATUS_HEADERS
+-            .iter()
+-            .any(|name| headers.get(*name).is_some_and(|value| value == "rejected"))
+-        {
++        if quota_rejected(headers) {
+             "quota"
+         } else {
+             "rate_limit"
+@@ -3770,10 +3850,7 @@ pub fn classify(status: StatusCode, headers: &HeaderMap) -> FailoverAction {
+         return FailoverAction::Relay;
+     }
+     if status == StatusCode::TOO_MANY_REQUESTS {
+-        if QUOTA_STATUS_HEADERS
+-            .iter()
+-            .any(|name| headers.get(*name).is_some_and(|value| value == "rejected"))
+-        {
++        if quota_rejected(headers) {
+             return FailoverAction::Rotate;
+         }
+         return FailoverAction::PauseSame;
+@@ -3981,6 +4058,50 @@ mod tests {
+     /// not rewrite it. Otherwise a terminal admin probe on an account the proxy
+     /// had already condemned would downgrade the verdict, and the next grant
+     /// that happened to succeed would clear a mark nothing had disproved.
++    #[test]
++    fn claude_organizations_separate_quota_cooldowns_and_aliases() {
++        let personal = AccountConfig {
++            name: "max".into(),
++            uuid: Some("same-user".into()),
++            organization_uuid: Some("personal".into()),
++            ..Default::default()
++        };
++        let team = AccountConfig {
++            name: "team".into(),
++            uuid: Some("same-user".into()),
++            organization_uuid: Some("team".into()),
++            ..Default::default()
++        };
++        let mut alias = team.clone();
++        alias.name = "team-alias".into();
++        assert_ne!(
++            account_key("anthropic", &personal),
++            account_key("anthropic", &team)
++        );
++        assert_eq!(
++            account_key("anthropic", &team),
++            account_key("anthropic", &alias)
++        );
++        let pool = AccountPool::new();
++        let accounts = vec![personal.clone(), team.clone(), alias];
++        assert_eq!(
++            pool.select_order("anthropic", &accounts, None, None, None)
++                .len(),
++            2
++        );
++        let mut headers = HeaderMap::new();
++        headers.insert(
++            "anthropic-ratelimit-unified-7d-utilization",
++            "1.0".parse().unwrap(),
++        );
++        pool.note_quota("anthropic", &personal, &headers);
++        pool.cooldown("anthropic", &personal, Duration::from_secs(60), "fixture");
++        let snapshot = pool.snapshot("anthropic", &accounts, None, None);
++        assert!(!snapshot[0].available);
++        assert!(snapshot[1].available);
++        assert_eq!(personal.uuid.as_deref(), Some("same-user"));
++    }
++
+     #[test]
+     fn a_grant_failure_never_downgrades_a_served_request_verdict() {
+         let pool = AccountPool::new();
+@@ -6944,6 +7065,7 @@ mod tests {
+             reset_at_status_7d: Some(now + 60),
+             reset_at_status_7d_oi: Some(now + 120),
+             observed_at_status: None,
++            reset_at_status: None,
+         };
+         expire_stale_quota(&mut quota, now);
+         assert_eq!(quota.status_5h, None);
+@@ -8021,6 +8143,125 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn aggregate_weekly_rejection_survives_missing_percentage_and_null_poll() {
++        let pool = AccountPool::new();
++        let a = account("weekly-hidden");
++        let reset = unix_now() + 3600;
++        let headers = quota_headers(&[
++            ("anthropic-ratelimit-unified-status", "rejected".into()),
++            (
++                "anthropic-ratelimit-unified-representative-claim",
++                "seven_day".into(),
++            ),
++            ("anthropic-ratelimit-unified-reset", reset.to_string()),
++            (QUOTA_STATUS_HEADERS[0], "allowed".into()),
++            ("anthropic-ratelimit-unified-7d-utilization", "0.6".into()),
++        ]);
++        assert!(matches!(
++            classify(StatusCode::TOO_MANY_REQUESTS, &headers),
++            FailoverAction::Rotate
++        ));
++        assert_eq!(
++            rotation_reason(StatusCode::TOO_MANY_REQUESTS, &headers),
++            "quota"
++        );
++        pool.note_quota("anthropic", &a, &headers);
++        pool.note_usage_inner("anthropic", &a, &UsageSnapshot::default(), false, true);
++        let rows = pool.snapshot("anthropic", std::slice::from_ref(&a), None, None);
++        assert!(!rows[0].available);
++        assert_eq!(rows[0].utilization_7d, None);
++        assert_eq!(rows[0].status_7d.as_deref(), Some("rejected"));
++        assert_eq!(rows[0].reset_7d, Some(reset));
++        let mut entries = pool.entries.lock().unwrap();
++        let q = &mut entries
++            .get_mut(&account_key("anthropic", &a))
++            .unwrap()
++            .quota;
++        expire_stale_quota(q, reset + 1);
++        assert_eq!(q.status_7d, None);
++        assert!(!assess_quota(q, &a, false, None, reset + 1).near);
++    }
++
++    #[test]
++    fn aggregate_rejection_expires_at_its_own_reset_without_any_window_percentage() {
++        let pool = AccountPool::new();
++        let a = account("weekly");
++        let reset = unix_now() + 60;
++        pool.note_quota(
++            "anthropic",
++            &a,
++            &quota_headers(&[
++                ("anthropic-ratelimit-unified-status", "rejected".into()),
++                (
++                    "anthropic-ratelimit-unified-representative-claim",
++                    "seven_day".into(),
++                ),
++                ("anthropic-ratelimit-unified-reset", reset.to_string()),
++            ]),
++        );
++        let mut entries = pool.entries.lock().unwrap();
++        let q = &mut entries
++            .get_mut(&account_key("anthropic", &a))
++            .unwrap()
++            .quota;
++        let restored: QuotaState = serde_json::from_slice(&serde_json::to_vec(q).unwrap()).unwrap();
++        assert_eq!(restored.reset_at_status, Some(reset));
++        assert!(assess_quota(q, &a, false, None, reset - 1).near);
++        expire_stale_quota(q, reset);
++        assert!(!assess_quota(q, &a, false, None, reset).near);
++    }
++
++    #[test]
++    fn aggregate_fable_rejection_keeps_opus_available() {
++        let pool = AccountPool::new();
++        let a = account("scoped");
++        let headers = quota_headers(&[
++            ("anthropic-ratelimit-unified-status", "rejected".into()),
++            (
++                "anthropic-ratelimit-unified-representative-claim",
++                "seven_day_oi".into(),
++            ),
++        ]);
++        assert!(is_fable_scoped_rejection(&headers));
++        pool.note_quota("anthropic", &a, &headers);
++        assert!(
++            pool.snapshot(
++                "anthropic",
++                std::slice::from_ref(&a),
++                Some("claude-opus-5-5"),
++                None
++            )[0]
++            .available
++        );
++        assert!(!pool.snapshot("anthropic", &[a], Some("claude-fable-5"), None)[0].available);
++    }
++
++    #[test]
++    fn overage_rejection_does_not_exhaust_the_subscription() {
++        let headers = quota_headers(&[
++            ("anthropic-ratelimit-unified-status", "allowed".into()),
++            (
++                "anthropic-ratelimit-unified-overage-status",
++                "rejected".into(),
++            ),
++            (
++                "anthropic-ratelimit-unified-representative-claim",
++                "seven_day".into(),
++            ),
++        ]);
++        assert!(matches!(
++            classify(StatusCode::TOO_MANY_REQUESTS, &headers),
++            FailoverAction::PauseSame
++        ));
++        let pool = AccountPool::new();
++        let a = account("subscription");
++        pool.note_quota("anthropic", &a, &headers);
++        let rows = pool.snapshot("anthropic", &[a], None, None);
++        assert!(rows[0].available);
++        assert_eq!(rows[0].status_7d, None);
++    }
++
+     #[test]
+     fn note_quota_records_each_window_status_when_present() {
+         let pool = AccountPool::new();
+@@ -8595,6 +8836,7 @@ mod tests {
+             reset_at_status_7d: Some(future + 3_600),
+             reset_at_status_7d_oi: Some(future + 7_200),
+             observed_at_status: Some(now),
++            reset_at_status: None,
+         };
+         let sibling_quota = QuotaState {
+             utilization_5h: Some(0.44),
+@@ -8755,6 +8997,7 @@ mod tests {
+             reset_at_status_7d: Some(future + 3_600),
+             reset_at_status_7d_oi: Some(future + 7_200),
+             observed_at_status: Some(now.saturating_sub(30)),
++            reset_at_status: None,
+         };
+         let sibling_quota = QuotaState {
+             utilization_7d_oi: Some(0.55),
+diff --git a/src/adapters/anthropic/mod.rs b/src/adapters/anthropic/mod.rs
+index b21bbb0..a95a9c6 100644
+--- a/src/adapters/anthropic/mod.rs
++++ b/src/adapters/anthropic/mod.rs
+@@ -190,13 +190,42 @@ async fn forward_claude_oauth(
+         .get("x-claude-code-session-id")
+         .and_then(|value| value.to_str().ok());
+     let is_fable = accounts::is_fable_model(Some(route.upstream_model.as_str()));
+-    let (order, cap) = state.accounts.select_order_with_cap(
++    let (mut order, cap) = state.accounts.select_order_with_cap(
+         &route.provider,
+         &accounts,
+         session_id,
+         Some(route.upstream_model.as_str()),
+         state.config.server.pool.as_ref(),
+     );
++    if let Some(preferred) = headers
++        .get("x-shunt-session-account")
++        .and_then(|v| v.to_str().ok())
++    {
++        let snapshots = state.accounts.snapshot(
++            &route.provider,
++            &accounts,
++            Some(route.upstream_model.as_str()),
++            state.config.server.pool.as_ref(),
++        );
++        if let Some(index) = order.iter().position(|&i| {
++            accounts[i].name == preferred
++                && snapshots[i].available
++                && !snapshots[i].needs_relogin
++                && !snapshots[i].near_quota
++        }) {
++            let selected = order.remove(index);
++            order.insert(0, selected);
++        }
++    }
++    let snapshots = state.accounts.snapshot(
++        &route.provider,
++        &accounts,
++        Some(route.upstream_model.as_str()),
++        state.config.server.pool.as_ref(),
++    );
++    let last_ready = order
++        .iter()
++        .rposition(|&i| snapshots[i].available && !snapshots[i].needs_relogin);
+     let url = upstream_url(&state, &route, uri);
+     normalize_upstream_model_request(&mut body, &route.upstream_model);
+     deferral::strip_unsupported_deferral(&mut body, &route.upstream_model);
+@@ -206,6 +235,7 @@ async fn forward_claude_oauth(
+     let ramp_initial = state.config.storm_ramp_initial();
+     let candidates = order.len();
+     let mut last_response = None;
++    let mut saturated = false;
+ 
+     for (position, index) in order.into_iter().enumerate() {
+         let account = &accounts[index];
+@@ -220,10 +250,18 @@ async fn forward_claude_oauth(
+             account,
+             ramp_initial,
+             position,
+-            candidates,
++            // Force the last usable candidate, rather than an exhausted fallback.
++            if last_ready == Some(position) {
++                position + 1
++            } else {
++                candidates
++            },
+         ) {
+             Some(admission) => admission,
+-            None => continue,
++            None => {
++                saturated = true;
++                continue;
++            }
+         };
+         // The per-account refresh_lock serializes only credential refreshes for
+         // one account: resolve_claude_account can refresh-on-read and write the
+@@ -381,7 +419,7 @@ async fn forward_claude_oauth(
+                     status = %status,
+                     "Claude OAuth account failed over; cooling down and rotating to the next account"
+                 );
+-                last_response = Some(upstream);
++                last_response = Some((upstream, account.name.clone()));
+             }
+             FailoverAction::PauseSame => {
+                 let delay = accounts::retry_after(upstream.headers())
+@@ -399,7 +437,7 @@ async fn forward_claude_oauth(
+                 )
+                 .await?
+                 else {
+-                    last_response = Some(upstream);
++                    last_response = Some((upstream, account.name.clone()));
+                     continue;
+                 };
+                 let retry_status = retry.status();
+@@ -426,6 +464,13 @@ async fn forward_claude_oauth(
+                         "Claude OAuth throttle retry did not succeed; cooling down account"
+                     );
+                 }
++                if !matches!(
++                    accounts::classify(retry_status, retry.headers()),
++                    FailoverAction::Relay
++                ) {
++                    last_response = Some((retry, account.name.clone()));
++                    continue;
++                }
+                 return relay_response(&state, &route, retry, Some(&account.name), bounds)
+                     .await
+                     .map(|(status, response)| {
+@@ -469,7 +514,7 @@ async fn forward_claude_oauth(
+                         account = %account.name,
+                         "Claude OAuth account returned 401 but its credential is not refreshable (token_env or long-lived setup token); cooling down"
+                     );
+-                    last_response = Some(upstream);
++                    last_response = Some((upstream, account.name.clone()));
+                     continue;
+                 }
+ 
+@@ -486,7 +531,7 @@ async fn forward_claude_oauth(
+                             account = %account.name,
+                             "claude_oauth account resolved a non-OAuth credential"
+                         );
+-                        last_response = Some(upstream);
++                        last_response = Some((upstream, account.name.clone()));
+                         continue;
+                     }
+                 };
+@@ -543,7 +588,7 @@ async fn forward_claude_oauth(
+                                 terminal,
+                                 "failed to force-refresh Claude OAuth account"
+                             );
+-                            last_response = Some(upstream);
++                            last_response = Some((upstream, account.name.clone()));
+                             continue;
+                         }
+                     }
+@@ -565,7 +610,7 @@ async fn forward_claude_oauth(
+                 )
+                 .await?
+                 else {
+-                    last_response = Some(upstream);
++                    last_response = Some((upstream, account.name.clone()));
+                     continue;
+                 };
+                 let retry_status = retry.status();
+@@ -593,7 +638,7 @@ async fn forward_claude_oauth(
+                         account,
+                         accounts::ReloginCause::ServedRequest,
+                     );
+-                    last_response = Some(retry);
++                    last_response = Some((retry, account.name.clone()));
+                     continue;
+                 }
+                 // Classify the refreshed retry the same way the initial response is
+@@ -677,7 +722,7 @@ async fn forward_claude_oauth(
+                             status = %retry_status,
+                             "Claude OAuth refresh retry did not succeed; rotating to the next account"
+                         );
+-                        last_response = Some(retry);
++                        last_response = Some((retry, account.name.clone()));
+                         continue;
+                     }
+                 }
+@@ -693,9 +738,31 @@ async fn forward_claude_oauth(
+         }
+     }
+ 
++    if saturated
++        && last_response
++            .as_ref()
++            .is_none_or(|(r, _)| r.status() == StatusCode::TOO_MANY_REQUESTS)
++    {
++        // A busy healthy account is not an exhausted pool: let Native retry.
++        let message = "Claude pool busy; retry shortly";
++        let mut response =
++            crate::error::ShuntError::new(StatusCode::SERVICE_UNAVAILABLE, "api_error", message)
++                .into_response();
++        response
++            .headers_mut()
++            .insert("retry-after", HeaderValue::from_static("1"));
++        return Err(AdapterError {
++            message: message.into(),
++            response: Box::new(response),
++            failure: Some(crate::adapters::AdapterFailure::UpstreamStatus(
++                StatusCode::SERVICE_UNAVAILABLE,
++            )),
++        });
++    }
++
+     crate::metrics::record_pool_rotation(&route.provider, "exhausted");
+-    if let Some(response) = last_response {
+-        return relay_response(&state, &route, response, None, bounds).await;
++    if let Some((response, account)) = last_response {
++        return relay_response(&state, &route, response, Some(&account), bounds).await;
+     }
+ 
+     Err(AdapterError {
+@@ -1288,6 +1355,7 @@ fn rewrite_account_uuid(body: Vec<u8>, account_uuid: Option<&str>) -> Vec<u8> {
+ /// stripped and replaced with the provider's key in its configured header.
+ fn outbound_headers(headers: &HeaderMap, credential: &Credential) -> HeaderMap {
+     let mut out = headers::filtered(headers);
++    out.remove("x-shunt-session-account");
+     match credential {
+         Credential::ApiKey { value, header } => {
+             out.remove("authorization");
+@@ -1679,6 +1747,21 @@ mod tests {
+         quota_cooldown_scope, rate_limit_kind, rewrite_account_uuid, Credential,
+     };
+ 
++    #[test]
++    fn session_account_preference_is_never_forwarded() {
++        let mut headers = client_headers();
++        headers.insert("x-shunt-session-account", "team".parse().unwrap());
++        let out = outbound_headers(
++            &headers,
++            &Credential::ClaudeOauth {
++                access_token: "fixture".into(),
++                account_uuid: None,
++            },
++        );
++        assert!(!out.contains_key("x-shunt-session-account"));
++        assert!(out.contains_key("anthropic-version"));
++    }
++
+     fn client_headers() -> HeaderMap {
+         let mut headers = HeaderMap::new();
+         headers.insert("authorization", "Bearer client-token".parse().unwrap());
+diff --git a/src/admin/mod.rs b/src/admin/mod.rs
+index 8efc42b..f969daa 100644
+--- a/src/admin/mod.rs
++++ b/src/admin/mod.rs
+@@ -1711,13 +1711,20 @@ async fn complete_account(
+             .await
+             .unwrap_or(None);
+ 
++    let organization_uuid = tokens.organization.as_ref().map(|o| o.uuid.clone());
+     let account_name = name.clone();
+     let stored = match pending.kind {
+         PendingKind::SetupToken => {
+             let access_token = tokens.access_token;
+             let account_uuid = account_uuid.expect("setup-token UUID validated above");
+             tokio::task::spawn_blocking(move || {
+-                claude_store::store_setup_token(&account_name, &access_token, Some(&account_uuid))
++                let path = claude_store::store_setup_token(
++                    &account_name,
++                    &access_token,
++                    Some(&account_uuid),
++                )?;
++                claude_store::store_organization(&account_name, organization_uuid.as_deref())?;
++                Ok::<_, anyhow::Error>(path)
+             })
+             .await
+         }
+@@ -1741,13 +1748,15 @@ async fn complete_account(
+             let access_token = tokens.access_token;
+             let expires_at_ms = claude_login::oauth_expires_at_ms(tokens.expires_in);
+             tokio::task::spawn_blocking(move || {
+-                claude_store::store_oauth_tokens(
++                let path = claude_store::store_oauth_tokens(
+                     &account_name,
+                     &access_token,
+                     &refresh_token,
+                     expires_at_ms,
+                     account_uuid.as_deref(),
+-                )
++                )?;
++                claude_store::store_organization(&account_name, organization_uuid.as_deref())?;
++                Ok::<_, anyhow::Error>(path)
+             })
+             .await
+         }
+@@ -1777,10 +1786,9 @@ async fn complete_account(
+     // name, and may be shared by other stored aliases, so only clear an
+     // identity when no other stored account still resolves to it.
+     let identity_name = name.clone();
+-    let account_uuid =
+-        tokio::task::spawn_blocking(move || claude_store::account_uuid(&identity_name))
+-            .await
+-            .unwrap_or(None);
++    let account_uuid = tokio::task::spawn_blocking(move || claude_store::pool_uuid(&identity_name))
++        .await
++        .unwrap_or(None);
+     let new_identity = account_uuid.clone().unwrap_or_else(|| name.clone());
+     let other_identities =
+         remaining_account_identities(&name, claude_store::scan_accounts_strict).await;
+@@ -1916,7 +1924,7 @@ async fn refresh_account(
+     // whether its credential file carries a `shuntAccountUuid` and on how the
+     // provider table reaches it — see `set_needs_relogin_for_store_account`.
+     let uuid_name = name.clone();
+-    let account_uuid = tokio::task::spawn_blocking(move || claude_store::account_uuid(&uuid_name))
++    let account_uuid = tokio::task::spawn_blocking(move || claude_store::pool_uuid(&uuid_name))
+         .await
+         .unwrap_or(None);
+ 
+@@ -2025,7 +2033,7 @@ async fn remove_account_handler(
+     }
+     let target = name.clone();
+     let removed = match tokio::task::spawn_blocking(move || {
+-        let identity = claude_store::account_uuid(&target).unwrap_or_else(|| target.clone());
++        let identity = claude_store::pool_uuid(&target).unwrap_or_else(|| target.clone());
+         claude_store::remove_account(&target).map(|removed| (removed, identity))
+     })
+     .await
+diff --git a/src/admin/plan.rs b/src/admin/plan.rs
+index c288879..317e3b7 100644
+--- a/src/admin/plan.rs
++++ b/src/admin/plan.rs
+@@ -52,7 +52,7 @@ use std::{
+ use serde_json::Value;
+ 
+ use crate::{
+-    accounts::{account_key, AccountKey, AccountStateIdentity},
++    accounts::{account_identity, account_key, AccountKey, AccountStateIdentity},
+     auth::{
+         claude::{auth as claude_auth, store as claude_store},
+         codex::store as codex_store,
+@@ -305,7 +305,7 @@ fn credential_path(auth: AuthMode, account: &AccountConfig) -> Option<PathBuf> {
+ struct FileDerivedPlans {
+     plans: Vec<Option<String>>,
+     tokens: Vec<Option<String>>,
+-    /// `shuntAccountUuid` as written by shunt's own credential import,
++    /// User and organization identity from the imported credential,
+     /// harvested from the same read that produced `plans`/`tokens` so it
+     /// costs no extra I/O. Used only to strengthen the profile cache key —
+     /// see [`plan_cache_key`].
+@@ -461,7 +461,7 @@ async fn file_derived_plans(
+             result.plans[index] = extractor(&value);
+             if matches!(auth, AuthMode::ClaudeOauth) {
+                 result.tokens[index] = claude_auth::refreshable_valid_access_token(&value, now);
+-                let uuid = credential_account_uuid(&value);
++                let uuid = credential_account_identity(&value);
+                 match uuid.as_deref() {
+                     Some(uuid) => remember_credential_uuid(&path, uuid),
+                     // The file was read and parsed; it simply carries no
+@@ -600,18 +600,23 @@ async fn acquire_read_permit(
+         .ok()
+ }
+ 
+-/// `shuntAccountUuid` from an already-parsed credential blob — the identity
+-/// shunt's own import stamps into the file. Mirrors
+-/// `auth::claude::store`'s reader, including its blank-uuid handling: a
+-/// whitespace-only value is a missing identity, never a distinct one that
+-/// could collide with another blank.
+-fn credential_account_uuid(value: &Value) -> Option<String> {
+-    value
++/// Use the pool's user-plus-organization identity so subscription caches cannot
++/// cross between personal and Team logins belonging to the same person.
++fn credential_account_identity(value: &Value) -> Option<String> {
++    let uuid = value
+         .get("shuntAccountUuid")
+         .and_then(Value::as_str)
+         .map(str::trim)
+-        .filter(|uuid| !uuid.is_empty())
+-        .map(ToOwned::to_owned)
++        .filter(|uuid| !uuid.is_empty())?;
++    let account = AccountConfig {
++        uuid: Some(uuid.to_owned()),
++        organization_uuid: value
++            .get("shuntOrganizationUuid")
++            .and_then(Value::as_str)
++            .map(ToOwned::to_owned),
++        ..Default::default()
++    };
++    Some(account_identity(&account).into_owned())
+ }
+ 
+ fn read_json(path: &Path) -> Option<Value> {
+@@ -692,7 +697,7 @@ impl CachedProfilePlan {
+ /// name-only configured account as `UpstreamInline`. The latter two are
+ /// names, not identities.
+ ///
+-/// The credential file's own `shuntAccountUuid` — harvested for free by
++/// The credential file's own user-plus-organization identity — harvested for free by
+ /// [`file_derived_plans`] — outranks all three, because the value being
+ /// cached is the plan of whoever *that file's token* authenticates as.
+ /// `account.uuid` never selects the file ([`credential_path`] reads only
+@@ -2367,6 +2372,62 @@ mod tests {
+         );
+     }
+ 
++    #[tokio::test]
++    async fn profile_cache_separates_personal_and_team_organizations_for_one_user() {
++        use wiremock::matchers::{header, method, path};
++        use wiremock::{Mock, MockServer, ResponseTemplate};
++
++        let _cache = exclusive_profile_cache().await;
++        let dir = unique_test_dir("same-user-organizations");
++        std::fs::create_dir_all(&dir).unwrap();
++        let mut accounts = Vec::new();
++        for name in ["team", "personal"] {
++            let creds = dir.join(format!("{name}.json"));
++            write_identified_fixture(&creds, &format!("token-{name}"), Some("same-user"));
++            let mut blob: Value = read_json(&creds).unwrap();
++            blob["shuntOrganizationUuid"] = Value::String(name.to_string());
++            std::fs::write(&creds, blob.to_string()).unwrap();
++            accounts.push(AccountConfig {
++                name: name.to_string(),
++                uuid: Some("same-user".to_string()),
++                organization_uuid: Some(name.to_string()),
++                credentials: Some(creds.to_string_lossy().into_owned()),
++                ..Default::default()
++            });
++        }
++        let server = MockServer::start().await;
++        for (name, tier) in [("team", "5x"), ("personal", "20x")] {
++            Mock::given(method("GET"))
++                .and(path("/api/oauth/profile"))
++                .and(header("authorization", format!("Bearer token-{name}")))
++                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
++                    "organization": {"rate_limit_tier": format!("default_claude_max_{tier}")}
++                })))
++                .expect(1)
++                .mount(&server)
++                .await;
++        }
++        let budgets = BackfillBudgets::default();
++        let client = reqwest::Client::new();
++        for expected in [["max 5x", "max 20x"], ["max 20x", "max 5x"]] {
++            let plans = plans_for_accounts_under(
++                &fresh_file_lock(),
++                AuthMode::ClaudeOauth,
++                "organization-cache",
++                &server.uri(),
++                &client,
++                &accounts,
++                &budgets,
++                tokio::time::Instant::now() + budgets.total,
++            )
++            .await;
++            assert_eq!(plans, expected.map(|p| Some(p.to_string())));
++            accounts.reverse();
++        }
++        assert_eq!(server.received_requests().await.unwrap().len(), 2);
++        std::fs::remove_dir_all(dir).unwrap();
++    }
++
+     #[test]
+     fn plan_cache_key_falls_back_to_the_account_uuid_without_a_file_uuid() {
+         let account = AccountConfig {
+diff --git a/src/auth/claude/login.rs b/src/auth/claude/login.rs
+index aa986a5..5c235c3 100644
+--- a/src/auth/claude/login.rs
++++ b/src/auth/claude/login.rs
+@@ -138,13 +138,15 @@ fn persist_oauth_tokens(name: &str, tokens: TokenExchangeResponse) -> anyhow::Re
+         eprintln!("Warning: Claude token exchange did not return an account UUID; the account_uuid rewrite will be skipped for this account.");
+     }
+     let expires_at_ms = oauth_expires_at_ms(tokens.expires_in);
+-    store::store_oauth_tokens(
++    let path = store::store_oauth_tokens(
+         name,
+         &tokens.access_token,
+         refresh_token,
+         expires_at_ms,
+         account_uuid,
+-    )
++    )?;
++    store::store_organization(name, tokens.organization.as_ref().map(|o| o.uuid.as_str()))?;
++    Ok(path)
+ }
+ 
+ /// Convert the token response's `expires_in` (seconds) to an absolute epoch-ms
+@@ -231,7 +233,9 @@ async fn run_setup_token(name: &str) -> anyhow::Result<PathBuf> {
+         .map(|account| account.uuid.as_str())
+         .filter(|uuid| !uuid.is_empty())
+         .ok_or_else(|| anyhow::anyhow!("Claude token exchange did not return an account UUID"))?;
+-    store::store_setup_token(name, &tokens.access_token, Some(account_uuid))
++    let path = store::store_setup_token(name, &tokens.access_token, Some(account_uuid))?;
++    store::store_organization(name, tokens.organization.as_ref().map(|o| o.uuid.as_str()))?;
++    Ok(path)
+ }
+ 
+ pub(crate) fn build_authorize_url(
+@@ -261,6 +265,8 @@ pub(crate) struct TokenExchangeResponse {
+     #[serde(default)]
+     pub expires_in: Option<i64>,
+     pub account: Option<TokenAccount>,
++    #[serde(default)]
++    pub organization: Option<TokenAccount>,
+ }
+ 
+ #[derive(Debug, Deserialize)]
+diff --git a/src/auth/claude/store.rs b/src/auth/claude/store.rs
+index 1cc7e21..d38bf46 100644
+--- a/src/auth/claude/store.rs
++++ b/src/auth/claude/store.rs
+@@ -41,7 +41,44 @@ pub fn account_path(name: &str) -> PathBuf {
+ /// Return store-managed accounts in deterministic name order. Each entry's UUID
+ /// is read from its stored credential file, unlike the Codex store.
+ pub fn scan_accounts() -> io::Result<Vec<AccountConfig>> {
+-    shared::scan_account_dir(&default_accounts_dir(), read_account_uuid)
++    enrich_organizations(shared::scan_account_dir(
++        &default_accounts_dir(),
++        read_account_uuid,
++    )?)
++}
++
++fn enrich_organizations(mut accounts: Vec<AccountConfig>) -> io::Result<Vec<AccountConfig>> {
++    for account in &mut accounts {
++        account.organization_uuid =
++            account_meta(&account.name).and_then(|meta| meta.organization_uuid);
++    }
++    Ok(accounts)
++}
++
++pub fn pool_uuid(name: &str) -> Option<String> {
++    let meta = account_meta(name)?;
++    let account = AccountConfig {
++        name: name.to_string(),
++        uuid: meta.uuid,
++        organization_uuid: meta.organization_uuid,
++        ..Default::default()
++    };
++    account.uuid.as_deref().filter(|id| !id.trim().is_empty())?;
++    Some(crate::accounts::account_identity(&account).into_owned())
++}
++
++pub fn store_organization(name: &str, organization_uuid: Option<&str>) -> anyhow::Result<()> {
++    let Some(org) = organization_uuid.filter(|id| !id.trim().is_empty()) else {
++        return Ok(());
++    };
++    let path = account_path(name);
++    let mut value: Value = serde_json::from_slice(&fs::read(&path)?)?;
++    value
++        .as_object_mut()
++        .ok_or_else(|| anyhow::anyhow!("credential file is not an object"))?
++        .insert("shuntOrganizationUuid".to_string(), json!(org));
++    shared::write_account_file(&path, &value)?;
++    Ok(())
+ }
+ 
+ pub fn account_uuid(name: &str) -> Option<String> {
+@@ -63,7 +100,7 @@ pub fn account_identity(name: &str) -> Option<String> {
+     if !account_path(name).exists() {
+         return None;
+     }
+-    Some(account_uuid(name).unwrap_or_else(|| name.to_string()))
++    Some(pool_uuid(name).unwrap_or_else(|| name.to_string()))
+ }
+ 
+ /// Whether a store account holds a long-lived setup token or an imported,
+@@ -85,6 +122,7 @@ pub struct AccountMeta {
+     /// `claudeAiOauth.expiresAt` in Unix epoch milliseconds, when present.
+     pub expires_at: Option<i64>,
+     pub uuid: Option<String>,
++    pub organization_uuid: Option<String>,
+ }
+ 
+ /// Read one store account's metadata without loading its token. `None` when the
+@@ -145,6 +183,11 @@ fn read_account_meta(name: &str, path: &Path) -> Option<AccountMeta> {
+         kind,
+         expires_at,
+         uuid,
++        organization_uuid: value
++            .get("shuntOrganizationUuid")
++            .and_then(Value::as_str)
++            .filter(|id| !id.trim().is_empty())
++            .map(str::to_owned),
+     })
+ }
+ 
+@@ -191,7 +234,10 @@ fn read_account_uuid_strict(path: &Path) -> Result<Option<String>, ()> {
+ /// by admin cleanup's fail-closed identity check — see
+ /// [`shared::scan_account_dir_strict`].
+ pub fn scan_accounts_strict() -> io::Result<Vec<AccountConfig>> {
+-    shared::scan_account_dir_strict(&default_accounts_dir(), read_account_uuid_strict)
++    enrich_organizations(shared::scan_account_dir_strict(
++        &default_accounts_dir(),
++        read_account_uuid_strict,
++    )?)
+ }
+ 
+ /// Import a refreshable Claude Code credential file without changing the source.
+@@ -327,6 +373,19 @@ mod tests {
+         ))
+     }
+ 
++    #[test]
++    fn organization_metadata_retains_the_authentication_uuid() {
++        let dir = temp_dir("org-metadata");
++        fs::create_dir_all(&dir).unwrap();
++        let path = dir.join("account.json");
++        fs::write(&path, br#"{"shuntAccountUuid":"user","shuntOrganizationUuid":"team","claudeAiOauth":{"accessToken":"fixture"}}"#).unwrap();
++        let meta = read_account_meta("account", &path).unwrap();
++        assert_eq!(meta.uuid.as_deref(), Some("user"));
++        assert_eq!(meta.organization_uuid.as_deref(), Some("team"));
++        assert_eq!(read_account_uuid(&path).as_deref(), Some("user"));
++        fs::remove_dir_all(dir).unwrap();
++    }
++
+     #[test]
+     fn validates_account_names() {
+         assert!(validate_account_name("primary-2").is_ok());
+diff --git a/src/auth/claude/usage.rs b/src/auth/claude/usage.rs
+index 86148f5..e7af9e3 100644
+--- a/src/auth/claude/usage.rs
++++ b/src/auth/claude/usage.rs
+@@ -370,6 +370,7 @@ mod tests {
+             disabled: false,
+             paused: false,
+             headroom_secs: None,
++            observed_at_5h: None,
+             utilization_5h: Some(0.4237),
+             reset_5h: Some(reset_5h),
+             utilization_7d: Some(0.6102),
+@@ -380,6 +381,9 @@ mod tests {
+             max_utilization_7d: None,
+             max_utilization_fable: None,
+             status: None,
++            status_5h: None,
++            status_7d: None,
++            status_7d_oi: None,
+             quota_buckets: Vec::new(),
+             needs_relogin: false,
+             requests_attempted: 0,
+diff --git a/src/auth/shared.rs b/src/auth/shared.rs
+index 641b103..aef3c04 100644
+--- a/src/auth/shared.rs
++++ b/src/auth/shared.rs
+@@ -417,6 +417,40 @@ pub(crate) async fn resolve_pool_accounts(
+             scoped
+         }
+     };
++    if store_family == StoreFamily::Claude
++        && accounts
++            .iter()
++            .any(|a| a.credentials.is_none() && a.token_env.is_none())
++    {
++        let dir = accounts_dir.clone();
++        let stored = tokio::task::spawn_blocking(move || {
++            let modified = fs::metadata(&dir).and_then(|m| m.modified()).ok();
++            scan_cached(
++                "Claude",
++                &dir,
++                modified,
++                crate::auth::claude::store::scan_accounts,
++            )
++        })
++        .await
++        .map_err(|e| format!("Claude store resolution failed: {e}"))?
++        .map_err(|e| format!("Claude store resolution failed: {e}"))?;
++        for account in &mut accounts {
++            if account.credentials.is_none() && account.token_env.is_none() {
++                if let Some(source) = stored
++                    .iter()
++                    .find(|s| s.name == account.name && s.organization_uuid.is_some())
++                {
++                    account.uuid = account.uuid.clone().or_else(|| source.uuid.clone());
++                    account.organization_uuid = account
++                        .organization_uuid
++                        .clone()
++                        .or_else(|| source.organization_uuid.clone());
++                    account.store_entry = true;
++                }
++            }
++        }
++    }
+     // Assign the store family inline — that touches no I/O — and try to fill each
+     // UUID-less inline account from the warm identity cache. `cached_inline_identity`
+     // is a pure in-memory lookup (no credential read, no `stat`, no env lock), so an
+diff --git a/src/config.rs b/src/config.rs
+index ba86c15..d141c74 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -2007,6 +2007,9 @@ pub struct AccountConfig {
+     /// `chatgpt_account_id`. When absent, pool selection falls back to `name`.
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub uuid: Option<String>,
++    /// Claude subscription organization; keeps quotas separate for one user in several organizations.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub organization_uuid: Option<String>,
+     /// Soft quota threshold for every window, overriding `[server.pool]`
+     /// defaults for this account. A low value reserves the account as a
+     /// backup: it is rotated away from earlier, so it is used less.
+@@ -2062,6 +2065,7 @@ impl Default for AccountConfig {
+             credentials: None,
+             token_env: None,
+             uuid: None,
++            organization_uuid: None,
+             threshold: None,
+             threshold_5h: None,
+             threshold_7d: None,
+@@ -4030,8 +4034,9 @@ impl Config {
+                 ("cache_write", row.cache_write),
+             ] {
+                 if !value.is_finite()
+-                    || value < crate::gateway::spend::pricing::MIN_USD_PER_MILLION
+-                    || value > crate::gateway::spend::pricing::MAX_USD_PER_MILLION
++                    || !(crate::gateway::spend::pricing::MIN_USD_PER_MILLION
++                        ..=crate::gateway::spend::pricing::MAX_USD_PER_MILLION)
++                        .contains(&value)
+                 {
+                     return Err(ConfigError::InvalidPricingRate {
+                         index,
+diff --git a/src/model/inbound_responses/chat_stream.rs b/src/model/inbound_responses/chat_stream.rs
+index 828be64..fb8fe7c 100644
+--- a/src/model/inbound_responses/chat_stream.rs
++++ b/src/model/inbound_responses/chat_stream.rs
+@@ -395,10 +395,10 @@ pub fn translate_error(chat_error: &Value) -> Value {
+     error.insert("message".to_string(), json!(error_message(source)));
+     // The same holds for `type`: a missing, non-string, or empty one becomes
+     // the generic `api_error` rather than reaching the client as-is.
+-    if !error
++    if error
+         .get("type")
+         .and_then(Value::as_str)
+-        .is_some_and(|kind| !kind.is_empty())
++        .is_none_or(|kind| kind.is_empty())
+     {
+         error.insert("type".to_string(), json!("api_error"));
+     }
+diff --git a/src/oauth_usage/tests.rs b/src/oauth_usage/tests.rs
+index 0e2ecbd..6e5c14b 100644
+--- a/src/oauth_usage/tests.rs
++++ b/src/oauth_usage/tests.rs
+@@ -33,6 +33,7 @@ fn snapshot(
+         disabled: false,
+         paused: false,
+         headroom_secs: None,
++        observed_at_5h: None,
+         utilization_5h: util_5h,
+         reset_5h,
+         utilization_7d: None,
+@@ -43,6 +44,9 @@ fn snapshot(
+         max_utilization_7d: None,
+         max_utilization_fable: None,
+         status: None,
++        status_5h: None,
++        status_7d: None,
++        status_7d_oi: None,
+         quota_buckets: Vec::new(),
+         needs_relogin: false,
+         requests_attempted: 0,
+diff --git a/src/protocol.rs b/src/protocol.rs
+index 12d303b..dc00c0f 100644
+--- a/src/protocol.rs
++++ b/src/protocol.rs
+@@ -104,6 +104,10 @@ pub async fn get() -> Json<ProtocolDescriptor> {
+                 },
+             ],
+             consumed: vec![
++                HeaderDescriptor {
++                    name: "x-shunt-session-account",
++                    description: "Prefer an eligible named Claude OAuth pool account; never forwarded upstream",
++                },
+                 HeaderDescriptor {
+                     name: "authorization",
+                     description: "Client credential used or replaced according to the selected route authentication mode",
+diff --git a/src/routing/stage/store.rs b/src/routing/stage/store.rs
+index 2039d92..4c7e706 100644
+--- a/src/routing/stage/store.rs
++++ b/src/routing/stage/store.rs
+@@ -47,7 +47,10 @@ use entries::{session_key, Entries, PinScope, SessionKey, StageSession};
+ // `unused_imports` error under CI's `-D warnings` (the `Test default build
+ // (no ui feature)` job), which `--all-features` runs cannot see.
+ #[cfg(any(test, feature = "bench"))]
+-pub(crate) use entries::{MAX_TRACKED_CHILD_PINS, MAX_TRACKED_SESSIONS};
++#[cfg(feature = "bench")]
++pub(crate) use entries::MAX_TRACKED_CHILD_PINS;
++#[cfg(any(test, feature = "bench"))]
++pub(crate) use entries::MAX_TRACKED_SESSIONS;
+ 
+ /// A pin [`StageRouterStore::apply`] prepared but has not written.
+ ///
+diff --git a/src/usage/tests.rs b/src/usage/tests.rs
+index 07fb4b4..452bd95 100644
+--- a/src/usage/tests.rs
++++ b/src/usage/tests.rs
+@@ -33,6 +33,7 @@ fn snapshot(
+         disabled: false,
+         paused: false,
+         headroom_secs: None,
++        observed_at_5h: None,
+         utilization_5h: util_5h,
+         reset_5h,
+         utilization_7d: util_7d,
+@@ -43,6 +44,9 @@ fn snapshot(
+         max_utilization_7d: None,
+         max_utilization_fable: None,
+         status: None,
++        status_5h: None,
++        status_7d: None,
++        status_7d_oi: None,
+         quota_buckets: Vec::new(),
+         needs_relogin: false,
+         requests_attempted: 0,
+diff --git a/tests/multi_account.rs b/tests/multi_account.rs
+index 739343d..90b33d0 100644
+--- a/tests/multi_account.rs
++++ b/tests/multi_account.rs
+@@ -662,7 +662,7 @@ async fn unauthorized_static_account_cools_down_and_rotates() {
+ }
+ 
+ #[tokio::test]
+-async fn plain_429_retries_the_same_account_without_rotating() {
++async fn persistent_429_retries_once_then_uses_the_next_account() {
+     if !can_bind_loopback() {
+         return;
+     }
+@@ -689,7 +689,7 @@ async fn plain_429_retries_the_same_account_without_rotating() {
+         .and(path("/v1/messages"))
+         .and(BearerToken(token_b.clone()))
+         .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"account":"b"}"#))
+-        .expect(0)
++        .expect(1)
+         .mount(&upstream)
+         .await;
+ 
+@@ -701,12 +701,12 @@ async fn plain_429_retries_the_same_account_without_rotating() {
+     .await;
+ 
+     let response = post_messages(&gateway, None).await;
+-    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
++    assert_eq!(response.status(), StatusCode::OK);
+     assert_eq!(
+         response.headers().get("x-shunt-account").unwrap(),
+-        "account-a"
++        "account-b"
+     );
+-    assert_eq!(response.text().await.unwrap(), error_body);
++    assert_eq!(response.text().await.unwrap(), r#"{"account":"b"}"#);
+     upstream.verify().await;
+ }
+ 
+@@ -2562,3 +2562,62 @@ async fn a_throttle_pause_retry_counts_as_a_second_attempt_on_the_same_account()
+     );
+     upstream.verify().await;
+ }
++
++#[tokio::test]
++async fn a_busy_account_prevents_an_unrelated_weekly_error_from_ending_the_task() {
++    if !can_bind_loopback() {
++        return;
++    }
++    let mut vars = common::env_lock().await;
++    vars.set("SHUNT_TEST_BUSY_A", "fixture-busy-a");
++    vars.set("SHUNT_TEST_BUSY_B", "fixture-busy-b");
++    let upstream = MockServer::start().await;
++    Mock::given(method("POST"))
++        .and(path("/v1/messages"))
++        .and(BearerToken("fixture-busy-b".into()))
++        .respond_with(
++            ResponseTemplate::new(429)
++                .insert_header("anthropic-ratelimit-unified-status", "rejected")
++                .insert_header(
++                    "anthropic-ratelimit-unified-representative-claim",
++                    "seven_day",
++                )
++                .set_body_string(
++                    r#"{"error":{"type":"rate_limit_error","message":"weekly limit"}}"#,
++                ),
++        )
++        .expect(1)
++        .mount(&upstream)
++        .await;
++    Mock::given(method("POST"))
++        .and(path("/v1/messages"))
++        .and(BearerToken("fixture-busy-a".into()))
++        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"account":"a"}"#))
++        .expect(1)
++        .mount(&upstream)
++        .await;
++    let a = account("a", "SHUNT_TEST_BUSY_A", "uuid-busy-a");
++    let mut config = test_config(
++        &upstream.uri(),
++        a.clone(),
++        account("b", "SHUNT_TEST_BUSY_B", "uuid-busy-b"),
++    );
++    config.server.pool = Some(shunt::config::PoolConfig {
++        ramp_initial_concurrency: Some(1),
++        ..Default::default()
++    });
++    let (gateway, state) = start_gateway_with_state(config).await;
++    let _held = state
++        .accounts
++        .clone()
++        .try_admit("anthropic", &a, 1, false)
++        .unwrap();
++    let response = post_messages(&gateway, None).await;
++    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
++    assert_eq!(response.headers()["retry-after"], "1");
++    assert!(!response.text().await.unwrap().contains("weekly"));
++    let resumed = post_messages(&gateway, None).await;
++    assert_eq!(resumed.status(), StatusCode::OK);
++    assert_eq!(resumed.headers()["x-shunt-account"], "a");
++    upstream.verify().await;
++}
+diff --git a/tests/responses_cache_affinity.rs b/tests/responses_cache_affinity.rs
+index 84ea63d..ee018d4 100644
+--- a/tests/responses_cache_affinity.rs
++++ b/tests/responses_cache_affinity.rs
+@@ -108,6 +108,7 @@ async fn a_metadata_only_client_reaches_the_upstream_with_matching_affinity_fiel
+                 credentials: None,
+                 token_env: Some("CACHE_AFFINITY_TEST_TOKEN".to_string()),
+                 uuid: None,
++                organization_uuid: None,
+                 threshold: None,
+                 threshold_5h: None,
+                 threshold_7d: None,
+diff --git a/tests/responses_chain_stream.rs b/tests/responses_chain_stream.rs
+index e4abd59..35a00fe 100644
+--- a/tests/responses_chain_stream.rs
++++ b/tests/responses_chain_stream.rs
+@@ -645,6 +645,28 @@ async fn a_routed_streaming_chain_stamps_the_router_headers() {
+     primary.verify().await;
+ }
+ 
++// Drain the POST before closing a fault response; unread request bytes can
++// make the OS reset the socket and discard the SSE we intended to test.
++async fn drain_fixture_request(socket: &mut tokio::net::TcpStream) {
++    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
++    let mut reader = tokio::io::BufReader::new(socket);
++    let mut length = 0;
++    loop {
++        let mut line = String::new();
++        assert!(reader.read_line(&mut line).await.unwrap() > 0);
++        if line == "\r\n" {
++            break;
++        }
++        if let Some((name, value)) = line.split_once(':') {
++            if name.eq_ignore_ascii_case("content-length") {
++                length = value.trim().parse::<usize>().unwrap();
++            }
++        }
++    }
++    assert!(length < 1024 * 1024);
++    reader.read_exact(&mut vec![0; length]).await.unwrap();
++}
++
+ /// A winner whose body errors after the complete turn already relayed —
+ /// `message_stop` included, then the connection closing short of the declared
+ /// content-length — must end the relay silently. Appending an `error` event
+@@ -667,6 +689,7 @@ async fn a_body_error_after_message_stop_ends_the_relay_silently() {
+     let responder = tokio::spawn(async move {
+         use tokio::io::AsyncWriteExt;
+         let (mut socket, _) = listener.accept().await.unwrap();
++        drain_fixture_request(&mut socket).await;
+         socket
+             .write_all(
+                 b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 4096\r\n\r\n",
+@@ -709,6 +732,7 @@ async fn a_body_error_before_message_stop_still_emits_the_terminal_error_event()
+     let responder = tokio::spawn(async move {
+         use tokio::io::AsyncWriteExt;
+         let (mut socket, _) = listener.accept().await.unwrap();
++        drain_fixture_request(&mut socket).await;
+         socket
+             .write_all(
+                 b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 4096\r\n\r\n",
+diff --git a/ui/package-lock.json b/ui/package-lock.json
+index 73d33aa..ffbefbb 100644
+--- a/ui/package-lock.json
++++ b/ui/package-lock.json
+@@ -3306,9 +3306,9 @@
+       "license": "ISC"
+     },
+     "node_modules/source-map-js": {
+-      "version": "1.2.1",
+-      "resolved": "https://registry.npmjs.org/source-map-js/-/source-map-js-1.2.1.tgz",
+-      "integrity": "sha512-UXWMKhLOwVKb728IUtQPXxfYU+usdybtUrK/8uGE8CQMvrhOpwvzDBwj0QhSL7MQc7vIsISBG8VQ8+IDQxpfQA==",
++      "version": "1.2.2",
++      "resolved": "https://registry.npmjs.org/source-map-js/-/source-map-js-1.2.2.tgz",
++      "integrity": "sha512-KGj/8Y43x35aZVDtt+J4mK1hoLGHULMYfSkODJNQjNDC3oW1PqPoxMwo0pLUsWM/UEGzON/NxeHywEfNXNP3Vw==",
+       "license": "BSD-3-Clause",
+       "engines": {
+         "node": ">=0.10.0"

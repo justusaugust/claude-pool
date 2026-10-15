@@ -1,0 +1,8 @@
+{
+  "name": "pool-phone-hub",
+  "version": "0.2.0",
+  "description": "Model-free Native phone overview and explicit task dispatch. Approvals stay in private Cockpit.",
+  "author": {
+    "name": "claude-pool contributors"
+  }
+}

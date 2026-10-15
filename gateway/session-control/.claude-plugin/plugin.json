@@ -1,0 +1,8 @@
+{
+  "name": "pool-controls",
+  "version": "0.2.0",
+  "description": "Connect this Native task to the private phone Cockpit without changing inference or permissions.",
+  "author": {
+    "name": "claude-pool contributors"
+  }
+}

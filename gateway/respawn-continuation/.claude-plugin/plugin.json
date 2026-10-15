@@ -1,0 +1,8 @@
+{
+  "name": "pool-respawn-controller",
+  "version": "0.1.0",
+  "description": "Send one continuation to an explicitly respawned local session.",
+  "author": {
+    "name": "claude-pool contributors"
+  }
+}

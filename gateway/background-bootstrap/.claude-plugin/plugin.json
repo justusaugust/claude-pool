@@ -1,0 +1,8 @@
+{
+  "name": "pool-background",
+  "version": "0.3.0",
+  "description": "Keep background Claude sessions on their selected subscription pool.",
+  "author": {
+    "name": "claude-pool contributors"
+  }
+}

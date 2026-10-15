@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.claude/
+.env
+.env.*
+gateway/bin/*
+gateway/*/.claude-plugin/types/
+.local/
+*.log
+*.mp4
