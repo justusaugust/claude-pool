@@ -18,6 +18,7 @@ REPOSITORY = 'https://github.com/justusaugust/claude-pool.git'
 
 
 def smoke(native):
+    raise RuntimeError('Intentional clean-install/update merge-gate test; never merge this fixture')
     with tempfile.TemporaryDirectory(prefix="claude-pool smoke ' ") as folder:
         root = Path(folder).resolve()
         home = root / 'empty home'
