@@ -1,6 +1,7 @@
 """Start/reuse the local account pool, then run the user's ordinary Claude TUI."""
 import argparse
 import fcntl
+import hashlib
 import http.client
 import json
 import os
@@ -321,9 +322,10 @@ def show_usage(client, once=False):
 def background_plugin(account, origin=None):
     source = HERE / 'background-bootstrap'
     version = json.loads((source / '.claude-plugin/plugin.json').read_text())['version']
-    folder = RUNTIME / 'background-plugins' / (version + '-' + (account or 'auto') + ('-' + origin if origin else ''))
+    connection = connection_ts()
+    folder = RUNTIME / 'background-plugins' / (version + '-' + (account or 'auto') + ('-' + origin if origin else '') + '-' + hashlib.sha256(connection.encode()).hexdigest()[:12])
     files = {name: (source / name).read_text() for name in ['.claude-plugin/plugin.json', 'hooks/hooks.json', 'hooks/register.ts', 'hooks/limits.ts']}
-    files['hooks/connection.ts'] = connection_ts()
+    files['hooks/connection.ts'] = connection
     files['hooks/account.ts'] = 'export const account: string | null = ' + json.dumps(account) + '\nexport const origin: string | null = ' + json.dumps(origin) + '\n'
     for name, content in files.items():
         path = folder / name
@@ -376,7 +378,6 @@ def respawn_agent(arguments):
 
 
 def configured_plugin(name):
-    import hashlib
     connection = connection_ts()
     version = json.loads((HERE / name / '.claude-plugin/plugin.json').read_text())['version']
     folder = RUNTIME / 'plugins' / (name + '-' + version + '-' + hashlib.sha256(connection.encode()).hexdigest()[:12])

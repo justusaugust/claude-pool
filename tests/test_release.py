@@ -65,6 +65,18 @@ class ReleaseTests(unittest.TestCase):
             link = root / 'link'; link.symlink_to(target)
             with self.assertRaisesRegex(RuntimeError, 'symlink'): settings.private_directory(link)
 
+    def test_background_snapshots_survive_release_and_connection_changes(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(launch, 'RUNTIME', Path(folder)), patch.object(launch, 'connection_ts') as connection:
+            connection.return_value = 'export const hookPath = "/old/release/control_hook.py"\n'
+            first = launch.background_plugin('work', 'same-origin')
+            before = {str(p.relative_to(first)): p.read_bytes() for p in first.rglob('*') if p.is_file()}
+            self.assertEqual(first, launch.background_plugin('work', 'same-origin'))
+            connection.return_value = 'export const hookPath = "/new/release/control_hook.py"\n'
+            second = launch.background_plugin('work', 'same-origin')
+            self.assertNotEqual(first, second)
+            self.assertIn('/new/release/', (second / 'hooks/connection.ts').read_text())
+            self.assertEqual(before, {str(p.relative_to(first)): p.read_bytes() for p in first.rglob('*') if p.is_file()})
+
     def test_generated_control_hooks_execute_after_relocation_and_keep_native_permissions(self):
         calls, status = [], ['expired']
         class Handler(BaseHTTPRequestHandler):

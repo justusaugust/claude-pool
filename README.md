@@ -65,6 +65,6 @@ python3 scripts/test.py
 
 Loopback-server tests use temporary ports and fixture credentials. Do not run model or artifact acceptance tests against unrelated active tasks.
 
-The Mods also have Native fixture tests. After installing the launchers, run `claude-native plugin test gateway/cockpit` from this source checkout, and similarly for `background-bootstrap`, `session-control`, `phone-hub` and `respawn-continuation`. These tests do not require a model request. Native generates its version-specific SDK declarations when a Mod loads interactively; those generated files are excluded from Git and source exports.
+The Mods also have Native fixture tests. Run `python3 scripts/test_mods.py` after installing Native Claude (or pass `--native-claude /path/to/claude`). This tests all five generated Mods with temporary configuration, phone controls configured and unconfigured, and paths containing spaces and quotes. It does not use live pool state or credentials, make model requests, or reload running sessions. Native generates its version-specific SDK declarations when a Mod loads interactively; those generated files are excluded from Git and source exports.
 
 MIT for this integration. Shunt retains its upstream MIT/Apache-2.0 license notices. This is an independent project, not an Anthropic product.

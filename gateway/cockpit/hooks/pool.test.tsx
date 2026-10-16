@@ -1,4 +1,5 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
+import { tokenFile as configuredTokenFile, phoneURL } from './connection'
 
 const NOW = Date.parse('2026-10-13T00:00:00+02:00')
 const BAND = { plugin: 'cockpit', component: 'AbovePrompt', props: { hasSurvey: false, isWorking: false, maxRows: 4, bodyColumns: 120 } } as const
@@ -79,7 +80,7 @@ describe('cockpit pooled routing', () => {
     on('command.run', { command: 'phone' }, () => { called++; return { text: 'Private Cockpit · public fixture' } })
     const result = await $.command.run({ command: 'cockpit', args: 'phone', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 120 } })
     expect(called).toBe(0)
-    expect(result.text?.includes(connected ? 'Private Cockpit' : 'has not been reloaded')).toBe(true)
+    expect(result.text?.includes(connected && phoneURL ? 'Private Cockpit' : 'has not been reloaded')).toBe(true)
   })
   test('three accounts share compact rows without hiding the personal weekly limit', async ($, on) => {
     mock.clock(on, { now: NOW }); mock.store(on)
@@ -313,7 +314,7 @@ describe('cockpit pooled routing', () => {
 
   test('native subscription mode reads only the designated local control token', async ($, on) => {
     mock.clock(on, { now: NOW }); mock.store(on)
-    const tokenFile = '/fixture/.shunt/accounts/claude/.pool-client-token'
+    const tokenFile = configuredTokenFile
     mock.env(on, { HOME: '/fixture', COCKPIT_BASE_URL: 'http://127.0.0.1:18341', COCKPIT_TOKEN_FILE: tokenFile })
     on('session.id', () => ({ value: 'pool-session' }))
     const state = { ...initial(), connectorIdentity: 'gmail' }
