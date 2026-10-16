@@ -174,6 +174,14 @@ class UpdateTests(unittest.TestCase):
         import account_metadata
         self.assertIn('update',account_metadata.RESERVED)
 
+    def test_installed_native_adapter_forwards_update_and_upgrade_exactly(self):
+        self.native.write_text('#!/bin/sh\nif [ "$1" = "--version" ]; then echo "2.1.300 (Claude Code)"; else printf "%s\\n" "$@"; exit 23; fi\n')
+        for command in ['update','upgrade']:
+            result=subprocess.run([str(self.bin/'claude-pool'),'exec',command,'--channel','stable'],env=self.env,capture_output=True,text=True)
+            self.assertEqual(result.returncode,23)
+            self.assertEqual(result.stdout.splitlines(),[command,'--channel','stable'])
+        self.assertFalse((self.root/'.local/state').exists());self.assertFalse((self.root/'.shunt').exists())
+
     def test_legacy_install_adopts_runner_and_retains_old_gateway(self):
         receipt=json.loads((self.app/'installation.json').read_text())
         receipt.pop('root');receipt.pop('native')

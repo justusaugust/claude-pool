@@ -38,6 +38,8 @@ claude usage                       # live account monitor; Ctrl-C closes it
 claude usage --once                 # one cached snapshot
 claude work --model opus --effort high
 claude work --resume <session-id>   # forks a new session with its own pin
+claude update                      # update Native Claude Code
+claude pool update                 # update Claude Pool
 claude-native                      # original Native Claude
 ```
 

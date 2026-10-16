@@ -1,23 +1,28 @@
 # Usage
 
-After shell setup, `claude` and `claude-pool` are equivalent. Native arguments, including model, effort, resume and continue, are forwarded.
+After shell setup, `claude` starts pooled sessions and preserves Native administrative commands. `claude-pool` is the explicit pool CLI; `claude pool …` is the same pool namespace. Model, effort, resume and continue arguments keep their existing behavior.
 
 | Command | Behavior |
 | --- | --- |
-| `claude update` | Stage and validate the latest source update; keep active tasks and service running |
+| `claude update` / `claude upgrade` | Update Native Claude Code through its original updater |
+| `claude pool update` / `claude-pool update` | Update Claude Pool; keep active tasks and service running |
 | `claude account add [email]` | Browser login, verified identity, automatic registration and live readiness check |
 | `claude account list` | Connected account labels and session shortcuts |
 | `claude usage` | Refresh account usage every five seconds; Ctrl-C closes the monitor |
 | `claude usage --once` | Print one cached snapshot |
 | `claude history` | Recent completed-response account switches and their reasons |
 | `claude forecast-check` | Score saved forecasts against later real quota observations |
-| `claude doctor` | Pool health and bounded recovery incidents |
+| `claude doctor` | Native Claude Code health check |
+| `claude pool doctor` | Pool health and bounded recovery incidents |
 | `claude work` | Start a new session pinned to your configured `work` alias |
 | `claude work --continue` | Fork saved conversation into a new independently pinned session |
 | `claude work --resume <id>` | Resume into a new fork, leaving the original session/pin alone |
-| `claude respawn <exact-agent-id>` | Target one background worker and queue guarded continuation |
+| `claude respawn <id>` | Native worker respawn behavior |
+| `claude pool respawn <exact-agent-id>` | Pool respawn with guarded automatic continuation |
 | `claude-native update` | Update Native Claude itself through its own updater |
 | `claude-native agents --json` | Native worker inventory |
+
+Native commands such as `auth`, `plugin`, `mcp`, `agents`, `install`, `doctor`, `update` and `upgrade` run without starting or contacting the pool. `claude --help` keeps Native help and adds a short pool-command guide. `claude-native` remains a direct escape to Native Claude.
 
 An account pin is a routing preference and retains quota/failure fallback. It is not a promise to spend an exhausted account. `/cockpit unpin` returns that session to automatic routing. Pausing an account through Cockpit affects the pool globally; inspect the scope before using a pause.
 

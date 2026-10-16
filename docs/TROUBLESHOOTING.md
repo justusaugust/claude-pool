@@ -1,5 +1,7 @@
 # Troubleshooting
 
+**Which updater should I use?** `claude update` updates Native Claude Code. `claude pool update` or `claude-pool update` updates Claude Pool. If an older shell function still sends `claude update` to the pool updater, replace it with the Native-compatible function in setup; no running session needs to restart.
+
 **An update is installed but the backend is still old.** This is deliberate: the updater never restarts the live service or reloads Native sessions. New commands use the selected release. Gateway/backend changes activate at the next service start; loaded Mods keep their old files until you choose to reload or start another session. Early alpha launchd definitions may need a deliberate reload after tasks finish.
 
 **Installation finds an existing launcher or directory it does not own.** It stops before replacing it. Use a separate `--prefix` and `--bin-dir` for an isolated test, or deliberately resolve ownership first. The private development wrapper is not a managed public installation.

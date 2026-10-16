@@ -18,12 +18,57 @@ def routing_args(argv):
 
 
 class LauncherTests(unittest.TestCase):
+    def test_claude_adapter_preserves_native_commands_without_pool_access(self):
+        from account_metadata import NATIVE_COMMANDS
+        for command in sorted(NATIVE_COMMANDS):
+            with self.subTest(command=command), patch.object(launch.sys,'argv',['claude-pool','exec',command,'--help']), \
+                 patch.object(launch.subprocess,'call',return_value=7) as native, patch.object(launch,'token') as token, \
+                 patch.object(launch,'ensure_pool') as pool, patch('update.cli') as updater:
+                with self.assertRaises(SystemExit) as result:launch.main()
+                self.assertEqual(result.exception.code,7)
+                native.assert_called_once_with([launch.NATIVE_CLAUDE,command,'--help'])
+                token.assert_not_called();pool.assert_not_called();updater.assert_not_called()
+
+    def test_pool_update_is_explicit_and_never_runs_native_updater(self):
+        for arguments in [['update'],['pool','update'],['exec','pool','update']]:
+            with self.subTest(arguments=arguments), patch.object(launch.sys,'argv',['claude-pool',*arguments]), \
+                 patch('update.cli',return_value=0) as updater,patch.object(launch.subprocess,'call') as native,patch.object(launch,'token') as token:
+                with self.assertRaises(SystemExit) as result:launch.main()
+                self.assertEqual(result.exception.code,0)
+                updater.assert_called_once_with([],launch.HERE);native.assert_not_called();token.assert_not_called()
+
+    def test_native_help_explains_both_updaters_without_changing_version_output(self):
+        for flag in ['--help','-h','--version']:
+            with patch.object(launch.sys,'argv',['claude-pool','exec',flag]),patch.object(launch.subprocess,'call',return_value=0) as native,redirect_stdout(io.StringIO()) as output:
+                with self.assertRaises(SystemExit):launch.main()
+                native.assert_called_once_with([launch.NATIVE_CLAUDE,flag])
+                if flag=='--version':self.assertEqual(output.getvalue(),'')
+                else:self.assertIn('claude pool update',output.getvalue());self.assertIn('claude update',output.getvalue())
+
+    def test_update_in_a_prompt_is_not_an_updater_command(self):
+        for arguments in [['-p','update'],['--','update'],['--model','claude-opus-5-5','--effort','high','-p','update']]:
+            with tempfile.TemporaryDirectory() as folder,patch.object(launch,'RUNTIME',Path(folder)), \
+                 patch.object(launch.sys,'argv',['claude-pool','exec',*arguments]),patch.object(launch,'token',return_value='fixture'), \
+                 patch.object(launch,'ensure_pool') as pool,patch('update.cli') as updater,patch.object(launch.subprocess,'call',return_value=0) as native:
+                with self.assertRaises(SystemExit):launch.main()
+                pool.assert_called_once();updater.assert_not_called()
+                self.assertEqual(native.call_args.args[0][-len(arguments):],arguments)
+                self.assertEqual(native.call_args.kwargs['env']['ANTHROPIC_DEFAULT_OPUS_MODEL'],'claude-opus-5-5')
+
     def test_native_help_and_version_work_without_starting_the_pool(self):
         for flag in ['--help', '-h', '--version']:
-            with patch.object(launch.sys, 'argv', ['claude-pool', flag]), patch.object(launch.subprocess, 'call', return_value=7) as native, patch.object(launch, 'token') as token, patch.object(launch, 'ensure_pool') as start:
+            with patch.object(launch.sys, 'argv', ['claude-pool', 'exec', flag]), patch.object(launch.subprocess, 'call', return_value=7) as native, patch.object(launch, 'token') as token, patch.object(launch, 'ensure_pool') as start:
                 with self.assertRaises(SystemExit) as result: launch.main()
                 self.assertEqual(result.exception.code, 7)
                 native.assert_called_once_with([launch.NATIVE_CLAUDE, flag]); token.assert_not_called(); start.assert_not_called()
+
+    def test_pool_help_lists_its_own_commands_without_native_or_pool_access(self):
+        for arguments in [['--help'],['help'],['exec','pool','--help']]:
+            with patch.object(launch.sys,'argv',['claude-pool',*arguments]),patch.object(launch.subprocess,'call') as native,patch.object(launch,'token') as token,redirect_stdout(io.StringIO()) as output:
+                launch.main()
+                self.assertIn('claude-pool update',output.getvalue())
+                self.assertIn('claude update = Claude Code',output.getvalue())
+                native.assert_not_called();token.assert_not_called()
 
     def setUp(self):
         self.aliases = patch.object(launch, "ACCOUNT_SHORTCUTS", {"personal":"personal", "work":"work", "studio":"studio", "secondary":"secondary", "backup":"backup"})

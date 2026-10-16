@@ -87,7 +87,7 @@ Use one active backend owner for each refreshable store. Do not run independent 
 
 ## 4. Optional configuration
 
-The installer creates `~/.config/claude-pool/config.json` with the Native executable path and an empty account list. Account setup maintains names, labels, aliases and verified plan labels there. Names and aliases use lowercase letters, digits and hyphens; aliases cannot collide with pool commands.
+The installer creates `~/.config/claude-pool/config.json` with the Native executable path and an empty account list. Account setup maintains names, labels, aliases and verified plan labels there. Names and aliases use lowercase letters, digits and hyphens; aliases cannot collide with Native or pool commands.
 
 Optional settings are `state_dir`, `credential_dir`, `gateway_port`, `backend_port`, `control_port` and an IANA `timezone` such as `Europe/London`. Defaults use the current OS timezone. Set these before starting the service. The guided command handles live account enrollment; other service settings still require a deliberate restart after active tasks finish. Creating a credential file alone does not enroll it.
 
@@ -108,15 +108,18 @@ For a two-account acceptance test, use a disposable project and public fixture. 
 After validating the explicit launcher, add this to your shell configuration:
 
 ```sh
-claude() { command claude-pool "$@"; }
+claude() { command claude-pool exec "$@"; }
 ```
 
-Reload that shell configuration or open a new terminal. `claude-native` continues to call the original executable directly. The installer never edits your shell files or replaces the updater-managed Native binary. Other tools launching `claude` directly do not inherit shell functions; use the explicit `claude-pool` executable there.
+If you used the earlier function without `exec`, replace it with the function above. Reload that shell configuration or open a new terminal. `claude-native` continues to call the original executable directly. The installer never edits your shell files or replaces the updater-managed Native binary. Other tools launching `claude` directly do not inherit shell functions; use the explicit `claude-pool` executable there.
 
 ## Updates without interrupting tasks
 
+`claude update` and `claude upgrade` retain their Native meaning: update Claude Code. Update the pool explicitly:
+
 ```sh
 claude-pool update
+# Or, after shell setup: claude pool update
 ```
 
 Or rerun the one-command installer. Updates download source, reuse or build the backend, validate the staged files, and atomically select the new version. Config, credentials, history, session pins and Native login stay outside the versioned application files. A second concurrent update fails cleanly. Modified launchers are preserved and reported.

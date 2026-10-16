@@ -123,7 +123,7 @@ def install(prefix, bin_dir, config, native, *, skip_backend=False, update=False
     print('Connect an account: claude-pool account add you@example.com')
     print('Native login is separate; keep its account among the configured pool identities.')
     print('To make claude use the pool, add this shell function:')
-    print('claude() { command claude-pool "$@"; }')
+    print('claude() { command claude-pool exec "$@"; }')
 
 
 def update_install(prefix, *, skip_backend=False):

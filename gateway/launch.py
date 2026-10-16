@@ -266,7 +266,7 @@ def ensure_pool(client):
                     request(client, path="/pool/status")
                     return
                 except OSError: time.sleep(.25)
-            raise RuntimeError("Local pool did not start; run claude doctor")
+            raise RuntimeError("Local pool did not start; run claude pool doctor")
 
 
 def show_usage(client, once=False):
@@ -335,7 +335,7 @@ def background_plugin(account, origin=None):
 
 def respawn_agent(arguments):
     if len(arguments) != 1 or not re.fullmatch(r'[a-f0-9]{8}', arguments[0]):
-        raise RuntimeError('Use claude respawn <exact-agent-id> for one background task; list IDs with claude-native agents --json.')
+        raise RuntimeError('Use claude pool respawn <exact-agent-id> for one background task; list IDs with claude-native agents --json.')
     agent_id = arguments[0]
     def target():
         result = subprocess.run([NATIVE_CLAUDE, 'agents', '--json', '--all'], capture_output=True, text=True, timeout=20)
@@ -391,6 +391,20 @@ def configured_plugin(name):
 
 
 def main():
+    # The shell's claude adapter preserves Native commands; claude-pool owns pool commands.
+    native_entry = sys.argv[1:2] == ['exec']
+    if native_entry: del sys.argv[1]
+    if sys.argv[1:2] == ['pool']:
+        del sys.argv[1]
+        native_entry = False
+        if len(sys.argv) == 1: sys.argv.append('help')
+    if native_entry:
+        from account_metadata import NATIVE_COMMANDS
+        if sys.argv[1:2] and sys.argv[1] in NATIVE_COMMANDS | {'--help', '-h', '--version'}:
+            code = subprocess.call([NATIVE_CLAUDE, *sys.argv[1:]])
+            if code == 0 and sys.argv[1:] in [['--help'], ['-h']]:
+                print('\nPool: sessions use pooling automatically.\n  claude usage             Live account usage\n  claude pool update       Update Claude Pool\n  claude update            Update Claude Code\n  claude pool help         Pool commands')
+            raise SystemExit(code)
     if len(sys.argv) > 1 and sys.argv[1] == 'update':
         from update import cli
         raise SystemExit(cli(sys.argv[2:], HERE))
@@ -409,10 +423,11 @@ def main():
         except (OSError, RuntimeError, ValueError): available = False
         raise SystemExit(cli(argv, config=CONFIG, stores=STORES, binary=HERE/'bin/shunt', runtime=RUNTIME,
                              backend_source=None, backend_env=None, overview=overview if available else None))
-    if sys.argv[1:] in [['--help'], ['-h'], ['--version']]:
+    if sys.argv[1:] in [['--help'], ['-h']]: sys.argv[1:] = ['help']
+    if sys.argv[1:] == ['--version']:
         raise SystemExit(subprocess.call([NATIVE_CLAUDE, *sys.argv[1:]]))
     if sys.argv[1:] == ['help']:
-        print('claude-pool [account-alias] [Claude arguments]\nCommands: update, usage [--once], history, forecast-check, doctor, account add <email>, account list, login <name>, phone, respawn <id>\nService: --start, --stop\nSetup: ' + str(ROOT / 'docs/SETUP.md'))
+        print('claude-pool [account-alias] [Claude arguments]\nCommands: update, usage [--once], history, forecast-check, doctor, account add <email>, account list, login <name>, phone, respawn <id>\nUpdates: claude update = Claude Code; claude-pool update or claude pool update = Claude Pool\nService: --start, --stop\nSetup: ' + str(ROOT / 'docs/SETUP.md'))
         return
     if len(sys.argv) > 1 and sys.argv[1] == 'phone':
         from control_main import cli
@@ -422,7 +437,7 @@ def main():
         except subprocess.TimeoutExpired: raise RuntimeError('Respawn control timed out; outcome unknown. Inspect the target before retrying.') from None
         return
     if len(sys.argv) > 2 and sys.argv[1] in ACCOUNT_SHORTCUTS and sys.argv[2] == 'respawn':
-        raise RuntimeError('Respawn preserves existing routing; use claude respawn <exact-agent-id>.')
+        raise RuntimeError('Respawn preserves existing routing; use claude pool respawn <exact-agent-id>.')
     parser = argparse.ArgumentParser(add_help=False)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--daemon", action="store_true")
@@ -480,7 +495,7 @@ def main():
         return
     if not account and claude_args and claude_args[0] in {"usage", "history", "forecast-check", "doctor"}:
         if claude_args not in (["usage"], ["usage", "--once"], ["history"], ["forecast-check"], ["doctor"]):
-            raise SystemExit("Usage: claude usage [--once] | claude history | claude forecast-check | claude doctor")
+            raise SystemExit("Usage: claude usage [--once] | claude history | claude forecast-check | claude pool doctor")
         if claude_args[0] == "usage":
             show_usage(client, once="--once" in claude_args)
         elif claude_args[0] == 'history':
