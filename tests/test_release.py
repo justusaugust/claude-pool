@@ -1,13 +1,16 @@
 import importlib.util
 import hashlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
 import plistlib
+import shutil
 import subprocess
 import sys
 import tempfile
 import tarfile
+import threading
 import tomllib
 import unittest
 from unittest.mock import Mock, patch
@@ -61,6 +64,66 @@ class ReleaseTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'mode 0700'): settings.private_directory(target)
             link = root / 'link'; link.symlink_to(target)
             with self.assertRaisesRegex(RuntimeError, 'symlink'): settings.private_directory(link)
+
+    def test_generated_control_hooks_execute_after_relocation_and_keep_native_permissions(self):
+        calls, status = [], ['expired']
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args): pass
+            def do_POST(self):
+                if self.headers.get('Authorization') != 'Bearer fixture-token':
+                    self.send_response(403); self.end_headers(); return
+                calls.append((self.path, json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
+                body = {'id': 'fixture-request'} if self.path == '/internal/challenge' else {'status': status[0]}
+                self.send_response(200); self.end_headers(); self.wfile.write(json.dumps(body).encode())
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        with tempfile.TemporaryDirectory(prefix="pool hook ' $ ") as folder:
+            root = Path(folder); source = root / 'relocated gateway'; source.mkdir()
+            shutil.copytree(launch.HERE / 'session-control', source / 'session-control')
+            for name in ['control_hook.py', 'settings.py', 'account_metadata.py']:
+                shutil.copyfile(launch.HERE / name, source / name)
+            stores = root / 'credentials'; stores.mkdir(); (stores / '.pool-client-token').write_text('fixture-token')
+            config = root / "config ' $ .json"
+            # Distinct ephemeral port; no requests can reach the user's real controls.
+            ports = [server.server_port] + [p for p in range(28000, 28003) if p != server.server_port][:2]
+            config.write_text(json.dumps({'credential_dir': str(stores), 'control_port': ports[0], 'gateway_port': ports[1], 'backend_port': ports[2]}))
+            with patch.object(launch, 'HERE', source), patch.object(launch, 'RUNTIME', root / 'state'), patch.object(launch, 'CONFIG', config):
+                plugin = launch.configured_plugin('session-control')
+                self.assertEqual(plugin, launch.configured_plugin('session-control'))
+            manifest = json.loads((plugin / 'hooks/hooks.json').read_text())
+            commands = [hook['command'] for groups in manifest['hooks'].values() for group in groups for hook in group['hooks']]
+            self.assertEqual(len(commands), 3)
+            self.assertEqual(len(set(commands)), 1)
+            self.assertNotIn('CLAUDE_PLUGIN_ROOT', commands[0])
+            env = {k: v for k, v in os.environ.items() if not k.startswith('COCKPIT_CONTROL_')}
+            env.update(CLAUDE_POOL_CONFIG='/missing/inherited/config', COCKPIT_CONTROL_TASK='task', COCKPIT_CONTROL_GENERATION='generation', COCKPIT_CONTROL_SESSION='native')
+            def run(event, **values):
+                result = subprocess.run(commands[0], shell=True, cwd=root, env=env,
+                    input=json.dumps({'session_id': 'native', 'hook_event_name': event, 'tool_name': 'Bash', 'tool_input': {'command': 'public'}, **values}),
+                    text=True, capture_output=True, timeout=5)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, '')
+                return json.loads(result.stdout) if result.stdout else None
+            self.assertIsNone(run('PreToolUse'))
+            self.assertEqual(calls[-1][1]['operation'], 'prepare')
+            for action in ['allow', 'deny', 'expired', 'local']:
+                status[0] = action
+                result = run('PermissionRequest')
+                if action in ['allow', 'deny']:
+                    decision = result['hookSpecificOutput']['decision']
+                    self.assertEqual(decision['behavior'], action)
+                    self.assertNotIn('updatedInput', decision); self.assertNotIn('updatedPermissions', decision)
+                else: self.assertIsNone(result)
+            self.assertIsNone(run('Notification', notification_type='permission_prompt'))
+            self.assertEqual(calls[-1][1]['status'], 'needs-native')
+            count = len(calls)
+            self.assertIsNone(run('PermissionRequest', session_id='unrelated'))
+            self.assertEqual(len(calls), count)
+            (stores / '.pool-client-token').unlink()
+            self.assertIsNone(run('PermissionRequest'))
+            self.assertEqual(len(calls), count)
 
     def test_export_excludes_generated_sdk_binaries_and_runtime(self):
         pack_spec = importlib.util.spec_from_file_location('pool_packager', ROOT / 'scripts/package.py')

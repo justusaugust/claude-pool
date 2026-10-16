@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import shlex
 import shutil
 import signal
 import stat
@@ -382,6 +383,15 @@ def configured_plugin(name):
     files = {str(f.relative_to(HERE / name)): f.read_text() for f in (HERE / name).rglob('*')
              if f.is_file() and '__pycache__' not in f.parts and '.claude-plugin/types' not in str(f)}
     files['hooks/connection.ts'] = connection
+    if name == 'session-control':
+        # Copied command hooks need the same retained release and config as the Mod.
+        hooks = json.loads(files['hooks/hooks.json'])
+        command = 'CLAUDE_POOL_CONFIG=' + shlex.quote(str(CONFIG)) + ' ' + shlex.join([sys.executable, str(HERE / 'control_hook.py'), 'hook'])
+        for groups in hooks['hooks'].values():
+            for group in groups:
+                for hook in group['hooks']:
+                    hook['command'] = command
+        files['hooks/hooks.json'] = json.dumps(hooks) + '\n'
     for name, content in files.items():
         path = folder / name
         path.parent.mkdir(parents=True, exist_ok=True)
