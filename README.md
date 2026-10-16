@@ -69,4 +69,6 @@ The Mods also have Native fixture tests. Run `python3 scripts/test_mods.py` afte
 
 GitHub Actions runs both test runners on pushes and pull requests, with a manual run option. Python fixtures run on macOS with Python 3.11 and 3.14; Mod fixtures use pinned Native Claude 2.1.301 with an isolated home and configuration. Jobs use GitHub-hosted runners, read-only repository permissions and no account secrets. Live OAuth, inference, connector and artifact acceptance tests remain manual.
 
+`main` requires `Python 3.11`, `Python 3.14`, and `Native Mod fixtures` from GitHub Actions, up to date with `main`. There are no bypass actors. Push changes to a branch and merge after CI passes; unchecked direct pushes to `main` are rejected.
+
 MIT for this integration. Shunt retains its upstream MIT/Apache-2.0 license notices. This is an independent project, not an Anthropic product.
