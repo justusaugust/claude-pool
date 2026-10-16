@@ -222,6 +222,13 @@ class UpdateTests(unittest.TestCase):
     def test_invalid_service_label_cannot_escape_launchagent_folder(self):
         with self.assertRaisesRegex(RuntimeError,'service label'):installer.service_path({'serviceLabel':'../other'})
 
+    def test_already_current_still_prepares_future_service_entry(self):
+        service=self.root/'Library/LaunchAgents/io.github.claude-pool.plist';service.parent.mkdir(parents=True)
+        service.write_bytes(plistlib.dumps({'Label':'io.github.claude-pool','ProgramArguments':[sys.executable,str(self.app/'gateway/launch.py'),'--daemon']}))
+        with patch.object(installer.Path,'home',return_value=self.root):result=self.apply()
+        self.assertIn('already up to date',result)
+        self.assertEqual(plistlib.loads(service.read_bytes())['ProgramArguments'][-2:],[str(self.app/'run.py'),'--daemon'])
+
     def test_stream_in_progress_finishes_during_update(self):
         started,release=threading.Event(),threading.Event()
         class Handler(BaseHTTPRequestHandler):

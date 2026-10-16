@@ -165,6 +165,9 @@ def update_install(prefix, *, skip_backend=False):
         # Check the copied files before changing the pointer or any launcher.
         check_release(target, receipt['config'])
         if (current / 'build-info.json').is_file() and json.loads((current / 'build-info.json').read_text())['version'] == info['version'] and build_info(current)['version'] == info['version'] and (skip_backend or os.access(current / 'gateway/bin/shunt', os.X_OK)):
+            if future_service:
+                atomic_write(service, future_service)
+                print('Future service entry prepared; the loaded service was left unchanged.')
             print('Claude Pool is already up to date.'); return
         destination = versions / info['version']
         if destination.exists():
