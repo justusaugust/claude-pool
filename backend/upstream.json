@@ -1,6 +1,6 @@
 {
   "repository": "https://github.com/pleaseai/shunt.git",
   "revision": "e147f9b9c13b7072c04b1330bd1e7fd61d63b4c5",
-  "patchSha256": "d533db30e34dd21883f96e59135240dfa63620cbf292ab785853f3a48a540486",
+  "patchSha256": "8089b459bfc694ef2b955370e318055771e45556691470e227038187d7540632",
   "rustToolchain": "1.96.1"
 }
