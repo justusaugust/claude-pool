@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def source_files(root):
-    names = {'README.md', 'LICENSE', '.gitignore', '.gitattributes', 'install.py'}
+    names = {'README.md', 'LICENSE', '.gitignore', '.gitattributes', 'install.py', 'run.py', 'install.sh'}
     for folder in ['gateway', 'backend', 'docs', 'scripts', 'tests']:
         for path in (root / folder).rglob('*'):
             if not path.is_file() or path.is_symlink(): continue

@@ -12,26 +12,37 @@ This is a source-built macOS alpha. Tested runtime work used Claude Code 2.1.300
 
 Use only accounts and organization access you are authorized to operate. The software does not change a provider's subscription policies.
 
-## 1. Build the pinned backend
+## 1. Install in one command
 
-From the root of the downloaded source:
+With Native Claude Code and Git already installed on macOS:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/justusaugust/claude-pool/main/install.sh | sh
+```
+
+The command downloads public source, checks Native compatibility, installs Python 3.11+ through Homebrew if needed, and builds the exact pinned backend. Missing Node/Rustup build tools can also be installed through Homebrew. Without Homebrew, install the listed requirements yourself and rerun. Native Claude is never installed, updated or logged in by this installer.
+
+The first build may take several minutes. Rust uses two jobs and runs at lower scheduling priority. Updates reuse the existing backend only when its upstream pin and binary checksum match; an altered patch is rejected. A failed download, build or staged-code check leaves the installed version selected.
+
+The same command updates a managed installation. Review the script before executing downloaded code. A local equivalent after downloading the source is:
+
+```sh
+python3 install.py --bootstrap
+```
+
+## 2. Manual build and installation
+
+For a reviewed checkout or source archive:
 
 ```sh
 rustup toolchain install 1.96.1 --profile minimal
 python3 scripts/build_backend.py
-```
-
-This fetches the exact upstream revision recorded in `backend/upstream.json`, checks and applies `backend/shunt.patch`, builds its dashboard and compiles Shunt with the `ui` feature and recorded Rust toolchain. Rust compilation uses two jobs. The generated binary is local build output and is excluded from Git. Review the pin and patch before building. This alpha does not download an unpinned “latest” binary.
-
-## 2. Install
-
-```sh
 python3 install.py --native-claude "$(command -v claude)"
 ```
 
-Run this before adding a shell function named `claude`. If that name already resolves to a wrapper, supply the actual Native executable path instead. The installer refuses existing `claude-pool` and `claude-native` launchers and an existing application installation; it never silently overwrites them.
+The build fetches the revision in `backend/upstream.json`, checks and applies `backend/shunt.patch`, builds the dashboard, and compiles Shunt with its pinned toolchain. It never substitutes an unpinned latest binary.
 
-Use the updater-managed Native launcher path when available. The installer preserves that symlink so later Native updates are picked up by both `claude-pool` and `claude-native`; it does not silently pin the symlink's current versioned binary.
+Use the updater-managed Native launcher path. The installer retains that symlink so Native updates continue to work. It refuses launchers it does not own; supply the real Native path if `claude` resolves to a wrapper. Installation does not overwrite the Native executable or edit shell startup files.
 
 Defaults:
 
@@ -102,9 +113,21 @@ claude() { command claude-pool "$@"; }
 
 Reload that shell configuration or open a new terminal. `claude-native` continues to call the original executable directly. The installer never edits your shell files or replaces the updater-managed Native binary. Other tools launching `claude` directly do not inherit shell functions; use the explicit `claude-pool` executable there.
 
-## Updates and uninstall
+## Updates without interrupting tasks
 
-No in-place update of active sessions is promised. Keep the installed directory until its tasks finish. Changing source files does not update an already-loaded Mod. User-managed `/reload-plugins` can load an updated Mod at a suitable checkpoint; it does not update the gateway process.
+```sh
+claude-pool update
+```
+
+Or rerun the one-command installer. Updates download source, reuse or build the backend, validate the staged files, and atomically select the new version. Config, credentials, history, session pins and Native login stay outside the versioned application files. A second concurrent update fails cleanly. Modified launchers are preserved and reported.
+
+New commands and sessions use the selected CLI and Mods. Already-running sessions retain their code and files; no plugin reload, Native restart, drain, model call or service restart is requested. A gateway/backend change is **installed but not active** until the service next starts. The updater does not force that boundary. Retained versions consume disk space and are not automatically deleted while tasks may reference them.
+
+New installations use a stable launchd entry point, so later natural starts select the new backend. An early alpha installation may still have a loaded launchd definition pointing at its original directory. The updater prepares its on-disk definition for the stable entry point but leaves the loaded job alone. The next login adopts it; to adopt it earlier, finish tasks and deliberately run `claude-pool --stop`, `launchctl bootout "gui/$(id -u)/io.github.claude-pool"`, then `claude-pool --start` once. Unmanaged development wrappers are never silently converted or overwritten.
+
+To inspect the selected source version, read `build-info.json` in the application root or its `current` release. Source checkouts need the bootstrap installer rather than `claude-pool update`. A new version cannot change code already loaded by a Native session.
+
+## Uninstall
 
 Once tasks have finished:
 

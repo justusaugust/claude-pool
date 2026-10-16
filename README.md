@@ -4,7 +4,7 @@ One Claude Code workflow, backed by your connected subscription accounts.
 
 Keep using the normal Claude Code terminal, tools and conversation. The local pool selects a serving subscription, keeps requests on it while it is eligible, and routes to another account when necessary. Cockpit shows account usage inside Claude; `claude usage` opens a live terminal monitor.
 
-**macOS alpha.** The private implementation has real task-level validation. This package has also been source-built and installed from its exported archive in an isolated environment on the maintainer's Mac, using empty credential storage and no inference. A full second-machine OAuth acceptance run remains outstanding. There are no prebuilt downloads. Claude Code is installed separately.
+**macOS alpha.** The private implementation has real task-level validation. This package has also been source-built and installed from its exported archive in an isolated environment on the maintainer's Mac, using empty credential storage and no inference. A full second-machine OAuth acceptance run remains outstanding. Installation builds the pinned backend locally; no prebuilt downloads are used. Claude Code is installed separately.
 
 ## What it does
 
@@ -20,11 +20,17 @@ Keep using the normal Claude Code terminal, tools and conversation. The local po
 ## Start here
 
 ```sh
-git clone https://github.com/justusaugust/claude-pool.git
-cd claude-pool
+curl -fsSL https://raw.githubusercontent.com/justusaugust/claude-pool/main/install.sh | sh
 ```
 
-Read [setup](docs/SETUP.md) to build the pinned backend, install without overwriting Native Claude, connect accounts and enable the `claude` shell function. Then read [usage](docs/USAGE.md), [compatibility](docs/COMPATIBILITY.md) and [security](docs/SECURITY.md).
+On macOS with Native Claude Code and Git installed, this installs or updates the pool. It uses Python 3.11+ or Homebrew to obtain it, builds missing backend dependencies, and verifies an existing backend before reusing it. The first source build takes longer; unchanged backends are reused on later updates. Review [install.sh](install.sh) before running downloaded code.
+
+```sh
+claude-pool account add             # guided login and live enrollment
+claude-pool update                  # install updates; keep active tasks running
+```
+
+Updates stage and check a separate version before switching new commands. Running tasks retain their files and service; backend changes wait for the next service start. Old versions are retained. See [setup](docs/SETUP.md) for PATH, the optional `claude` shell function, manual builds and update boundaries, then [usage](docs/USAGE.md) and [security](docs/SECURITY.md).
 
 ```sh
 claude                             # automatic routing, after shell setup

@@ -10,6 +10,8 @@ Saved usage history contains quota values, resets, availability and numerical fo
 
 Private phone access requires Tailscale identity, same-origin writes, cookie/CSRF checks and exact request generations. A chat instruction cannot grant approval. Unknown delivery, changed tool inputs and unsupported prompts fall back to Native rather than granting lasting permissions.
 
+The one-command installer and updater fetch public code from this repository and may build dependencies locally. Review downloaded code; this alpha does not provide signed binary releases. Releases are staged in separate directories, and retained files are not removed during updates. No live service control or Native session restart is part of an update.
+
 For public releases, export this source directory only. Never publish the original development workspace, account store, runtime directory, Native configuration, raw task transcripts, private receipts or browser state. Demo material must use public fixture content and generic account labels.
 
 No dedicated vulnerability-reporting channel is configured for this alpha. Contact the [repository maintainer](https://github.com/justusaugust) privately before disclosing a security issue. Never include secrets in public issues.

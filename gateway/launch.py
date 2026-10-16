@@ -39,9 +39,12 @@ def service_command(*args, check=True):
 
 
 def service_definition():
-    return {'Label': SERVICE_LABEL, 'ProgramArguments': ['/opt/homebrew/bin/python3' if Path('/opt/homebrew/bin/python3').exists() else sys.executable, str(HERE / 'launch.py'), '--daemon'],
+    receipt = ROOT / 'installation.json'
+    root = Path(json.loads(receipt.read_text()).get('root', ROOT)) if receipt.is_file() else ROOT
+    entry = root / 'run.py' if (root / 'run.py').is_file() else HERE / 'launch.py'
+    return {'Label': SERVICE_LABEL, 'ProgramArguments': ['/opt/homebrew/bin/python3' if Path('/opt/homebrew/bin/python3').exists() else sys.executable, str(entry), '--daemon'],
             'RunAtLoad': True, 'KeepAlive': {'SuccessfulExit': False}, 'ThrottleInterval': 10,
-            'ExitTimeOut': 360, 'WorkingDirectory': str(ROOT),
+            'ExitTimeOut': 360, 'WorkingDirectory': str(root),
             'EnvironmentVariables': {'POOL_MANAGED': '1', 'CLAUDE_POOL_CONFIG': str(CONFIG)},
             'StandardOutPath': '/dev/null', 'StandardErrorPath': '/dev/null'}
 
@@ -386,6 +389,9 @@ def configured_plugin(name):
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == 'update':
+        from update import cli
+        raise SystemExit(cli(sys.argv[2:], HERE))
     if len(sys.argv) > 1 and sys.argv[1] in {'account', 'login'}:
         from accounts_cli import cli
         argv = sys.argv[2:]
@@ -404,7 +410,7 @@ def main():
     if sys.argv[1:] in [['--help'], ['-h'], ['--version']]:
         raise SystemExit(subprocess.call([NATIVE_CLAUDE, *sys.argv[1:]]))
     if sys.argv[1:] == ['help']:
-        print('claude-pool [account-alias] [Claude arguments]\nCommands: usage [--once], history, forecast-check, doctor, account add <email>, account list, login <name>, phone, respawn <id>\nService: --start, --stop\nSetup: ' + str(ROOT / 'docs/SETUP.md'))
+        print('claude-pool [account-alias] [Claude arguments]\nCommands: update, usage [--once], history, forecast-check, doctor, account add <email>, account list, login <name>, phone, respawn <id>\nService: --start, --stop\nSetup: ' + str(ROOT / 'docs/SETUP.md'))
         return
     if len(sys.argv) > 1 and sys.argv[1] == 'phone':
         from control_main import cli

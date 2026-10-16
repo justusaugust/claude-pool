@@ -1,5 +1,11 @@
 # Troubleshooting
 
+**An update is installed but the backend is still old.** This is deliberate: the updater never restarts the live service or reloads Native sessions. New commands use the selected release. Gateway/backend changes activate at the next service start; loaded Mods keep their old files until you choose to reload or start another session. Early alpha launchd definitions may need a deliberate reload after tasks finish.
+
+**Installation finds an existing launcher or directory it does not own.** It stops before replacing it. Use a separate `--prefix` and `--bin-dir` for an isolated test, or deliberately resolve ownership first. The private development wrapper is not a managed public installation.
+
+**The build needs tools.** The one-command installer can use Homebrew for Python, Node and Rustup. Without Homebrew, install the requirements in setup and rerun. An unchanged checksum-verified backend is reused on updates.
+
 **Account setup is waiting or was interrupted.** Rerun the same `claude-pool account add <email>` command with the same name. A saved login is reused; no existing credential is overwritten. The provider's first usage poll can take five minutes. Until it arrives, setup reports pending rather than claiming the account is ready.
 
 **The browser selected the wrong account or organization.** Nothing is enrolled when email or requested organization checks fail. Keep the saved file private; do not paste it into support messages. Use the correct account name or deliberately resolve that saved login with its owner. The CLI never replaces an existing refresh token automatically.

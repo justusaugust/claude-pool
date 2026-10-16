@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 import re
 
-RESERVED = {'account', 'login', 'usage', 'history', 'forecast-check', 'doctor', 'phone', 'respawn', 'help'}
+RESERVED = {'update', 'account', 'login', 'usage', 'history', 'forecast-check', 'doctor', 'phone', 'respawn', 'help'}
 
 
 def load(path):
