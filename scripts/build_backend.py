@@ -30,10 +30,16 @@ def main():
         run('npm', 'run', 'build', cwd=path / 'ui')
         target = Path(os.environ.get('CARGO_TARGET_DIR', path / 'target')).expanduser().resolve()
         env = dict(os.environ, CARGO_BUILD_JOBS='2', CARGO_TARGET_DIR=str(target))
+        def clean_backend():
+            subprocess.run(['cargo', '+' + upstream['rustToolchain'], 'clean', '--release', '--locked', '--package', 'shunt-gateway'], cwd=path, env=env, check=True)
+            if (target / 'release/shunt').exists(): raise RuntimeError('Backend survived Cargo cleanup; refusing shared build cache')
+        # A shared target retains dependencies, never an application build.
+        if os.environ.get('CARGO_TARGET_DIR'): clean_backend()
         subprocess.run(['cargo', '+' + upstream['rustToolchain'], 'build', '--release', '--locked', '--features', 'ui', '-j', '2'], cwd=path, env=env, check=True)
         output.parent.mkdir(exist_ok=True)
         shutil.copyfile(target / 'release/shunt', output)
         output.chmod(0o755)
+        if os.environ.get('CARGO_TARGET_DIR'): clean_backend()
     print('Built pinned Shunt backend: ' + str(output))
 
 

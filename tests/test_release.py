@@ -170,18 +170,30 @@ class ReleaseTests(unittest.TestCase):
             patch_file = root / 'backend/shunt.patch'; patch_file.write_text('fixture patch')
             pin = {'repository':'https://example.invalid/upstream.git', 'revision':'a' * 40, 'rustToolchain':'1.96.1', 'patchSha256':hashlib.sha256(patch_file.read_bytes()).hexdigest()}
             (root / 'backend/upstream.json').write_text(json.dumps(pin))
+            cached = root / 'cache/release/shunt'; cached.parent.mkdir(parents=True); cached.write_text('stale backend')
             commands = []
             def run(argv, **kwargs):
                 commands.append(list(argv))
                 if argv[0] == 'cargo':
-                    output = Path(kwargs['env']['CARGO_TARGET_DIR']) / 'release/shunt'; output.parent.mkdir(parents=True); output.write_text('fixture binary')
+                    output = Path(kwargs['env']['CARGO_TARGET_DIR']) / 'release/shunt'
+                    if 'clean' in argv: output.unlink(missing_ok=True)
+                    else:
+                        self.assertFalse(output.exists(), 'Cached application must be removed before building')
+                        output.parent.mkdir(parents=True, exist_ok=True); output.write_text('fixture binary')
                     self.assertEqual(kwargs['env']['CARGO_BUILD_JOBS'], '2')
                 return Mock(returncode=0)
             with patch.object(builder, 'ROOT', root), patch.dict(os.environ, {'CARGO_TARGET_DIR':str(root / 'cache')}), patch.object(builder.subprocess, 'run', side_effect=run): builder.main()
             self.assertIn(['git', 'fetch', '--depth', '1', 'origin', pin['revision']], commands)
             self.assertIn(['cargo', '+1.96.1', 'build', '--release', '--locked', '--features', 'ui', '-j', '2'], commands)
+            clean = ['cargo', '+1.96.1', 'clean', '--release', '--locked', '--package', 'shunt-gateway']
+            self.assertEqual([cmd for cmd in commands if cmd[0] == 'cargo'], [clean, ['cargo', '+1.96.1', 'build', '--release', '--locked', '--features', 'ui', '-j', '2'], clean])
+            self.assertFalse(cached.exists(), 'Shared cache must not retain the application')
             self.assertEqual((root / 'gateway/bin/shunt').read_text(), 'fixture binary')
             (root / 'gateway/bin/shunt').unlink()
+            cached.write_text('stale backend')
+            with patch.object(builder, 'ROOT', root), patch.dict(os.environ, {'CARGO_TARGET_DIR':str(root / 'cache')}), patch.object(builder.subprocess, 'run', return_value=Mock(returncode=0)):
+                with self.assertRaisesRegex(RuntimeError, 'Backend survived Cargo cleanup'): builder.main()
+            self.assertFalse((root / 'gateway/bin/shunt').exists())
             patch_file.write_text('modified without review')
             with patch.object(builder, 'ROOT', root), patch.object(builder.subprocess, 'run') as network:
                 with self.assertRaisesRegex(RuntimeError, 'digest changed'): builder.main()

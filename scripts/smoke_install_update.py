@@ -33,7 +33,7 @@ def smoke(native):
         if binary.exists():
             (source / 'gateway/bin').mkdir()
             shutil.copy2(binary, source / 'gateway/bin/shunt')
-        env = {key: os.environ[key] for key in ['PATH', 'TMPDIR', 'LANG'] if key in os.environ}
+        env = {key: os.environ[key] for key in ['PATH', 'TMPDIR', 'LANG', 'CARGO_TARGET_DIR', 'NPM_CONFIG_CACHE'] if key in os.environ}
         env.update(HOME=str(home), CLAUDE_CONFIG_DIR=str(home / '.claude'),
                    GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=str(home / '.gitconfig'),
                    GIT_TERMINAL_PROMPT='0', PYTHONDONTWRITEBYTECODE='1',
