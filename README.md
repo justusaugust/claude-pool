@@ -74,3 +74,5 @@ GitHub Actions runs these tests on pushes and pull requests, with a manual run o
 CI caches npm downloads and Rust dependency builds, keyed by the runner image, architecture and pinned backend inputs. It never caches the installed pool, account state, Native installation or a completed Shunt backend. With a shared `CARGO_TARGET_DIR`, the builder cleans the `shunt-gateway` package before compiling and after copying out the new binary. Each smoke run still uses an empty home, fresh source and installation, runs `npm ci` and `cargo build --locked`, and exercises every update and preservation check even on a cache hit. A cache miss builds normally; cache hits never skip tests.
 
 MIT for this integration. Shunt retains its upstream MIT/Apache-2.0 license notices. This is an independent project, not an Anthropic product.
+
+<!-- Temporary documentation-only main-cache reuse fixture. Do not merge. -->
