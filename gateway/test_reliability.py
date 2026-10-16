@@ -120,10 +120,14 @@ class FailureTests(unittest.TestCase):
         finally:self.bridge.requests.clear()
 
     def test_long_thinking_heartbeats_extend_idle_deadline_without_replay(self):
-        self.bridge.idle_timeout = .2
+        # Keep the timing ratio, with headroom for shared-runner scheduling.
+        self.bridge.idle_timeout = 1
         self.stream_events = [{'type':'ping'}] * 8 + [{'type':'message_stop'}]
-        self.event_interval = .08
+        self.event_interval = .4
+        started = time.monotonic()
         status, payload = self.call('/v1/messages', b'{"messages":[],"stream":true}')
+        self.assertGreater(time.monotonic() - started, self.bridge.idle_timeout)
+        self.assertEqual(payload.count(b'"type": "ping"'), 8)
         self.assertEqual(status, 200); self.assertIn(b'message_stop', payload)
         self.assertNotIn('request_idle_timeout', [r['code'] for r in self.bridge.journal.snapshot()])
         self.assertEqual(len(self.inputs), 1)
