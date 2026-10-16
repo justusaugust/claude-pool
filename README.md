@@ -71,4 +71,6 @@ GitHub Actions runs these tests on pushes and pull requests, with a manual run o
 
 `main` requires `Python 3.11`, `Python 3.14`, `Native Mod fixtures`, and `Clean install and update` from GitHub Actions, up to date with `main`. There are no bypass actors. Push changes to a branch and merge after CI passes; unchecked direct pushes to `main` are rejected.
 
+CI caches npm downloads and Rust dependency builds, keyed by the runner image, architecture and pinned backend inputs. It never caches the installed pool, account state, Native installation or a completed Shunt backend. With a shared `CARGO_TARGET_DIR`, the builder cleans the `shunt-gateway` package before compiling and after copying out the new binary. Each smoke run still uses an empty home, fresh source and installation, runs `npm ci` and `cargo build --locked`, and exercises every update and preservation check even on a cache hit. A cache miss builds normally; cache hits never skip tests.
+
 MIT for this integration. Shunt retains its upstream MIT/Apache-2.0 license notices. This is an independent project, not an Anthropic product.

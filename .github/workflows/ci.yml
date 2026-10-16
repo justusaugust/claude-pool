@@ -49,6 +49,13 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
+      - name: Set Native download cache path
+        run: echo "NPM_CONFIG_CACHE=$RUNNER_TEMP/claude-pool-mod-npm" >> "$GITHUB_ENV"
+      - name: Cache Native package downloads
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.NPM_CONFIG_CACHE }}
+          key: ${{ runner.os }}-${{ runner.arch }}-mods-npm-node22-claude2.1.301-v1
       - name: Install pinned Native Claude in the runner's temporary directory
         run: npm install --prefix "$RUNNER_TEMP/claude-code" --no-audit --no-fund @anthropic-ai/claude-code@2.1.301
       - name: Test all generated Mods with phone controls off and on
@@ -68,9 +75,27 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
+      - name: Identify runner image and dependency cache paths
+        id: image
+        run: |
+          printf 'version=%s\n' "${ImageVersion:?}" >> "$GITHUB_OUTPUT"
+          echo "CARGO_HOME=$RUNNER_TEMP/claude-pool-cargo" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/claude-pool-target" >> "$GITHUB_ENV"
+          echo "NPM_CONFIG_CACHE=$RUNNER_TEMP/claude-pool-install-npm" >> "$GITHUB_ENV"
+      - name: Cache build dependencies only
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ env.CARGO_HOME }}/registry
+            ${{ env.CARGO_HOME }}/git
+            ${{ env.CARGO_TARGET_DIR }}
+            ${{ env.NPM_CONFIG_CACHE }}
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.image.outputs.version }}-install-node22-claude2.1.301-v1-${{ hashFiles('backend/upstream.json', 'backend/shunt.patch', 'scripts/build_backend.py') }}
       - name: Install pinned Native Claude in the runner's temporary directory
         run: npm install --prefix "$RUNNER_TEMP/claude-code" --no-audit --no-fund @anthropic-ai/claude-code@2.1.301
       - name: Build, install and update with a retained worker
         run: |
           test ! -e gateway/bin/shunt
+          test ! -e "$CARGO_TARGET_DIR/release/shunt"
           python3 scripts/smoke_install_update.py --native-claude "$RUNNER_TEMP/claude-code/node_modules/.bin/claude"
+          test ! -e "$CARGO_TARGET_DIR/release/shunt"
