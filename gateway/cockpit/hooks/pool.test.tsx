@@ -9,6 +9,37 @@ const initial = () => ({ active: 'team', mode: 'auto', wrap: true, ready: 2, upd
 ] })
 
 describe('cockpit pooled routing', () => {
+  test('overlapping refreshes announce each switch once, including after an outage or replay', async ($, on) => {
+    mock.clock(on, { now: NOW }); mock.store(on)
+    mock.env(on, { COCKPIT_BASE_URL: 'http://127.0.0.1:18341', ANTHROPIC_AUTH_TOKEN: 'fixture-client' })
+    on('session.id', () => ({ value: 'pool-session' }))
+    on('session.measure', ($, e) => ({ changed: e.changed }) as never)
+    const notices: string[] = []
+    on('ui.log', ($, e) => { notices.push(e.text); return { value: undefined } })
+    let state = { ...initial(), switch: { at: NOW, from: 'team', to: 'gmail', reason: 'five-hour quota exhausted' } }
+    let online = true
+    let arrivals = 0
+    let release!: () => void
+    const overlap = new Promise<void>(resolve => { release = resolve })
+    on('http.fetch', async () => {
+      const text = JSON.stringify(state)
+      if (++arrivals <= 2) { if (arrivals === 2) release(); await overlap }
+      return { value: { status: online ? 200 : 503, ok: online, headers: {}, text } }
+    })
+    const refresh = () => $.session.measure({ context: {}, rateLimits: [], changed: ['rateLimits'] } as never)
+    await Promise.all([refresh(), refresh()])
+    expect(notices).toEqual(['Work → Gmail · five-hour quota exhausted'])
+    await refresh()
+    online = false; await refresh(); online = true; await refresh()
+    expect(notices.length).toBe(1)
+    state = { ...state, switch: { ...state.switch, at: NOW + 1000 } }
+    await Promise.all([refresh(), refresh()])
+    expect(notices.length).toBe(2)
+    state = { ...state, switch: { ...state.switch, at: NOW } }
+    await refresh()
+    expect(notices.length).toBe(2)
+  })
+
   test('separate Fable usage and missing all-model coverage stay explicit on both surfaces', async ($, on) => {
     mock.clock(on, { now: NOW }); mock.store(on)
     mock.env(on, { COCKPIT_BASE_URL: 'http://127.0.0.1:18341', ANTHROPIC_AUTH_TOKEN: 'fixture-client' })

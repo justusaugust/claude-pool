@@ -58,7 +58,7 @@ export type Machine = {
 
 declare module 'claude-code' {
   interface PluginState {
-    cockpit: { quota: Quota; preview: boolean; machine: Machine | null; live: Live; wrap: Wrap; pool: PoolData | null; wrapNoted: boolean }
+    cockpit: { quota: Quota; preview: boolean; machine: Machine | null; live: Live; wrap: Wrap; pool: PoolData | null; wrapNoted: boolean; switchNoted: number }
   }
 }
 

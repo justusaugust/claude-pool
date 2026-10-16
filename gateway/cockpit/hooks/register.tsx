@@ -34,6 +34,7 @@ import type { Account, Live, Machine, Pace, Quota, Window, Wrap, PoolData } from
 
 const quota = atom({ plugin: 'cockpit', key: 'quota' } as const, { others: [] } as Quota)
 const pool = atom({ plugin: 'cockpit', key: 'pool' } as const, null as PoolData | null)
+const switchNoted = atom({ plugin: 'cockpit', key: 'switchNoted' } as const, 0)
 const wrapNoted = atom({ plugin: 'cockpit', key: 'wrapNoted' } as const, false)
 const POOL_PANE = 'cockpit-pool'
 const HISTORY_PANE = 'cockpit-pool-history'
@@ -1076,7 +1077,16 @@ async function refreshPool($: $) {
   await update($, quota, q => ({ ...q, active, others: accounts.filter(a => a !== active),
     pace: active?.fiveHour && typeof speed === 'number' && Number.isFinite(speed) && speed >= 0 ? { rate: speed / 3600_000, pctNow: active.fiveHour.pct } : undefined,
     guardRate: undefined }))
-  if (result.switch && result.switch.at !== previous?.switch?.at) $.ui.log(`${accountLabel(result.switch.from, accounts)} → ${accountLabel(result.switch.to, accounts)} · ${result.switch.reason}`)
+  if (result.switch) {
+    const event = result.switch
+    let announce = false
+    // Compare-and-set survives overlapping polls and Mod reloads; stale replies cannot replay a notice.
+    await update($, switchNoted, at => {
+      announce = event.at > at
+      return Math.max(at, event.at)
+    })
+    if (announce) $.ui.log(`${accountLabel(event.from, accounts)} → ${accountLabel(event.to, accounts)} · ${event.reason}`)
+  }
 }
 
 function accountLabel(name: string, accounts: { name: string; label: string }[]) {
