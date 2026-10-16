@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Build the exact upstream revision plus the reviewed local patch."""
+# Temporary builder-cache invalidation fixture. Do not merge.
 import hashlib
 import json
 import os
