@@ -238,11 +238,11 @@ class UpdateTests(unittest.TestCase):
         self.assertEqual(plistlib.loads(service.read_bytes())['ProgramArguments'][-2:],[str(self.app/'run.py'),'--daemon'])
 
     def test_stream_in_progress_finishes_during_update(self):
-        started,release=threading.Event(),threading.Event()
+        release=threading.Event()
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
                 self.send_response(200);self.send_header('Content-Length','12');self.end_headers()
-                self.wfile.write(b'before');self.wfile.flush();started.set()
+                self.wfile.write(b'before');self.wfile.flush()
                 if release.wait(10): self.wfile.write(b'after!');self.wfile.flush()
             def log_message(self,*args):pass
         server=ThreadingHTTPServer(('127.0.0.1',0),Handler)
@@ -250,7 +250,7 @@ class UpdateTests(unittest.TestCase):
         connection=http.client.HTTPConnection('127.0.0.1',server.server_port,timeout=10)
         try:
             connection.request('GET','/');response=connection.getresponse()
-            self.assertEqual(response.read(6),b'before');self.assertTrue(started.is_set())
+            self.assertEqual(response.read(6),b'before')
             self.change_source();self.apply();self.assertTrue(thread.is_alive())
             release.set();self.assertEqual(response.read(),b'after!')
             self.assertIn('new-release',self.command('help').stdout)
