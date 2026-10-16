@@ -61,6 +61,12 @@ def check_release(target, config):
     subprocess.run([sys.executable, str(target / 'gateway/launch.py'), 'help'], env=env, check=True, capture_output=True)
 
 
+def service_path(receipt):
+    label = receipt.get('serviceLabel', 'io.github.claude-pool')
+    if not isinstance(label, str) or not re.fullmatch(r'[a-zA-Z0-9.-]+', label): raise RuntimeError('Invalid installed service label')
+    return label, Path.home() / ('Library/LaunchAgents/' + label + '.plist')
+
+
 def install(prefix, bin_dir, config, native, *, skip_backend=False, update=False):
     if sys.platform != 'darwin': raise RuntimeError('This alpha supports macOS only')
     if sys.version_info < (3, 11): raise RuntimeError('Python 3.11 or newer is required')
@@ -132,16 +138,19 @@ def update_install(prefix, *, skip_backend=False):
     check_native(Path(options.get('native_claude', receipt.get('native', ''))))
     current = (prefix / 'current').resolve() if (prefix / 'current').is_symlink() else prefix
     if current != prefix and current.parent != prefix / 'versions': raise RuntimeError('Invalid release pointer')
-    service = Path.home() / 'Library/LaunchAgents/io.github.claude-pool.plist'
+    label, service = service_path(receipt)
+    legacy_entry = receipt.get('legacyEntry', str(prefix / 'gateway/launch.py'))
     future_service = None
     if service.is_symlink(): raise RuntimeError('Service file changed; leaving it intact')
     if service.exists():
         definition = plistlib.loads(service.read_bytes())
         arguments = definition.get('ProgramArguments', [])
-        if definition.get('Label') != 'io.github.claude-pool' or not any(str(prefix / p) in arguments for p in ['gateway/launch.py', 'run.py']):
+        if definition.get('Label') != label or not any(p in arguments for p in [legacy_entry, str(prefix / 'run.py')]):
             raise RuntimeError('Service file belongs to another installation; leaving it intact')
-        if str(prefix / 'gateway/launch.py') in arguments:
-            definition['ProgramArguments'] = [str(prefix / 'run.py') if a == str(prefix / 'gateway/launch.py') else a for a in arguments]
+        if legacy_entry in arguments:
+            definition['ProgramArguments'] = [str(prefix / 'run.py') if a == legacy_entry else a for a in arguments]
+            definition['WorkingDirectory'] = str(prefix)
+            definition.setdefault('EnvironmentVariables', {})['CLAUDE_POOL_CONFIG'] = receipt['config']
             future_service = plistlib.dumps(definition).decode()
     versions = prefix / 'versions'
     if versions.is_symlink(): raise RuntimeError('Release directory cannot be a symlink')
@@ -204,16 +213,16 @@ def prepare_backend(prefix):
 
 def uninstall(prefix):
     receipt = json.loads((prefix / 'installation.json').read_text())
-    job = subprocess.run(['launchctl', 'print', 'gui/' + str(os.getuid()) + '/io.github.claude-pool'], capture_output=True)
-    if job.returncode == 0: raise RuntimeError('Pool service is loaded. Finish tasks, run claude-pool --stop, then launchctl bootout gui/$(id -u)/io.github.claude-pool before uninstalling')
+    label, plist = service_path(receipt)
+    job = subprocess.run(['launchctl', 'print', 'gui/' + str(os.getuid()) + '/' + label], capture_output=True)
+    if job.returncode == 0: raise RuntimeError('Pool service is loaded. Finish tasks, run claude-pool --stop, then launchctl bootout gui/$(id -u)/' + label + ' before uninstalling')
     for raw, expected in receipt['launchers'].items():
         path = Path(raw)
         if path.is_symlink() or (path.exists() and hashlib.sha256(path.read_bytes()).hexdigest() != expected): raise RuntimeError('Launcher changed; leaving everything intact: ' + str(path))
-    plist = Path.home() / 'Library/LaunchAgents/io.github.claude-pool.plist'
     if plist.is_symlink(): raise RuntimeError('Service file changed; leaving everything intact')
     if plist.exists():
         definition = plistlib.loads(plist.read_bytes())
-        if definition.get('Label') != 'io.github.claude-pool' or not any(str(prefix / entry) in definition.get('ProgramArguments', []) for entry in ['gateway/launch.py', 'run.py']):
+        if definition.get('Label') != label or not any(entry in definition.get('ProgramArguments', []) for entry in [receipt.get('legacyEntry', str(prefix / 'gateway/launch.py')), str(prefix / 'run.py')]):
             raise RuntimeError('Service file belongs to another installation; leaving everything intact')
     for raw in receipt['launchers']: Path(raw).unlink(missing_ok=True)
     plist.unlink(missing_ok=True)

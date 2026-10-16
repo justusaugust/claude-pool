@@ -16,6 +16,7 @@ After shell setup, `claude` and `claude-pool` are equivalent. Native arguments, 
 | `claude work --continue` | Fork saved conversation into a new independently pinned session |
 | `claude work --resume <id>` | Resume into a new fork, leaving the original session/pin alone |
 | `claude respawn <exact-agent-id>` | Target one background worker and queue guarded continuation |
+| `claude-native update` | Update Native Claude itself through its own updater |
 | `claude-native agents --json` | Native worker inventory |
 
 An account pin is a routing preference and retains quota/failure fallback. It is not a promise to spend an exhausted account. `/cockpit unpin` returns that session to automatic routing. Pausing an account through Cockpit affects the pool globally; inspect the scope before using a pause.

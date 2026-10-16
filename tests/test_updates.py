@@ -202,6 +202,26 @@ class UpdateTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError,'another installation'):self.apply()
         self.assertEqual(service.read_bytes(),value);self.assertFalse((self.app/'current').exists())
 
+    def test_owned_development_service_keeps_label_without_reload(self):
+        receipt=json.loads((self.app/'installation.json').read_text())
+        old_entry=self.root/'development/gateway/launch.py'
+        receipt.update(serviceLabel='example.dev.pool',legacyEntry=str(old_entry))
+        (self.app/'installation.json').write_text(json.dumps(receipt))
+        service=self.root/'Library/LaunchAgents/example.dev.pool.plist';service.parent.mkdir(parents=True)
+        service.write_bytes(plistlib.dumps({'Label':'example.dev.pool','ProgramArguments':[sys.executable,str(old_entry),'--daemon']}))
+        self.change_source()
+        with patch.object(installer.Path,'home',return_value=self.root):self.apply()
+        definition=plistlib.loads(service.read_bytes())
+        self.assertEqual(definition['Label'],'example.dev.pool')
+        self.assertEqual(definition['ProgramArguments'][-2:],[str(self.app/'run.py'),'--daemon'])
+        self.assertEqual(definition['EnvironmentVariables']['CLAUDE_POOL_CONFIG'],str(self.config))
+        code='import sys;sys.path.insert(0,sys.argv[1]);import launch;print(launch.SERVICE_LABEL)'
+        label=subprocess.check_output([sys.executable,'-c',code,str(self.current()/'gateway')],env=self.env,text=True)
+        self.assertEqual(label.strip(),'example.dev.pool')
+
+    def test_invalid_service_label_cannot_escape_launchagent_folder(self):
+        with self.assertRaisesRegex(RuntimeError,'service label'):installer.service_path({'serviceLabel':'../other'})
+
     def test_stream_in_progress_finishes_during_update(self):
         started,release=threading.Event(),threading.Event()
         class Handler(BaseHTTPRequestHandler):

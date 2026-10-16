@@ -27,7 +27,9 @@ from validation import render as validation_view
 from settings import HERE, RUNTIME, STORES, NATIVE_CLAUDE, CONFIG, BASE_URL, GATEWAY_PORT, BACKEND_PORT, backend_config, connection_ts, ALIASES, private_directory
 ROOT = HERE.parent
 HEALTH_INTERVAL = 10
-SERVICE_LABEL = 'io.github.claude-pool'
+INSTALLATION = json.loads((ROOT / 'installation.json').read_text()) if (ROOT / 'installation.json').is_file() else {}
+SERVICE_LABEL = INSTALLATION.get('serviceLabel', 'io.github.claude-pool')
+if not isinstance(SERVICE_LABEL, str) or not re.fullmatch(r'[a-zA-Z0-9.-]+', SERVICE_LABEL): raise RuntimeError('Invalid installed service label')
 SERVICE_PLIST = Path.home() / 'Library/LaunchAgents' / (SERVICE_LABEL + '.plist')
 ACCOUNT_SHORTCUTS = ALIASES
 
