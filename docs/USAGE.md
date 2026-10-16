@@ -4,6 +4,8 @@ After shell setup, `claude` and `claude-pool` are equivalent. Native arguments, 
 
 | Command | Behavior |
 | --- | --- |
+| `claude account add [email]` | Browser login, verified identity, automatic registration and live readiness check |
+| `claude account list` | Connected account labels and session shortcuts |
 | `claude usage` | Refresh account usage every five seconds; Ctrl-C closes the monitor |
 | `claude usage --once` | Print one cached snapshot |
 | `claude history` | Recent completed-response account switches and their reasons |

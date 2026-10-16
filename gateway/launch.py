@@ -104,6 +104,9 @@ def request(client, method="GET", path="/health", body=None):
                 try: enrich(data, read_admin(token('.pool-admin-token')))
                 except (OSError, ValueError, RuntimeError, http.client.HTTPException): pass
             body = json.dumps(data).encode()
+        if method == 'GET' and (path == '/pool/overview' or path.startswith('/cockpit/')):
+            from account_metadata import decorate
+            body = json.dumps(decorate(json.loads(body), CONFIG)).encode()
         return body
     finally:
         conn.close()
@@ -383,18 +386,26 @@ def configured_plugin(name):
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] in {'account', 'login'}:
+        from accounts_cli import cli
+        argv = sys.argv[2:]
+        if sys.argv[1] == 'login':
+            if len(argv) != 1: raise RuntimeError('Usage: claude login <name>, or claude account add <email>')
+            argv = ['add', '--name', argv[0]]
+        def overview():
+            return json.loads(request(token('.pool-client-token'), path='/pool/overview'))
+        try:
+            if not argv or argv[0] != 'add' or '--help' in argv or '-h' in argv or not (STORES / '.pool-client-token').is_file():
+                raise OSError('No live readiness check needed')
+            overview(); available = True
+        except (OSError, RuntimeError, ValueError): available = False
+        raise SystemExit(cli(argv, config=CONFIG, stores=STORES, binary=HERE/'bin/shunt', runtime=RUNTIME,
+                             backend_source=None, backend_env=None, overview=overview if available else None))
     if sys.argv[1:] in [['--help'], ['-h'], ['--version']]:
         raise SystemExit(subprocess.call([NATIVE_CLAUDE, *sys.argv[1:]]))
     if sys.argv[1:] == ['help']:
-        print('claude-pool [account-alias] [Claude arguments]\nCommands: usage [--once], history, forecast-check, doctor, login <name>, phone, respawn <id>\nService: --start, --stop\nSetup: ' + str(ROOT / 'docs/SETUP.md'))
+        print('claude-pool [account-alias] [Claude arguments]\nCommands: usage [--once], history, forecast-check, doctor, account add <email>, account list, login <name>, phone, respawn <id>\nService: --start, --stop\nSetup: ' + str(ROOT / 'docs/SETUP.md'))
         return
-    if len(sys.argv) > 1 and sys.argv[1] == 'login':
-        if len(sys.argv) != 3 or not re.fullmatch(r'[a-z0-9-]{1,80}', sys.argv[2]): raise RuntimeError('Usage: claude-pool login <account-name>')
-        path = STORES / (sys.argv[2] + '.json')
-        if path.exists() or path.is_symlink(): raise RuntimeError('That account name already exists; choose a new name to preserve its credential')
-        private_directory(STORES)
-        env = dict(os.environ, SHUNT_CLAUDE_ACCOUNTS_DIR=str(STORES))
-        raise SystemExit(subprocess.call([str(HERE / 'bin/shunt'), 'login', 'claude', '--name', sys.argv[2], '--mode', 'oauth'], env=env))
     if len(sys.argv) > 1 and sys.argv[1] == 'phone':
         from control_main import cli
         return cli(sys.argv[2:])
@@ -521,4 +532,4 @@ def main():
 
 if __name__ == "__main__":
     try: main()
-    except (OSError, RuntimeError) as error: raise SystemExit(str(error))
+    except (OSError, RuntimeError, ValueError) as error: raise SystemExit(str(error))

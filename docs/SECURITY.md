@@ -2,7 +2,7 @@
 
 The pool runs locally as the macOS user. Shunt owns subscription credentials and token refresh. The gateway validates the Native caller against Anthropic's fixed profile endpoint, matches its user and organization to configured identities, then substitutes a private local client token before forwarding inference to Shunt. Native bearer tokens are not forwarded to other account endpoints or exposed to Cockpit.
 
-Credentials are provisioned only by the browser OAuth flow into the selected private folder. Keep that directory at 0700 and credential/control-token files at 0600. Tokens, passwords and authorization codes do not belong in Git, issues, screenshots, demo videos, command arguments or model prompts. A label/path configuration is separate from credential content.
+Credentials are provisioned only by the browser OAuth flow into the selected private folder. Keep that directory at 0700 and credential/control-token files at 0600. Tokens, passwords and authorization codes do not belong in Git, issues, screenshots, demo videos, command arguments or model prompts. A label/path configuration is separate from credential content. Guided enrollment verifies both user and organization against Anthropic’s fixed profile endpoint, rejects duplicate subscriptions, and validates backend configuration before activating membership. Pasted authorization codes stay inside the owning local login process; raw child output is not logged.
 
 The bridge binds to loopback; client and admin credentials are distinct. Do not expose the admin API or inference ports publicly. Mods run with the local user's privileges and can access session data: review the code before loading it. This is not isolation from hostile software running as the same OS user.
 

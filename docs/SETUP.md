@@ -49,36 +49,36 @@ Application, launcher and configuration locations can be selected with installer
 
 Add `~/.local/bin` to PATH if it is not already present.
 
-## 3. Name the accounts
+## 3. Connect your accounts
 
-Edit `~/.config/claude-pool/config.json`. The installer creates this example with the resolved Native executable path:
-
-```json
-{
-  "native_claude": "/absolute/path/to/native/claude",
-  "accounts": [
-    {"name": "personal", "label": "Personal", "alias": "personal"},
-    {"name": "work", "label": "Work", "alias": "work"}
-  ]
-}
-```
-
-Names and aliases use lowercase letters, digits and hyphens. Labels are display text. Names must match credential filenames; aliases cannot collide with pool commands. Account count is configurable. Optional fields are `state_dir`, `credential_dir`, `gateway_port`, `backend_port`, `control_port` and an IANA `timezone` such as `Europe/London`. Defaults use the current OS timezone.
-
-Configuration is loaded when processes start. Changing pool membership requires a deliberate restart after active tasks finish; adding a credential file does not automatically enroll a new account in an already-running gateway.
-
-## 4. Connect each subscription
+Run one command per subscription:
 
 ```sh
-claude-pool login personal
-claude-pool login work
+claude-pool account add you@example.com --name personal --label Personal
+claude-pool account add you@company.example --name work --label Work --organization "Company"
 ```
 
-Each command starts Shunt's refreshable browser OAuth flow into the selected private folder. Confirm the actual account and organization in the browser. Do not paste credentials into an issue, command argument or chat. Login refuses an existing account filename rather than overwriting its refresh token. Reauthentication of an existing store should be handled deliberately with the original credential owner after its tasks finish.
+Or run `claude-pool account add` and enter your email when prompted. The name and shortcut default to the part before `@`; use `--name` to distinguish accounts with the same email prefix. `--label` selects the readable display name. No configuration editing is needed.
 
-Your Native login stays separate. A personal and Team subscription can share a user UUID but have different organizations; check the selected organization, not just the email address. Multiple aliases for the same real user/organization do not create additional quota.
+The command opens browser authorization. Confirm the selected account and subscription organization, then paste the complete code into the private macOS dialog (a hidden terminal prompt on other supported terminals). Never paste it into chat or a command argument. The CLI verifies the returned email and organization identity, stores refreshable credentials privately, registers the account and creates its session shortcut. `--organization` additionally requires the selected organization name to match.
+
+With a running pool, enrollment hot-reloads backend membership without restarting Claude or changing existing session pins. The command waits for the backend's first quota reading and reports the actual status, including `limited` if exhausted. This can take up to five minutes. A pending result means readiness is still unconfirmed; rerunning the same command resumes with the saved login instead of opening another browser. If the pool is stopped, the account is saved for its next normal start.
+
+```sh
+claude-pool account list
+claude-pool work                 # independently pinned session
+claude-pool                     # automatic routing across all accounts
+```
+
+The Native login stays separate and must also be among your connected subscriptions. A personal and Team subscription can share a user UUID but have different organizations. Duplicate aliases for the same user/organization do not create extra quota and are rejected. Existing credential files are reused, never silently overwritten. Revoked credentials need deliberate reauthentication with their owner; rerunning setup does not replace them.
 
 Use one active backend owner for each refreshable store. Do not run independent backends or copy rotating refresh tokens across machines.
+
+## 4. Optional configuration
+
+The installer creates `~/.config/claude-pool/config.json` with the Native executable path and an empty account list. Account setup maintains names, labels, aliases and verified plan labels there. Names and aliases use lowercase letters, digits and hyphens; aliases cannot collide with pool commands.
+
+Optional settings are `state_dir`, `credential_dir`, `gateway_port`, `backend_port`, `control_port` and an IANA `timezone` such as `Europe/London`. Defaults use the current OS timezone. Set these before starting the service. The guided command handles live account enrollment; other service settings still require a deliberate restart after active tasks finish. Creating a credential file alone does not enroll it.
 
 ## 5. Validate, then use
 

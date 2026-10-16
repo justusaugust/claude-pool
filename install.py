@@ -41,9 +41,7 @@ def install(prefix, bin_dir, config, native, *, skip_backend=False):
         value = json.loads(config.read_text())
         if not isinstance(value, dict): raise RuntimeError('Existing config is invalid')
     else:
-        value = {'native_claude': str(native.absolute()), 'accounts': [
-            {'name': 'personal', 'label': 'Personal', 'alias': 'personal'},
-            {'name': 'work', 'label': 'Work', 'alias': 'work'}]}
+        value = {'native_claude': str(native.absolute()), 'accounts': []}
     config.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if not config.exists():
         fd = os.open(config, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -76,7 +74,7 @@ def install(prefix, bin_dir, config, native, *, skip_backend=False):
                 if path.is_file() and not path.is_symlink() and body.startswith(path.read_bytes()): path.unlink()
             raise
     print('Installed to ' + str(prefix))
-    print('Edit ' + str(config) + ', then run claude-pool login <each configured account name>.')
+    print('Connect an account: claude-pool account add you@example.com')
     print('Native login is separate; keep its account among the configured pool identities.')
     print('To make claude use the pool, add this shell function:')
     print('claude() { command claude-pool "$@"; }')

@@ -1,5 +1,11 @@
 # Troubleshooting
 
+**Account setup is waiting or was interrupted.** Rerun the same `claude-pool account add <email>` command with the same name. A saved login is reused; no existing credential is overwritten. The provider's first usage poll can take five minutes. Until it arrives, setup reports pending rather than claiming the account is ready.
+
+**The browser selected the wrong account or organization.** Nothing is enrolled when email or requested organization checks fail. Keep the saved file private; do not paste it into support messages. Use the correct account name or deliberately resolve that saved login with its owner. The CLI never replaces an existing refresh token automatically.
+
+**Authorization shows a redirect error.** The guided CLI uses the registered manual-code browser flow from the start. Start a fresh `account add` flow and use its complete code in the hidden dialog; old codes and codes from another login are rejected.
+
 **The banner says API Usage Billing or connectors disappear.** Start with the explicit `claude-pool` launcher. It retains Native OAuth and removes conflicting API-key/auth-token/provider overrides in its child environment. Bare/safe modes disable required integration. Do not add a fake API key or copy tokens into shell configuration. Verify the intended Native account with `claude-native auth status`.
 
 **An artifact is not found after a switch.** Compare the Native login, not just the serving account in Cockpit. A changed Native login may lack access to the original owner's artifact. Restore the intended login deliberately or use its original owner session; inference routing cannot transfer it.

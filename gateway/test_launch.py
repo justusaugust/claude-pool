@@ -134,11 +134,11 @@ class LauncherTests(unittest.TestCase):
                 with patch.object(launch.sys,'argv',['claude',shortcut,'--model','opus','--','hello']):
                     with self.assertRaises(SystemExit) as result:launch.main()
                     self.assertEqual(result.exception.code,0)
-        self.assertEqual(len(set(launches)),5)
+        self.assertEqual(len(set(launches)),len(launch.ACCOUNT_SHORTCUTS))
         self.assertEqual([states[key]['pin'] for key in launches],list(launch.ACCOUNT_SHORTCUTS.values()))
         self.assertEqual(states['existing-session'],{'mode':'pinned','pin':'gmail'})
 
-    def test_resumed_shortcuts_fork_and_pin_only_their_new_session_for_all_five_accounts(self):
+    def test_resumed_shortcuts_fork_and_pin_only_their_new_session_for_all_configured_accounts(self):
         variants = [['--continue'],['-c'],['--resume','saved-session'],['-r','saved-session'],['-rsaved-session'],
                     ['--resume=saved-session'],['--resume'],['-r'],['--continue','--fork-session']]
         for shortcut, account in launch.ACCOUNT_SHORTCUTS.items():

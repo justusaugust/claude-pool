@@ -8,6 +8,7 @@ Keep using the normal Claude Code terminal, tools and conversation. The local po
 
 ## What it does
 
+- Guided `claude-pool account add` setup with identity checks, private code input and live enrollment.
 - Automatic, session-aware inference routing across explicitly configured accounts, with optional per-session account shortcuts.
 - A Cockpit Mod with per-account five-hour, all-model weekly and separate Fable weekly readings, reset times, routing explanations, session activity, switch history and partial forecasts.
 - A live `claude usage` view that refreshes every five seconds. `--once` prints a snapshot; redirected output stays a snapshot. These commands do not call a model.

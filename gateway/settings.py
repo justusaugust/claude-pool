@@ -2,31 +2,20 @@
 import json
 import os
 from pathlib import Path
-import re
 import shutil
 import stat
 import sys
 
 HERE = Path(__file__).resolve().parent
 CONFIG = Path(os.environ.get('CLAUDE_POOL_CONFIG', Path.home() / '.config/claude-pool/config.json')).expanduser().resolve()
-RESERVED = {'usage', 'history', 'forecast-check', 'doctor', 'phone', 'respawn', 'login', 'help'}
+from account_metadata import load as load_accounts
 
 
 def load(path=CONFIG):
-    value = json.loads(path.read_text()) if path.exists() else {}
+    value = load_accounts(path)
     if not isinstance(value, dict): raise ValueError('Pool configuration must be an object')
     allowed = {'accounts', 'native_claude', 'state_dir', 'credential_dir', 'gateway_port', 'backend_port', 'control_port', 'timezone'}
     if set(value) - allowed: raise ValueError('Unknown pool configuration field: ' + ', '.join(sorted(set(value) - allowed)))
-    accounts, names, aliases = value.get('accounts', []), set(), set()
-    if not isinstance(accounts, list): raise ValueError('accounts must be a list')
-    for account in accounts:
-        if not isinstance(account, dict) or set(account) - {'name', 'label', 'alias'}: raise ValueError('Invalid account configuration')
-        name, alias = account.get('name'), account.get('alias', account.get('name'))
-        if not isinstance(name, str) or not re.fullmatch(r'[a-z0-9-]{1,80}', name) or name in names: raise ValueError('Account names must be unique lowercase names')
-        if not isinstance(alias, str) or not re.fullmatch(r'[a-z0-9-]{1,80}', alias) or alias in RESERVED or alias in aliases: raise ValueError('Account aliases must be unique and cannot use a command name')
-        label = account.get('label', name)
-        if not isinstance(label, str) or not 1 <= len(label) <= 80 or not all(c.isprintable() for c in label): raise ValueError('Account label must be printable text, 1–80 characters')
-        names.add(name); aliases.add(alias)
     ports = [value.get(key, default) for key, default in [('gateway_port', 18341), ('backend_port', 18340), ('control_port', 18342)]]
     if any(type(port) is not int or not 1024 <= port <= 65535 for port in ports) or len(set(ports)) != 3: raise ValueError('Pool ports must be distinct integers from 1024 to 65535')
     for key in ['native_claude', 'state_dir', 'credential_dir', 'timezone']:

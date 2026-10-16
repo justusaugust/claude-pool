@@ -79,6 +79,8 @@ class ReleaseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             output = Path(folder) / 'source.tar.gz'; packager.package(ROOT, output)
             with tarfile.open(output) as archive:
+                for module in ['account_login.py', 'account_metadata.py', 'accounts_cli.py']:
+                    self.assertGreater(len(archive.extractfile('claude-pool/gateway/' + module).read()), 100)
                 for name in ['index.html', 'app.js', 'style.css']:
                     self.assertGreater(len(archive.extractfile('claude-pool/gateway/phone/' + name).read()), 100)
                 manifest = json.load(archive.extractfile('claude-pool/SOURCE-MANIFEST.json'))
@@ -125,6 +127,10 @@ class ReleaseTests(unittest.TestCase):
             self.assertIn('usage [--once]', result.stdout)
             self.assertFalse((root / '.local/state').exists()); self.assertFalse((root / '.shunt').exists())
             self.assertEqual(config.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(json.loads(config.read_text())['accounts'], [])
+            result = subprocess.run([str(binaries / 'claude-pool'), 'account', '--help'], text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('add', result.stdout)
             result = subprocess.run([str(binaries / 'claude-native'), '--resume', 'public-fixture'], text=True, capture_output=True)
             self.assertEqual(result.stdout.splitlines(), ['--resume', 'public-fixture'])
             before = native.read_bytes(); saved = config.read_bytes()

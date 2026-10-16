@@ -21,7 +21,7 @@ from diagnostics import Journal
 from native_auth import NativeAuthUnavailable
 from telemetry import fable_windows, capacity
 
-from settings import LABELS
+from settings import LABELS, CONFIG
 HOP = {"host", "connection", "content-length", "transfer-encoding"}
 
 
@@ -259,6 +259,8 @@ class PoolBridge(ThreadingHTTPServer):
                              "fiveHour": window("5h"), "sevenDay": window("7d"), "fableWeekly": fable.get((provider['provider'], source['name'], source['account_ref'])), "status": status,
                              "plan": source.get("plan"), "seenAt": (source.get("observed_at_5h") or 0) * 1000,
                              "paused": source.get("paused", False), "cooldownSeconds": source.get("cooldown_secs_remaining", 0) or 0})
+        from account_metadata import decorate
+        decorate({'accounts': rows}, CONFIG)
         with self.lock:
             self.last_accounts = rows
             changed = False
