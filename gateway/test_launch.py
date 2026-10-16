@@ -94,6 +94,19 @@ class LauncherTests(unittest.TestCase):
                         self.assertEqual(native.call_args.kwargs['env'].get('ANTHROPIC_MODEL'),chosen)
                         self.assertEqual(dict(launch.os.environ),env)
 
+    def test_native_tool_continuity_defaults_reach_resume_and_background_without_overriding_users(self):
+        defaults={'ENABLE_TOOL_SEARCH':'force','CLAUDE_CODE_INLINE_TOOLS':'1','CLAUDE_CODE_FORCE_MID_CONVERSATION_SYSTEM':'1'}
+        for options in [[],['--resume','saved-session'],['--continue'],['--bg']]:
+            for overrides in [{},{key:'0' for key in defaults},{'ENABLE_TOOL_SEARCH':'auto'}]:
+                with self.subTest(options=options,overrides=overrides), tempfile.TemporaryDirectory() as folder, \
+                     patch.object(launch,'RUNTIME',Path(folder)),patch.dict(launch.os.environ,overrides,clear=True), \
+                     patch.object(launch,'token',return_value='fixture'),patch.object(launch,'ensure_pool'), \
+                     patch.object(launch.subprocess,'call',return_value=0) as native,patch.object(launch.sys,'argv',['claude',*options]):
+                    with self.assertRaises(SystemExit):launch.main()
+                    env=native.call_args.kwargs['env']
+                    self.assertEqual({key:env[key] for key in defaults},{**defaults,**overrides})
+                    self.assertEqual(dict(launch.os.environ),overrides)
+
     def test_foreground_origins_are_unique_and_headless_calls_keep_their_arguments(self):
         paths=[]
         with tempfile.TemporaryDirectory() as folder, patch.object(launch,'RUNTIME',Path(folder)), \

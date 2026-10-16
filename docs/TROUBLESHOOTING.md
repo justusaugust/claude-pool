@@ -28,6 +28,12 @@
 
 **A plugin update seems absent.** Installed files and loaded session code are different states. Use a user-managed `/reload-plugins` checkpoint or start a fresh disposable session. A tool-list change can require confirmation; do not force it past Native's check.
 
+**Thinking resets when tools change on resume.** The launcher defaults to Native's forced tool discovery, inline tools and mid-conversation system support. Native owns the saved prefix, signatures, tool discovery and permission checks; the pool never rewrites signed history. Explicit environment overrides still win. Tested on Native 2.1.301 with Opus 5.5/high effort. Earlier conversations or explicitly disabled discovery can still require a Native reasoning reset. Native may retain an existing tool's recorded description/schema until compaction; a changed tool implementation must remain compatible with that recorded schema.
+
+**Context7 needs authentication.** Open `/mcp` in Claude and authenticate Context7 through its browser flow. The official plugin uses OAuth; setting `CONTEXT7_API_KEY` does not authenticate that plugin. This login is separate from pool accounts and remains Native-managed.
+
+**Cua stopped connecting after its app updated.** Check `cua daemon status --json` against the installed version before restarting anything. An old daemon may still serve another task. For new clients, the supported `cua mcp --embedded` mode uses the installed runtime without replacing that daemon. Verify with `/mcp` and a read-only `list_spaces` call. Cua Driver is a separate installation: use its `mcp-config` output for the absolute executable path, then grant CuaDriver Accessibility and Screen Recording in macOS settings. Do not restart active Claude sessions to apply these configuration changes.
+
 **Resume changes another window's account.** Use `claude <alias> --resume <id>` to fork into a new independently pinned conversation. A plain `--resume` keeps Native behavior. Inspect that session's Cockpit pin before changing pool-wide pauses.
 
 **A stream failed after a tool call.** The gateway does not blindly replay partial output or tool effects. Inspect the last step before retrying when Native cannot safely continue. An API error is not proof that a file write or external side effect did not complete.

@@ -531,6 +531,10 @@ def main():
                COCKPIT_PROJECT=Path.cwd().name, CLAUDE_CODE_GATEWAY_HINT_HEADERS="1")
     # Native inherits model choices from this environment when handing off or respawning.
     env.setdefault('ANTHROPIC_DEFAULT_OPUS_MODEL', 'claude-opus-5-5')
+    # Native keeps signed prefixes stable only when discovery survives resume.
+    env.setdefault('ENABLE_TOOL_SEARCH', 'force')
+    env.setdefault('CLAUDE_CODE_INLINE_TOOLS', '1')
+    env.setdefault('CLAUDE_CODE_FORCE_MID_CONVERSATION_SYSTEM', '1')
     for i, arg in enumerate(options):
         if arg == '--model' and i + 1 < len(options): model = options[i + 1]
         elif arg.startswith('--model='): model = arg.removeprefix('--model=')
