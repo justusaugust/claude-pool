@@ -1785,3 +1785,9 @@ index 73d33aa..ffbefbb 100644
        "license": "BSD-3-Clause",
        "engines": {
          "node": ">=0.10.0"
+diff --git a/ci-cache-invalidation-fixture.txt b/ci-cache-invalidation-fixture.txt
+new file mode 100644
+--- /dev/null
++++ b/ci-cache-invalidation-fixture.txt
+@@ -0,0 +1 @@
++Temporary cache-invalidation verification fixture. Do not merge.
