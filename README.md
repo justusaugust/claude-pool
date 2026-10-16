@@ -67,4 +67,6 @@ Loopback-server tests use temporary ports and fixture credentials. Do not run mo
 
 The Mods also have Native fixture tests. Run `python3 scripts/test_mods.py` after installing Native Claude (or pass `--native-claude /path/to/claude`). This tests all five generated Mods with temporary configuration, phone controls configured and unconfigured, and paths containing spaces and quotes. It does not use live pool state or credentials, make model requests, or reload running sessions. Native generates its version-specific SDK declarations when a Mod loads interactively; those generated files are excluded from Git and source exports.
 
+GitHub Actions runs both test runners on pushes and pull requests, with a manual run option. Python fixtures run on macOS with Python 3.11 and 3.14; Mod fixtures use pinned Native Claude 2.1.301 with an isolated home and configuration. Jobs use GitHub-hosted runners, read-only repository permissions and no account secrets. Live OAuth, inference, connector and artifact acceptance tests remain manual.
+
 MIT for this integration. Shunt retains its upstream MIT/Apache-2.0 license notices. This is an independent project, not an Anthropic product.

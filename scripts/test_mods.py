@@ -21,7 +21,8 @@ def main():
         home = Path(folder)
         config = home / 'config.json'
         config.write_text(json.dumps({'state_dir': str(home / 'state'), 'credential_dir': str(home / 'credentials')}))
-        env = dict(os.environ, CLAUDE_POOL_CONFIG=str(config), PYTHONDONTWRITEBYTECODE='1')
+        env = dict(os.environ, HOME=str(home), CLAUDE_CONFIG_DIR=str(home / '.claude'),
+                   CLAUDE_POOL_CONFIG=str(config), PYTHONDONTWRITEBYTECODE='1')
         code = ('import json, launch; print(json.dumps([str(launch.configured_plugin(n)) for n in '
                 '["cockpit", "session-control", "phone-hub", "respawn-continuation"]] + [str(launch.background_plugin(None))]))')
         for phone in [False, True]:
