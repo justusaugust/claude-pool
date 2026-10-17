@@ -432,6 +432,18 @@ def native_identity():
     return native
 
 
+def long_lived_report():
+    """Print long-lived token findings; True when any of them failed."""
+    import long_lived, registry
+    try: known = registry.load()
+    except ValueError: known = registry.EMPTY()
+    findings = long_lived.health(STORES, LONG_LIVED, known, int(time.time() * 1000), registry.self_name())
+    shown = [f for f in findings if f['level'] != 'ok']
+    for f in shown: print(f"  {f['level']} {f['account']}: {f['message']}" + (f" · fix: {f['fix']}" if f['fix'] else ''))
+    if not shown and findings: print(f'  ok long-lived tokens: {len({f["account"] for f in findings})} checked')
+    return any(f['level'] == 'fail' for f in shown)
+
+
 def main():
     # The shell's claude adapter preserves Native commands; claude-pool owns pool commands.
     native_entry = sys.argv[1:2] == ['exec']
@@ -559,6 +571,7 @@ def main():
             print(f"Claude pool · {health['supervisor']} · backend {health['backend']} · {health['activeRequests']}/{health['requestLimit']} requests")
             print('Metadata storage: ' + ('needs attention' if health['storageError'] else 'ready'))
             for incident in value['incidents'][:10]: print('  ' + incident['message'])
+            if long_lived_report(): raise SystemExit(1)
         else:
             print(validation_view(json.loads(request(client, path='/pool/validation'))))
         return
