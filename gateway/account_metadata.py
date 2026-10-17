@@ -6,7 +6,7 @@ import re
 NATIVE_COMMANDS = {'agents', 'attach', 'auth', 'auto-mode', 'doctor', 'gateway', 'help', 'import',
                    'install', 'logs', 'mcp', 'plugin', 'plugins', 'purge', 'respawn', 'rm',
                    'setup-token', 'stop', 'kill', 'ultrareview', 'update', 'upgrade'}
-RESERVED = NATIVE_COMMANDS | {'pool', 'exec', 'account', 'login', 'usage', 'history', 'forecast-check', 'phone'}
+RESERVED = NATIVE_COMMANDS | {'pool', 'exec', 'account', 'login', 'usage', 'history', 'forecast-check', 'phone', 'device'}
 
 
 def load(path):

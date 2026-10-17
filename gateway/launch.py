@@ -417,6 +417,15 @@ def configured_plugin(name):
     return folder
 
 
+def native_identity():
+    """This machine's Native login ({'email', 'organization'}), or None when Native is signed out."""
+    from native_login import parse_auth_status
+    try: done = subprocess.run([NATIVE_CLAUDE, 'auth', 'status', '--json'], capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        raise RuntimeError('Could not read the Native login (claude-native auth status); nothing was changed') from None
+    return parse_auth_status(done.stdout)
+
+
 def main():
     # The shell's claude adapter preserves Native commands; claude-pool owns pool commands.
     native_entry = sys.argv[1:2] == ['exec']
@@ -444,17 +453,17 @@ def main():
         def overview():
             return json.loads(request(token('.pool-client-token'), path='/pool/overview'))
         try:
-            if not argv or argv[0] != 'add' or '--help' in argv or '-h' in argv or not (STORES / '.pool-client-token').is_file():
+            if not argv or argv[0] not in ('add', 'remove') or '--help' in argv or '-h' in argv or not (STORES / '.pool-client-token').is_file():
                 raise OSError('No live readiness check needed')
             overview(); available = True
         except (OSError, RuntimeError, ValueError): available = False
         raise SystemExit(cli(argv, config=CONFIG, stores=STORES, binary=HERE/'bin/shunt', runtime=RUNTIME,
-                             overview=overview if available else None, long_lived=LONG_LIVED))
+                             overview=overview if available else None, long_lived=LONG_LIVED, native_identity=native_identity))
     if sys.argv[1:] in [['--help'], ['-h']]: sys.argv[1:] = ['help']
     if sys.argv[1:] == ['--version']:
         raise SystemExit(subprocess.call([NATIVE_CLAUDE, *sys.argv[1:]]))
     if sys.argv[1:] == ['help']:
-        print('claude-pool [account-alias] [Claude arguments]\nCommands: update, usage [--once], history, forecast-check, doctor, account add <email>, account list, login <name>, phone, respawn <id>\nUpdates: claude update = Claude Code; claude-pool update or claude pool update = Claude Pool\nService: --start, --stop\nSetup: ' + str(ROOT / 'docs/SETUP.md'))
+        print('claude-pool [account-alias] [Claude arguments]\nCommands: update, usage [--once], history, forecast-check, doctor, account add <email>, account list, account remove <name> [--wait], login <name>, phone, respawn <id>\nUpdates: claude update = Claude Code; claude-pool update or claude pool update = Claude Pool\nService: --start, --stop\nSetup: ' + str(ROOT / 'docs/SETUP.md'))
         return
     if len(sys.argv) > 1 and sys.argv[1] == 'phone':
         from control_main import cli

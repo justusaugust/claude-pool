@@ -1,5 +1,6 @@
 """Session demand is a routing preference; Shunt still enforces eligibility."""
 import re
+import time
 
 ACTIVE_SECONDS = 300
 REASONS = {'manual selection', 'cache affinity', 'shared capacity', 'new session',
@@ -43,6 +44,23 @@ def session_rows(sessions, now):
                      'busy': bool(s.get('inFlight')), 'lastRequestAt': s.get('requestAt', 0) * 1000,
                      'reason': s.get('routing', {}).get('reason', 'awaiting next request' if s.get('active') else 'new session')})
     return sorted(rows, key=lambda r: (not r['busy'], -r['lastRequestAt']))
+
+
+def in_flight(overview, account=None):
+    """True while the pool serves a request: any request at all, or one served by `account`."""
+    if account is None and (overview.get('health') or {}).get('activeRequests', 0) > 0: return True
+    return any(row.get('busy') and (account is None or row.get('account') == account) for row in overview.get('sessions', []))
+
+
+def wait_idle(overview, account, wait, sleep=time.sleep, clock=time.monotonic, interval=5, limit=1800):
+    """True once nothing (or nothing on `account`) is in flight. Polls only with `wait`; an unreadable overview is never idle."""
+    deadline = clock() + limit if wait else None
+    while True:
+        try:
+            if not in_flight(overview(), account): return True
+        except (OSError, ValueError, RuntimeError, AttributeError, TypeError): pass
+        if not wait or clock() >= deadline: return False
+        sleep(interval)
 
 
 def choose(accounts, sessions, session_id, forecast, now):
