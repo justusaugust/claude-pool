@@ -26,17 +26,20 @@ NO = Completed(1, b'', b'')
 def has(argv, *words): return all(w in argv for w in words)
 
 
-def host(configured=True, running=True, permissions=()):
-    return json.dumps({'configured': configured, 'service': {'running': running}, 'permissions': [{'id': p} for p in permissions]}).encode()
+def host(configured=True, running=True, permissions=(), url=IP + ':3211'):
+    return json.dumps({'configured': configured, 'directUrl': url, 'service': {'running': running}, 'permissions': [{'id': p} for p in permissions]}).encode()
 
 
 class Target:
     """A fake machine: cua presence, host state and registered spaces."""
-    def __init__(self, cua=True, setup_state=None, state=None, spaces=(), mcp=False, ip=IP):
+    def __init__(self, cua=True, setup_state=None, state=None, spaces=(), mcp=False, ip=IP, fail=()):
+        self.fail = set(fail)
         self.cua, self.state, self.setup_state, self.spaces, self.mcp, self.ip = cua, state or host(False, False), setup_state, list(spaces), mcp, ip
         self.remote = FakeRemote('t', self.handle)
 
     def handle(self, argv, stdin):
+        if any(w in argv for w in self.fail): return NO
+        if argv[:2] == ['sh', '-c'] and 'managed by claude-pool installer' in argv[2]: return Completed(0, b'/opt/claude\n', b'')
         if argv[:2] == ['sh', '-c'] and 'command -v cua' in argv[2]: return Completed(0, ABS.encode(), b'') if self.cua else NO
         if has(argv, 'tailscale'): return Completed(0, self.ip.encode() + b'\n', b'')
         if has(argv, 'setup'):
@@ -45,6 +48,9 @@ class Target:
         if has(argv, 'host', 'status'): return Completed(0, self.state, b'')
         if has(argv, 'spaces', 'ls'): return Completed(0, json.dumps({'spaces': [{'id': s} for s in self.spaces]}).encode(), b'')
         if has(argv, 'spaces', 'add'): self.spaces.append(f'direct:{IP}:3211'); return OK
+        if has(argv, 'spaces', 'rm'): self.spaces = [x for x in self.spaces if x not in argv]; return OK
+        if has(argv, 'host', 'remove'): self.state = host(False, False); return OK
+        if has(argv, 'mcp', 'remove'): self.mcp = False; return OK
         if has(argv, 'mcp', 'get'): return OK if self.mcp else NO
         if has(argv, 'mcp', 'add'): self.mcp = True; return OK
         return OK
@@ -78,7 +84,7 @@ class CuaTests(unittest.TestCase):
         target = Target(cua=False)
         step = device_cua.ensure_host(target.remote, 'vps', IP)
         self.assertEqual((step.status, step.fix), ('missing', 'see docs/DEVICES.md, Cua'))
-        self.assertFalse([a for a, _ in target.remote.calls if any('curl' in w or 'install' in w for w in a)])
+        self.assertEqual(len(target.remote.calls), 1); self.assertIn('command -v cua', target.remote.calls[0][0][2])
 
     def test_missing_accessibility_is_a_manual_step_naming_cua_spacesd(self):
         step = device_cua.ensure_host(Target(setup_state=host(True, True, ['accessibility'])).remote, 'mac', IP)
@@ -100,7 +106,7 @@ class CuaTests(unittest.TestCase):
         self.assertEqual(target.calls('mcp', 'add'), [['/opt/claude', 'mcp', 'add', '-s', 'user', 'cua', '--', ABS, 'mcp', '--embedded']])
 
     def test_remove_forgets_space_host_and_mcp(self):
-        device, peer = Target(mcp=True), Target()
+        device, peer = Target(state=host(), mcp=True), Target(spaces=[f'direct:{IP}:3211'])
         steps = device_cua.remove(device.remote, [peer.remote], native='/opt/claude')
         self.assertTrue(all(s.status == 'ok' for s in steps), steps)
         self.assertEqual(len(peer.calls('spaces', 'rm', f'direct:{IP}:3211')), 1)
@@ -118,6 +124,91 @@ class CuaTests(unittest.TestCase):
 
     def test_status_part_registered(self):
         self.assertIn(device_cua._status, device_sync.STATUS_PARTS)
+
+    # fix round 1
+    def sendtoken(self, path, out=None):
+        r, w = os.pipe()
+        try:
+            with os.fdopen(w, 'wb') as pipe: device_cua.send_token(out or pipe, path)
+        finally: os.close(r)
+
+    def test_send_token_refuses_symlink_foreign_owner_and_non_regular(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            real = Path(tmp) / 'real'; real.write_bytes(TOKEN); real.chmod(0o600)
+            link = Path(tmp) / 'link'; link.symlink_to(real)
+            with self.assertRaisesRegex(RuntimeError, 'private 0600 file'): self.sendtoken(link)
+            with self.assertRaisesRegex(RuntimeError, 'private 0600 file'): self.sendtoken(Path(tmp))
+            with self.assertRaisesRegex(RuntimeError, 'private 0600 file'): self.sendtoken(Path(tmp) / 'absent')
+            real_fstat = os.fstat
+            def foreign(fd):
+                info = real_fstat(fd)
+                return os.stat_result((info.st_mode, info.st_ino, info.st_dev, info.st_nlink, os.getuid() + 1, info.st_gid, info.st_size, 0, 0, 0))
+            with mock.patch('device_cua.os.fstat', foreign), self.assertRaisesRegex(RuntimeError, 'private 0600 file'): self.sendtoken(real)
+
+    def test_send_token_refuses_a_terminal(self):
+        class Tty(io.BytesIO):
+            def isatty(self): return True
+        out = Tty()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 't'; path.write_bytes(TOKEN); path.chmod(0o600)
+            with self.assertRaises(RuntimeError): device_cua.send_token(out, path)
+        self.assertEqual(out.getvalue(), b'')
+
+    def test_host_token_refuses_empty_and_failed(self):
+        for done in (Completed(0, b'\n', b''), Completed(1, TOKEN, b'')):
+            with self.assertRaises(RuntimeError): device_cua.host_token(FakeRemote('t', lambda a, s, d=done: d))
+        self.assertEqual(device_cua.host_token(FakeRemote('t', lambda a, s: Completed(0, TOKEN + b'\n', b''))), TOKEN)
+
+    def test_register_refuses_an_empty_token(self):
+        peer = Target()
+        self.assertEqual(device_cua.register(peer.remote, b' \n', IP, 'mac').status, 'failed')
+        self.assertEqual(peer.calls('spaces', 'add'), [])
+
+    def test_addresses_outside_tailscale_raise(self):
+        for bad in ('0.0.0.0', '192.168.1.5', 'nope'):
+            with self.assertRaises(ValueError): device_cua.host_setup_argv(bad, 'mac')
+            with self.assertRaises(ValueError): device_cua.register(Target().remote, TOKEN, bad, 'mac')
+
+    def test_host_with_another_address_is_set_up_again(self):
+        for url in ('100.64.0.9:3211', None):
+            target = Target(state=host(url=url), setup_state=host())
+            self.assertEqual(device_cua.ensure_host(target.remote, 'mac', IP).status, 'ok')
+            self.assertEqual(len(target.calls('setup')), 1)
+        for url in ('http://' + IP + ':3211', 'https://' + IP + ':3211'):
+            target = Target(state=host(url=url))
+            device_cua.ensure_host(target.remote, 'mac', IP); self.assertEqual(target.calls('setup'), [])
+
+    def test_failed_branches(self):
+        self.assertEqual(device_cua.ensure_host(Target().remote, 'mac', IP).status, 'failed')
+        self.assertEqual(device_cua.register(Target(fail=['add']).remote, TOKEN, IP, 'mac').status, 'failed')
+        self.assertEqual(device_cua.ensure_mcp(Target(fail=['add']).remote, '/opt/claude').status, 'failed')
+        self.assertEqual(device_cua.ensure_mcp(Target(cua=False).remote, '/opt/claude').status, 'missing')
+
+    def test_remove_is_idempotent_and_precheck_only(self):
+        device, peer = Target(state=host(), mcp=True, spaces=[]), Target(spaces=[f'direct:{IP}:3211'])
+        for _ in range(2):
+            steps = device_cua.remove(device.remote, [peer.remote], native='/opt/claude')
+            self.assertTrue(all(s.status == 'ok' for s in steps), steps)
+        self.assertEqual(len(peer.calls('spaces', 'rm')), 1)
+        self.assertEqual(len(device.calls('host', 'remove')), 1)
+        self.assertEqual(len(device.calls('mcp', 'remove')), 1)
+
+    def test_remove_finds_native_itself(self):
+        device = Target(mcp=True)
+        device_cua.remove(device.remote, [])
+        self.assertEqual(device.calls('mcp', 'remove'), [['/opt/claude', 'mcp', 'remove', 'cua', '-s', 'user']])
+
+    def test_status_part_shape_and_timeouts(self):
+        target = Target(state=host(), spaces=['direct:x:1'], mcp=True)
+        timeouts = []
+        class Rec:
+            name = 'local'
+            def call(self, argv, stdin=None, timeout=120): timeouts.append(timeout); return target.handle(list(argv), stdin)
+        with mock.patch('device_cua.Local', Rec):
+            self.assertEqual(device_cua._status(), {'cua': {'host': True, 'spaces': ['direct:x:1'], 'mcp': True}})
+            self.assertEqual(set(timeouts), {10})
+            target.cua = False
+            self.assertEqual(device_cua._status(), {'cua': None})
 
 
 if __name__ == '__main__': unittest.main()
