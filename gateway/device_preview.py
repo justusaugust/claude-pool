@@ -2,7 +2,8 @@
 
 `preview <port>` runs a small proxy as a `systemd --user` unit and prints a Tailscale link (HTTPS through Tailscale Serve
 when the user may use it, otherwise HTTP on the Tailscale address). The proxy binds 127.0.0.1 or the Tailscale IP only.
-The tool is never overwritten when a different `~/.local/bin/preview` is already there."""
+The tool is never overwritten when a different `~/.local/bin/preview` is already there; only a copy whose SHA-256 is in
+KNOWN_PREVIOUS (an earlier release of this same tool) is updated in place."""
 import hashlib
 from pathlib import Path
 import sys
@@ -18,20 +19,47 @@ TARGET = '.local/bin/preview'
 RULES_START = '<!-- claude-pool:previews start -->'
 RULES_END = '<!-- claude-pool:previews end -->'
 LINUX_ONLY = 'preview runs its proxy as a systemd user unit; Linux only for now'
+# Earlier releases of gateway/preview that install() may replace. The first is the copy live on personal-vps.
+KNOWN_PREVIOUS = {'b3e645e7ba9750057b68c12f7dd518d19ff792a98062eeea857115b194358d94'}
 
-_SHA_SCRIPT = ('cd "$HOME" || exit 1; f="$1"; if [ ! -e "$f" ]; then echo absent; '
-               'elif command -v sha256sum >/dev/null 2>&1; then sha256sum "$f" | cut -d" " -f1; '
-               'else shasum -a 256 "$f" | cut -d" " -f1; fi')
+_HASH = ('if command -v sha256sum >/dev/null 2>&1; then h=$(sha256sum "$f" | cut -d" " -f1); '
+         'else h=$(shasum -a 256 "$f" | cut -d" " -f1); fi; ')
+# Prints `absent`, `broken` (a symlink to nothing), `link <sha>` (a symlink) or `<sha>` (a regular file).
+_SHA_SCRIPT = ('cd "$HOME" || exit 1; f="$1"; if [ -L "$f" ] && [ ! -e "$f" ]; then echo broken; '
+               'elif [ ! -e "$f" ]; then echo absent; else ' + _HASH +
+               'if [ -L "$f" ]; then echo "link $h"; else echo "$h"; fi; fi')
+# Fresh install: a hard link from a temp file, which fails (and replaces nothing) if any file appeared meanwhile.
 _INSTALL_SCRIPT = ('cd "$HOME" || exit 1; mkdir -p .local/bin && t=$(mktemp .local/bin/.preview.XXXXXX) || exit 1; '
-                   'cat > "$t" && chmod 0755 "$t" && mv "$t" "$1" || { rm -f "$t"; exit 1; }')
-# Removes the file only when it still is the packaged tool; $2 is its SHA-256.
-_UNLINK_SCRIPT = ('cd "$HOME" || exit 1; f="$1"; [ -e "$f" ] || exit 0; '
-                  'if command -v sha256sum >/dev/null 2>&1; then h=$(sha256sum "$f" | cut -d" " -f1); '
-                  'else h=$(shasum -a 256 "$f" | cut -d" " -f1); fi; [ "$h" = "$2" ] && rm -f "$f"; exit 0')
+                   'if cat > "$t" && chmod 0755 "$t" && ln "$t" "$1"; then rm -f "$t"; exit 0; fi; rm -f "$t"; exit 1')
+# Update: replaces $1 only if it is a regular file (not a symlink) whose SHA-256 is one of $2..., checked in this shell.
+_UPDATE_SCRIPT = ('cd "$HOME" || exit 1; f="$1"; shift; t=$(mktemp .local/bin/.preview.XXXXXX) || exit 1; '
+                  'cat > "$t" && chmod 0755 "$t" || { rm -f "$t"; exit 1; }; '
+                  'if [ -L "$f" ] || [ ! -f "$f" ]; then rm -f "$t"; exit 3; fi; ' + _HASH +
+                  'ok=; for k in "$@"; do [ "$h" = "$k" ] && ok=1; done; '
+                  '[ -n "$ok" ] || { rm -f "$t"; exit 3; }; mv -f "$t" "$f" || { rm -f "$t"; exit 1; }')
+# Removes the file only when it still is the packaged tool or a known earlier copy; $2... are their SHA-256s.
+_UNLINK_SCRIPT = ('cd "$HOME" || exit 1; f="$1"; shift; [ -e "$f" ] || exit 0; ' + _HASH +
+                  'for k in "$@"; do [ "$h" = "$k" ] && { rm -f "$f"; exit 0; }; done; exit 0')
+# Runs the installed tool from the home folder; the tool's arguments follow.
+_RUN_SCRIPT = 'cd "$HOME" && exec .local/bin/preview "$@"'
 
 
 def _text(data): return (data or b'').decode('utf-8', 'replace').strip()
 def _tool_sha(): return hashlib.sha256(TOOL.read_bytes()).hexdigest()
+def _accepted(): return [_tool_sha(), *sorted(KNOWN_PREVIOUS)]
+def _run_tool(remote, *args, timeout=60): return remote.call(['sh', '-c', _RUN_SCRIPT, 'preview', *args], timeout=timeout)
+
+
+def _inspect(remote):
+    """`absent`, `broken`, `link <sha>`, `<sha>`, or None when the device could not be asked."""
+    done = remote.call(['sh', '-c', _SHA_SCRIPT, 'sha', TARGET])
+    out = _text(done.stdout)
+    return out.splitlines()[0] if done.returncode == 0 and out else None
+
+
+def _ours(have):
+    """True when the installed file is the packaged tool or a known earlier copy (a regular file or a symlink to one)."""
+    return have is not None and have.split()[-1] in {_tool_sha(), *KNOWN_PREVIOUS} and have not in ('absent', 'broken')
 
 
 def _is_mac(remote): return _text(remote.call(['uname', '-s']).stdout) == 'Darwin'
@@ -39,15 +67,21 @@ def _is_mac(remote): return _text(remote.call(['uname', '-s']).stdout) == 'Darwi
 
 def install(remote):
     if _is_mac(remote): return Step('preview', 'skipped', LINUX_ONLY)
-    done = remote.call(['sh', '-c', _SHA_SCRIPT, 'sha', TARGET])
-    have = _text(done.stdout).splitlines()[0] if done.returncode == 0 and _text(done.stdout) else None
-    if have is None: return Step('preview', 'failed', 'could not inspect ~/.local/bin/preview', 'claude-pool device add ' + remote.name)
-    if have == _tool_sha(): return Step('preview', 'ok', 'preview tool present')
+    have = _inspect(remote)
+    retry = 'claude-pool device add ' + remote.name
+    rename = f'remove or rename ~/.local/bin/preview on {remote.name}, then rerun claude-pool device add {remote.name}'
+    if have is None: return Step('preview', 'failed', 'could not inspect ~/.local/bin/preview', retry)
+    if have in (_tool_sha(), 'link ' + _tool_sha()): return Step('preview', 'ok', 'preview tool present')
+    if have == 'broken': return Step('preview', 'failed', '~/.local/bin/preview is a broken symlink', rename)
+    if have in KNOWN_PREVIOUS:
+        done = remote.call(['sh', '-c', _UPDATE_SCRIPT, 'update', TARGET, *_accepted()], stdin=TOOL.read_bytes())
+        if done.returncode == 3: return Step('preview', 'failed', '~/.local/bin/preview changed while updating it', rename)
+        if done.returncode: return Step('preview', 'failed', 'could not update the preview tool', retry)
+        return Step('preview', 'ok', 'updated')
     if have != 'absent':
-        return Step('preview', 'failed', 'a different ~/.local/bin/preview is already there',
-                    f'remove or rename ~/.local/bin/preview on {remote.name}, then rerun claude-pool device add {remote.name}')
+        return Step('preview', 'failed', 'a different ~/.local/bin/preview is already there', rename)
     done = remote.call(['sh', '-c', _INSTALL_SCRIPT, 'install', TARGET], stdin=TOOL.read_bytes())
-    if done.returncode: return Step('preview', 'failed', 'could not install the preview tool', 'claude-pool device add ' + remote.name)
+    if done.returncode: return Step('preview', 'failed', 'could not install the preview tool', retry)
     return Step('preview', 'ok', 'preview tool installed')
 
 
@@ -60,7 +94,7 @@ def _backend(output):
 
 
 def check(remote, user):
-    done = remote.call([TARGET, 'doctor'], timeout=60)
+    done = _run_tool(remote, 'doctor')
     if done.returncode in (126, 127): return Step('preview', 'missing', 'preview is not installed', 'claude-pool device add ' + remote.name)
     backend = _backend(_text(done.stdout))
     if done.returncode == 0 and backend == 'https': return Step('preview', 'ok', 'HTTPS links through Tailscale Serve')
@@ -103,12 +137,19 @@ def rules_verb(action, path=None):
 
 def remove(remote):
     if _is_mac(remote): return Step('preview', 'skipped', LINUX_ONLY)
-    remote.call([TARGET, 'stop', '--all'], timeout=60)
+    have = _inspect(remote)
+    if _ours(have):
+        _run_tool(remote, 'stop', '--all')  # stops only previews and file shares this tool created
+        stopped = 'previews stopped'
+    elif have in ('absent', 'broken'):
+        stopped = 'no preview tool installed'
+    else:
+        stopped = 'previews not stopped: ~/.local/bin/preview is not this tool, left alone'
     rules = remote.pool('device', 'preview-rules', 'remove')
-    unlink = remote.call(['sh', '-c', _UNLINK_SCRIPT, 'unlink', TARGET, _tool_sha()])
-    if rules.returncode or unlink.returncode:
+    unlink = remote.call(['sh', '-c', _UNLINK_SCRIPT, 'unlink', TARGET, *_accepted()])
+    if have is None or rules.returncode or unlink.returncode:
         return Step('preview', 'failed', 'could not remove everything', 'claude-pool device remove ' + remote.name)
-    return Step('preview', 'ok', 'previews stopped, rules block removed')
+    return Step('preview', 'ok', stopped + ', rules block removed')
 
 
 def _status():

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""preview: open a web server that runs on this VPS's localhost from any device on the tailnet.
+"""preview: open a web server that runs on this VPS's localhost, or one file or folder, from any device on the tailnet.
 
 Single file, Python 3 standard library only. See `preview --help`.
 Tests: preview_test.py next to this file (python3 -m unittest from that directory).
@@ -7,18 +7,25 @@ Tests: preview_test.py next to this file (python3 -m unittest from that director
 
 import argparse
 import asyncio
+import codecs
+import html
 import ipaddress
 import json
 import os
 import re
+import shlex
 import signal
 import socket
+import stat
 import subprocess
 import sys
+import threading
 import time
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "1.0"
+VERSION = "1.1"
 FALLBACK_TS_IP = "100.108.161.69"
 FALLBACK_TS_NAME = "personal-vps.tail69b084.ts.net"
 UNIT_PREFIX = "preview-"
@@ -43,13 +50,27 @@ HOW
      It prints one line with the link, plus a short note. Send that link to Justus.
   3. When the work is done: preview stop 5173
 
+  To share a file or folder instead (a Markdown report, screenshots, a PDF):
+       preview file docs/report.md        or        preview file screenshots/
+
 COMMANDS
   preview <port> [--name LABEL]   expose 127.0.0.1:<port> to the tailnet and print the link.
                                   Safe to run again (same link; also upgrades HTTP to HTTPS
                                   once Tailscale Serve is allowed). Works before the server is up.
+  preview file <path> [--name LABEL]
+                                  share one file or one folder read-only and print the link.
+                                  Markdown opens as a readable page (add ?raw=1 for the source),
+                                  images and PDFs open in the browser, other text shows as plain
+                                  text, everything else downloads. Dotfiles and dot folders
+                                  (.env, .git, ~/.ssh, ...) are never served, nor anything a
+                                  symlink points to outside the shared folder; / and the home
+                                  folder itself are refused. Safe to run again (same path, same
+                                  link). File shares use ports 18400-18499.
   preview list [--json]           open previews: port, label, link, backend, target listening?
-  preview stop <port>             stop one preview (the dev server itself keeps running)
-  preview stop --all              stop every preview created by this tool (nothing else)
+                                  File shares also show their path.
+  preview stop <port>|<path>      stop one preview or file share (a dev server keeps running).
+                                  A folder named only with digits: write ./2026
+  preview stop --all              stop every preview and file share created by this tool (nothing else)
   preview doctor                  which backend is available and how to enable HTTPS
 
 BACKENDS (chosen automatically)
@@ -63,6 +84,8 @@ BACKENDS (chosen automatically)
   redirects to localhost:<port> are rewritten to the preview link. The proxy never listens
   on 0.0.0.0 or a public address. If nothing listens on the port yet, the page says so and
   reloads itself every few seconds. Ports 22, 80 and 443 are refused (system services).
+  A file share adds one more unit, preview-file-<port>.service: a read-only file server bound
+  to 127.0.0.1 only, which the proxy above exposes like any other port.
   Tests: python3 -m unittest preview_test (in ~/.local/bin).
 """
 
@@ -423,6 +446,549 @@ def cmd_serve(args):
 
 
 # ---------------------------------------------------------------------------
+# File shares (the file server runs inside the systemd --user unit preview-file-<port>.service via
+# `preview _serve-file`, bound to 127.0.0.1 only; a normal preview proxy exposes that port)
+# ---------------------------------------------------------------------------
+
+FILE_PORTS = range(18400, 18500)
+FILE_UNIT_PREFIX = "preview-file-"
+HTML_CSP = "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'"
+OTHER_CSP = "sandbox"
+INLINE_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+                ".webp": "image/webp", ".pdf": "application/pdf"}
+MARKDOWN_EXTS = {".md", ".markdown"}
+MARKDOWN_RENDER_LIMIT = 2 * 1024 * 1024  # larger Markdown files are served as plain text
+CHUNK = 64 * 1024
+TEXT_SNIFF = 8192
+
+
+class FileShareRefused(ValueError):
+    pass
+
+
+def hidden(parts):
+    """True if any path component starts with a dot (dotfiles, dot folders, and . or ..)."""
+    return any(part.startswith(".") for part in parts)
+
+
+def check_share_root(path):
+    """The resolved path to share, or FileShareRefused for anything that must never be shared."""
+    raw = Path(os.path.expanduser(str(path)))
+    try:
+        resolved = raw.resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise FileShareRefused(f"{path}: no such file or folder")
+    if hidden(Path(os.path.abspath(raw)).parts) or hidden(resolved.parts):
+        raise FileShareRefused(f"refusing to share {path}: dotfiles and dot folders (like ~/.ssh) are never shared")
+    if resolved == Path(resolved.anchor):
+        raise FileShareRefused("refusing to share /: pick one file or folder")
+    home = Path.home().resolve()
+    if resolved == home or home.is_relative_to(resolved):
+        raise FileShareRefused(f"refusing to share {path}: that is the home folder (or contains it); "
+                               f"pick one file or folder inside it")
+    if not (resolved.is_file() or resolved.is_dir()):
+        raise FileShareRefused(f"refusing to share {path}: not a regular file or folder")
+    return resolved
+
+
+def resolve_request(root, single, request_path):
+    """The file or folder a request path names inside the share, or None (404)."""
+    path = request_path.split("#", 1)[0]
+    try:
+        path = urllib.parse.unquote(path, errors="strict")
+    except UnicodeDecodeError:
+        return None
+    if not path.startswith("/") or "\x00" in path:
+        return None
+    parts = [part for part in path.split("/") if part not in ("", ".")]
+    if hidden(parts):  # also catches ".."
+        return None
+    if single:
+        return root if parts in ([], [root.name]) else None
+    try:
+        target = root.joinpath(*parts).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if target != root and not target.is_relative_to(root):
+        return None  # a symlink that points outside the shared folder
+    if hidden(target.relative_to(root).parts):
+        return None  # a symlink that points at a dotfile inside the shared folder
+    return target
+
+
+def looks_like_text(head):
+    if b"\x00" in head:
+        return False
+    try:
+        codecs.getincrementaldecoder("utf-8")().decode(head, final=False)
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
+def content_disposition(kind, name):
+    """`inline` or `attachment` with a safely quoted filename (RFC 6266 / RFC 5987 for anything not plain ASCII)."""
+    fallback = "".join(c if 32 <= ord(c) < 127 and c not in '"\\' else "_" for c in name) or "file"
+    value = f'{kind}; filename="{fallback}"'
+    if fallback != name:
+        value += "; filename*=UTF-8''" + urllib.parse.quote(name, safe="")
+    return value
+
+
+PAGE_CSS = """
+:root { color-scheme: light dark; }
+body { margin: 0; padding: 2rem 1.25rem 4rem; font: 17px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  color: #1d1d1f; background: #fff; -webkit-text-size-adjust: 100%; }
+main { max-width: 70ch; margin: 0 auto; overflow-wrap: anywhere; }
+h1, h2, h3, h4, h5, h6 { line-height: 1.25; margin: 1.6em 0 .6em; text-wrap: balance; }
+h1 { font-size: 1.8rem; margin-top: 0; } h2 { font-size: 1.4rem; } h3 { font-size: 1.15rem; }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+li + li { margin-top: .25em; }
+a { color: #0a58ca; }
+code, pre { font: .88em/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+code { background: rgba(127, 127, 127, .15); padding: .1em .3em; border-radius: 4px; }
+pre { background: rgba(127, 127, 127, .12); padding: .8em 1em; overflow-x: auto; border-radius: 8px; }
+pre code { background: none; padding: 0; overflow-wrap: normal; }
+blockquote { margin-left: 0; padding-left: 1em; border-left: 3px solid rgba(127, 127, 127, .4); opacity: .85; }
+img { max-width: 100%; height: auto; }
+table { border-collapse: collapse; display: block; overflow-x: auto; }
+th, td { border: 1px solid rgba(127, 127, 127, .35); padding: .35em .6em; text-align: left; vertical-align: top; }
+hr { border: 0; border-top: 1px solid rgba(127, 127, 127, .35); margin: 2em 0; }
+ul.index { list-style: none; padding: 0; }
+ul.index li { margin: 0; padding: .45em 0; border-bottom: 1px solid rgba(127, 127, 127, .2); }
+@media (prefers-color-scheme: dark) { body { color: #e8e8ea; background: #161618; } a { color: #6ea8fe; } }
+"""
+
+
+def html_page(title, body):
+    return ('<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n'
+            '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+            '<meta name="referrer" content="no-referrer">\n'
+            f"<title>{html.escape(title)}</title>\n<style>{PAGE_CSS}</style>\n</head>\n<body>\n<main>\n"
+            f"{body}\n</main>\n</body>\n</html>\n")
+
+
+# Markdown: a small, conservative subset. Every text run is HTML-escaped; raw HTML shows as text;
+# link and image URLs must be http(s), mailto (links only) or relative, otherwise only their text is kept.
+
+MD_SPAN = 2000   # an inline construct (emphasis, link) may span at most this many characters
+MD_DEPTH = 8     # nesting limit for block quotes, lists and emphasis
+_MD_FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+_MD_HEADING = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+(.*?))?(?:[ \t]+#+)?[ \t]*$")
+_MD_HR = re.compile(r"^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$")
+_MD_ITEM = re.compile(r"^( *)(?:([-*+])|(\d{1,9})[.)])(?:[ \t]+(.*))?$")
+_MD_QUOTE = re.compile(r"^ {0,3}> ?(.*)$")
+_MD_TABLE_SEP = re.compile(r"^ {0,3}\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)*\|?[ \t]*$")
+_MD_SPECIAL = re.compile(r"[\\`*_\[!<]")
+_MD_LINK = re.compile(r"\[((?:[^\[\]\\]|\\.|\[[^\[\]]*\])*)\]\(\s*(<[^<>\n]*>|[^\s()<>]*(?:\([^\s()<>]*\)[^\s()<>]*)*)"
+                      r'(?:\s+"([^"\n]*)")?\s*\)', re.S)
+_MD_AUTOLINK = re.compile(r"<((?:https?|mailto):[^\s<>]+)>", re.I)
+_MD_STRONG = re.compile(r"(\*\*|__)(?=\S)(.+?)(?<=\S)\1", re.S)
+_MD_EM = re.compile(r"\*(?=[^\s*])(.+?)(?<=[^\s*])\*|_(?=\S)(.+?)(?<=\S)_(?![0-9A-Za-z])", re.S)
+_MD_ESCAPABLE = set("\\`*_{}[]()#+-.!|<>~\"'")
+
+
+def md_url_ok(url, image=False):
+    if not url or "\\" in url or any(ord(c) < 0x21 or ord(c) == 0x7F for c in url):
+        return False
+    m = re.match(r"([A-Za-z][A-Za-z0-9+.-]*):", url)
+    if not m:
+        return True  # relative
+    return m.group(1).lower() in ({"http", "https"} if image else {"http", "https", "mailto"})
+
+
+def md_inline(text, links=True, depth=0):
+    if depth > MD_DEPTH:
+        return html.escape(text)
+    out, i, n = [], 0, len(text)
+    while i < n:
+        m = _MD_SPECIAL.search(text, i)
+        if not m:
+            out.append(html.escape(text[i:]))
+            break
+        if m.start() > i:
+            out.append(html.escape(text[i:m.start()]))
+        i = m.start()
+        c, end = text[i], min(n, i + MD_SPAN)
+        if c == "\\" and i + 1 < n and text[i + 1] in _MD_ESCAPABLE:
+            out.append(html.escape(text[i + 1]))
+            i += 2
+            continue
+        if c == "`":
+            j = i
+            while j < n and text[j] == "`":
+                j += 1
+            run = j - i
+            close = re.compile(r"(?<!`)`{%d}(?!`)" % run).search(text, j, min(n, j + MD_SPAN))
+            if close:
+                out.append("<code>" + html.escape(text[j:close.start()].strip(" ") or text[j:close.start()]) + "</code>")
+                i = close.end()
+            else:
+                out.append(html.escape(text[i:j]))
+                i = j
+            continue
+        if c == "!" and i + 1 < n and text[i + 1] == "[":
+            lm = _MD_LINK.match(text, i + 1, end)
+            if lm:
+                label, url, title = lm.group(1), lm.group(2).strip("<>"), lm.group(3)
+                if md_url_ok(url, image=True):
+                    out.append(f'<img src="{html.escape(url)}" alt="{html.escape(label)}"'
+                               + (f' title="{html.escape(title)}"' if title else "") + ">")
+                else:
+                    out.append(html.escape(label))
+                i = lm.end()
+                continue
+        if c == "[":
+            lm = _MD_LINK.match(text, i, end)
+            if lm:
+                label, url, title = lm.group(1), lm.group(2).strip("<>"), lm.group(3)
+                inner = md_inline(label, links=False, depth=depth + 1)
+                if links and md_url_ok(url):
+                    out.append(f'<a href="{html.escape(url)}"' + (f' title="{html.escape(title)}"' if title else "")
+                               + f">{inner}</a>")
+                else:
+                    out.append(inner)
+                i = lm.end()
+                continue
+        if c == "<":
+            am = _MD_AUTOLINK.match(text, i, end)
+            if am and links and md_url_ok(am.group(1)):
+                out.append(f'<a href="{html.escape(am.group(1))}">{html.escape(am.group(1))}</a>')
+                i = am.end()
+                continue
+        if c in "*_" and not (c == "_" and i > 0 and text[i - 1].isalnum()):
+            sm = _MD_STRONG.match(text, i, end)
+            if sm:
+                out.append("<strong>" + md_inline(sm.group(2), links, depth + 1) + "</strong>")
+                i = sm.end()
+                continue
+            em = _MD_EM.match(text, i, end)
+            if em:
+                out.append("<em>" + md_inline(em.group(1) or em.group(2), links, depth + 1) + "</em>")
+                i = em.end()
+                continue
+        out.append(html.escape(c))
+        i += 1
+    return "".join(out)
+
+
+def _md_table_cells(line):
+    line = line.strip()
+    if line.startswith("|"):
+        line = line[1:]
+    if line.endswith("|") and not line.endswith("\\|"):
+        line = line[:-1]
+    return [cell.strip() for cell in re.split(r"(?<!\\)\|", line)]
+
+
+def _md_block_start(line):
+    return bool(_MD_FENCE.match(line) or _MD_HEADING.match(line) or _MD_HR.match(line) or _MD_QUOTE.match(line))
+
+
+def _md_list(lines, i, depth):
+    """Parse the list that starts at lines[i]. Returns (html, next index)."""
+    items, n = [], len(lines)
+    while i < n:
+        line = lines[i]
+        if not line.strip():
+            j = i
+            while j < n and not lines[j].strip():
+                j += 1
+            if j < n and (_MD_ITEM.match(lines[j]) or lines[j].startswith("  ")):
+                i = j
+                continue
+            break
+        m = _MD_ITEM.match(line)
+        if m and not _MD_HR.match(line):
+            items.append({"indent": len(m.group(1)), "ordered": m.group(3) is not None,
+                          "start": int(m.group(3) or 1), "text": [m.group(4) or ""]})
+        elif items and (line.startswith("  ") or not _md_block_start(line)):
+            items[-1]["text"].append(line.strip())
+        else:
+            break
+        i += 1
+    return _md_list_html(items, 0, depth)[0], i
+
+
+def _md_list_html(items, k, depth):
+    first = items[k]
+    indent, ordered = first["indent"], first["ordered"]
+    tag = "ol" if ordered else "ul"
+    start = f' start="{first["start"]}"' if ordered and first["start"] != 1 else ""
+    parts, current = [f"<{tag}{start}>"], None
+
+    def close():
+        if current is not None:
+            parts.append("<li>" + md_inline("\n".join(current["text"]).strip(), depth=depth)
+                         + "".join(current["children"]) + "</li>")
+
+    while k < len(items):
+        item = items[k]
+        if item["indent"] < indent:
+            break
+        if item["indent"] >= indent + 2 and current is not None:
+            if depth >= MD_DEPTH:
+                current["text"].append(item["text"][0])
+                current["text"].extend(item["text"][1:])
+                k += 1
+                continue
+            child, k = _md_list_html(items, k, depth + 1)
+            current["children"].append(child)
+            continue
+        if item["ordered"] != ordered:
+            break
+        close()
+        current = {"text": list(item["text"]), "children": []}
+        k += 1
+    close()
+    parts.append(f"</{tag}>")
+    return "".join(parts), k
+
+
+def md_blocks(raw_lines, depth=0):
+    lines = [line.expandtabs(4) for line in raw_lines]
+    out, para, i, n = [], [], 0, len(lines)
+
+    def flush():
+        if para:
+            out.append("<p>" + md_inline("\n".join(p.strip() for p in para), depth=depth) + "</p>")
+            para.clear()
+
+    while i < n:
+        line = lines[i]
+        if not line.strip():
+            flush()
+            i += 1
+            continue
+        m = _MD_FENCE.match(line)
+        if m and not (m.group(1)[0] == "`" and "`" in m.group(2)):
+            flush()
+            fence, info = m.group(1), m.group(2).strip()
+            closing = re.compile(r"^ {0,3}" + re.escape(fence[0]) + "{%d,}[ \t]*$" % len(fence))
+            i += 1
+            code = []
+            while i < n and not closing.match(lines[i]):
+                code.append(raw_lines[i])
+                i += 1
+            i += 1
+            lang = re.sub(r"[^\w+.-]", "", info.split()[0]) if info else ""
+            cls = f' class="language-{lang}"' if lang else ""
+            out.append(f"<pre><code{cls}>" + html.escape("\n".join(code)) + "</code></pre>")
+            continue
+        m = _MD_HEADING.match(line)
+        if m:
+            flush()
+            level = len(m.group(1))
+            out.append(f"<h{level}>" + md_inline(m.group(2) or "", depth=depth) + f"</h{level}>")
+            i += 1
+            continue
+        if _MD_HR.match(line):
+            flush()
+            out.append("<hr>")
+            i += 1
+            continue
+        if _MD_QUOTE.match(line):
+            flush()
+            quoted = []
+            while i < n and _MD_QUOTE.match(lines[i]):
+                quoted.append(_MD_QUOTE.match(lines[i]).group(1))
+                i += 1
+            if depth >= MD_DEPTH:
+                out.append("<blockquote><p>" + md_inline("\n".join(quoted), depth=depth) + "</p></blockquote>")
+            else:
+                out.append("<blockquote>" + md_blocks(quoted, depth + 1) + "</blockquote>")
+            continue
+        if _MD_ITEM.match(line):
+            flush()
+            listed, i = _md_list(lines, i, depth)
+            out.append(listed)
+            continue
+        if "|" in line and i + 1 < n and "|" in lines[i + 1] and _MD_TABLE_SEP.match(lines[i + 1]):
+            flush()
+            head = _md_table_cells(line)
+            i += 2
+            rows = []
+            while i < n and lines[i].strip() and "|" in lines[i]:
+                rows.append(_md_table_cells(lines[i]))
+                i += 1
+            cell = lambda tag, text: f"<{tag}>" + md_inline(text, depth=depth) + f"</{tag}>"
+            body = "".join("<tr>" + "".join(cell("td", c) for c in row) + "</tr>" for row in rows)
+            out.append("<table><thead><tr>" + "".join(cell("th", c) for c in head) + "</tr></thead>"
+                       + (f"<tbody>{body}</tbody>" if body else "") + "</table>")
+            continue
+        para.append(line)
+        i += 1
+    flush()
+    return "\n".join(out)
+
+
+def render_markdown(text, title):
+    """A complete, self-contained HTML page for a Markdown text (standard library only)."""
+    return html_page(title, md_blocks(text.splitlines()))
+
+
+def index_page(root, folder):
+    rel = folder.relative_to(root).parts
+    title = "/".join((root.name, *rel))
+    rows = []
+    if rel:
+        parent = "/" + "".join(urllib.parse.quote(part, safe="") + "/" for part in rel[:-1])
+        rows.append(f'<li><a href="{html.escape(parent)}">..</a></li>')
+    try:
+        children = sorted(folder.iterdir(), key=lambda child: child.name)
+    except OSError:
+        children = []
+    for child in children:
+        if child.name.startswith("."):
+            continue
+        try:
+            real = child.resolve(strict=True)
+            mode = real.stat().st_mode
+        except (OSError, RuntimeError):
+            continue
+        if (real != root and not real.is_relative_to(root)) or hidden(real.relative_to(root).parts):
+            continue
+        is_dir = stat.S_ISDIR(mode)
+        if not (is_dir or stat.S_ISREG(mode)):
+            continue
+        href = "/" + "/".join(urllib.parse.quote(part, safe="") for part in (*rel, child.name)) + ("/" if is_dir else "")
+        rows.append(f'<li><a href="{html.escape(href)}">{html.escape(child.name)}{"/" if is_dir else ""}</a></li>')
+    body = f"<h1>{html.escape(title)}</h1>\n<ul class=\"index\">\n" + "\n".join(rows) + "\n</ul>"
+    if len(rows) == (1 if rel else 0):
+        body += "\n<p>This folder is empty.</p>"
+    return html_page(title, body)
+
+
+def make_file_handler(root, quiet=False):
+    """A read-only GET/HEAD handler for one file or one folder. Nothing outside `root`, and no dotfile, is served."""
+    root = Path(root).resolve(strict=True)
+    single = root.is_file()
+
+    class FileHandler(BaseHTTPRequestHandler):
+        server_version = "preview"
+        sys_version = ""
+
+        def __getattr__(self, name):
+            if name.startswith("do_"):
+                return self.not_allowed
+            raise AttributeError(name)
+
+        def log_message(self, format, *args):
+            if not quiet:
+                super().log_message(format, *args)
+
+        def send_error(self, code, message=None, explain=None):
+            phrase = self.responses.get(code, ("Error",))[0]
+            self.send_bytes(code, "text/plain; charset=utf-8", f"{code} {phrase}\n".encode(), OTHER_CSP)
+
+        def not_allowed(self):
+            self.send_bytes(405, "text/plain; charset=utf-8", b"Only GET and HEAD are allowed.\n", OTHER_CSP,
+                            [("Allow", "GET, HEAD")])
+
+        def not_found(self):
+            self.send_bytes(404, "text/plain; charset=utf-8", b"Not found.\n", OTHER_CSP)
+
+        def start(self, code, ctype, length, csp, extra=()):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(length))
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Content-Security-Policy", csp)
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Cache-Control", "no-cache")
+            for name, value in extra:
+                self.send_header(name, value)
+            self.end_headers()
+
+        def send_bytes(self, code, ctype, body, csp, extra=()):
+            self.start(code, ctype, len(body), csp, extra)
+            if self.command != "HEAD":
+                self.wfile.write(body)
+
+        def do_GET(self):
+            path, _, query = self.path.partition("?")
+            target = resolve_request(root, single, path)
+            if target is None:
+                return self.not_found()
+            if target.is_dir():
+                return self.send_bytes(200, "text/html; charset=utf-8", index_page(root, target).encode(), HTML_CSP)
+            self.send_file(target, query)
+
+        do_HEAD = do_GET
+
+        def send_file(self, target, query):
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+            try:
+                fd = os.open(target, flags)
+            except OSError:
+                return self.not_found()
+            with os.fdopen(fd, "rb") as f:
+                st = os.fstat(f.fileno())
+                if not stat.S_ISREG(st.st_mode):
+                    return self.not_found()
+                name, ext = target.name, target.suffix.lower()
+                raw = urllib.parse.parse_qs(query).get("raw") == ["1"]
+                if ext in MARKDOWN_EXTS and not raw and st.st_size <= MARKDOWN_RENDER_LIMIT:
+                    text = f.read(MARKDOWN_RENDER_LIMIT + 1).decode("utf-8", "replace")
+                    return self.send_bytes(200, "text/html; charset=utf-8", render_markdown(text, name).encode(), HTML_CSP)
+                extra = []
+                if ext in MARKDOWN_EXTS:
+                    ctype = "text/plain; charset=utf-8"
+                elif ext in INLINE_TYPES:
+                    ctype = INLINE_TYPES[ext]
+                    extra.append(("Content-Disposition", content_disposition("inline", name)))
+                else:
+                    head = f.read(TEXT_SNIFF)
+                    f.seek(0)
+                    if looks_like_text(head):
+                        ctype = "text/plain; charset=utf-8"
+                    else:
+                        ctype = "application/octet-stream"
+                        extra.append(("Content-Disposition", content_disposition("attachment", name)))
+                self.start(200, ctype, st.st_size, OTHER_CSP, extra)
+                if self.command == "HEAD":
+                    return
+                left = st.st_size
+                try:
+                    while left > 0:
+                        data = f.read(min(CHUNK, left))
+                        if not data:
+                            break
+                        self.wfile.write(data)
+                        left -= len(data)
+                except (BrokenPipeError, ConnectionResetError):
+                    self.close_connection = True
+
+    return FileHandler
+
+
+def cmd_serve_file(args):
+    try:
+        root = check_share_root(args.root)
+    except FileShareRefused as e:
+        print(f"preview: {e}", file=sys.stderr)
+        return EXIT_CONFIG
+    if args.port not in FILE_PORTS:
+        print(f"preview: file shares use ports {FILE_PORTS.start}-{FILE_PORTS.stop - 1}, not {args.port}", file=sys.stderr)
+        return EXIT_CONFIG
+    host = check_listen_host("127.0.0.1")  # the file server is never reachable except through the preview proxy
+    try:
+        server = ThreadingHTTPServer((host, args.port), make_file_handler(root))
+    except OSError as e:
+        print(f"preview: cannot listen on {host}:{args.port}: {e.strerror or e}", file=sys.stderr)
+        return EXIT_CONFIG
+    server.daemon_threads = True
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda *_: threading.Thread(target=server.shutdown, daemon=True).start())
+    print(f"preview: serving {root} read-only on {host}:{args.port}", flush=True)
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # System access (tailscale, systemd --user, ss). Tests replace this class.
 # ---------------------------------------------------------------------------
 
@@ -684,6 +1250,11 @@ def note_for(entry, listening, sysm=None):
     return "  " + " ".join(parts)
 
 
+def backend_choice(operator, forced):
+    """'https' when cmd_start tries Tailscale Serve first, 'http' when it goes straight to the tailnet-IP proxy."""
+    return "https" if forced != "http" and (operator is not False or forced == "https") else "http"
+
+
 def cmd_start(sysm, port, label=None, out=None, err=None):
     out, err = out or sys.stdout, err or sys.stderr
     ts_ip, _ = sysm.tailnet()
@@ -719,7 +1290,7 @@ def cmd_start(sysm, port, label=None, out=None, err=None):
 
     entry = None
     serve_error = ""
-    if forced != "http" and (operator is not False or forced == "https"):
+    if backend_choice(operator, forced) == "https":
         internal = sysm.free_local_port()
         ok, serve_error = sysm.serve_add(port, internal)
         if ok:
@@ -753,22 +1324,115 @@ def stop_entry(sysm, entry, quiet=False):
     drop_state(entry["port"])
 
 
-def cmd_stop(sysm, port=None, all_=False, out=None, err=None):
+def file_unit_of(entry):
+    """The file-server unit of a file share (only the name this tool gives it, whatever the state file says)."""
+    unit = f"{FILE_UNIT_PREFIX}{entry['port']}.service"
+    return unit if entry.get("file_unit") == unit else None
+
+
+def stop_share(sysm, entry):
+    """Stop a preview, and for a file share also its file server."""
+    stop_entry(sysm, entry)
+    if file_unit_of(entry):
+        sysm.unit_stop(file_unit_of(entry))
+
+
+def stopped_line(entry):
+    return f"stopped {entry['port']} ({entry['label']}" + (f", {entry['path']})" if entry.get("path") else ")")
+
+
+def cmd_stop(sysm, port=None, all_=False, out=None, err=None, path=None):
     out, err = out or sys.stdout, err or sys.stderr
     if all_:
         entries = all_states()
         for e in entries:
-            stop_entry(sysm, e)
-            print(f"stopped {e['port']} ({e['label']})", file=out)
+            stop_share(sysm, e)
+            print(stopped_line(e), file=out)
         if not entries:
             print("no previews running", file=out)
         return 0
-    entry = load_state(port)
-    if not entry:
-        print(f"preview: no preview on port {port} (see preview list)", file=err)
+    if path is not None:
+        wanted = {os.path.abspath(os.path.expanduser(path))}
+        try:
+            wanted.add(str(Path(os.path.expanduser(path)).resolve()))
+        except (OSError, RuntimeError):
+            pass
+        entry = next((e for e in all_states() if e.get("path") in wanted), None)
+        if not entry:
+            print(f"preview: no file share for {path} (see preview list)", file=err)
+            return 1
+    else:
+        entry = load_state(port)
+        if not entry:
+            print(f"preview: no preview on port {port} (see preview list)", file=err)
+            return 1
+    stop_share(sysm, entry)
+    print(stopped_line(entry), file=out)
+    return 0
+
+
+def pick_file_port(sysm):
+    taken = {e.get("port") for e in all_states()} | sysm.serve_ports()
+    for port in FILE_PORTS:
+        if port in taken or sysm.listeners(port) or target_listening(sysm, port):
+            continue
+        return port
+    return None
+
+
+def plan_file_share(sysm, path, label=None):
+    """What `preview file <path>` will do, without starting anything."""
+    root = check_share_root(path)
+    existing = next((e for e in all_states() if e.get("path") == str(root)), None)
+    port = existing["port"] if existing else pick_file_port(sysm)
+    if port is None:
+        raise FileShareRefused(f"no free port in {FILE_PORTS.start}-{FILE_PORTS.stop - 1} for file shares; "
+                               f"stop one first (preview list)")
+    operator, forced = sysm.operator_ok(), os.environ.get("PREVIEW_BACKEND", "")
+    backend = backend_choice(operator, forced)
+    if existing and entry_healthy(sysm, existing):
+        upgrade = existing["backend"] == "http" and operator is True and forced != "http"
+        backend = backend if upgrade else existing["backend"]
+    label = label or (existing or {}).get("label") or (root.name + ("/" if root.is_dir() else ""))
+    return {"path": str(root), "kind": "folder" if root.is_dir() else "file", "port": port, "label": label,
+            "serve": ("127.0.0.1", port), "unit": f"{FILE_UNIT_PREFIX}{port}.service", "proxy_unit": f"{UNIT_PREFIX}{port}",
+            "backend": backend, "reuse": existing is not None,
+            "argv": ["/usr/bin/python3", "-I", self_path(), "_serve-file", "--root", str(root), "--port", str(port)]}
+
+
+def file_plan(argv, sysm):
+    """The plan for a `file ...` command line (port, loopback bind, backend), with nothing started."""
+    cmd, a = parse(argv)
+    if cmd != "file":
+        raise ValueError("file_plan takes a `file <path>` command line")
+    return plan_file_share(sysm, a.path, a.name)
+
+
+def cmd_file(sysm, path, label=None, out=None, err=None):
+    out, err = out or sys.stdout, err or sys.stderr
+    try:
+        plan = plan_file_share(sysm, path, label)
+    except FileShareRefused as e:
+        print(f"preview: {e}", file=err)
         return 1
-    stop_entry(sysm, entry)
-    print(f"stopped {port} ({entry['label']})", file=out)
+    port, unit = plan["port"], plan["unit"]
+    host, lport = plan["serve"]
+    if not (sysm.unit_state(unit) == "active" and sysm.can_connect(host, lport)):
+        ok, msg = sysm.unit_start(unit, f"preview file {port}: {plan['label']}", plan["argv"])
+        if ok and not wait_listening(sysm, host, lport):
+            ok, msg = False, sysm.unit_log(unit) or f"file server did not start listening on {host}:{lport}"
+        if not ok:
+            sysm.unit_stop(unit)
+            print(f"preview: could not start the file server for {plan['path']}: {msg or 'systemd-run failed'}", file=err)
+            return 1
+    code = cmd_start(sysm, port, plan["label"], out=out, err=err)
+    if code != 0:
+        sysm.unit_stop(unit)
+        return code
+    entry = load_state(port) or {}
+    entry.update(path=plan["path"], kind=plan["kind"], file_unit=unit)
+    save_state(entry)
+    print(f"  Shares {plan['path']} read-only. Stop: preview stop {shlex.quote(plan['path'])}", file=err)
     return 0
 
 
@@ -776,18 +1440,20 @@ def cmd_list(sysm, as_json=False, out=None):
     out = out or sys.stdout
     rows = []
     for e in all_states():
-        rows.append({**e, "target_listening": target_listening(sysm, e["port"]),
-                     "proxy": sysm.unit_state(e["unit"])})
+        row = {**e, "target_listening": target_listening(sysm, e["port"]), "proxy": sysm.unit_state(e["unit"])}
+        if file_unit_of(e):
+            row["file_server"] = sysm.unit_state(file_unit_of(e))
+        rows.append(row)
     if as_json:
         print(json.dumps(rows, indent=2), file=out)
         return 0
     if not rows:
         print("no previews running (start one with: preview <port>)", file=out)
         return 0
-    table = [("PORT", "LABEL", "BACKEND", "TARGET", "PROXY", "LINK")]
+    table = [("PORT", "LABEL", "BACKEND", "TARGET", "PROXY", "LINK", "PATH")]
     for r in rows:
         table.append((str(r["port"]), r["label"], r["backend"], "listening" if r["target_listening"] else "not listening",
-                      r["proxy"], r["link"]))
+                      r["proxy"], r["link"], r.get("path", "")))
     widths = [max(len(row[i]) for row in table) for i in range(len(table[0]))]
     for row in table:
         print("  ".join(c.ljust(w) for c, w in zip(row, widths)).rstrip(), file=out)
@@ -831,7 +1497,7 @@ def cmd_doctor(sysm, out=None):
 
 def build_parser():
     p = argparse.ArgumentParser(prog="preview", description=HELP, formatter_class=argparse.RawDescriptionHelpFormatter,
-                                usage="preview <port> [--name LABEL] | list [--json] | stop <port>|--all | doctor")
+                                usage="preview <port> [--name LABEL] | file <path> [--name LABEL] | list [--json] | stop <port>|<path>|--all | doctor")
     p.add_argument("--version", action="version", version=f"preview {VERSION}")
     return p
 
@@ -851,13 +1517,31 @@ def parse(argv):
         a = sp.parse_args(argv[1:])
         return "list", a
     if cmd == "stop":
-        sp = argparse.ArgumentParser(prog="preview stop", usage="preview stop <port> | preview stop --all")
-        sp.add_argument("port", nargs="?", type=check_port)
+        sp = argparse.ArgumentParser(prog="preview stop", usage="preview stop <port> | preview stop <path> | preview stop --all")
+        sp.add_argument("target", nargs="?", metavar="port|path")
         sp.add_argument("--all", action="store_true", help="stop every preview created by this tool")
         a = sp.parse_args(argv[1:])
-        if bool(a.port) == bool(a.all):
-            sp.error("give exactly one of <port> or --all")
+        if (a.target is not None) == bool(a.all):
+            sp.error("give exactly one of <port>, <path> or --all")
+        a.port = a.path = None
+        if a.target is not None and a.target.isdigit():
+            try:
+                a.port = check_port(a.target)
+            except argparse.ArgumentTypeError as e:
+                sp.error(str(e))
+        elif a.target is not None:
+            a.path = a.target
         return "stop", a
+    if cmd == "file":
+        sp = argparse.ArgumentParser(prog="preview file", usage="preview file <path> [--name LABEL]")
+        sp.add_argument("path")
+        sp.add_argument("--name", "--label", dest="name", help="short label shown in preview list")
+        return "file", sp.parse_args(argv[1:])
+    if cmd == "_serve-file":
+        sp = argparse.ArgumentParser(prog="preview _serve-file")
+        sp.add_argument("--root", required=True)
+        sp.add_argument("--port", required=True, type=int)
+        return "_serve-file", sp.parse_args(argv[1:])
     if cmd == "doctor":
         argparse.ArgumentParser(prog="preview doctor").parse_args(argv[1:])
         return "doctor", None
@@ -879,11 +1563,15 @@ def main(argv=None, sysm=None):
     cmd, a = parse(sys.argv[1:] if argv is None else argv)
     if cmd == "_serve":
         return cmd_serve(a)
+    if cmd == "_serve-file":
+        return cmd_serve_file(a)
     sysm = sysm or System()
     if cmd == "list":
         return cmd_list(sysm, a.json)
     if cmd == "stop":
-        return cmd_stop(sysm, a.port, a.all)
+        return cmd_stop(sysm, a.port, a.all, path=a.path)
+    if cmd == "file":
+        return cmd_file(sysm, a.path, a.name)
     if cmd == "doctor":
         return cmd_doctor(sysm)
     return cmd_start(sysm, a.port, a.name)

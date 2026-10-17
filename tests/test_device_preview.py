@@ -20,13 +20,32 @@ import device_sync
 from fakes import FakeRemote
 from remote import Completed
 
-TOOL_SHA = 'b3e645e7ba9750057b68c12f7dd518d19ff792a98062eeea857115b194358d94'
+TOOL_SHA = '89c880b1411939c7996239273e28aa51399a1dca1cd56e387754e82e235faabe'
+PREVIOUS_SHA = 'b3e645e7ba9750057b68c12f7dd518d19ff792a98062eeea857115b194358d94'  # the copy live on personal-vps
 OTHER_SHA = '0' * 64
+RUN = 'cd "$HOME" && exec .local/bin/preview "$@"'
 DOCTOR_HTTPS = 'tailnet name   box.ts.net\nbackend        https (Tailscale Serve is allowed for this user)\n'
 DOCTOR_HTTP = 'tailnet name   box.ts.net\nbackend        http (Tailscale Serve not allowed for this user; links look like http://x:<port>)\n'
 
 
 def done(out='', code=0): return Completed(code, out.encode(), b'')
+
+
+def _run_sh(script, name, *args, home, stdin=None):
+    """Runs one of the device scripts for real in a temp HOME. PATH is a stub folder (real preview, systemctl and
+    tailscale can never be reached) followed by /usr/bin:/bin for sh and the coreutils the scripts use."""
+    import subprocess
+    stubs = Path(home) / 'stub-bin'
+    if not stubs.exists():
+        stubs.mkdir()
+        for tool in ('preview', 'systemctl', 'tailscale', 'claude-pool'):
+            (stubs / tool).write_text('#!/bin/sh\nexit 97\n'); (stubs / tool).chmod(0o755)
+    return subprocess.run(['/bin/sh', '-c', script, name, *args], input=stdin or b'', capture_output=True,
+                          env={'HOME': home, 'PATH': f'{stubs}:/usr/bin:/bin'}, timeout=30)
+
+
+def sh(script, name, *args, home, stdin=None): return _run_sh(script, name, *args, home=home, stdin=stdin).returncode
+def sh_out(script, name, *args, home): return _run_sh(script, name, *args, home=home).stdout.decode().strip()
 
 
 def load_tool():
@@ -48,6 +67,12 @@ def device(system='Linux', target_sha=None, doctor=DOCTOR_HTTPS, doctor_code=0):
 
 
 def argvs(remote): return [argv for argv, _ in remote.calls]
+def remove_on(remote):
+    device_preview.remove(remote)
+    return remote
+
+
+def runs(remote): return [argv[4:] for argv in argvs(remote) if argv[:4] == ['sh', '-c', RUN, 'preview']]
 def installs(remote): return [(a, s) for a, s in remote.calls if a[0] == 'sh' and 'mktemp' in a[2]]
 
 
@@ -75,8 +100,80 @@ class InstallTests(unittest.TestCase):
         argv, stdin = remote.calls[-1]
         self.assertEqual(stdin, device_preview.TOOL.read_bytes())
         script = argv[2]
-        self.assertIn('0755', script); self.assertIn('mv ', script)
+        self.assertIn('0755', script)
+        self.assertIn('ln ', script)  # a hard link fails when a file appeared meanwhile; nothing is overwritten
+        self.assertNotIn('mv ', script)
         self.assertNotIn(TOOL_SHA, ' '.join(argv))
+
+    def test_known_previous_copy_is_updated_in_place(self):
+        self.assertEqual(device_preview.KNOWN_PREVIOUS, {PREVIOUS_SHA})
+        remote = device(target_sha=PREVIOUS_SHA)
+        step = device_preview.install(remote)
+        self.assertEqual((step.status, step.detail), ('ok', 'updated'))
+        [(argv, stdin)] = installs(remote)
+        self.assertEqual(stdin, device_preview.TOOL.read_bytes())
+        script = argv[2]
+        self.assertIn('0755', script); self.assertIn('mv ', script)
+        # The device re-checks the file it replaces within the same shell: only the packaged or a known previous copy.
+        self.assertIn(TOOL_SHA, argv[3:]); self.assertIn(PREVIOUS_SHA, argv[3:])
+        self.assertIn('-L', script)
+
+    def test_update_script_replaces_only_a_known_file(self):
+        with tempfile.TemporaryDirectory() as home:
+            target = Path(home) / '.local/bin/preview'; target.parent.mkdir(parents=True)
+            run = lambda: sh(device_preview._UPDATE_SCRIPT, 'update', device_preview.TARGET,
+                                              *device_preview._accepted(), home=home, stdin=b'new tool')
+            target.write_bytes(b'someone else'); target.chmod(0o755)
+            self.assertNotEqual(run(), 0)
+            self.assertEqual(target.read_bytes(), b'someone else')
+            with mock.patch.object(device_preview, 'KNOWN_PREVIOUS', {hashlib.sha256(b'someone else').hexdigest()}):
+                self.assertEqual(run(), 0)
+            self.assertEqual(target.read_bytes(), b'new tool')
+            self.assertEqual(target.stat().st_mode & 0o777, 0o755)
+            self.assertEqual(sorted(p.name for p in target.parent.iterdir()), ['preview'])
+
+    def test_install_script_never_replaces_a_file_that_appeared(self):
+        with tempfile.TemporaryDirectory() as home:
+            target = Path(home) / '.local/bin/preview'; target.parent.mkdir(parents=True)
+            target.write_bytes(b'raced in')
+            code = sh(device_preview._INSTALL_SCRIPT, 'install', device_preview.TARGET, home=home, stdin=b'tool')
+            self.assertNotEqual(code, 0)
+            self.assertEqual(target.read_bytes(), b'raced in')
+            self.assertEqual(sorted(p.name for p in target.parent.iterdir()), ['preview'])
+            target.unlink(); target.symlink_to(Path(home) / 'gone')
+            self.assertNotEqual(sh(device_preview._INSTALL_SCRIPT, 'install', device_preview.TARGET,
+                                                   home=home, stdin=b'tool'), 0)
+            self.assertTrue(target.is_symlink())
+            target.unlink()
+            self.assertEqual(sh(device_preview._INSTALL_SCRIPT, 'install', device_preview.TARGET,
+                                                home=home, stdin=b'tool'), 0)
+            self.assertEqual((target.read_bytes(), target.stat().st_mode & 0o777), (b'tool', 0o755))
+            self.assertEqual(sorted(p.name for p in target.parent.iterdir()), ['preview'])
+
+    def test_sha_script_reports_broken_and_linked_files(self):
+        with tempfile.TemporaryDirectory() as home:
+            target = Path(home) / '.local/bin/preview'; target.parent.mkdir(parents=True)
+            sha = lambda: sh_out(device_preview._SHA_SCRIPT, 'sha', device_preview.TARGET, home=home)
+            self.assertEqual(sha(), 'absent')
+            target.symlink_to(Path(home) / 'gone')
+            self.assertEqual(sha(), 'broken')
+            (Path(home) / 'gone').write_bytes(b'x')
+            self.assertEqual(sha(), 'link ' + hashlib.sha256(b'x').hexdigest())
+            target.unlink(); target.write_bytes(b'y')
+            self.assertEqual(sha(), hashlib.sha256(b'y').hexdigest())
+
+    def test_broken_symlink_is_refused_not_replaced(self):
+        remote = device(target_sha='broken')
+        step = device_preview.install(remote)
+        self.assertEqual(step.status, 'failed')
+        self.assertIn('symlink', step.detail)
+        self.assertEqual(installs(remote), [])
+
+    def test_a_symlinked_previous_copy_is_refused(self):
+        remote = device(target_sha='link ' + PREVIOUS_SHA)
+        self.assertEqual(device_preview.install(remote).status, 'failed')
+        self.assertEqual(installs(remote), [])
+        self.assertEqual(device_preview.install(device(target_sha='link ' + TOOL_SHA)).status, 'ok')
 
     def test_a_failed_install_is_reported(self):
         remote = FakeRemote('box', lambda argv, stdin: done('Linux\n') if argv[0] == 'uname' else
@@ -106,6 +203,11 @@ class CheckTests(unittest.TestCase):
 
     def test_check_failed_when_doctor_is_unreadable(self):
         self.assertEqual(device_preview.check(device(doctor='nonsense\n'), 'justus').status, 'failed')
+
+    def test_check_runs_the_tool_from_home(self):
+        remote = device()
+        device_preview.check(remote, 'justus')
+        self.assertEqual(argvs(remote), [['sh', '-c', RUN, 'preview', 'doctor']])
 
 
 class RulesTests(unittest.TestCase):
@@ -149,13 +251,18 @@ class RulesTests(unittest.TestCase):
     def test_unknown_action_is_an_error(self):
         self.assertEqual(self.verb('explode'), 2)
 
+    def test_remove_on_a_missing_claude_md_changes_nothing(self):
+        self.assertEqual(self.verb('remove'), 0)
+        self.assertFalse(self.file.exists())
+        self.assertFalse(self.file.parent.exists())
+
 
 class RemoveTests(unittest.TestCase):
     def test_remove_stops_only_previews_it_created(self):
         remote = device(target_sha=TOOL_SHA)
         step = device_preview.remove(remote)
         self.assertEqual(step.status, 'ok')
-        self.assertIn(['.local/bin/preview', 'stop', '--all'], argvs(remote))
+        self.assertIn(['stop', '--all'], runs(remote))
         self.assertNotIn('systemctl', ' '.join(' '.join(map(str, argv)) for argv in argvs(remote)))
         self.assertIn(['.local/bin/claude-pool', 'device', 'preview-rules', 'remove'], argvs(remote))
 
@@ -164,6 +271,35 @@ class RemoveTests(unittest.TestCase):
         device_preview.remove(remote)
         unlink = [a for a in argvs(remote) if a[0] == 'sh' and 'rm -f' in a[2]][0]
         self.assertIn(TOOL_SHA, unlink)  # the identity check happens on the device, against the packaged hash
+
+    def test_remove_stops_and_unlinks_a_known_previous_copy(self):
+        remote = device(target_sha=PREVIOUS_SHA)
+        self.assertEqual(device_preview.remove(remote).status, 'ok')
+        self.assertIn(['stop', '--all'], runs(remote))
+        unlink = [a for a in argvs(remote) if a[0] == 'sh' and 'rm -f' in a[2]][0]
+        self.assertIn(PREVIOUS_SHA, unlink)
+
+    def test_remove_stops_previews_of_a_symlinked_copy_of_the_tool(self):
+        self.assertEqual(runs(remove_on(device(target_sha='link ' + PREVIOUS_SHA))), [['stop', '--all']])
+
+    def test_remove_leaves_a_different_tool_alone(self):
+        for target_sha in [OTHER_SHA, 'link ' + OTHER_SHA, 'broken', None]:
+            remote = device(target_sha=target_sha)
+            step = device_preview.remove(remote)
+            self.assertEqual(runs(remote), [], target_sha)
+            self.assertEqual(step.status, 'ok', target_sha)
+            self.assertIn(['.local/bin/claude-pool', 'device', 'preview-rules', 'remove'], argvs(remote))
+            if target_sha == OTHER_SHA: self.assertIn('not stopped', step.detail)
+
+    def test_unlink_script_removes_only_known_files(self):
+        with tempfile.TemporaryDirectory() as home:
+            target = Path(home) / '.local/bin/preview'; target.parent.mkdir(parents=True)
+            target.write_bytes(b'mine')
+            known = hashlib.sha256(b'mine').hexdigest()
+            sh(device_preview._UNLINK_SCRIPT, 'unlink', device_preview.TARGET, OTHER_SHA, home=home)
+            self.assertTrue(target.exists())
+            sh(device_preview._UNLINK_SCRIPT, 'unlink', device_preview.TARGET, OTHER_SHA, known, home=home)
+            self.assertFalse(target.exists())
 
     def test_remove_skips_macos(self):
         self.assertEqual(device_preview.remove(device(system='Darwin')).status, 'skipped')
