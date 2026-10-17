@@ -150,7 +150,7 @@ def remove(remote):
         stopped = 'no preview tool installed'
     else:
         stopped = 'previews not stopped: ~/.local/bin/preview is not this tool, left alone'
-    rules = remote.pool('device', 'preview-rules', 'remove')
+    rules = remote.device('preview-rules', 'remove')
     unlink = remote.call(['sh', '-c', _UNLINK_SCRIPT, 'unlink', TARGET, *_accepted()])
     if have is None or rules.returncode or unlink.returncode:
         return Step('preview', 'failed', 'could not remove everything', 'claude-pool device remove ' + remote.name)

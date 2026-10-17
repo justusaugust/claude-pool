@@ -444,7 +444,7 @@ def apply_hook(value):
 
 
 def _status_of(remote):
-    done = remote.pool('device', 'status', '--json')
+    done = remote.device('status', '--json')
     if done.returncode: return None
     try: value = json.loads(done.stdout)
     except ValueError: return None
@@ -481,9 +481,9 @@ def move(target, value, remotes=Remote, local=None, sleep=time.sleep):
     if found.get('service') != 'running':
         print('The pool service on ' + target + ' is not running; start it first (claude-pool --start). Nothing was changed.')
         return 1
-    done = there.pool('device', 'conductor', 'install', '--move', '--fresh')
+    done = there.device('conductor', 'install', '--move', '--fresh')
     if done.returncode:
-        there.pool('device', 'conductor', 'uninstall')  # it may have started before failing; never leave a second Conductor
+        there.device('conductor', 'uninstall')  # it may have started before failing; never leave a second Conductor
         print('Installing the Conductor on ' + target + ' failed; the Conductor stays on ' + source + '.')
         return 1
     for _ in range(MOVE_WAIT // MOVE_POLL):
@@ -491,11 +491,11 @@ def move(target, value, remotes=Remote, local=None, sleep=time.sleep):
         if part.get('ready'): break
         sleep(MOVE_POLL)
     else:
-        there.pool('device', 'conductor', 'uninstall')
+        there.device('conductor', 'uninstall')
         print('The Conductor on ' + target + ' did not connect within ' + str(MOVE_WAIT) + ' s; it stays on ' + source + '.')
         return 1
     old = reach(source)
-    gone = old.pool('device', 'conductor', 'uninstall') if old is not None else None
+    gone = old.device('conductor', 'uninstall') if old is not None else None
     if gone is None or gone.returncode == 255:
         print(source + ' is unreachable; its old Conductor is removed there later (claude-pool device check reports it).')
     elif gone.returncode:

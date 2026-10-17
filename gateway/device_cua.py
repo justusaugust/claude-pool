@@ -120,7 +120,7 @@ def send_token(out=None, path=None):
 
 
 def host_token(remote):
-    done = remote.pool('device', 'cua-token')
+    done = remote.device('cua-token')
     token = (done.stdout or b'').strip()
     if done.returncode or not token: raise RuntimeError('The other device did not send its Cua token')
     return token

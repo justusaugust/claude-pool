@@ -87,4 +87,24 @@ class RemoteTests(unittest.TestCase):
             watch.tree(Path(folder), {Path(folder) / 'f'})
 
 
+class DeviceVerbRouteTests(unittest.TestCase):
+    def test_every_device_verb_goes_through_the_support_check(self):
+        """A launcher without device support takes `device ...` as a Claude prompt and starts its pool, so every caller under
+        gateway/ uses Remote.device (which runs it only after the support check), never pool('device', ...)."""
+        import re
+        pattern = re.compile(r"""\.pool\(\s*['"]device['"]|POOL\s*,\s*['"]device['"]""")
+        gateway = Path(__file__).resolve().parents[1] / 'gateway'
+        found = [str(path.relative_to(gateway)) + ':' + str(number)
+                 for path in sorted(gateway.rglob('*.py')) if not path.name.startswith('test_')
+                 for number, line in enumerate(path.read_text().splitlines(), 1) if pattern.search(line)]
+        self.assertEqual(found, [])
+
+    def test_the_guard_pattern_matches_both_quote_styles(self):
+        import re
+        pattern = re.compile(r"""\.pool\(\s*['"]device['"]|POOL\s*,\s*['"]device['"]""")
+        for line in ["r.pool('device', 'status')", 'r.pool("device", "status")', "call([POOL, 'device'])"]:
+            self.assertTrue(pattern.search(line), line)
+        self.assertFalse(pattern.search("r.device('status')"))
+
+
 if __name__ == '__main__': unittest.main()

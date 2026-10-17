@@ -73,7 +73,7 @@ def check_native(remote):
 
 
 def _status(remote):
-    done = remote.pool('device', 'status', '--json')
+    done = remote.device('status', '--json')
     if done.returncode: return done, None
     try: value = json.loads(_text(done.stdout))
     except ValueError: return done, None
@@ -189,18 +189,18 @@ def shell_remove(rc):
 
 
 def check_shell(remote):
-    if remote.pool('device', 'shell', 'check').returncode == 0: return Step('shell', 'ok', 'claude goes through the pool', None)
+    if remote.device('shell', 'check').returncode == 0: return Step('shell', 'ok', 'claude goes through the pool', None)
     return Step('shell', 'missing', 'no claude function in the shell rc file', 'claude-pool device add ' + remote.name)
 
 
 def add_shell(remote):
-    done = remote.pool('device', 'shell', 'add')
+    done = remote.device('shell', 'add')
     if done.returncode: return Step('shell', 'failed', 'could not add it: ' + _tail(done), 'claude-pool device add ' + remote.name)
     return check_shell(remote)
 
 
 def remove_shell(remote):
-    return remote.pool('device', 'shell', 'remove').returncode == 0
+    return remote.device('shell', 'remove').returncode == 0
 
 
 def _local_status():
