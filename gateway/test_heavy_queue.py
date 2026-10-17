@@ -1,5 +1,5 @@
 """Legacy calls run concurrently; supported suites get local worker defaults."""
-import json,os,shlex,subprocess,sys,tempfile,time,unittest
+import json,os,shlex,shutil,subprocess,sys,tempfile,time,unittest
 from pathlib import Path
 from heavy_queue import prepare,PREFIX
 HERE=Path(__file__).parent;RUNNER=HERE/'heavy_queue.py'
@@ -31,7 +31,7 @@ class SuiteLimitsTests(unittest.TestCase):
   result=subprocess.run([sys.executable,str(RUNNER),'--classify'],input='npm test; cargo test',capture_output=True,text=True,timeout=3)
   self.assertEqual(result.stdout.strip(),'light')
   script=shlex.join([sys.executable,str(RUNNER.resolve()),'--gate'])+' "$$" && printf PASSED'
-  result=subprocess.run(['/bin/zsh','-c',script],capture_output=True,text=True,timeout=3)
+  result=subprocess.run([shutil.which('zsh') or '/bin/sh','-c',script],capture_output=True,text=True,timeout=3)
   self.assertEqual(result.returncode,0,result.stderr);self.assertEqual(result.stdout,'PASSED')
  def test_independent_legacy_jobs_start_concurrently_and_preserve_exit_and_env(self):
   with tempfile.TemporaryDirectory() as folder:
