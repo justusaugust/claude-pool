@@ -283,7 +283,7 @@ class ReleaseTests(unittest.TestCase):
             plist.parent.mkdir(parents=True)
             definition = {'Label':'io.github.claude-pool', 'ProgramArguments':['python3','/another/app/launch.py','--daemon']}
             plist.write_bytes(plistlib.dumps(definition))
-            with patch.object(installer.Path, 'home', return_value=root), patch.object(installer.subprocess, 'run', return_value=Mock(returncode=1)):
+            with patch.object(installer.sys, 'platform', 'darwin'), patch.object(installer.Path, 'home', return_value=root), patch.object(installer.subprocess, 'run', return_value=Mock(returncode=1)):
                 with self.assertRaisesRegex(RuntimeError, 'another installation'): installer.uninstall(app)
                 self.assertTrue(app.exists()); self.assertTrue((binaries / 'claude-pool').exists())
                 definition['ProgramArguments'][1] = str(app / 'gateway/launch.py')
