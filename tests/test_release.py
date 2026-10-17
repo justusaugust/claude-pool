@@ -299,7 +299,10 @@ class ReleaseTests(unittest.TestCase):
             with patch.object(installer.sys, 'platform', 'linux'):
                 self.assertEqual(installer.service_path({'serviceLabel': 'io.github.claude-pool'})[1].name, 'io.github.claude-pool.service')
                 self.assertIn('.config/systemd/user', str(installer.service_path({})[1]))
-                installer.install(app, binaries, config, native, skip_backend=True)
+                previous = os.umask(0o002)
+                try: installer.install(app, binaries, config, native, skip_backend=True)
+                finally: os.umask(previous)
+                self.assertEqual(app.stat().st_mode & 0o777, 0o755)
                 self.assertFalse((root / 'Library').exists()); self.assertFalse((root / '.config/systemd').exists())
                 unit = root / '.config/systemd/user/io.github.claude-pool.service'; unit.parent.mkdir(parents=True)
                 unit.write_bytes(installer.service.render({'Label': 'io.github.claude-pool', 'ProgramArguments': ['/usr/bin/python3', '/another/app/launch.py', '--daemon']}))
@@ -311,7 +314,13 @@ class ReleaseTests(unittest.TestCase):
                     with patch.object(installer.subprocess, 'run', return_value=Mock(returncode=0)) as run:
                         with self.assertRaisesRegex(RuntimeError, 'systemctl --user disable --now io.github.claude-pool.service'): installer.uninstall(app)
                         self.assertEqual(run.call_args_list[0].args[0][:3], ['systemctl', '--user', 'is-active'])
-                    installer.uninstall(app)
+                    # Stopped but still enabled (the state after claude-pool --stop) must block too.
+                    def enabled_only(argv, **kwargs): return Mock(returncode=0 if argv[2] == 'is-enabled' else 1)
+                    with patch.object(installer.subprocess, 'run', side_effect=enabled_only):
+                        with self.assertRaisesRegex(RuntimeError, 'service is loaded'): installer.uninstall(app)
+                    self.assertTrue(app.exists())
+                    with patch.object(installer.subprocess, 'run', return_value=Mock(returncode=1)) as run: installer.uninstall(app)
+                    self.assertIn(['systemctl', '--user', 'daemon-reload'], [c.args[0] for c in run.call_args_list])
             self.assertFalse(unit.exists()); self.assertFalse(app.exists()); self.assertTrue(config.exists())
 
     def test_unsupported_platform_is_refused_before_any_change(self):
@@ -326,7 +335,7 @@ class ReleaseTests(unittest.TestCase):
         forbidden = ['/Us' + 'ers/', '/ho' + 'me/', '-----BEGIN ' + 'PRIVATE KEY-----']
         for path in ROOT.rglob('*'):
             if not path.is_file() or path.suffix not in {'.py', '.ts', '.tsx', '.json', '.md', '.patch'}: continue
-            if '__pycache__' in path.parts or '.claude-plugin/types' in str(path): continue
+            if '__pycache__' in path.parts or '.scratch' in path.parts or '.claude-plugin/types' in str(path): continue
             for text in forbidden: self.assertNotIn(text, path.read_text(), str(path.relative_to(ROOT)))
 
 

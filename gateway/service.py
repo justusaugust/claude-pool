@@ -11,6 +11,7 @@ import plistlib
 import re
 import subprocess
 import sys
+import tempfile
 
 DEFAULTS = {'RunAtLoad': True, 'KeepAlive': {'SuccessfulExit': False}, 'ThrottleInterval': 10, 'ExitTimeOut': 360,
             'StandardOutPath': '/dev/null', 'StandardErrorPath': '/dev/null'}
@@ -36,9 +37,22 @@ def quote(value):
     return '"' + value.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n') + '"'
 
 
-def words(line):
-    """Split a unit value into words; the inverse of quote()."""
+def exec_quote(value):
+    """An ExecStart word: systemd expands $VAR even inside quotes, so `$` is doubled too."""
+    return quote(str(value).replace('$', '$$'))
+
+
+def directory(value):
+    """WorkingDirectory is never quoted (systemd wants a bare absolute path); only `%` is doubled."""
+    value = str(value)
+    if not value.startswith('/') or any(c.isspace() and c != ' ' for c in value): raise ValueError('WorkingDirectory must be an absolute path without line breaks or tabs')
+    return value.replace('%', '%%')
+
+
+def words(line, exec=False):
+    """Split a unit value into words; the inverse of quote() (exec: of exec_quote())."""
     result, current, i, quoted, started = [], '', 0, None, False
+    undo = (lambda w: w.replace('%%', '%').replace('$$', '$')) if exec else (lambda w: w.replace('%%', '%'))
     while i < len(line):
         char = line[i]
         if quoted:
@@ -48,19 +62,19 @@ def words(line):
             else: current += char
         elif char in '"\'': quoted = char; started = True
         elif char.isspace():
-            if started: result.append(current.replace('%%', '%')); current, started = '', False
+            if started: result.append(undo(current)); current, started = '', False
         else: current += char; started = True
         i += 1
     if quoted: raise ValueError('Unterminated quote in service unit')
-    if started: result.append(current.replace('%%', '%'))
+    if started: result.append(undo(current))
     return result
 
 
 def render(definition):
     if platform() == 'darwin': return plistlib.dumps(definition)
     lines = ['[Unit]', 'Description=' + DESCRIPTION + quote(definition['Label']), '',
-             '[Service]', 'Type=simple', 'ExecStart=' + ' '.join(quote(a) for a in definition['ProgramArguments'])]
-    if 'WorkingDirectory' in definition: lines.append('WorkingDirectory=' + quote(definition['WorkingDirectory']))
+             '[Service]', 'Type=simple', 'ExecStart=' + ' '.join(exec_quote(a) for a in definition['ProgramArguments'])]
+    if 'WorkingDirectory' in definition: lines.append('WorkingDirectory=' + directory(definition['WorkingDirectory']))
     for key, value in definition.get('EnvironmentVariables', {}).items(): lines.append('Environment=' + quote(key + '=' + value))
     if definition.get('KeepAlive') == {'SuccessfulExit': False}: lines.append('Restart=on-failure')
     if 'ThrottleInterval' in definition: lines.append('RestartSec=' + str(int(definition['ThrottleInterval'])))
@@ -83,8 +97,8 @@ def load(data):
         if section == '[Unit]' and key == 'Description' and value.startswith(DESCRIPTION):
             definition['Label'] = ' '.join(words(value[len(DESCRIPTION):]))
         elif section == '[Service]':
-            if key == 'ExecStart': definition['ProgramArguments'] = words(value)
-            elif key == 'WorkingDirectory': definition['WorkingDirectory'] = ' '.join(words(value))
+            if key == 'ExecStart': definition['ProgramArguments'] = words(value, exec=True)
+            elif key == 'WorkingDirectory': definition['WorkingDirectory'] = value.replace('%%', '%')
             elif key == 'Environment':
                 for word in words(value):
                     name, _, content = word.partition('=')
@@ -104,6 +118,30 @@ def loaded(label, run=subprocess.run):
         return run(['launchctl', 'print', 'gui/' + str(os.getuid()) + '/' + label], capture_output=True).returncode == 0
     return any(run(['systemctl', '--user', check, '--quiet', label + '.service'], capture_output=True).returncode == 0
                for check in ['is-active', 'is-enabled'])
+
+
+def needs_reload(label, run=subprocess.run):
+    """True when the user manager holds an older copy of this unit than the file."""
+    result = run(['systemctl', '--user', 'show', '-p', 'NeedDaemonReload', '--value', label + '.service'], capture_output=True, text=True)
+    return result.returncode == 0 and result.stdout.strip() == 'yes'
+
+
+def reload(run=subprocess.run):
+    """Linux only: forget a removed unit. launchd needs nothing after bootout."""
+    if platform() == 'linux': run(['systemctl', '--user', 'daemon-reload'], capture_output=True)
+
+
+def write(path, data):
+    """Atomic service file, world-readable like any unit, independent of the umask; nothing secret goes in."""
+    fd, temporary = tempfile.mkstemp(dir=path.parent, prefix='.' + path.name + '.')
+    try:
+        with os.fdopen(fd, 'wb') as file:
+            file.write(data); file.flush(); os.fsync(file.fileno())
+        os.chmod(temporary, 0o644)
+        os.replace(temporary, path)
+    except BaseException:
+        Path(temporary).unlink(missing_ok=True)
+        raise
 
 
 def unload_hint(label):

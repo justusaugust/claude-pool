@@ -2,6 +2,7 @@
 import http.client
 import io
 import json
+import os
 import socket
 import tempfile
 import threading
@@ -334,16 +335,34 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(service.load(text.encode()), definition)
             self.assertEqual(service.service_file('io.github.claude-pool', '/h'), Path('/h/.config/systemd/user/io.github.claude-pool.service'))
             self.assertEqual(service.unload_hint('x'), 'systemctl --user disable --now x.service')
-            with tempfile.TemporaryDirectory() as folder, patch.object(launch, 'SERVICE_FILE', Path(folder) / 'u.service'), patch.object(launch, 'service_command') as control:
-                launch.managed_start()
+            with tempfile.TemporaryDirectory() as folder, patch.object(launch, 'SERVICE_FILE', Path(folder) / 'u.service'), patch.object(launch, 'service_command') as control, \
+                 patch.object(service, 'needs_reload', return_value=False) as needs:
+                previous = os.umask(0o002)
+                try: launch.managed_start()
+                finally: os.umask(previous)
                 self.assertEqual([c.args for c in control.call_args_list], [('daemon-reload',), ('enable', 'io.github.claude-pool.service'), ('start', 'io.github.claude-pool.service')])
+                self.assertEqual((Path(folder) / 'u.service').stat().st_mode & 0o777, 0o644)
                 self.assertEqual(service.load((Path(folder) / 'u.service').read_bytes()), definition)
+                self.assertEqual(sorted(Path(folder).iterdir()), [Path(folder) / 'u.service'], 'no temporary file left behind')
+                # An unchanged unit is not reloaded again; a changed one on disk is.
+                control.reset_mock(); launch.managed_start()
+                self.assertEqual([c.args for c in control.call_args_list], [('enable', 'io.github.claude-pool.service'), ('start', 'io.github.claude-pool.service')])
+                needs.return_value = True; control.reset_mock(); launch.managed_start()
+                self.assertEqual(control.call_args_list[0].args, ('daemon-reload',))
                 (Path(folder) / 'u.service').write_text('[Service]\nExecStart=/elsewhere/python run.py --daemon\n')
                 with self.assertRaisesRegex(RuntimeError, 'definition differs'): launch.install_service()
         for value, expected in [('"a b"', ['a b']), ('x "y\\"z" \'w v\'', ['x', 'y"z', 'w v']), ('50%%', ['50%'])]:
             self.assertEqual(service.words(value), expected)
         with patch.object(service.sys, 'platform', 'linux'):
             self.assertEqual(service.quote('/p/it\'s 100%'), '"/p/it\'s 100%%"')
+            spaced = dict(definition, ProgramArguments=['/usr/bin/python3', '/srv/a b/$HOME/run.py', '--daemon'], WorkingDirectory='/srv/a b/50%')
+            text = service.render(spaced).decode()
+            self.assertIn('WorkingDirectory=/srv/a b/50%%\n', text, 'WorkingDirectory is never quoted')
+            self.assertIn('ExecStart=/usr/bin/python3 "/srv/a b/$$HOME/run.py" --daemon', text, '$ must not expand in ExecStart')
+            self.assertEqual(service.load(text.encode()), spaced)
+            with self.assertRaisesRegex(ValueError, 'WorkingDirectory'): service.render(dict(definition, WorkingDirectory='/srv/new\nline'))
+            self.assertTrue(service.needs_reload('x', run=lambda *a, **k: Mock(returncode=0, stdout='yes\n')))
+            self.assertFalse(service.needs_reload('x', run=lambda *a, **k: Mock(returncode=0, stdout='no\n')))
 
     def test_orphan_detection_accepts_the_user_systemd_instance_on_linux(self):
         with patch.object(launch, 'process_command', return_value='/usr/lib/systemd/systemd --user'):

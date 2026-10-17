@@ -104,7 +104,7 @@ def install(prefix, bin_dir, config, native, *, skip_backend=False, update=False
         'claude-native': '#!/bin/sh\n' + MARKER + 'exec ' + shlex.quote(str(native.absolute())) + ' "$@"\n'}
     with tempfile.TemporaryDirectory(prefix='.claude-pool-install-', dir=prefix.parent) as staging:
         target = Path(staging) / 'app'
-        target.mkdir()
+        target.mkdir(mode=0o755)
         copy_release(target)
         written = {str(bin_dir / name): hashlib.sha256(body.encode()).hexdigest() for name, body in bodies.items()}
         (target / 'installation.json').write_text(json.dumps({'launchers': written, 'config': str(config), 'root': str(prefix), 'native': str(native.absolute())}, indent=2) + '\n')
@@ -159,7 +159,7 @@ def update_install(prefix, *, skip_backend=False):
     if versions.is_symlink(): raise RuntimeError('Release directory cannot be a symlink')
     versions.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='.staging-', dir=versions) as folder:
-        target = Path(folder) / 'app'; target.mkdir()
+        target = Path(folder) / 'app'; target.mkdir(mode=0o755)
         copy_release(target)
         if not skip_backend and not os.access(target / 'gateway/bin/shunt', os.X_OK): raise RuntimeError('Backend build is missing or not executable; nothing activated')
         (target / 'installation.json').write_text(json.dumps(receipt | {'root': str(prefix)}) + '\n')
@@ -228,7 +228,9 @@ def prepare_linux_tools(missing, pin):
         print('Installing rustup into ' + str(cargo_home) + ' (user space, PATH untouched)…', flush=True)
         with tempfile.TemporaryDirectory(prefix='claude-pool-rustup-') as folder:
             script = Path(folder) / 'rustup-init.sh'
-            with urllib.request.urlopen(RUSTUP_INIT, timeout=60) as response: script.write_bytes(response.read(4 * 1024 * 1024))
+            with urllib.request.urlopen(RUSTUP_INIT, timeout=60) as response: body = response.read(4 * 1024 * 1024 + 1)
+            if len(body) > 4 * 1024 * 1024 or not body.startswith(b'#!'): raise RuntimeError('Unexpected rustup installer download; nothing activated.')
+            script.write_bytes(body)
             subprocess.run(['sh', str(script), '-y', '--quiet', '--no-modify-path', '--profile', 'minimal',
                             '--default-toolchain', pin['rustToolchain']], check=True)
     os.environ['PATH'] = str(cargo_home / 'bin') + os.pathsep + os.environ.get('PATH', '')
@@ -249,6 +251,7 @@ def uninstall(prefix):
             raise RuntimeError('Service file belongs to another installation; leaving everything intact')
     for raw in receipt['launchers']: Path(raw).unlink(missing_ok=True)
     service_file.unlink(missing_ok=True)
+    service.reload(run=subprocess.run)
     shutil.rmtree(prefix)
     print('Removed the application and unchanged launchers. Config, credentials, history and Native Claude were retained.')
 

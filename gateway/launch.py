@@ -59,10 +59,12 @@ def install_service():
     definition = service_definition()
     if SERVICE_FILE.exists() and service.load(SERVICE_FILE.read_bytes()) != definition:
         raise RuntimeError('Existing pool service definition differs; review before replacing')
-    if not SERVICE_FILE.exists(): SERVICE_FILE.write_bytes(service.render(definition))
+    written = not SERVICE_FILE.exists()
+    if written: service.write(SERVICE_FILE, service.render(definition))
     if service.platform() == 'linux':
+        # Reload only for our own new or changed unit; other user services stay untouched.
+        if written or service.needs_reload(SERVICE_LABEL): service_command('daemon-reload')
         # Enabling mirrors RunAtLoad: the unit starts at login and, with linger, at boot.
-        service_command('daemon-reload')
         service_command('enable', SERVICE_LABEL + '.service')
         return SERVICE_LABEL + '.service'
     domain = f'gui/{os.getuid()}'
