@@ -80,10 +80,17 @@ def _status(remote):
     return done, value if isinstance(value, dict) else None
 
 
-LAUNCHER_SCRIPT = '''wrapper="$HOME/.local/bin/claude-pool"
+LAUNCHER_SCRIPT = r'''wrapper="$HOME/.local/bin/claude-pool"
 [ -f "$wrapper" ] || exit 10
-run=$(tr -d "'" < "$wrapper" | grep -o '[^ ]*run\\.py' | head -n 1)
-[ -n "$run" ] && [ -f "$(dirname "$run")/gateway/devices_cli.py" ] || exit 11
+line=$(grep '^exec ' "$wrapper" | tail -n 1)
+rest=${line% \"\$@\"}
+case "$rest" in
+  *\') run=${rest%\'}; run=${run##*\'} ;;
+  *) run=${rest##* } ;;
+esac
+dir=$(dirname "$run")
+if [ -L "$dir/current" ]; then cli="$dir/current/gateway/devices_cli.py"; else cli="$dir/gateway/devices_cli.py"; fi
+[ -n "$run" ] && [ -f "$cli" ] || exit 11
 exit 0'''
 
 

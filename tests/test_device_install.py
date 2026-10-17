@@ -3,6 +3,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import sys
@@ -68,6 +69,29 @@ class InstallTests(unittest.TestCase):
         step = device_install.check_install(fake)
         self.assertEqual((step.status, step.detail), ('missing', 'older claude-pool without device support'))
         self.assertFalse([a for a, _ in fake.calls if a[:2] == ['.local/bin/claude-pool', 'device']])
+
+    def launcher(self, folder='claude pool', current=True, support=True, quote=True):
+        home = Path(tempfile.mkdtemp(prefix='launcher-')); self.addCleanup(shutil.rmtree, home)
+        prefix = home / '.local/share' / folder; (home / '.local/bin').mkdir(parents=True); prefix.mkdir(parents=True)
+        release = prefix / 'versions/abc' if current else prefix
+        (release / 'gateway').mkdir(parents=True)
+        if support: (release / 'gateway/devices_cli.py').write_text('')
+        if current: (prefix / 'current').symlink_to(release)
+        run = shlex.quote(str(prefix / 'run.py')) if quote else str(prefix / 'run.py')
+        (home / '.local/bin/claude-pool').write_text('#!/bin/sh\n# managed by claude-pool installer\nexport X=1\nexec /usr/bin/python3 ' + run + ' "$@"\n')
+        return subprocess.run(['sh', '-c', device_install.LAUNCHER_SCRIPT], env={'HOME': str(home), 'PATH': '/usr/bin:/bin'}, capture_output=True).returncode
+
+    def test_launcher_script_reads_the_real_layouts(self):
+        self.assertEqual(self.launcher(current=True), 0)
+        self.assertEqual(self.launcher(current=False), 0)
+        self.assertEqual(self.launcher(current=True, support=False), 11)
+        self.assertEqual(self.launcher(current=False, support=False), 11)
+        self.assertEqual(self.launcher(folder='plain', quote=False), 0)
+
+    def test_launcher_script_without_a_wrapper_exits_10(self):
+        home = Path(tempfile.mkdtemp(prefix='launcher-')); self.addCleanup(shutil.rmtree, home)
+        done = subprocess.run(['sh', '-c', device_install.LAUNCHER_SCRIPT], env={'HOME': str(home), 'PATH': '/usr/bin:/bin'}, capture_output=True)
+        self.assertEqual(done.returncode, 10)
 
     def test_launcher_with_device_support_reports_its_status(self):
         fake = remote(lambda argv, stdin: answer(0, '{}') )
