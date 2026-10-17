@@ -3,12 +3,12 @@ import json
 import os
 from pathlib import Path
 import shutil
-import stat
 import sys
 
 HERE = Path(__file__).resolve().parent
 CONFIG = Path(os.environ.get('CLAUDE_POOL_CONFIG', Path.home() / '.config/claude-pool/config.json')).expanduser().resolve()
 from account_metadata import load as load_accounts
+from private_files import private_directory  # re-exported for existing callers
 
 
 def load(path=CONFIG):
@@ -27,18 +27,11 @@ def load(path=CONFIG):
     return value
 
 
-def private_directory(path):
-    if path.is_symlink(): raise RuntimeError('Private directory cannot be a symlink: ' + str(path))
-    path.mkdir(parents=True, exist_ok=True, mode=0o700)
-    info = path.stat()
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
-        raise RuntimeError('Private directory must be owned by you with mode 0700: ' + str(path))
-
-
 try: OPTIONS = load()
 except (OSError, ValueError) as error: raise SystemExit('Invalid pool configuration: ' + str(error)) from None
 RUNTIME = Path(OPTIONS.get('state_dir', Path.home() / '.local/state/claude-pool')).expanduser().resolve()
 STORES = Path(OPTIONS.get('credential_dir', Path.home() / '.shunt/accounts/claude')).expanduser().resolve()
+LONG_LIVED = STORES.parent / 'claude-long-lived'  # 0700; long-lived token files before they join STORES
 NATIVE_CLAUDE = str(Path(OPTIONS.get('native_claude', shutil.which('claude') or Path.home() / '.local/bin/claude')).expanduser().absolute())
 GATEWAY_PORT = OPTIONS.get('gateway_port', 18341)
 BACKEND_PORT = OPTIONS.get('backend_port', 18340)

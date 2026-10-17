@@ -94,7 +94,7 @@ class ReleaseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="pool hook ' $ ") as folder:
             root = Path(folder); source = root / 'relocated gateway'; source.mkdir()
             shutil.copytree(launch.HERE / 'session-control', source / 'session-control')
-            for name in ['control_hook.py', 'settings.py', 'account_metadata.py']:
+            for name in ['control_hook.py', 'settings.py', 'account_metadata.py', 'private_files.py']:
                 shutil.copyfile(launch.HERE / name, source / name)
             stores = root / 'credentials'; stores.mkdir(); (stores / '.pool-client-token').write_text('fixture-token')
             config = root / "config ' $ .json"

@@ -5,7 +5,6 @@ import json
 import os
 from pathlib import Path
 import re
-import stat
 import subprocess
 import tempfile
 import time
@@ -16,7 +15,8 @@ import urllib.request
 
 from account_login import login
 from account_metadata import load
-from bridge import atomic_write
+from long_lived import kind
+from private_files import atomic_write, read_private
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -24,22 +24,19 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def credential(path):
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    with os.fdopen(fd) as file:
-        info = os.fstat(file.fileno())
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077 or info.st_size > 131072:
-            raise RuntimeError('Credential must be your private 0600 file')
-        value = json.load(file)
-    if not isinstance(value, dict): raise RuntimeError('Invalid credential format')
-    oauth = value.get('claudeAiOauth', {})
-    if not isinstance(oauth, dict): raise RuntimeError('Invalid OAuth credential format')
-    if not all(isinstance(oauth.get(k), str) and oauth[k] for k in ('accessToken', 'refreshToken')):
-        raise RuntimeError('A refreshable OAuth login is required')
+    value = read_private(path)
+    kind(value)
+    return value
+
+
+def refreshable(path):
+    value = credential(path)
+    if kind(value) != 'refreshable': raise RuntimeError('A refreshable OAuth login is required')
     return value
 
 
 def profile(path):
-    stored = credential(path)
+    stored = refreshable(path)
     request = urllib.request.Request('https://api.anthropic.com/api/oauth/profile', headers={
         'Authorization': 'Bearer ' + stored['claudeAiOauth']['accessToken'],
         'User-Agent': 'claude-cli/2.1.300 (external, cli)', 'anthropic-beta': 'oauth-2025-04-20'})

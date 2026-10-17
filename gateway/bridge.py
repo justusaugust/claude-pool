@@ -4,7 +4,6 @@ import http.client
 import json
 import math
 import os
-import tempfile
 import re
 import threading
 import time
@@ -21,6 +20,7 @@ from validation import archive, HistoryIndex
 from diagnostics import Journal
 from native_auth import NativeAuthUnavailable
 from telemetry import fable_windows, capacity
+from private_files import atomic_write
 
 from settings import LABELS, CONFIG
 HOP = {"host", "connection", "content-length", "transfer-encoding"}
@@ -44,16 +44,6 @@ def event(value):
         "cacheCreationTokens": value.get("cacheCreationTokens", 0) if number(value.get("cacheCreationTokens", 0)) else 0,
         "thinkingDropped": value.get("thinkingDropped") is True}
 
-
-def atomic_write(path, data):
-    tmp = None
-    try:
-        with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, prefix=path.name + ".", delete=False) as file:
-            tmp = Path(file.name)
-            file.write(data); file.flush(); os.fsync(file.fileno())
-        tmp.replace(path)
-    finally:
-        if tmp: tmp.unlink(missing_ok=True)
 
 class PoolBridge(ThreadingHTTPServer):
     daemon_threads = False
