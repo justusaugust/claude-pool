@@ -53,7 +53,7 @@ def adopt(source, directory, name):
     if source.resolve() == target.resolve(): return target
     if target.exists() or target.is_symlink():
         if fingerprint(read_private(target)) != fingerprint(value):
-            raise RuntimeError('A different long-lived token is already saved for ' + name + '; nothing was changed')
+            raise RuntimeError('A different long-lived token is already saved for ' + name + '; nothing was changed. Add --replace to install the new one.')
     write_private(target, json.dumps(value))
     if fingerprint(read_private(target)) != fingerprint(value):
         raise RuntimeError('The saved token did not verify; the staged file was kept')

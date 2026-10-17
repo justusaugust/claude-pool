@@ -284,7 +284,7 @@ class LongLivedEnrollmentTests(unittest.TestCase):
         code, out = self.run_cli('--long-lived', '--from-file', str(staged), lookup=Mock(return_value=self.info()),
                                  overview=lambda: {'accounts': [{'name': 'operations', 'status': 'reauthenticate'}]})
         self.assertEqual(code, 2)
-        self.assertIn('account add operations@example.test --long-lived --name operations', out)
+        self.assertIn('account add operations@example.test --long-lived --replace --name operations', out)
 
     def test_rerun_is_idempotent(self):
         staged = self.staged()
@@ -303,6 +303,93 @@ class LongLivedEnrollmentTests(unittest.TestCase):
         self.assertLessEqual(value['generation'] - first, 1)
         self.assertEqual(self.backend.read_text().count('name = "operations"'), 1)
         self.assertEqual((self.stores / 'operations.json').read_bytes(), store)
+
+    def enrolled(self):
+        """Enroll token a, then let the pool report it revoked."""
+        self.run_cli('--long-lived', '--from-file', str(self.staged()), lookup=Mock(return_value=self.info()))
+        code, out = self.run_cli('--long-lived', lookup=Mock(return_value=self.info()),
+                                 overview=lambda: {'accounts': [{'name': 'operations', 'status': 'reauthenticate'}]})
+        self.assertEqual(code, 2)
+        return out
+
+    def asides(self, directory):
+        return sorted(p for p in directory.iterdir() if '.replaced-' in p.name)
+
+    def test_reauthenticate_message_names_replace(self):
+        self.assertIn('account add operations@example.test --long-lived --replace --name operations', self.enrolled())
+
+    def test_replace_after_reauthenticate_installs_the_new_token_and_moves_the_old_aside(self):
+        self.enrolled()
+        old = long_lived.fingerprint(setup.credential(self.long_lived / 'operations.json'))
+        new_file = long_lived_file(self.staging, 'new', token=fixture_token('b'), expires_ms=4_100_000_000_000)
+        code, out = self.run_cli('--long-lived', '--replace', '--from-file', str(new_file), lookup=Mock(return_value=self.info()),
+                                 overview=lambda: {'accounts': [{'name': 'operations', 'status': 'unknown'}]})
+        self.assertEqual(code, 0)
+        SecretWatch(fixture_token('a'), fixture_token('b')).text(out)
+        new = long_lived.fingerprint(setup.credential(self.long_lived / 'operations.json'))
+        self.assertNotEqual(new, old)
+        self.assertFalse(new_file.exists())
+        for directory in (self.long_lived, self.stores):
+            with self.subTest(directory.name):
+                self.assertEqual(long_lived.fingerprint(setup.credential(directory / 'operations.json')), new)
+                [aside] = self.asides(directory)
+                self.assertRegex(aside.name, r'^operations\.json\.replaced-\d{8}T\d{6}Z$')
+                self.assertEqual(mode(aside), 0o600)
+                self.assertEqual(long_lived.fingerprint(setup.credential(aside)), old)
+        entry = registry.account(registry.load(self.reg), 'operations')
+        self.assertEqual((entry['fingerprint'], entry['expiresAt']), (new, 4_100_000_000_000))
+
+    def test_replace_with_a_fresh_login_uses_a_private_staging_folder(self):
+        self.enrolled()
+        seen = []
+        def fake_login(binary, directory, name, label, mode='oauth'):
+            directory = Path(directory)
+            self.assertEqual((directory.parent, mode, directory.stat().st_mode & 0o777), (self.long_lived, 'setup-token', 0o700))
+            seen.append(directory)
+            long_lived_file(directory, name, token=fixture_token('b'))
+        with patch.object(setup, 'login', side_effect=fake_login):
+            code, out = self.run_cli('--long-lived', '--replace', lookup=Mock(return_value=self.info()))
+        self.assertEqual(code, 0)
+        self.assertFalse(seen[0].exists())
+        self.assertEqual(long_lived.fingerprint(setup.credential(self.long_lived / 'operations.json')),
+                         long_lived.fingerprint(setup.credential(self.stores / 'operations.json')))
+        self.assertEqual(len(self.asides(self.long_lived)), 1)
+
+    def files(self):
+        return {p: p.read_bytes() for d in (self.long_lived, self.stores, self.cfg, self.runtime) for p in sorted(d.rglob('*')) if p.is_file()}
+
+    def test_replace_with_another_identity_or_the_same_token_writes_nothing(self):
+        self.enrolled()
+        cases = [('other user', long_lived_file(self.staging, 'other-user', user='user-b', token=fixture_token('b')), 'another account'),
+                 ('other org', long_lived_file(self.staging, 'other-org', org='team-b', token=fixture_token('c')), 'another account'),
+                 ('same token', long_lived_file(self.staging, 'same', token=fixture_token('a')), 'same as the saved one')]
+        for label, staged, message in cases:
+            with self.subTest(label):
+                before, source = self.files(), staged.read_bytes()
+                lookup = Mock(return_value=self.info())
+                with self.assertRaisesRegex(RuntimeError, message):
+                    self.run_cli('--long-lived', '--replace', '--from-file', str(staged), lookup=lookup)
+                self.assertEqual(self.files(), before)
+                self.assertEqual(staged.read_bytes(), source)
+                self.assertEqual(self.asides(self.long_lived), [])
+
+    def test_replace_needs_a_saved_token_and_long_lived(self):
+        with self.assertRaisesRegex(RuntimeError, 'No long-lived token is saved'):
+            self.run_cli('--long-lived', '--replace', '--from-file', str(self.staged()))
+        with self.assertRaisesRegex(RuntimeError, '--long-lived'):
+            self.run_cli('--replace')
+
+    def test_rerun_without_replace_reuses_the_saved_token(self):
+        self.enrolled()
+        before = (self.long_lived / 'operations.json').read_bytes()
+        with patch.object(setup, 'login') as login:
+            code, out = self.run_cli('--long-lived', lookup=Mock(return_value=self.info()))
+        login.assert_not_called()
+        self.assertIn('Using saved long-lived token', out)
+        self.assertEqual((self.long_lived / 'operations.json').read_bytes(), before)
+        self.assertEqual(self.asides(self.long_lived), [])
+        with self.assertRaisesRegex(RuntimeError, '--replace'):
+            self.run_cli('--long-lived', '--from-file', str(long_lived_file(self.staging, 'new', token=fixture_token('b'))))
 
     def test_from_file_needs_long_lived(self):
         staged = self.staged()

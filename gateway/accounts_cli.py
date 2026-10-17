@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tempfile
 import time
@@ -203,7 +204,7 @@ def readiness(overview, entry, name, email, long):
             row = next((a for a in data.get('accounts', []) if a.get('name') == name), None)
         except (OSError, ValueError, RuntimeError): row = None
         if long and row and row.get('status') == 'reauthenticate':
-            print(entry['label'] + ' rejected its long-lived token. Fix: claude-pool account add ' + email + ' --long-lived --name ' + name + ', then claude-pool device sync')
+            print(entry['label'] + ' rejected its long-lived token. Fix: claude-pool account add ' + email + ' --long-lived --replace --name ' + name + ', then claude-pool device sync')
             return 2
         if long and row and row.get('status') == 'unknown':
             print('Connected ' + entry['label'] + ' · no reading yet (first request fills it)')
@@ -221,20 +222,72 @@ def readiness(overview, entry, name, email, long):
     return 2
 
 
+def ids(value): return (value.get('shuntAccountUuid'), value.get('shuntOrganizationUuid'))
+
+
+def swap_in(path, value, stamp):
+    """Install `value` at `path` atomically; the old file stays beside it as <file>.replaced-<stamp> (0600, never deleted)."""
+    aside, n = path.with_name(path.name + '.replaced-' + stamp), 1
+    while aside.exists() or aside.is_symlink():
+        aside, n = path.with_name(path.name + '.replaced-' + stamp + '-' + str(n)), n + 1
+    os.link(path, aside)  # same inode: the old token survives the atomic replace below
+    write_private(path, json.dumps(value))
+    if fingerprint(credential(path)) != fingerprint(value): raise RuntimeError('The new token did not verify after install; the old one is kept as ' + aside.name)
+
+
+def replacement(args, binary, directory, name, label, registry_path, staging):
+    """Mint or read a new token for an enrolled account without touching any saved file; verify it replaces like for like."""
+    token = directory / (name + '.json')
+    if not (token.exists() or token.is_symlink()):
+        raise RuntimeError('No long-lived token is saved for ' + name + '; run this without --replace')
+    old = credential(token)
+    if kind(old) != 'long-lived': raise RuntimeError('The saved file is not a long-lived token; nothing was replaced')
+    if args.from_file:
+        print('1/4 · Reading the replacement token', flush=True)
+        new = read_private(Path(args.from_file).expanduser())
+    else:
+        print('1/4 · Opening browser authorization for a replacement token', flush=True)
+        private_directory(directory)
+        staging.append(Path(tempfile.mkdtemp(prefix='.replace-', dir=directory)))
+        login(binary, staging[0], name, label, mode='setup-token')
+        new = credential(staging[0] / (name + '.json'))
+    if kind(new) != 'long-lived': raise RuntimeError('Only a long-lived token can replace a long-lived token; nothing was replaced')
+    if fingerprint(new) == fingerprint(old): raise RuntimeError('The new token is the same as the saved one; nothing was replaced')
+    saved = registry.account(registry.load(registry_path), name) or {}
+    if ids(new) != ids(old) or (saved.get('userId') is not None and (saved.get('userId'), saved.get('organizationId')) != ids(new)):
+        raise RuntimeError('The new token belongs to another account or organization; nothing was replaced')
+    return new
+
+
 def enroll_long_lived(args, email, name, entry, *, config, stores, binary, runtime, backend_source, backend_env,
                       overview, directory, registry_path, self_path, lookup):
+    staging = []
+    try:
+        return enroll_steps(args, email, name, entry, config=config, stores=stores, binary=binary, runtime=runtime,
+                            backend_source=backend_source, backend_env=backend_env, overview=overview, directory=directory,
+                            registry_path=registry_path, self_path=self_path, lookup=lookup, staging=staging)
+    finally:
+        # A minted replacement that was not installed is discarded; the saved token stays as it was.
+        for folder in staging: shutil.rmtree(folder, ignore_errors=True)
+
+
+def enroll_steps(args, email, name, entry, *, config, stores, binary, runtime, backend_source, backend_env,
+                 overview, directory, registry_path, self_path, lookup, staging):
     token = directory / (name + '.json')
-    if args.from_file:
-        print('1/4 · Saving the staged long-lived token', flush=True)
-        long_lived.adopt(Path(args.from_file).expanduser(), directory, name)
-    elif token.exists() or token.is_symlink():
-        print('1/4 · Using saved long-lived token', flush=True)
+    if args.replace:
+        value = replacement(args, binary, directory, name, entry['label'] + ' — ' + email, registry_path, staging)
     else:
-        print('1/4 · Opening browser authorization for a long-lived token', flush=True)
-        private_directory(directory)
-        login(binary, directory, name, entry['label'] + ' — ' + email, mode='setup-token')
-    value = credential(token)
-    if kind(value) != 'long-lived': raise RuntimeError('The saved file is not a long-lived token; nothing was enrolled')
+        if args.from_file:
+            print('1/4 · Saving the staged long-lived token', flush=True)
+            long_lived.adopt(Path(args.from_file).expanduser(), directory, name)
+        elif token.exists() or token.is_symlink():
+            print('1/4 · Using saved long-lived token', flush=True)
+        else:
+            print('1/4 · Opening browser authorization for a long-lived token', flush=True)
+            private_directory(directory)
+            login(binary, directory, name, entry['label'] + ' — ' + email, mode='setup-token')
+        value = credential(token)
+        if kind(value) != 'long-lived': raise RuntimeError('The saved file is not a long-lived token; nothing was enrolled')
     print('2/4 · Verifying account and organization', flush=True)
     info = long_lived_identity(value, stores, lookup or owner_lookup)
     verify_expected(info, email, args.organization)
@@ -254,6 +307,10 @@ def enroll_long_lived(args, email, name, entry, *, config, stores, binary, runti
     for row in known['accounts']:
         if row['name'] != name and (row.get('userId'), row.get('organizationId')) == (info['userId'], info['organizationId']):
             raise RuntimeError('This subscription is already connected as ' + (row.get('label') or row['name']) + '; a second alias adds no quota.')
+    stamp = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
+    if args.replace:
+        swap_in(token, value, stamp)
+        if args.from_file: Path(args.from_file).expanduser().unlink()
     if registry.account(known, name) != wanted(known): known = registry.update(upsert, registry_path)
     owner = registry.owner(known)
     is_owner = owner is not None and owner['name'] == registry.self_name(self_path)
@@ -266,6 +323,8 @@ def enroll_long_lived(args, email, name, entry, *, config, stores, binary, runti
     elif current is None and is_owner:
         print('This machine is the usage owner and serves ' + entry['label'] + ' from a refreshable login. Connect one with claude-pool account add ' + email + ' --name ' + name + '.')
         return 0
+    elif current is not None and args.replace and fingerprint(current) != fingerprint(value):
+        swap_in(store, value, stamp)
     elif current is None or fingerprint(current) != fingerprint(value):
         write_private(store, json.dumps(value))
         if fingerprint(credential(store)) != fingerprint(value): raise RuntimeError('The pool copy of the token did not verify; rerun this command')
@@ -284,6 +343,7 @@ def cli(argv, *, config, stores, binary, runtime, backend_source=None, backend_e
     add.add_argument('--alias'); add.add_argument('--organization')
     add.add_argument('--long-lived', action='store_true', help='Enroll a long-lived token (shared by every device)')
     add.add_argument('--from-file', help='With --long-lived: adopt a staged 0600 token file instead of opening a browser')
+    add.add_argument('--replace', action='store_true', help='With --long-lived: install a new token for this account; the old one is kept aside')
     args = parser.parse_args(argv)
     config, stores, binary, runtime = map(Path, (config, stores, binary, runtime))
     if args.command == 'list':
@@ -291,6 +351,7 @@ def cli(argv, *, config, stores, binary, runtime, backend_source=None, backend_e
             print(f"{row.get('label', row['name'])} · claude {row.get('alias', row['name'])}")
         return 0
     if args.from_file and not args.long_lived: raise RuntimeError('--from-file needs --long-lived')
+    if args.replace and not args.long_lived: raise RuntimeError('--replace needs --long-lived')
     email = args.email
     if not email and os.isatty(0): email = input('Account email: ').strip()
     if not email or not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+', email):
