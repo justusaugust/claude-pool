@@ -33,6 +33,12 @@ def unavailable(account):
     return 'quota or upstream failover'
 
 
+def reserve_blocked(account):
+    """A reserved account takes no new pool work once any window reaches its reserve limit."""
+    limit = account.get('reserveAt') or 0
+    return limit > 0 and any(account.get(k) and account[k]['pct'] >= limit for k in ('fiveHour', 'sevenDay', 'fableWeekly'))
+
+
 def session_rows(sessions, now):
     rows = []
     for key, s in sessions.items():
@@ -71,7 +77,7 @@ def choose(accounts, sessions, session_id, forecast, now):
     rows = [r for r in session_rows({k: v for k, v in sessions.items() if k != session_id}, now)
             if r['busy'] or now - r['lastRequestAt'] / 1000 <= ACTIVE_SECONDS]
     ready = [a for a in accounts if a['status'] == 'ready' and
-             all(not a.get(k) or a[k]['pct'] < 95 for k in ('fiveHour', 'sevenDay'))]
+             all(not a.get(k) or a[k]['pct'] < 95 for k in ('fiveHour', 'sevenDay')) and not reserve_blocked(a)]
     by_name = {a['name']: a for a in accounts}
     loads = {a['name']: sum(r['account'] == a['name'] for r in rows) for a in accounts}
     busy = {a['name']: sum(r['account'] == a['name'] and r['busy'] for r in rows) for a in accounts}
@@ -84,10 +90,12 @@ def choose(accounts, sessions, session_id, forecast, now):
     # Remaining time is comparable across plans; percentages are not.
     def score(a):
         name = a['name']; capacity = seconds.get(name)
-        return (busy[name], loads[name], -(capacity or 0), name)
+        return (bool(a.get('reserveAt')), busy[name], loads[name], -(capacity or 0), name)
     best = min(ready, key=score)['name']
+    held = bool(by_name.get(previous, {}).get('reserveAt')) and not by_name[best].get('reserveAt')
     reason = unavailable(by_name.get(pin or previous)) if pin or previous else 'new session'
-    if previous and any(a['name'] == previous for a in ready) and not pin:
+    if previous and held and not pin and any(a['name'] == previous for a in ready): reason = 'shared capacity'  # a reserved account never keeps a session while an unreserved one is ready
+    elif previous and any(a['name'] == previous for a in ready) and not pin:
         remaining = seconds.get(previous)
         crowded = loads[previous] > loads[best] and remaining is not None and remaining / (loads[previous] + 1) < 600
         if not crowded: return {'account': previous, 'reason': 'cache affinity', 'peers': loads[previous]}

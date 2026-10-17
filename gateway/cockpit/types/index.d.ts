@@ -62,7 +62,7 @@ declare module 'claude-code' {
   }
 }
 
-export type PoolAccount = Account & { name: string; status: string; plan?: string; paused: boolean; fableWeekly?: Window; quotaLimits?: Record<string, { status: string | null; resetsAt: number | null }> }
+export type PoolAccount = Account & { name: string; status: string; plan?: string; reserveAt?: number; paused: boolean; fableWeekly?: Window; quotaLimits?: Record<string, { status: string | null; resetsAt: number | null }> }
 export type PoolSwitch = { from: string; to: string; reason: string; at: number; cacheReadTokens?: number; cacheCreationTokens?: number; thinkingDropped?: boolean }
 export type PoolPace = { ratePerHour: number | null; reason: string }
 export type PoolData = {

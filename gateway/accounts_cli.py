@@ -230,6 +230,83 @@ def unregister(config, stores, binary, paths, name, env):
                  rejected='Backend rejected the removal; live membership is unchanged')
 
 
+def set_account_option(text, name, key, value):
+    """Set (float) or remove (None) `key` inside the [[providers.anthropic.accounts]] table named `name`.
+    Every other table stays byte-identical; the result must parse to the old document with only that key changed."""
+    before = tomllib.loads(text)
+    rows = before.get('providers', {}).get('anthropic', {}).get('accounts', [])
+    if not any(row.get('name') == name for row in rows): return text
+    lines = text.splitlines(keepends=True)
+    header = '[[providers.anthropic.accounts]]'
+    start = end = None
+    for index, line in enumerate(lines):
+        if line.strip() != header: continue
+        stop = index + 1
+        while stop < len(lines) and not lines[stop].strip().startswith('['): stop += 1  # the member's own keys end at the next table
+        block = tomllib.loads(''.join(lines[index:stop]))['providers']['anthropic']['accounts']
+        if block and block[0].get('name') == name: start, end = index, stop; break
+    if start is None: raise RuntimeError('The runtime configuration lists ' + name + ' in a form this command cannot edit')
+    own = re.compile(r'\s*' + re.escape(key) + r'\s*=')
+    at = next((i for i in range(start + 1, end) if own.match(lines[i])), None)
+    if value is None:
+        if at is None: return text
+        del lines[at]
+    else:
+        line = key + ' = ' + repr(float(value)) + '\n'
+        if at is not None: lines[at] = line
+        else:
+            last = max(i for i in range(start, end) if lines[i].strip())
+            if not lines[last].endswith('\n'): lines[last] += '\n'
+            lines.insert(last + 1, line)
+    candidate = ''.join(lines)
+    expected = copy.deepcopy(before)
+    row = next(r for r in expected['providers']['anthropic']['accounts'] if r.get('name') == name)
+    if value is None: row.pop(key, None)
+    else: row[key] = float(value)
+    if tomllib.loads(candidate) != expected: raise RuntimeError('Editing ' + name + ' would change other runtime settings; nothing was changed')
+    return candidate
+
+
+def reserve(config, binary, paths, env, name, pct, *, registry_path=None):
+    """Make `name` the pool's last choice from `pct` percent (None = off). Same validated write path as membership.
+    Shunt (pinned e147f9b9, src/accounts.rs resolved_max_utilization): an account-level `max_utilization` caps every
+    quota window (5h, weekly and Fable 7d_oi) and excludes the account from selection at or above it, with or without
+    [server.pool]; no per-window key is needed. The pool layer (routing.choose) enforces the same limit on merged readings.
+    The registry entry (when there is one) follows so other devices apply it; the hook passes no registry_path."""
+    if not any(r['name'] == name for r in load(config).get('accounts', [])):
+        raise RuntimeError('No account named ' + name + ' is connected (see claude-pool account list)')
+    def change(value):
+        next(r for r in value['accounts'] if r['name'] == name)['reserveAt'] = pct or 0
+    apply_change(config, binary, paths, env, change,
+                 lambda text: set_account_option(text, name, 'max_utilization', pct / 100 if pct else None),
+                 rejected='Backend rejected the reserve; live routing is unchanged')
+    if registry_path is not False:
+        try:
+            if registry.account(registry.load(registry_path), name) is not None:
+                def note(value): registry.account(value, name)['reserveAt'] = pct or 0
+                registry.update(note, registry_path)
+        except ValueError: pass  # an unreadable registry never undoes a reserve that is already applied
+
+
+def local_context():
+    import settings
+    paths, env = local_paths_env(settings.RUNTIME, settings.STORES)
+    return settings.CONFIG, settings.HERE / 'bin/shunt', paths, env
+
+
+def reserve_hook(value, context=None):
+    """Device sync: apply each registry `reserveAt` that differs from this device. Never raises, never syncs onward."""
+    try:
+        config, binary, paths, env = context or local_context()
+        local = {r['name']: r.get('reserveAt', 0) for r in load(config).get('accounts', [])}
+    except (OSError, ValueError, RuntimeError, ImportError): return
+    for row in value.get('accounts', []):
+        name, want = row.get('name'), row.get('reserveAt')
+        if name not in local or want is None or want == local[name]: continue
+        try: reserve(config, binary, paths, env, name, want or None, registry_path=False)
+        except Exception: continue
+
+
 def local_paths_env(runtime, stores, backend_source=None, backend_env=None):
     """The runtime TOML files that list members, and the environment `shunt check` validates them with."""
     paths = ([Path(backend_source)] if backend_source else []) + [Path(runtime) / 'shunt.toml']
@@ -494,11 +571,16 @@ def remove_account(name, wait, *, config, stores, binary, runtime, backend_sourc
     return 0
 
 
+def percent(text):
+    if not re.fullmatch('[0-9]{1,3}', text) or not 1 <= int(text) <= 99: raise argparse.ArgumentTypeError('--at must be a whole number from 1 to 99')
+    return int(text)
+
+
 def cli(argv, *, on_change=None, **options):
     """Run an account command. After a successful add or remove, `on_change()` (a device sync) reports one line per
     device; a failing sync never changes the exit code of a change that already succeeded."""
     code = run_cli(argv, **options)
-    if code == 0 and on_change is not None and argv[:1] in (['add'], ['remove']):
+    if code == 0 and on_change is not None and argv[:1] in (['add'], ['remove'], ['reserve']):
         try: results = on_change()
         except Exception as error: print('Device sync failed (' + type(error).__name__ + '); run claude-pool device sync later.')
         else:
@@ -519,6 +601,11 @@ def run_cli(argv, *, config, stores, binary, runtime, backend_source=None, backe
     add.add_argument('--replace', action='store_true', help='With --long-lived: install a new token for this account; the old one is kept aside')
     remove = sub.add_parser('remove', help='Disconnect a subscription without interrupting running requests')
     remove.add_argument('name'); remove.add_argument('--wait', action='store_true', help='Wait (up to 30 minutes) until the account serves no request')
+    reserved = sub.add_parser('reserve', help='Make an account the pool\'s last choice, with no new pool work near its limits')
+    reserved.add_argument('name')
+    mode = reserved.add_mutually_exclusive_group(required=True)
+    mode.add_argument('--at', type=percent, metavar='PCT', help='Reserve from this percent (1-99) of its 5-hour or weekly limit')
+    mode.add_argument('--off', action='store_true', help='Use the account like any other again')
     args = parser.parse_args(argv)
     config, stores, binary, runtime = map(Path, (config, stores, binary, runtime))
     directory = Path(long_lived) if long_lived else stores.parent / 'claude-long-lived'
@@ -526,6 +613,15 @@ def run_cli(argv, *, config, stores, binary, runtime, backend_source=None, backe
         return remove_account(args.name, args.wait, config=config, stores=stores, binary=binary, runtime=runtime,
                               backend_source=backend_source, backend_env=backend_env, overview=overview, directory=directory,
                               registry_path=registry_path, native_identity=native_identity)
+    if args.command == 'reserve':
+        row = next((r for r in load(config).get('accounts', []) if r['name'] == args.name), None)
+        if row is None: raise RuntimeError('No account named ' + args.name + ' is connected (see claude-pool account list)')
+        paths, env = local_paths_env(runtime, stores, backend_source, backend_env)
+        reserve(config, binary, paths, env, args.name, None if args.off else args.at, registry_path=registry_path)
+        label = row.get('label', row['name'])
+        if args.off: print(label + ' is no longer reserved.')
+        else: print('Reserved ' + label + ' from ' + str(args.at) + '%: last choice, and no new pool work at or above ' + str(args.at) + '% of its 5-hour or weekly limit.')
+        return 0
     if args.command == 'list':
         for row in load(config).get('accounts', []):
             print(f"{row.get('label', row['name'])} · claude {row.get('alias', row['name'])}")

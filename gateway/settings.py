@@ -53,7 +53,9 @@ def backend_config(state=RUNTIME):
              '[server.admin]\ntokens_env = "POOL_ADMIN_TOKENS"\nhide_observed = true',
              '[server.pool]\ndefault_threshold = 0.95\nusage_refresh_seconds = 300\nramp_initial_concurrency = 2\nstate_path = ' + json.dumps(str(state / 'quota.json')),
              '[providers.anthropic]\nkind = "anthropic"\nbase_url = "https://api.anthropic.com"\nauth = "claude_oauth"']
-    lines.extend('[[providers.anthropic.accounts]]\nname = ' + json.dumps(a['name']) for a in ACCOUNTS)
+    # A reserved account gets Shunt's hard cap too (backstop for requests without a session); resolved for the 5h, weekly and Fable windows.
+    lines.extend('[[providers.anthropic.accounts]]\nname = ' + json.dumps(a['name'])
+                 + ('\nmax_utilization = ' + repr(a['reserveAt'] / 100) if a.get('reserveAt', 0) > 0 else '') for a in ACCOUNTS)
     return '\n\n'.join(lines) + '\n'
 
 

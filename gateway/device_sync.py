@@ -23,7 +23,7 @@ import settings
 LIMIT = 131072
 NAME = re.compile(r'[a-z0-9-]{1,80}')
 STATUS_PARTS = []       # callables returning extra non-secret keys for `status()`
-INTEGRATION_HOOKS = []  # callables run with the new registry after it replaced the local one
+INTEGRATION_HOOKS = [accounts_cli.reserve_hook]  # callables run with the new registry after it replaced the local one
 switch_pending = long_lived.switch_pending
 
 
