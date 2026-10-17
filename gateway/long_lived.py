@@ -1,5 +1,9 @@
 """Long-lived (setup-token) store files: classification, fingerprint and expiry. Never prints a token."""
 import hashlib
+import json
+from pathlib import Path
+
+from private_files import read_private, write_private
 
 DAY_MS = 86_400_000
 
@@ -39,3 +43,19 @@ def expires_at_ms(value):
 def days_left(value, now_ms):
     expires = expires_at_ms(value)
     return None if expires is None else (expires - now_ms) / DAY_MS
+
+
+def adopt(source, directory, name):
+    """Move a staged long-lived token file into the long-lived folder. Verifies the copy before removing the source."""
+    source, target = Path(source), Path(directory) / (name + '.json')
+    value = read_private(source)
+    if kind(value) != 'long-lived': raise RuntimeError('Only a long-lived token file can be adopted; nothing was changed')
+    if source.resolve() == target.resolve(): return target
+    if target.exists() or target.is_symlink():
+        if fingerprint(read_private(target)) != fingerprint(value):
+            raise RuntimeError('A different long-lived token is already saved for ' + name + '; nothing was changed')
+    write_private(target, json.dumps(value))
+    if fingerprint(read_private(target)) != fingerprint(value):
+        raise RuntimeError('The saved token did not verify; the staged file was kept')
+    source.unlink()
+    return target

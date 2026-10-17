@@ -26,7 +26,7 @@ from native_auth import NativeAuth
 import service
 from validation import render as validation_view
 
-from settings import HERE, RUNTIME, STORES, NATIVE_CLAUDE, CONFIG, BASE_URL, GATEWAY_PORT, BACKEND_PORT, backend_config, connection_ts, ALIASES, private_directory
+from settings import HERE, RUNTIME, STORES, LONG_LIVED, NATIVE_CLAUDE, CONFIG, BASE_URL, GATEWAY_PORT, BACKEND_PORT, backend_config, connection_ts, ALIASES, private_directory
 ROOT = HERE.parent
 HEALTH_INTERVAL = 10
 INSTALLATION = json.loads((ROOT / 'installation.json').read_text()) if (ROOT / 'installation.json').is_file() else {}
@@ -449,7 +449,7 @@ def main():
             overview(); available = True
         except (OSError, RuntimeError, ValueError): available = False
         raise SystemExit(cli(argv, config=CONFIG, stores=STORES, binary=HERE/'bin/shunt', runtime=RUNTIME,
-                             backend_source=None, backend_env=None, overview=overview if available else None))
+                             overview=overview if available else None, long_lived=LONG_LIVED))
     if sys.argv[1:] in [['--help'], ['-h']]: sys.argv[1:] = ['help']
     if sys.argv[1:] == ['--version']:
         raise SystemExit(subprocess.call([NATIVE_CLAUDE, *sys.argv[1:]]))

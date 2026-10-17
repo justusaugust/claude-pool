@@ -50,8 +50,14 @@ def child_environment(stores, environ=os.environ, platform=None):
     return env
 
 
-def login(binary, stores, name, label, code_reader=private_code, timeout=900, extra_args=()):
-    """Own exactly one child PTY, never echo its raw output or a pasted code."""
+MODES = {'oauth': ('--mode', 'oauth', '--manual'), 'setup-token': ('--mode', 'setup-token')}
+
+
+def login(binary, stores, name, label, code_reader=private_code, timeout=900, extra_args=(), mode='oauth'):
+    """Own exactly one child PTY, never echo its raw output or a pasted code.
+
+    mode 'oauth' writes a refreshable grant; 'setup-token' a long-lived inference token (same URL and hidden prompt)."""
+    if mode not in MODES: raise ValueError('Unknown login mode')
     target = Path(stores) / (name + '.json')
     if target.exists() or target.is_symlink():
         raise RuntimeError('Credential already exists; verify it instead of overwriting it.')
@@ -61,8 +67,7 @@ def login(binary, stores, name, label, code_reader=private_code, timeout=900, ex
         attrs = termios.tcgetattr(0)
         attrs[3] &= ~termios.ECHO
         termios.tcsetattr(0, termios.TCSANOW, attrs)
-        os.execve(str(binary), [str(binary), 'login', 'claude', '--name', name,
-                               '--mode', 'oauth', '--manual', *extra_args], env)
+        os.execve(str(binary), [str(binary), 'login', 'claude', '--name', name, *MODES[mode], *extra_args], env)
     buffer, state, submitted, exited = '', None, False, False
     deadline = time.monotonic() + timeout
     try:

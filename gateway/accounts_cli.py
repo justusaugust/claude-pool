@@ -15,8 +15,11 @@ import urllib.request
 
 from account_login import login
 from account_metadata import load
-from long_lived import kind
-from private_files import atomic_write, read_private
+import long_lived
+from long_lived import fingerprint, kind
+from private_files import atomic_write, private_directory, read_private, write_private
+import registry
+from remote import Remote
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -73,6 +76,41 @@ def identity(data, stored):
             'userId': user_id, 'organizationId': org_id}
 
 
+IDENTITY_KEYS = ('email', 'organization', 'plan', 'userId', 'organizationId')
+OWNER_NEEDED = 'Identity needs the usage owner: run this on the usage owner or make it reachable. The token is saved; rerun to resume.'
+
+
+def long_lived_identity(value, stores, lookup):
+    """A long-lived token has no profile scope: borrow the identity of a refreshable grant with the same UUIDs."""
+    ids = (value.get('shuntAccountUuid'), value.get('shuntOrganizationUuid'))
+    for path in sorted(Path(stores).glob('*.json')):
+        if path.is_symlink() or not path.is_file(): continue
+        try: other = credential(path)
+        except (OSError, ValueError, RuntimeError): continue
+        if kind(other) == 'refreshable' and (other.get('shuntAccountUuid'), other.get('shuntOrganizationUuid')) == ids:
+            return profile(path)
+    info = lookup(*ids)
+    if info is None: raise RuntimeError(OWNER_NEEDED)
+    if not isinstance(info, dict) or any(not isinstance(info.get(key), str) or not info[key] for key in IDENTITY_KEYS):
+        raise RuntimeError('The usage owner returned an incomplete identity; nothing was enrolled')
+    if (info['userId'], info['organizationId']) != ids:
+        raise RuntimeError('Credential and verified organization differ; nothing was enrolled')
+    return {key: info[key] for key in IDENTITY_KEYS}
+
+
+def owner_lookup(user_id, org_id, remotes=Remote):
+    """Ask the usage owner (over SSH) for the identity of its refreshable grant with these UUIDs."""
+    value = registry.load()
+    owner = registry.owner(value)
+    if owner is None or owner['name'] == registry.self_name() or not owner.get('ssh'): return None
+    try: done = remotes(owner['ssh']).pool('device', 'identity', user_id, org_id)
+    except ValueError: return None  # an ssh target the transport refuses
+    if done.returncode: return None
+    try: info = json.loads(done.stdout)
+    except ValueError: return None
+    return info if isinstance(info, dict) else None
+
+
 def normalized(value):
     return re.sub('[^a-z0-9]', '', unicodedata.normalize('NFKD', value.lower().replace('æ', 'ae')))
 
@@ -101,19 +139,24 @@ def verify_expected(info, email, organization):
         raise RuntimeError('Selected organization is ' + info['organization'] + ', expected ' + organization + '. Nothing was enrolled.')
 
 
+def refuse_duplicate(rows, stores, name, info):
+    """A second name for the same subscription adds no quota."""
+    for row in rows:
+        if row['name'] == name: continue
+        other_path = stores / (row['name'] + '.json')
+        if not other_path.exists(): continue
+        other = credential(other_path)
+        if (other.get('shuntAccountUuid'), other.get('shuntOrganizationUuid')) == (info['userId'], info['organizationId']):
+            raise RuntimeError('This subscription is already connected as ' + row.get('label', row['name']) + '; a second alias adds no quota.')
+
+
 def register(config, stores, binary, paths, entry, info, env):
     config.parent.mkdir(parents=True, exist_ok=True)
     with (config.parent / ('.' + config.name + '.lock')).open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         value = load(config)
         rows = value.setdefault('accounts', [])
-        for row in rows:
-            if row['name'] == entry['name']: continue
-            other_path = stores / (row['name'] + '.json')
-            if not other_path.exists(): continue
-            other = credential(other_path)
-            if (other.get('shuntAccountUuid'), other.get('shuntOrganizationUuid')) == (info['userId'], info['organizationId']):
-                raise RuntimeError('This subscription is already connected as ' + row.get('label', row['name']) + '; a second alias adds no quota.')
+        refuse_duplicate(rows, stores, entry['name'], info)
         old = next((r for r in rows if r['name'] == entry['name']), None)
         if old: rows[rows.index(old)] = entry
         else: rows.append(entry)
@@ -132,19 +175,122 @@ def register(config, stores, binary, paths, entry, info, env):
             if path.read_text() != content: atomic_write(path, content)
 
 
-def cli(argv, *, config, stores, binary, runtime, backend_source=None, backend_env=None, overview=None):
+def local_paths_env(runtime, stores, backend_source=None, backend_env=None):
+    """The runtime TOML files that list members, and the environment `shunt check` validates them with."""
+    paths = ([Path(backend_source)] if backend_source else []) + [Path(runtime) / 'shunt.toml']
+    env = {**os.environ, 'POOL_CLIENT_TOKENS':'setup:local-config-validation-token',
+           'POOL_ADMIN_TOKENS':'setup:local-config-validation-token', **(backend_env or {}),
+           'SHUNT_CLAUDE_ACCOUNTS_DIR': str(stores)}
+    return paths, env
+
+
+def register_local(entry, info):
+    import settings
+    paths, env = local_paths_env(settings.RUNTIME, settings.STORES)
+    register(settings.CONFIG, settings.STORES, settings.HERE / 'bin/shunt', paths, entry, info, env)
+
+
+def readiness(overview, entry, name, email, long):
+    print('4/4 · Checking the running pool', flush=True)
+    if not overview:
+        print('Connected ' + entry['label'] + '. Start the pool with claude; shortcut: claude ' + entry['alias'])
+        return 0
+    deadline = time.monotonic() + 330
+    announced = False
+    while time.monotonic() < deadline:
+        try:
+            data = overview()
+            row = next((a for a in data.get('accounts', []) if a.get('name') == name), None)
+        except (OSError, ValueError, RuntimeError): row = None
+        if long and row and row.get('status') == 'reauthenticate':
+            print(entry['label'] + ' rejected its long-lived token. Fix: claude-pool account add ' + email + ' --long-lived --name ' + name + ', then claude-pool device sync')
+            return 2
+        if long and row and row.get('status') == 'unknown':
+            print('Connected ' + entry['label'] + ' · no reading yet (first request fills it)')
+            print('Start a session: claude ' + entry['alias'] + '  |  All accounts: claude')
+            return 0
+        if row and row.get('status') not in ('unknown', None):
+            print(f"Connected {entry['label']} · {row['status']} · {len(data['accounts'])} accounts")
+            print('Start a session: claude ' + entry['alias'] + '  |  All accounts: claude')
+            return 0
+        if not announced:
+            print('Waiting for the backend’s first quota reading…', flush=True)
+            announced = True
+        time.sleep(5)
+    print('Login and membership are saved. Readiness is not confirmed yet; rerun this command to resume without another login.')
+    return 2
+
+
+def enroll_long_lived(args, email, name, entry, *, config, stores, binary, runtime, backend_source, backend_env,
+                      overview, directory, registry_path, self_path, lookup):
+    token = directory / (name + '.json')
+    if args.from_file:
+        print('1/4 · Saving the staged long-lived token', flush=True)
+        long_lived.adopt(Path(args.from_file).expanduser(), directory, name)
+    elif token.exists() or token.is_symlink():
+        print('1/4 · Using saved long-lived token', flush=True)
+    else:
+        print('1/4 · Opening browser authorization for a long-lived token', flush=True)
+        private_directory(directory)
+        login(binary, directory, name, entry['label'] + ' — ' + email, mode='setup-token')
+    value = credential(token)
+    if kind(value) != 'long-lived': raise RuntimeError('The saved file is not a long-lived token; nothing was enrolled')
+    print('2/4 · Verifying account and organization', flush=True)
+    info = long_lived_identity(value, stores, lookup or owner_lookup)
+    verify_expected(info, email, args.organization)
+    print(info['email'] + ' · ' + info['organization'] + ' · ' + info['plan'], flush=True)
+    entry['plan'] = info['plan']
+    print('3/4 · Registering account and shortcut', flush=True)
+    shared = {**{key: info[key] for key in IDENTITY_KEYS}, **entry, 'fingerprint': fingerprint(value),
+              'expiresAt': long_lived.expires_at_ms(value)}
+    def wanted(current):
+        old = registry.account(current, name) or {}
+        return {**shared, **({'reserveAt': old['reserveAt']} if 'reserveAt' in old else {})}
+    def upsert(current):
+        current['accounts'] = [r for r in current['accounts'] if r['name'] != name] + [wanted(current)]
+    known = registry.load(registry_path)
+    # Refuse a second name for this subscription before anything is written (register() checks again under its lock).
+    refuse_duplicate(load(config).get('accounts', []), stores, name, info)
+    for row in known['accounts']:
+        if row['name'] != name and (row.get('userId'), row.get('organizationId')) == (info['userId'], info['organizationId']):
+            raise RuntimeError('This subscription is already connected as ' + (row.get('label') or row['name']) + '; a second alias adds no quota.')
+    if registry.account(known, name) != wanted(known): known = registry.update(upsert, registry_path)
+    owner = registry.owner(known)
+    is_owner = owner is not None and owner['name'] == registry.self_name(self_path)
+    store = stores / (name + '.json')
+    if store.is_symlink(): raise RuntimeError('Credential file must not be a symlink: ' + store.name)
+    current = credential(store) if store.exists() else None
+    if current is not None and kind(current) == 'refreshable':
+        # A refreshable grant is unique; replacing it would lose it. Switching is a separate, deliberate step.
+        if not is_owner: print('This machine keeps its own login for ' + entry['label'] + '; run claude-pool device switch when no task is running.', flush=True)
+    elif current is None and is_owner:
+        print('This machine is the usage owner and serves ' + entry['label'] + ' from a refreshable login. Connect one with claude-pool account add ' + email + ' --name ' + name + '.')
+        return 0
+    elif current is None or fingerprint(current) != fingerprint(value):
+        write_private(store, json.dumps(value))
+        if fingerprint(credential(store)) != fingerprint(value): raise RuntimeError('The pool copy of the token did not verify; rerun this command')
+    paths, env = local_paths_env(runtime, stores, backend_source, backend_env)
+    register(config, stores, binary, paths, entry, info, env)
+    return readiness(overview, entry, name, email, kind(credential(store)) == 'long-lived')
+
+
+def cli(argv, *, config, stores, binary, runtime, backend_source=None, backend_env=None, overview=None,
+        long_lived=None, registry_path=None, self_path=None, lookup=None):
     parser = argparse.ArgumentParser(prog='claude account')
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('list', help='Show connected names and shortcuts')
     add = sub.add_parser('add', help='Authorize, verify and enroll a subscription')
     add.add_argument('email', nargs='?'); add.add_argument('--name'); add.add_argument('--label')
     add.add_argument('--alias'); add.add_argument('--organization')
+    add.add_argument('--long-lived', action='store_true', help='Enroll a long-lived token (shared by every device)')
+    add.add_argument('--from-file', help='With --long-lived: adopt a staged 0600 token file instead of opening a browser')
     args = parser.parse_args(argv)
     config, stores, binary, runtime = map(Path, (config, stores, binary, runtime))
     if args.command == 'list':
         for row in load(config).get('accounts', []):
             print(f"{row.get('label', row['name'])} · claude {row.get('alias', row['name'])}")
         return 0
+    if args.from_file and not args.long_lived: raise RuntimeError('--from-file needs --long-lived')
     email = args.email
     if not email and os.isatty(0): email = input('Account email: ').strip()
     if not email or not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+', email):
@@ -168,6 +314,11 @@ def cli(argv, *, config, stores, binary, runtime, backend_source=None, backend_e
     with (stores / ('.' + name + '.add.lock')).open('a') as lock:
         try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError: raise RuntimeError('This account already has a connection in progress') from None
+        if args.long_lived:
+            directory = Path(long_lived) if long_lived else stores.parent / 'claude-long-lived'
+            return enroll_long_lived(args, email, name, entry, config=config, stores=stores, binary=binary, runtime=runtime,
+                                     backend_source=backend_source, backend_env=backend_env, overview=overview,
+                                     directory=directory, registry_path=registry_path, self_path=self_path, lookup=lookup)
         path = stores / (name + '.json')
         print('1/4 · ' + ('Using saved login' if path.exists() else 'Opening browser authorization'), flush=True)
         if not path.exists() and not path.is_symlink(): login(binary, stores, name, entry['label'] + ' — ' + email)
@@ -176,29 +327,6 @@ def cli(argv, *, config, stores, binary, runtime, backend_source=None, backend_e
         print(info['email'] + ' · ' + info['organization'] + ' · ' + info['plan'], flush=True)
         entry['plan'] = info['plan']
         print('3/4 · Registering account and shortcut', flush=True)
-        paths = ([Path(backend_source)] if backend_source else []) + [runtime / 'shunt.toml']
-        env = {**os.environ, 'POOL_CLIENT_TOKENS':'setup:local-config-validation-token',
-               'POOL_ADMIN_TOKENS':'setup:local-config-validation-token', **(backend_env or {}),
-               'SHUNT_CLAUDE_ACCOUNTS_DIR': str(stores)}
+        paths, env = local_paths_env(runtime, stores, backend_source, backend_env)
         register(config, stores, binary, paths, entry, info, env)
-        print('4/4 · Checking the running pool', flush=True)
-        if overview:
-            deadline = time.monotonic() + 330
-            announced = False
-            while time.monotonic() < deadline:
-                try:
-                    data = overview()
-                    row = next((a for a in data.get('accounts', []) if a.get('name') == name), None)
-                except (OSError, ValueError, RuntimeError): row = None
-                if row and row.get('status') not in ('unknown', None):
-                    print(f"Connected {entry['label']} · {row['status']} · {len(data['accounts'])} accounts")
-                    print('Start a session: claude ' + entry['alias'] + '  |  All accounts: claude')
-                    return 0
-                if not announced:
-                    print('Waiting for the backend’s first quota reading…', flush=True)
-                    announced = True
-                time.sleep(5)
-            print('Login and membership are saved. Readiness is not confirmed yet; rerun this command to resume without another login.')
-            return 2
-        print('Connected ' + entry['label'] + '. Start the pool with claude; shortcut: claude ' + entry['alias'])
-        return 0
+        return readiness(overview, entry, name, email, False)
