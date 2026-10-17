@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -12,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 # Real tools a test must never reach; each stub prints nothing and exits 97.
 STUBBED_TOOLS = ['herdr', 'claude', 'claude-native', 'claude-pool', 'launchctl', 'systemctl', 'loginctl',
                  'gh', 'avd', 'preview', 'tailscale', 'cua']
+ALLOWED_TOOLS = ['node']  # the only tools taken from the caller's PATH (the Cockpit host-command test needs Node)
 
 
 def fake_bin(home):
@@ -21,6 +23,16 @@ def fake_bin(home):
     for name in STUBBED_TOOLS:
         stub = folder / name
         stub.write_text('#!/bin/sh\nexit 97\n'); stub.chmod(0o755)
+    return folder
+
+
+def allowed_bin(home, path):
+    """Links to the allowed tools as found on the caller's PATH, placed after the stubs."""
+    folder = home / 'allowed-bin'
+    folder.mkdir()
+    for name in ALLOWED_TOOLS:
+        found = shutil.which(name, path=path)
+        if found: (folder / name).symlink_to(os.path.realpath(found))
     return folder
 
 
@@ -37,7 +49,7 @@ def main():
         config.write_text(json.dumps({'native_claude': str(native), 'state_dir': str(home / 'state'),
                                      'credential_dir': str(home / 'credentials')}))
         env = dict(os.environ, HOME=str(home), CLAUDE_POOL_CONFIG=str(config), PYTHONDONTWRITEBYTECODE='1',
-                   PATH=f'{fake_bin(home)}:/usr/bin:/bin')
+                   PATH=f'{fake_bin(home)}:{allowed_bin(home, os.environ.get("PATH", ""))}:/usr/bin:/bin')
         ran = False
         for suite in ['gateway', 'tests']:
             code = subprocess.run([sys.executable, '-m', 'unittest', 'discover', '-s', suite, '-p', 'test_*.py', *patterns],
