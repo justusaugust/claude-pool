@@ -168,8 +168,26 @@ class MarkdownTests(unittest.TestCase):
         self.assertIn('<meta charset="utf-8">', html)
 
     def test_markdown_survives_pathological_input(self):
-        for text in ['*' * 20000, '[' * 20000, '`' * 20000, '_a' * 10000, '> ' * 5000]:
+        tabs = ' \t' * 20000  # 40 KB of alternating space and tab
+        texts = ['*' * 20000, '[' * 20000, '`' * 20000, '_a' * 10000, '> ' * 5000,
+                 '# a' + ' ' * 10000 + 'x', '# a' + tabs + 'x', tabs, '# ' + tabs, tabs + '#', '-' + tabs + 'x',
+                 'a | b\n-' + ' ' * 10000 + '|' + ' ' * 10000 + 'x', 'a | b\n-' + tabs + '|' + tabs + 'x',
+                 'a | b\n' + tabs, ('[a](' + ' ' * 1999 + 'x\n') * 20, ('[a](x' + ' ' * 1999 + '\n') * 20,
+                 '*a ' * 20000, '**a ' * 15000, '_a _' * 10000, ('``a' + '`' * 3) * 5000,
+                 '- ' + '- ' * 10000 + 'x', '-' + ' ' * 10000 + '-' + ' ' * 10000 + 'x', '1.' + tabs + 'x',
+                 '>' + tabs + 'x', '```' + tabs, '| ' + tabs + ' |\n|' + tabs]
+        for text in texts:
+            started = pv.time.perf_counter()
             self.assertIn('<main>', pv.render_markdown(text, 'T'))
+            self.assertLess(pv.time.perf_counter() - started, 0.5, repr(text[:30]))
+
+    def test_heading_closing_hashes_and_table_separator_still_work(self):
+        html = pv.render_markdown('## Title ##\n\n# C#\n\n# #\n\n| a | b |\n| :-- | --: |\n| 1 | 2 |\n', 'T')
+        self.assertIn('<h2>Title</h2>', html)
+        self.assertIn('<h1>C#</h1>', html)
+        self.assertIn('<h1></h1>', html)
+        self.assertIn('<td>2</td>', html)
+        self.assertIn('<p>a | b\n| - x |</p>', pv.render_markdown('a | b\n| - x |', 'T'))
 
 
 # ---------------------------------------------------------------------------
@@ -314,7 +332,8 @@ class ServerTests(unittest.TestCase):
     def test_markdown_raw_and_security_headers(self):
         r = get(self.folder_server, '/notes.md')
         self.assertEqual(r.headers['Content-Type'], 'text/html; charset=utf-8')
-        self.assertEqual(r.headers['Content-Security-Policy'], "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'")
+        self.assertEqual(r.headers['Content-Security-Policy'], "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; "
+                                                               "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
         self.assertIn(b'Hello &lt;b&gt;you&lt;/b&gt;', r.body)
         raw = get(self.folder_server, '/notes.md?raw=1')
         self.assertEqual(raw.headers['Content-Type'], 'text/plain; charset=utf-8')
@@ -335,6 +354,25 @@ class ServerTests(unittest.TestCase):
         head = request(self.folder_server, 'HEAD', '/plain.txt')
         self.assertEqual((head.status, head.body), (200, b""))
         self.assertEqual(head.headers['Content-Length'], str(len("plain text\n")))
+
+    def test_short_read_closes_the_connection_instead_of_hanging(self):
+        handler = type('KeepAlive', (pv.make_file_handler(self.folder, quiet=True),), {'protocol_version': 'HTTP/1.1'})
+        server = pv.ThreadingHTTPServer(('127.0.0.1', 0), handler)
+        server.daemon_threads = True
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        real = os.fstat
+        def bigger(fd):  # the file shrank after its size was read
+            st = real(fd)
+            return os.stat_result((st.st_mode, *tuple(st)[1:6], st.st_size + 5000, *tuple(st)[7:]))
+        conn = http.client.HTTPConnection('127.0.0.1', server.server_address[1], timeout=3)
+        with mock.patch.object(pv.os, 'fstat', bigger):
+            conn.request('GET', '/data.bin')
+            response = conn.getresponse()
+        with self.assertRaises(http.client.IncompleteRead):
+            response.read()
+        conn.close()
 
     def test_server_header_does_not_name_python(self):
         self.assertNotIn('Python', get(self.folder_server, '/').headers.get('Server', ''))
@@ -476,6 +514,59 @@ class FileCommandTests(unittest.TestCase):
         code, _, err = self.main(['stop', str(self.folder)], FakeSystem())
         self.assertEqual(code, 1)
         self.assertIn('no file share', err)
+
+    def test_control_characters_and_system_folders_are_refused(self):
+        odd = self.folder / 'bad\x1b[31mname'
+        odd.mkdir()
+        for path in [odd, self.folder / 'line\nbreak', Path('/dev'), Path('/dev/null'), Path('/proc/self'),
+                     Path('/sys'), Path('/run')]:
+            if path.name == 'line\nbreak':
+                path.mkdir()
+            code, out, err = self.main(['file', str(path)], FakeSystem())
+            self.assertNotEqual(code, 0, path)
+            self.assertEqual(len(err.strip().splitlines()), 1, (path, err))
+            self.assertNotIn('\x1b', err)
+        for root in ['/dev', '/sys', '/proc', '/run']:
+            if Path(root).exists():
+                with self.assertRaises(pv.FileShareRefused):
+                    pv.check_share_root(root)
+
+    def test_dollar_signs_reach_systemd_escaped(self):
+        folder = self.home / '${HOME}x$USER'
+        folder.mkdir()
+        fake = FakeSystem(operator=False)
+        code, _, err = self.main(['file', str(folder)], fake)
+        self.assertEqual(code, 0, err)
+        [run] = [a for a in fake.argvs() if a[0] == 'systemd-run' and '_serve-file' in a]
+        self.assertIn(str(self.home) + '/$${HOME}x$$USER', run)
+        self.assertNotIn(str(folder), run)
+        for argv in fake.argvs():
+            if argv[0] == 'systemd-run':
+                command = argv[argv.index('/usr/bin/python3'):]
+                self.assertFalse([a for a in command if '$' in a.replace('$$', '')], command)
+
+    def test_list_strips_control_characters_from_labels(self):
+        fake = FakeSystem(operator=False)
+        self.main(['file', str(self.folder), '--name', 'evil\x1b]0;title\x07\x1b[2Jlabel'], fake)
+        _, table, _ = self.main(['list'], fake)
+        self.assertNotIn('\x1b', table)
+        self.assertNotIn('\x07', table)
+        self.assertIn('label', table)
+
+    def test_stop_relative_digit_folder_name(self):
+        fake = FakeSystem(operator=False)
+        (self.folder / '2026').mkdir()
+        self.main(['file', str(self.folder / '2026')], fake)
+        old = os.getcwd()
+        os.chdir(self.folder)
+        try:
+            code, out, _ = self.main(['stop', './2026'], fake)
+        finally:
+            os.chdir(old)
+        self.assertEqual(code, 0)
+        self.assertIn('2026', out)
+        self.assertEqual(pv.all_states(), [])
+        self.assertEqual(fake.active, {})
 
     def test_serve_file_command_refuses_unsafe_roots(self):
         for root in [self.home, Path('/'), self.home / '.ssh']:

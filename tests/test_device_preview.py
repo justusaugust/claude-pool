@@ -20,8 +20,9 @@ import device_sync
 from fakes import FakeRemote
 from remote import Completed
 
-TOOL_SHA = '89c880b1411939c7996239273e28aa51399a1dca1cd56e387754e82e235faabe'
+TOOL_SHA = '7894d83a893ab63cc07ec07244b910ae8fce1949b080ba355a3b08f6e3903efd'
 PREVIOUS_SHA = 'b3e645e7ba9750057b68c12f7dd518d19ff792a98062eeea857115b194358d94'  # the copy live on personal-vps
+FIRST_FILE_SHARE_SHA = '89c880b1411939c7996239273e28aa51399a1dca1cd56e387754e82e235faabe'  # Task 16's first release
 OTHER_SHA = '0' * 64
 RUN = 'cd "$HOME" && exec .local/bin/preview "$@"'
 DOCTOR_HTTPS = 'tailnet name   box.ts.net\nbackend        https (Tailscale Serve is allowed for this user)\n'
@@ -42,6 +43,19 @@ def _run_sh(script, name, *args, home, stdin=None):
             (stubs / tool).write_text('#!/bin/sh\nexit 97\n'); (stubs / tool).chmod(0o755)
     return subprocess.run(['/bin/sh', '-c', script, name, *args], input=stdin or b'', capture_output=True,
                           env={'HOME': home, 'PATH': f'{stubs}:/usr/bin:/bin'}, timeout=30)
+
+
+def _gnu_ln():
+    import subprocess
+    try:
+        done = subprocess.run(['ln', '--help'], capture_output=True, env={'PATH': '/usr/bin:/bin'}, timeout=10)
+    except OSError:
+        return False
+    return b'--no-target-directory' in done.stdout
+
+
+GNU_LN = _gnu_ln()  # the device scripts use `ln -T` and `mv -T` (GNU coreutils; devices are Linux)
+needs_gnu = unittest.skipUnless(GNU_LN, 'needs GNU ln/mv -T (Linux); the script text is checked separately')
 
 
 def sh(script, name, *args, home, stdin=None): return _run_sh(script, name, *args, home=home, stdin=stdin).returncode
@@ -101,23 +115,27 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(stdin, device_preview.TOOL.read_bytes())
         script = argv[2]
         self.assertIn('0755', script)
-        self.assertIn('ln ', script)  # a hard link fails when a file appeared meanwhile; nothing is overwritten
+        self.assertIn('ln -T ', script)  # a hard link fails when anything appeared meanwhile; nothing is overwritten
         self.assertNotIn('mv ', script)
         self.assertNotIn(TOOL_SHA, ' '.join(argv))
 
     def test_known_previous_copy_is_updated_in_place(self):
-        self.assertEqual(device_preview.KNOWN_PREVIOUS, {PREVIOUS_SHA})
+        self.assertEqual(device_preview.KNOWN_PREVIOUS, {PREVIOUS_SHA, FIRST_FILE_SHARE_SHA})
         remote = device(target_sha=PREVIOUS_SHA)
         step = device_preview.install(remote)
         self.assertEqual((step.status, step.detail), ('ok', 'updated'))
         [(argv, stdin)] = installs(remote)
         self.assertEqual(stdin, device_preview.TOOL.read_bytes())
         script = argv[2]
-        self.assertIn('0755', script); self.assertIn('mv ', script)
+        self.assertIn('0755', script); self.assertIn('mv -f -T ', script)
         # The device re-checks the file it replaces within the same shell: only the packaged or a known previous copy.
         self.assertIn(TOOL_SHA, argv[3:]); self.assertIn(PREVIOUS_SHA, argv[3:])
         self.assertIn('-L', script)
 
+    def test_first_file_share_release_is_updated_too(self):
+        self.assertEqual(device_preview.install(device(target_sha=FIRST_FILE_SHARE_SHA)).detail, 'updated')
+
+    @needs_gnu
     def test_update_script_replaces_only_a_known_file(self):
         with tempfile.TemporaryDirectory() as home:
             target = Path(home) / '.local/bin/preview'; target.parent.mkdir(parents=True)
@@ -132,6 +150,37 @@ class InstallTests(unittest.TestCase):
             self.assertEqual(target.stat().st_mode & 0o777, 0o755)
             self.assertEqual(sorted(p.name for p in target.parent.iterdir()), ['preview'])
 
+    @needs_gnu
+    def test_scripts_never_write_into_a_directory_at_the_target(self):
+        with tempfile.TemporaryDirectory() as home:
+            target = Path(home) / '.local/bin/preview'; target.mkdir(parents=True)
+            self.assertNotEqual(sh(device_preview._INSTALL_SCRIPT, 'install', device_preview.TARGET, home=home, stdin=b't'), 0)
+            with mock.patch.object(device_preview, 'KNOWN_PREVIOUS', {hashlib.sha256(b'').hexdigest()}):
+                self.assertNotEqual(sh(device_preview._UPDATE_SCRIPT, 'update', device_preview.TARGET,
+                                       *device_preview._accepted(), home=home, stdin=b't'), 0)
+            self.assertEqual(list(target.iterdir()), [])
+            self.assertEqual(sorted(p.name for p in target.parent.iterdir()), ['preview'])
+
+    def test_install_and_update_scripts_use_no_target_directory(self):
+        self.assertIn('ln -T "$t" "$1"', device_preview._INSTALL_SCRIPT)
+        self.assertIn('mv -f -T "$t" "$f"', device_preview._UPDATE_SCRIPT)
+        self.assertNotRegex(device_preview._INSTALL_SCRIPT + device_preview._UPDATE_SCRIPT, r'\b(ln|mv)(?! -)')
+
+    def test_a_directory_at_the_target_is_refused(self):
+        with tempfile.TemporaryDirectory() as home:
+            target = Path(home) / '.local/bin/preview'; target.mkdir(parents=True)
+            self.assertEqual(sh_out(device_preview._SHA_SCRIPT, 'sha', device_preview.TARGET, home=home), 'notfile')
+            target.rmdir(); target.symlink_to(Path(home))
+            self.assertEqual(sh_out(device_preview._SHA_SCRIPT, 'sha', device_preview.TARGET, home=home), 'notfile')
+        remote = device(target_sha='notfile')
+        step = device_preview.install(remote)
+        self.assertEqual((step.status, step.detail), ('failed', 'not a regular file'))
+        self.assertEqual(installs(remote), [])
+        remote = device(target_sha='notfile')
+        device_preview.remove(remote)
+        self.assertEqual(runs(remote), [])
+
+    @needs_gnu
     def test_install_script_never_replaces_a_file_that_appeared(self):
         with tempfile.TemporaryDirectory() as home:
             target = Path(home) / '.local/bin/preview'; target.parent.mkdir(parents=True)

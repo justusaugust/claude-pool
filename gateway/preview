@@ -7,6 +7,7 @@ Tests: preview_test.py next to this file (python3 -m unittest from that director
 
 import argparse
 import asyncio
+import bisect
 import codecs
 import html
 import ipaddress
@@ -452,7 +453,8 @@ def cmd_serve(args):
 
 FILE_PORTS = range(18400, 18500)
 FILE_UNIT_PREFIX = "preview-file-"
-HTML_CSP = "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'"
+HTML_CSP = ("default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; "
+            "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
 OTHER_CSP = "sandbox"
 INLINE_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
                 ".webp": "image/webp", ".pdf": "application/pdf"}
@@ -460,6 +462,13 @@ MARKDOWN_EXTS = {".md", ".markdown"}
 MARKDOWN_RENDER_LIMIT = 2 * 1024 * 1024  # larger Markdown files are served as plain text
 CHUNK = 64 * 1024
 TEXT_SNIFF = 8192
+SYSTEM_ROOTS = tuple(Path(p) for p in ("/proc", "/sys", "/dev", "/run"))
+CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def printable(text):
+    """Text without control characters (escape sequences, bells, newlines) for terminal output."""
+    return CONTROL_CHARS.sub("", str(text))
 
 
 class FileShareRefused(ValueError):
@@ -473,11 +482,17 @@ def hidden(parts):
 
 def check_share_root(path):
     """The resolved path to share, or FileShareRefused for anything that must never be shared."""
+    if CONTROL_CHARS.search(str(path)):
+        raise FileShareRefused("refusing to share a path that contains control characters")
     raw = Path(os.path.expanduser(str(path)))
     try:
         resolved = raw.resolve(strict=True)
-    except (OSError, RuntimeError):
+    except (OSError, RuntimeError, ValueError):
         raise FileShareRefused(f"{path}: no such file or folder")
+    if CONTROL_CHARS.search(str(resolved)):
+        raise FileShareRefused(f"refusing to share {path}: the real path contains control characters")
+    if any(resolved == system or resolved.is_relative_to(system) for system in SYSTEM_ROOTS):
+        raise FileShareRefused(f"refusing to share {path}: system folders (/proc, /sys, /dev, /run) are never shared")
     if hidden(Path(os.path.abspath(raw)).parts) or hidden(resolved.parts):
         raise FileShareRefused(f"refusing to share {path}: dotfiles and dot folders (like ~/.ssh) are never shared")
     if resolved == Path(resolved.anchor):
@@ -574,17 +589,17 @@ def html_page(title, body):
 MD_SPAN = 2000   # an inline construct (emphasis, link) may span at most this many characters
 MD_DEPTH = 8     # nesting limit for block quotes, lists and emphasis
 _MD_FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
-_MD_HEADING = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+(.*?))?(?:[ \t]+#+)?[ \t]*$")
+_MD_HEADING = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+(.*))?$")
 _MD_HR = re.compile(r"^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$")
 _MD_ITEM = re.compile(r"^( *)(?:([-*+])|(\d{1,9})[.)])(?:[ \t]+(.*))?$")
 _MD_QUOTE = re.compile(r"^ {0,3}> ?(.*)$")
-_MD_TABLE_SEP = re.compile(r"^ {0,3}\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)*\|?[ \t]*$")
 _MD_SPECIAL = re.compile(r"[\\`*_\[!<]")
-_MD_LINK = re.compile(r"\[((?:[^\[\]\\]|\\.|\[[^\[\]]*\])*)\]\(\s*(<[^<>\n]*>|[^\s()<>]*(?:\([^\s()<>]*\)[^\s()<>]*)*)"
-                      r'(?:\s+"([^"\n]*)")?\s*\)', re.S)
+_MD_LABEL = re.compile(r"\[((?:[^\[\]\\]|\\.|\[[^\[\]]*\])*)\]\(", re.S)
 _MD_AUTOLINK = re.compile(r"<((?:https?|mailto):[^\s<>]+)>", re.I)
-_MD_STRONG = re.compile(r"(\*\*|__)(?=\S)(.+?)(?<=\S)\1", re.S)
-_MD_EM = re.compile(r"\*(?=[^\s*])(.+?)(?<=[^\s*])\*|_(?=\S)(.+?)(?<=\S)_(?![0-9A-Za-z])", re.S)
+_MD_SPACE = " \t\n\r\f\v"
+_ASCII_ALNUM = set("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
+# Every Markdown pattern above is linear: no two adjacent quantifiers can match the same characters. Closing
+# delimiters for emphasis and code spans are found by bisecting precomputed positions, not by lazy regex scans.
 _MD_ESCAPABLE = set("\\`*_{}[]()#+-.!|<>~\"'")
 
 
@@ -597,10 +612,92 @@ def md_url_ok(url, image=False):
     return m.group(1).lower() in ({"http", "https"} if image else {"http", "https", "mailto"})
 
 
+def _md_heading_text(text):
+    """Heading text without an optional closing run of # (which must follow a space)."""
+    text = (text or "").rstrip(" \t")
+    bare = text.rstrip("#")
+    if bare != text and (not bare or bare[-1] in " \t"):
+        text = bare.rstrip(" \t")
+    return text
+
+
+def _md_table_sep(line):
+    cells = line.strip()
+    if "|" not in cells:
+        return False
+    cells = cells[1:] if cells.startswith("|") else cells
+    cells = cells[:-1] if cells.endswith("|") else cells
+    return all(re.fullmatch(r":?-+:?", cell.strip()) for cell in cells.split("|"))
+
+
+def _md_destination(text, j, end):
+    """Parse `url` or `<url>`, an optional "title" and the closing `)`, starting just after `(`.
+    Returns (url, title, index after the `)`) or None. One pass, no backtracking."""
+    while j < end and text[j] in _MD_SPACE:
+        j += 1
+    if j < end and text[j] == "<":
+        k = text.find(">", j + 1, end)
+        if k < 0 or "<" in text[j + 1:k] or "\n" in text[j + 1:k]:
+            return None
+        url, j = text[j + 1:k], k + 1
+    else:
+        start, nested = j, False
+        while j < end and text[j] not in _MD_SPACE:
+            c = text[j]
+            if c in "<>":
+                return None
+            if c == "(":
+                if nested:
+                    return None
+                nested = True
+            elif c == ")":
+                if not nested:
+                    break
+                nested = False
+            j += 1
+        if nested:
+            return None
+        url = text[start:j]
+    k, title = j, None
+    while k < end and text[k] in _MD_SPACE:
+        k += 1
+    if k > j and k < end and text[k] == '"':
+        q = text.find('"', k + 1, end)
+        if q < 0 or "\n" in text[k + 1:q]:
+            return None
+        title, k = text[k + 1:q], q + 1
+        while k < end and text[k] in _MD_SPACE:
+            k += 1
+    if k < end and text[k] == ")":
+        return url, title, k + 1
+    return None
+
+
 def md_inline(text, links=True, depth=0):
     if depth > MD_DEPTH:
         return html.escape(text)
     out, i, n = [], 0, len(text)
+    marks = {}
+
+    def closer(kind, lo, hi):
+        """First closing delimiter of `kind` at a position in [lo, hi], or None."""
+        if not marks:
+            marks.update({"**": [], "__": [], "*": [], "_": [], "`": {}})
+            for m in re.finditer(r"[*_]", text):
+                j, c = m.start(), text[m.start()]
+                if j == 0 or text[j - 1].isspace():
+                    continue
+                if text.startswith(c * 2, j):
+                    marks[c * 2].append(j)
+                if c == "*" and text[j - 1] != "*":
+                    marks["*"].append(j)
+                if c == "_" and not (j + 1 < n and text[j + 1] in _ASCII_ALNUM):
+                    marks["_"].append(j)
+            for m in re.finditer(r"`+", text):
+                marks["`"].setdefault(m.end() - m.start(), []).append(m.start())
+        found = marks[kind[0]].get(len(kind), []) if kind[0] == "`" else marks[kind]
+        k = bisect.bisect_left(found, lo)
+        return found[k] if k < len(found) and found[k] <= hi else None
     while i < n:
         m = _MD_SPECIAL.search(text, i)
         if not m:
@@ -619,36 +716,38 @@ def md_inline(text, links=True, depth=0):
             while j < n and text[j] == "`":
                 j += 1
             run = j - i
-            close = re.compile(r"(?<!`)`{%d}(?!`)" % run).search(text, j, min(n, j + MD_SPAN))
-            if close:
-                out.append("<code>" + html.escape(text[j:close.start()].strip(" ") or text[j:close.start()]) + "</code>")
-                i = close.end()
+            close = closer("`" * run, j, min(n, j + MD_SPAN) - run)
+            if close is not None:
+                out.append("<code>" + html.escape(text[j:close].strip(" ") or text[j:close]) + "</code>")
+                i = close + run
             else:
                 out.append(html.escape(text[i:j]))
                 i = j
             continue
         if c == "!" and i + 1 < n and text[i + 1] == "[":
-            lm = _MD_LINK.match(text, i + 1, end)
-            if lm:
-                label, url, title = lm.group(1), lm.group(2).strip("<>"), lm.group(3)
+            lm = _MD_LABEL.match(text, i + 1, end)
+            dest = lm and _md_destination(text, lm.end(), end)
+            if dest:
+                label, (url, title, after) = lm.group(1), dest
                 if md_url_ok(url, image=True):
                     out.append(f'<img src="{html.escape(url)}" alt="{html.escape(label)}"'
                                + (f' title="{html.escape(title)}"' if title else "") + ">")
                 else:
                     out.append(html.escape(label))
-                i = lm.end()
+                i = after
                 continue
         if c == "[":
-            lm = _MD_LINK.match(text, i, end)
-            if lm:
-                label, url, title = lm.group(1), lm.group(2).strip("<>"), lm.group(3)
+            lm = _MD_LABEL.match(text, i, end)
+            dest = lm and _md_destination(text, lm.end(), end)
+            if dest:
+                label, (url, title, after) = lm.group(1), dest
                 inner = md_inline(label, links=False, depth=depth + 1)
                 if links and md_url_ok(url):
                     out.append(f'<a href="{html.escape(url)}"' + (f' title="{html.escape(title)}"' if title else "")
                                + f">{inner}</a>")
                 else:
                     out.append(inner)
-                i = lm.end()
+                i = after
                 continue
         if c == "<":
             am = _MD_AUTOLINK.match(text, i, end)
@@ -657,16 +756,18 @@ def md_inline(text, links=True, depth=0):
                 i = am.end()
                 continue
         if c in "*_" and not (c == "_" and i > 0 and text[i - 1].isalnum()):
-            sm = _MD_STRONG.match(text, i, end)
-            if sm:
-                out.append("<strong>" + md_inline(sm.group(2), links, depth + 1) + "</strong>")
-                i = sm.end()
-                continue
-            em = _MD_EM.match(text, i, end)
-            if em:
-                out.append("<em>" + md_inline(em.group(1) or em.group(2), links, depth + 1) + "</em>")
-                i = em.end()
-                continue
+            if text.startswith(c * 2, i) and i + 2 < n and not text[i + 2].isspace():
+                j = closer(c * 2, i + 3, end - 2)
+                if j is not None:
+                    out.append("<strong>" + md_inline(text[i + 2:j], links, depth + 1) + "</strong>")
+                    i = j + 2
+                    continue
+            if i + 1 < n and not text[i + 1].isspace() and not (c == "*" and text[i + 1] == "*"):
+                j = closer(c, i + 2, end - 1)
+                if j is not None:
+                    out.append("<em>" + md_inline(text[i + 1:j], links, depth + 1) + "</em>")
+                    i = j + 1
+                    continue
         out.append(html.escape(c))
         i += 1
     return "".join(out)
@@ -779,7 +880,7 @@ def md_blocks(raw_lines, depth=0):
         if m:
             flush()
             level = len(m.group(1))
-            out.append(f"<h{level}>" + md_inline(m.group(2) or "", depth=depth) + f"</h{level}>")
+            out.append(f"<h{level}>" + md_inline(_md_heading_text(m.group(2)), depth=depth) + f"</h{level}>")
             i += 1
             continue
         if _MD_HR.match(line):
@@ -803,7 +904,7 @@ def md_blocks(raw_lines, depth=0):
             listed, i = _md_list(lines, i, depth)
             out.append(listed)
             continue
-        if "|" in line and i + 1 < n and "|" in lines[i + 1] and _MD_TABLE_SEP.match(lines[i + 1]):
+        if "|" in line and i + 1 < n and _md_table_sep(lines[i + 1]):
             flush()
             head = _md_table_cells(line)
             i += 2
@@ -952,7 +1053,8 @@ def make_file_handler(root, quiet=False):
                 try:
                     while left > 0:
                         data = f.read(min(CHUNK, left))
-                        if not data:
+                        if not data:  # the file shrank: the promised length cannot be met, so end the connection
+                            self.close_connection = True
                             break
                         self.wfile.write(data)
                         left -= len(data)
@@ -1059,7 +1161,8 @@ class System:
         r = self.run([
             "systemd-run", "--user", "--quiet", f"--unit={unit}", f"--description={description}",
             "-p", "Restart=on-failure", "-p", "RestartSec=2", "-p", f"RestartPreventExitStatus={EXIT_CONFIG}",
-            "-p", "StartLimitIntervalSec=0", "--setenv=PYTHONUNBUFFERED=1", *argv,
+            "-p", "StartLimitIntervalSec=0", "--setenv=PYTHONUNBUFFERED=1",
+            *(arg.replace("$", "$$") for arg in argv),  # systemd expands $VAR and ${VAR} in the command; $$ is a literal $
         ], timeout=30)
         return r.returncode == 0, (r.stderr or r.stdout).strip()
 
@@ -1338,7 +1441,7 @@ def stop_share(sysm, entry):
 
 
 def stopped_line(entry):
-    return f"stopped {entry['port']} ({entry['label']}" + (f", {entry['path']})" if entry.get("path") else ")")
+    return printable(f"stopped {entry['port']} ({entry['label']}" + (f", {entry['path']})" if entry.get("path") else ")"))
 
 
 def cmd_stop(sysm, port=None, all_=False, out=None, err=None, path=None):
@@ -1452,8 +1555,9 @@ def cmd_list(sysm, as_json=False, out=None):
         return 0
     table = [("PORT", "LABEL", "BACKEND", "TARGET", "PROXY", "LINK", "PATH")]
     for r in rows:
-        table.append((str(r["port"]), r["label"], r["backend"], "listening" if r["target_listening"] else "not listening",
-                      r["proxy"], r["link"], r.get("path", "")))
+        table.append((str(r["port"]), printable(r["label"]), r["backend"],
+                      "listening" if r["target_listening"] else "not listening", r["proxy"], r["link"],
+                      printable(r.get("path", ""))))
     widths = [max(len(row[i]) for row in table) for i in range(len(table[0]))]
     for row in table:
         print("  ".join(c.ljust(w) for c, w in zip(row, widths)).rstrip(), file=out)

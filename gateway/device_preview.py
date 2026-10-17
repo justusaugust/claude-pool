@@ -19,24 +19,28 @@ TARGET = '.local/bin/preview'
 RULES_START = '<!-- claude-pool:previews start -->'
 RULES_END = '<!-- claude-pool:previews end -->'
 LINUX_ONLY = 'preview runs its proxy as a systemd user unit; Linux only for now'
-# Earlier releases of gateway/preview that install() may replace. The first is the copy live on personal-vps.
-KNOWN_PREVIOUS = {'b3e645e7ba9750057b68c12f7dd518d19ff792a98062eeea857115b194358d94'}
+# Earlier releases of gateway/preview that install() may replace: the copy live on personal-vps, then the first
+# release with file shares.
+KNOWN_PREVIOUS = {'b3e645e7ba9750057b68c12f7dd518d19ff792a98062eeea857115b194358d94',
+                  '89c880b1411939c7996239273e28aa51399a1dca1cd56e387754e82e235faabe'}
 
 _HASH = ('if command -v sha256sum >/dev/null 2>&1; then h=$(sha256sum "$f" | cut -d" " -f1); '
          'else h=$(shasum -a 256 "$f" | cut -d" " -f1); fi; ')
-# Prints `absent`, `broken` (a symlink to nothing), `link <sha>` (a symlink) or `<sha>` (a regular file).
+# Prints `absent`, `broken` (a symlink to nothing), `notfile` (a directory or other non-file), `link <sha>` (a symlink
+# to a file) or `<sha>` (a regular file).
 _SHA_SCRIPT = ('cd "$HOME" || exit 1; f="$1"; if [ -L "$f" ] && [ ! -e "$f" ]; then echo broken; '
-               'elif [ ! -e "$f" ]; then echo absent; else ' + _HASH +
+               'elif [ ! -e "$f" ]; then echo absent; elif [ ! -f "$f" ]; then echo notfile; else ' + _HASH +
                'if [ -L "$f" ]; then echo "link $h"; else echo "$h"; fi; fi')
-# Fresh install: a hard link from a temp file, which fails (and replaces nothing) if any file appeared meanwhile.
+# Fresh install: a hard link from a temp file, which fails (and replaces nothing) if anything appeared meanwhile.
+# -T (GNU; devices are Linux) never treats an existing directory as the place to put the link.
 _INSTALL_SCRIPT = ('cd "$HOME" || exit 1; mkdir -p .local/bin && t=$(mktemp .local/bin/.preview.XXXXXX) || exit 1; '
-                   'if cat > "$t" && chmod 0755 "$t" && ln "$t" "$1"; then rm -f "$t"; exit 0; fi; rm -f "$t"; exit 1')
+                   'if cat > "$t" && chmod 0755 "$t" && ln -T "$t" "$1"; then rm -f "$t"; exit 0; fi; rm -f "$t"; exit 1')
 # Update: replaces $1 only if it is a regular file (not a symlink) whose SHA-256 is one of $2..., checked in this shell.
 _UPDATE_SCRIPT = ('cd "$HOME" || exit 1; f="$1"; shift; t=$(mktemp .local/bin/.preview.XXXXXX) || exit 1; '
                   'cat > "$t" && chmod 0755 "$t" || { rm -f "$t"; exit 1; }; '
                   'if [ -L "$f" ] || [ ! -f "$f" ]; then rm -f "$t"; exit 3; fi; ' + _HASH +
                   'ok=; for k in "$@"; do [ "$h" = "$k" ] && ok=1; done; '
-                  '[ -n "$ok" ] || { rm -f "$t"; exit 3; }; mv -f "$t" "$f" || { rm -f "$t"; exit 1; }')
+                  '[ -n "$ok" ] || { rm -f "$t"; exit 3; }; mv -f -T "$t" "$f" || { rm -f "$t"; exit 1; }')
 # Removes the file only when it still is the packaged tool or a known earlier copy; $2... are their SHA-256s.
 _UNLINK_SCRIPT = ('cd "$HOME" || exit 1; f="$1"; shift; [ -e "$f" ] || exit 0; ' + _HASH +
                   'for k in "$@"; do [ "$h" = "$k" ] && { rm -f "$f"; exit 0; }; done; exit 0')
@@ -73,6 +77,7 @@ def install(remote):
     if have is None: return Step('preview', 'failed', 'could not inspect ~/.local/bin/preview', retry)
     if have in (_tool_sha(), 'link ' + _tool_sha()): return Step('preview', 'ok', 'preview tool present')
     if have == 'broken': return Step('preview', 'failed', '~/.local/bin/preview is a broken symlink', rename)
+    if have == 'notfile': return Step('preview', 'failed', 'not a regular file', rename)
     if have in KNOWN_PREVIOUS:
         done = remote.call(['sh', '-c', _UPDATE_SCRIPT, 'update', TARGET, *_accepted()], stdin=TOOL.read_bytes())
         if done.returncode == 3: return Step('preview', 'failed', '~/.local/bin/preview changed while updating it', rename)
