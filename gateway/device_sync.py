@@ -126,7 +126,7 @@ def send_account(name, out=None):
     out.write(path.read_bytes()); out.flush()
 
 
-def receive_account(name, data):
+def receive_account(name, data, journal=None):
     path = replica(name)
     if not isinstance(data, bytes) or len(data) > LIMIT: raise ValueError('Account file is larger than 128 KiB')
     try: value = json.loads(data)
@@ -153,7 +153,11 @@ def receive_account(name, data):
         try:
             config, binary, paths, env = accounts_cli.local_context()
             accounts_cli.reserve(config, binary, paths, env, name, row['reserveAt'], registry_path=False)
-        except Exception as error: return 'installed (reserve not applied: ' + type(error).__name__ + ')'
+        except Exception:
+            # The install stands; the failure is recorded for diagnostics, never in the return value.
+            if journal is not None:
+                try: journal.record('reserve_not_applied', account=name)
+                except Exception: pass
     return 'installed'
 
 

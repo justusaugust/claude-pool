@@ -11,6 +11,7 @@ from unittest.mock import Mock, call, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'gateway'))
 import device_sync
+import diagnostics
 import long_lived
 import registry
 import settings
@@ -102,8 +103,11 @@ class DeviceSyncTests(unittest.TestCase):
         self.devices(MAC, VPS, accounts=[{**ROW, 'reserveAt': 85}])
         shunt = self.here / 'bin/shunt'
         shunt.write_text('#!' + sys.executable + '\nimport sys\nsys.exit(1 if "max_utilization" in open(sys.argv[2]).read() else 0 if "check" in sys.argv else 3)\n')
-        result = device_sync.receive_account('team', self.blob())
-        self.assertTrue(result.startswith('installed (reserve not applied'))
+        journal = Mock()
+        result = device_sync.receive_account('team', self.blob(), journal=journal)
+        self.assertEqual(result, 'installed')
+        journal.record.assert_called_once_with('reserve_not_applied', account='team')
+        self.assertIn('reserve_not_applied', diagnostics.CODES)
         self.assertIn('team', self.config_names())
         self.assertNotIn('max_utilization', self.runtime_toml.read_text())
 
