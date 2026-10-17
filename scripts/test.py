@@ -9,6 +9,19 @@ import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
+# Real tools a test must never reach; each stub prints nothing and exits 97.
+STUBBED_TOOLS = ['herdr', 'claude', 'claude-native', 'claude-pool', 'launchctl', 'systemctl', 'loginctl',
+                 'gh', 'avd', 'preview', 'tailscale', 'cua']
+
+
+def fake_bin(home):
+    """A directory of stubs that shadow real tools for the whole run."""
+    folder = home / 'fake-bin'
+    folder.mkdir()
+    for name in STUBBED_TOOLS:
+        stub = folder / name
+        stub.write_text('#!/bin/sh\nexit 97\n'); stub.chmod(0o755)
+    return folder
 
 
 def main():
@@ -23,7 +36,8 @@ def main():
         config = home / 'config.json'
         config.write_text(json.dumps({'native_claude': str(native), 'state_dir': str(home / 'state'),
                                      'credential_dir': str(home / 'credentials')}))
-        env = dict(os.environ, HOME=str(home), CLAUDE_POOL_CONFIG=str(config), PYTHONDONTWRITEBYTECODE='1')
+        env = dict(os.environ, HOME=str(home), CLAUDE_POOL_CONFIG=str(config), PYTHONDONTWRITEBYTECODE='1',
+                   PATH=f'{fake_bin(home)}:/usr/bin:/bin')
         ran = False
         for suite in ['gateway', 'tests']:
             code = subprocess.run([sys.executable, '-m', 'unittest', 'discover', '-s', suite, '-p', 'test_*.py', *patterns],

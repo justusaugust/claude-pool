@@ -159,6 +159,7 @@ class UpdateTests(unittest.TestCase):
         git=tools/'git'
         git.write_text('#!'+sys.executable+'\nimport os,shutil,sys\nshutil.copytree(os.environ["POOL_FIXTURE_SOURCE"],sys.argv[-1])\n')
         git.chmod(0o755)
+        (tools/'python3').symlink_to(sys.executable)  # the run's PATH holds only system tools
         app=self.root/'fresh app';binaries=self.root/'fresh bin';config=self.root/'fresh config.json'
         env=self.env|{'POOL_FIXTURE_SOURCE':str(self.source),'PATH':str(tools)+os.pathsep+os.environ['PATH']}
         command=['sh',str(self.source/'install.sh'),'--prefix',str(app),'--bin-dir',str(binaries),'--config',str(config),'--native-claude',str(self.native)]
