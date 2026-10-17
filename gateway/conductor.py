@@ -217,7 +217,7 @@ def definition(root, cwd):
     return {'Label': LABEL, 'ProgramArguments': [service.python(), str(Path(root) / 'run.py'), 'device', 'conductor', 'serve'],
             'RunAtLoad': True, 'KeepAlive': {'SuccessfulExit': False}, 'ThrottleInterval': 10, 'ExitTimeOut': 30,
             'WorkingDirectory': str(cwd), 'EnvironmentVariables': {'CLAUDE_POOL_CONFIG': str(settings.CONFIG), 'PATH': unit_path()},
-            'StandardOutPath': '/dev/null', 'StandardErrorPath': '/dev/null', 'WaitForNetwork': True}
+            'StandardOutPath': '/dev/null', 'StandardErrorPath': '/dev/null'}
 
 
 def _run(argv, timeout=30):
@@ -387,6 +387,9 @@ def check(statuses, value):
     device = entry['device']
     parts = {name: (s.get('conductor') or {}) for name, s in statuses.items() if isinstance(s, dict)}
     running = sorted(name for name, part in parts.items() if part.get('running'))
+    broken = sorted(name for name, part in parts.items() if part.get('error'))
+    if broken:
+        return Step(STEP, 'failed', '; '.join('status error on ' + name + ': ' + str(parts[name]['error']) for name in broken), None)
     extra = {name: part.get('duplicates') for name, part in parts.items() if part.get('duplicates')}
     if extra: return Step(STEP, 'failed', 'another Conductor runs on ' + ', '.join(sorted(extra)), HERDR_FIX)
     if len(running) > 1:

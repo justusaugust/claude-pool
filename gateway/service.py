@@ -18,7 +18,6 @@ DEFAULTS = {'RunAtLoad': True, 'KeepAlive': {'SuccessfulExit': False}, 'Throttle
             'StandardOutPath': '/dev/null', 'StandardErrorPath': '/dev/null'}
 DESCRIPTION = 'Claude Pool background service '
 DEFAULT_LABEL = 'io.github.claude-pool'
-LINUX_ONLY = {'WaitForNetwork'}  # True: the unit starts after network-online.target; launchd has no equivalent key
 
 
 def receipt(app_root):
@@ -96,10 +95,9 @@ def words(line, exec=False):
 
 
 def render(definition):
-    if platform() == 'darwin': return plistlib.dumps({k: v for k, v in definition.items() if k not in LINUX_ONLY})
-    lines = ['[Unit]', 'Description=' + DESCRIPTION + quote(definition['Label'])]
-    if definition.get('WaitForNetwork'): lines += ['After=network-online.target', 'Wants=network-online.target']
-    lines += ['', '[Service]', 'Type=simple', 'ExecStart=' + ' '.join(exec_quote(a) for a in definition['ProgramArguments'])]
+    if platform() == 'darwin': return plistlib.dumps(definition)
+    lines = ['[Unit]', 'Description=' + DESCRIPTION + quote(definition['Label']), '',
+             '[Service]', 'Type=simple', 'ExecStart=' + ' '.join(exec_quote(a) for a in definition['ProgramArguments'])]
     if 'WorkingDirectory' in definition: lines.append('WorkingDirectory=' + directory(definition['WorkingDirectory']))
     for key, value in definition.get('EnvironmentVariables', {}).items(): lines.append('Environment=' + quote(key + '=' + value))
     if definition.get('KeepAlive') == {'SuccessfulExit': False}: lines.append('Restart=on-failure')
@@ -122,7 +120,6 @@ def load(data):
         key, value = key.strip(), value.strip()
         if section == '[Unit]' and key == 'Description' and value.startswith(DESCRIPTION):
             definition['Label'] = ' '.join(words(value[len(DESCRIPTION):]))
-        elif section == '[Unit]' and key == 'After' and value == 'network-online.target': definition['WaitForNetwork'] = True
         elif section == '[Service]':
             if key == 'ExecStart': definition['ProgramArguments'] = words(value, exec=True)
             elif key == 'WorkingDirectory': definition['WorkingDirectory'] = value.replace('%%', '%')

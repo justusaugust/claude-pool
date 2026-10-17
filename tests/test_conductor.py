@@ -230,16 +230,11 @@ class DefinitionTests(unittest.TestCase):
         with mock.patch.object(service, 'platform', return_value='linux'):
             unit = service.render(d).decode()
         self.assertIn('WantedBy=default.target', unit); self.assertIn('Restart=on-failure', unit)
-        self.assertIn('After=network-online.target\nWants=network-online.target', unit)
+        # A user unit cannot order against network-online.target; the reattach rule and backoff cover slow networks.
+        self.assertNotIn('network-online', unit); self.assertNotIn('WaitForNetwork', d)
         self.assertIn('PATH=' + path, unit)
         with mock.patch.object(service, 'platform', return_value='linux'):
             self.assertEqual(service.load(service.render(d)), d)
-            pool = {key: value for key, value in d.items() if key != 'WaitForNetwork'}
-            self.assertNotIn('network-online', service.render(pool).decode())
-            self.assertEqual(service.render(pool), service.render({**pool}))
-        with mock.patch.object(service, 'platform', return_value='darwin'):
-            plist = service.render(d)
-            self.assertNotIn(b'WaitForNetwork', plist); self.assertEqual(service.render(pool), plist)
 
     def test_install_helpers_are_shared_with_the_pool_service(self):
         import launch
@@ -441,6 +436,14 @@ class CheckTests(unittest.TestCase):
         self.assertEqual(conductor.check({'personal-vps': fresh}, value).status, 'manual')
         self.assertEqual(conductor.check({'mac': IDLE}, value).status, 'unreachable')
         self.assertEqual(conductor.check({}, {**value, 'conductor': None}).status, 'skipped')
+
+    def test_check_reports_a_status_error_instead_of_not_running(self):
+        value = value_with()
+        broken = {**RUNNING, 'conductor': {'error': 'RuntimeError'}}
+        step = conductor.check({'personal-vps': broken}, value)
+        self.assertEqual(step.status, 'failed')
+        self.assertEqual(step.detail, 'status error on personal-vps: RuntimeError')
+        self.assertNotIn('not running', step.detail)
 
 
 class ContextTests(unittest.TestCase):
