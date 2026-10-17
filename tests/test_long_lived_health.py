@@ -79,19 +79,59 @@ class HealthTests(unittest.TestCase):
         refreshable_file(self.stores, 'own', 'user-o', 'org-o')
         self.assertEqual(long_lived.health(self.stores, self.directory, registry.EMPTY(), NOW, 'mac'), [])
 
-    def test_doctor_prints_findings_and_exits_nonzero_on_fail(self):
-        long_lived_file(self.directory, 'team', expires_ms=NOW + 3 * DAY)
+    def run_doctor(self):
         diagnostics = json.dumps({'health': {'supervisor': 's', 'backend': 'up', 'activeRequests': 0, 'requestLimit': 4, 'storageError': False}, 'incidents': []})
-        out = io.StringIO()
+        out = io.StringIO(); code = None
         with patch.object(launch, 'STORES', self.stores), patch.object(launch, 'LONG_LIVED', self.directory), \
              patch.object(launch.time, 'time', lambda: NOW / 1000), patch.object(launch, 'request', return_value=diagnostics), \
              patch.object(launch, 'ensure_pool'), patch.object(launch, 'token', return_value='fixture-client'), \
              patch.object(launch, 'RUNTIME', self.root / 'runtime'), patch.object(launch, 'NATIVE_CLAUDE', sys.executable), \
              patch.object(settings, 'REGISTRY', self.root / 'devices.json'), patch.object(settings, 'SELF', self.root / 'device.json'), \
              patch.object(launch.sys, 'argv', ['claude-pool', 'doctor']), contextlib.redirect_stdout(out):
-            with self.assertRaises(SystemExit) as result: launch.main()
-        self.assertEqual(result.exception.code, 1)
-        self.assertRegex(out.getvalue(), r'  fail team: expires in 3 days · fix: claude-pool account add .* --long-lived --name team')
+            try: launch.main()
+            except SystemExit as exit: code = exit.code
+        return code, out.getvalue()
+
+    def test_doctor_prints_findings_and_exits_nonzero_on_fail(self):
+        long_lived_file(self.directory, 'team', expires_ms=NOW + 3 * DAY)
+        code, text = self.run_doctor()
+        self.assertEqual(code, 1)
+        self.assertRegex(text, r'  fail team: expires in 3 days · fix: claude-pool account add .* --long-lived --name team')
+
+    def test_doctor_without_long_lived_tokens_prints_nothing_extra_and_keeps_its_exit(self):
+        refreshable_file(self.stores, 'own', 'user-o', 'org-o')
+        code, text = self.run_doctor()
+        self.assertIsNone(code); self.assertNotIn('long-lived', text)
+
+    def test_doctor_healthy_prints_the_summary_line(self):
+        long_lived_file(self.directory, 'team', expires_ms=NOW + 200 * DAY)
+        long_lived_file(self.directory, 'other', expires_ms=NOW + 200 * DAY)
+        code, text = self.run_doctor()
+        self.assertIsNone(code); self.assertIn('  ok long-lived tokens: 2 checked\n', text)
+
+    def test_store_files_with_wrong_mode_or_symlink_fail_whatever_their_kind(self):
+        a = long_lived_file(self.stores, 'll', expires_ms=NOW + 200 * DAY); a.chmod(0o640)
+        b = refreshable_file(self.stores, 'rf', 'user-r', 'org-r'); b.chmod(0o640)
+        real = long_lived_file(self.root / 'elsewhere', 'real', expires_ms=NOW + 200 * DAY)
+        (self.stores / 'link.json').symlink_to(real)
+        found = {f['account']: f for f in long_lived.health(self.stores, self.directory, registry.EMPTY(), NOW, 'mac')}
+        for name, path in (('ll', a), ('rf', b)):
+            self.assertEqual((found[name]['level'], found[name]['message'], found[name]['fix']), ('fail', 'store file mode 640', 'chmod 600 ' + str(path)))
+        self.assertEqual((found['link']['level'], found['link']['message']), ('fail', 'store file is a symlink'))
+        self.assertEqual(found['link']['fix'], 'replace ' + str(self.stores / 'link.json') + ' with the real file')
+
+    def test_a_symlinked_replica_fails(self):
+        real = long_lived_file(self.root / 'elsewhere', 'team', expires_ms=NOW + 200 * DAY)
+        (self.directory / 'team.json').symlink_to(real)
+        found = long_lived.health(self.stores, self.directory, registry.EMPTY(), NOW, 'mac')
+        self.assertEqual([f['level'] for f in found], ['fail']); self.assertIn('symlink', found[0]['message'])
+
+    def test_a_refreshable_file_in_the_long_lived_folder_warns_without_content(self):
+        path = refreshable_file(self.directory, 'team', 'user-a', 'team-a')
+        found = long_lived.health(self.stores, self.directory, registry.EMPTY(), NOW, 'mac')
+        self.assertEqual([(f['level'], f['message'], f['fix']) for f in found],
+                         [('warn', 'not a long-lived token', 'move ' + str(path) + ' out of ' + str(self.directory))])
+        SecretWatch(fixture_token('r')).text(json.dumps(found))
 
 
 if __name__ == '__main__': unittest.main()

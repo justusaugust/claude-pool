@@ -112,10 +112,18 @@ def health(stores, directory, value, now_ms, self_name):
         findings.append(_finding('fail', 'long-lived folder', 'folder ' + problem, 'chmod 700 ' + str(directory)))
     pending = set(switch_pending(stores, directory, value, self_name))
     replicas = {p.stem: p for p in directory.glob('*.json') if not p.stem.startswith('.')} if directory.is_dir() else {}
-    held = {}
+    held, bad = {}, []
     if stores.is_dir():
-        for path in stores.glob('*.json'):
-            if not path.stem.startswith('.') and _kind_of(path) == 'long-lived': held[path.stem] = path
+        for path in sorted(stores.glob('*.json')):
+            if path.stem.startswith('.') or (path.is_dir() and not path.is_symlink()): continue
+            if path.is_symlink():
+                bad.append(_finding('fail', path.stem, 'store file is a symlink', 'replace ' + str(path) + ' with the real file')); continue
+            try: octal = format(path.lstat().st_mode & 0o777, 'o')
+            except OSError: continue
+            if octal != '600':
+                bad.append(_finding('fail', path.stem, 'store file mode ' + octal, 'chmod 600 ' + str(path))); continue
+            if _kind_of(path) == 'long-lived': held[path.stem] = path
+    findings.extend(bad)
     for name in sorted(set(replicas) | set(held)):
         mine = []
         values = {}
@@ -125,8 +133,15 @@ def health(stores, directory, value, now_ms, self_name):
             if problem:
                 mine.append(_finding('fail', name, label + ' file ' + problem, 'chmod 600 ' + str(path)))
                 continue
-            try: values[label] = read_private(path)
-            except (OSError, ValueError, RuntimeError): mine.append(_finding('fail', name, 'unreadable', None))
+            try: loaded = read_private(path)
+            except (OSError, ValueError, RuntimeError):
+                mine.append(_finding('fail', name, 'unreadable', None)); continue
+            if label == 'replica':
+                try: ours = kind(loaded) == 'long-lived'
+                except RuntimeError: ours = False
+                if not ours:
+                    mine.append(_finding('warn', name, 'not a long-lived token', 'move ' + str(path) + ' out of ' + str(directory))); continue
+            values[label] = loaded
         served = values.get('store') or values.get('replica')
         row = registry.account(value, name) or {}
         fix = 'claude-pool account add ' + (row.get('email') or '<email>') + ' --long-lived --name ' + name + ', then claude-pool device sync'
