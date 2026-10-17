@@ -60,7 +60,7 @@ def source_archive(root):
     with gzip.GzipFile(filename='', mode='wb', fileobj=raw, mtime=0) as compressed, tarfile.open(fileobj=compressed, mode='w') as archive:
         for name, data in sorted(files.items()):
             info = tarfile.TarInfo('claude-pool/' + name)
-            info.size = len(data); info.mode = 0o644
+            info.size = len(data); info.mode = 0o755 if name == 'gateway/preview' else 0o644
             archive.addfile(info, io.BytesIO(data))
     return raw.getvalue()
 

@@ -18,7 +18,7 @@ def source_files(root):
             if not path.is_file() or path.is_symlink(): continue
             name = path.relative_to(root).as_posix()
             if '__pycache__' in path.parts or '/.claude-plugin/types/' in name or name.startswith('gateway/bin/'): continue
-            if path.suffix in {'.py', '.ts', '.tsx', '.js', '.css', '.html', '.json', '.md', '.patch'} or path.name.startswith('LICENSE-'):
+            if name == 'gateway/preview' or path.suffix in {'.py', '.ts', '.tsx', '.js', '.css', '.html', '.json', '.md', '.patch'} or path.name.startswith('LICENSE-'):
                 names.add(name)
     return sorted(names)
 
@@ -29,7 +29,7 @@ def package(root, output):
     with output.open('wb') as raw, gzip.GzipFile(filename='', mode='wb', fileobj=raw, mtime=0) as compressed, tarfile.open(fileobj=compressed, mode='w') as archive:
         for name, data in sorted(files.items()):
             info = tarfile.TarInfo('claude-pool/' + name)
-            info.size = len(data); info.mode = 0o644
+            info.size = len(data); info.mode = 0o755 if name == 'gateway/preview' else 0o644
             archive.addfile(info, io.BytesIO(data))
     print(str(output) + ' · ' + str(len(files)) + ' files · source only')
 

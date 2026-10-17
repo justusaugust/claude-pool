@@ -1,0 +1,893 @@
+#!/usr/bin/env python3
+"""preview: open a web server that runs on this VPS's localhost from any device on the tailnet.
+
+Single file, Python 3 standard library only. See `preview --help`.
+Tests: preview_test.py next to this file (python3 -m unittest from that directory).
+"""
+
+import argparse
+import asyncio
+import ipaddress
+import json
+import os
+import re
+import signal
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+VERSION = "1.0"
+FALLBACK_TS_IP = "100.108.161.69"
+FALLBACK_TS_NAME = "personal-vps.tail69b084.ts.net"
+UNIT_PREFIX = "preview-"
+RESERVED_PORTS = {22, 80, 443}
+TAILNET_NETS = (ipaddress.ip_network("100.64.0.0/10"), ipaddress.ip_network("fd7a:115c:a1e0::/48"))
+EXIT_CONFIG = 78  # systemd does not restart on this exit status (RestartPreventExitStatus)
+
+HELP = """\
+Open a web server that runs on this VPS (localhost) on Justus' Mac and iPhone with one link.
+
+WHEN TO USE
+  Every time you start or change a web frontend or any HTTP server a human should look at
+  (Vite, Next.js, Astro, php -S, python -m http.server, Storybook, ...). Give Justus the
+  printed link instead of screenshots. The link only works on devices in the Tailscale tailnet.
+
+HOW
+  1. Start the dev server bound to 127.0.0.1 (never 0.0.0.0; that would expose it publicly):
+       npm run dev -- --host 127.0.0.1 --port 5173
+       php -S 127.0.0.1:8000 router.php
+       python3 -m http.server 8080 --bind 127.0.0.1
+  2. preview 5173 --name "landing page"
+     It prints one line with the link, plus a short note. Send that link to Justus.
+  3. When the work is done: preview stop 5173
+
+COMMANDS
+  preview <port> [--name LABEL]   expose 127.0.0.1:<port> to the tailnet and print the link.
+                                  Safe to run again (same link; also upgrades HTTP to HTTPS
+                                  once Tailscale Serve is allowed). Works before the server is up.
+  preview list [--json]           open previews: port, label, link, backend, target listening?
+  preview stop <port>             stop one preview (the dev server itself keeps running)
+  preview stop --all              stop every preview created by this tool (nothing else)
+  preview doctor                  which backend is available and how to enable HTTPS
+
+BACKENDS (chosen automatically)
+  https  Tailscale Serve: https://<vps>.<tailnet>.ts.net:<port>, needs the operator setting.
+  http   Fallback when Serve is not allowed: proxy bound only to the VPS tailnet IP,
+         http://<vps>.<tailnet>.ts.net:<port>. The VPS firewall may block tailnet ports for this
+         backend (preview doctor shows which ports pass); https works on any port.
+  Both run a small proxy (systemd --user unit preview-<port>) that rewrites Host, Origin and
+  Referer to localhost:<port>, so Vite allowedHosts, Next.js dev origin checks and similar
+  host checks pass. WebSockets (hot reload) and streaming responses pass through. Absolute
+  redirects to localhost:<port> are rewritten to the preview link. The proxy never listens
+  on 0.0.0.0 or a public address. If nothing listens on the port yet, the page says so and
+  reloads itself every few seconds. Ports 22, 80 and 443 are refused (system services).
+  Tests: python3 -m unittest preview_test (in ~/.local/bin).
+"""
+
+
+# ---------------------------------------------------------------------------
+# Bind-address guarantee
+# ---------------------------------------------------------------------------
+
+class UnsafeListenAddress(ValueError):
+    pass
+
+
+def check_listen_host(host):
+    """Allow only loopback or a Tailscale address. Never 0.0.0.0, ::, a hostname or a public IP."""
+    try:
+        ip = ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        raise UnsafeListenAddress(f"refusing to listen on {host!r}: not a literal IP address")
+    if ip.is_unspecified:
+        raise UnsafeListenAddress(f"refusing to listen on {host}: that is every interface, including the public one")
+    if ip.is_loopback or any(ip in net for net in TAILNET_NETS):
+        return str(ip)
+    raise UnsafeListenAddress(f"refusing to listen on {host}: only 127.0.0.1 or the Tailscale IP are allowed")
+
+
+def parse_hostport(value):
+    m = re.fullmatch(r"\[?([0-9a-fA-F:.]+)\]?:(\d+)", value)
+    if not m:
+        raise ValueError(f"expected HOST:PORT, got {value!r}")
+    return m.group(1), int(m.group(2))
+
+
+def check_port(value):
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"not a port number: {value!r}")
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError(f"port out of range (1-65535): {port}")
+    if port in RESERVED_PORTS:
+        raise argparse.ArgumentTypeError(f"port {port} is used by system services on this VPS; pick another port")
+    return port
+
+
+# ---------------------------------------------------------------------------
+# The proxy (runs inside the systemd --user unit via `preview _serve`)
+# ---------------------------------------------------------------------------
+
+class ProtocolError(Exception):
+    pass
+
+
+async def read_head(reader):
+    """Read one HTTP header block. Returns bytes (without the final CRLFCRLF) or None at clean EOF."""
+    while True:
+        try:
+            data = await reader.readuntil(b"\r\n\r\n")
+        except asyncio.IncompleteReadError as e:
+            if e.partial.strip():
+                raise ProtocolError("connection closed inside a header block")
+            return None
+        except asyncio.LimitOverrunError:
+            raise ProtocolError("header block too large")
+        data = data.lstrip(b"\r\n")
+        if data:
+            return data[:-4] if data.endswith(b"\r\n\r\n") else data
+
+
+def split_head(head):
+    lines = head.split(b"\r\n")
+    headers = []
+    for line in lines[1:]:
+        if not line:
+            continue
+        name, sep, value = line.partition(b":")
+        if not sep:
+            raise ProtocolError("malformed header line")
+        headers.append((name.strip(), value.strip()))
+    return lines[0], headers
+
+
+def join_head(start, headers):
+    return start + b"\r\n" + b"".join(n + b": " + v + b"\r\n" for n, v in headers) + b"\r\n"
+
+
+def _hname(name):
+    return (name.encode("latin-1") if isinstance(name, str) else name).lower()
+
+
+def header(headers, name):
+    name = _hname(name)
+    for n, v in headers:
+        if n.lower() == name:
+            return v
+    return None
+
+
+def header_tokens(headers, name):
+    out = set()
+    name = _hname(name)
+    for n, v in headers:
+        if n.lower() == name:
+            out.update(t.strip().lower() for t in v.split(b","))
+    return out
+
+
+def rewrite_request(headers, target_host, peer_ip=None):
+    """Make the request look like it was made on localhost:<port> itself."""
+    orig_host = header(headers, "host")
+    out = []
+    saw_xff = False
+    for n, v in headers:
+        ln = n.lower()
+        if ln == b"host":
+            v = target_host
+        elif ln in (b"origin", b"referer") and orig_host:
+            for scheme in (b"http://", b"https://"):
+                pref = scheme + orig_host
+                if v == pref or v.startswith(pref + b"/") or v.startswith(pref + b"?"):
+                    v = b"http://" + target_host + v[len(pref):]
+                    break
+        elif ln in (b"x-forwarded-host", b"x-forwarded-proto", b"x-forwarded-port", b"forwarded"):
+            continue
+        elif ln == b"x-forwarded-for":
+            saw_xff = True
+        out.append((n, v))
+    if orig_host is None:
+        out.append((b"Host", target_host))
+    if not saw_xff and peer_ip:
+        out.append((b"X-Forwarded-For", peer_ip.encode()))
+    return out
+
+
+def rewrite_response(headers, target_port, public_base):
+    if not public_base:
+        return headers
+    locals_ = [f"http://{h}:{target_port}".encode() for h in ("localhost", "127.0.0.1", "[::1]")]
+    out = []
+    for n, v in headers:
+        if n.lower() in (b"location", b"content-location"):
+            for local in locals_:
+                if v == local or v[len(local):len(local) + 1] in (b"/", b"?", b"#") and v.startswith(local):
+                    v = public_base + v[len(local):]
+                    break
+        out.append((n, v))
+    return out
+
+
+def body_length(headers):
+    """Returns ('chunked', None), ('length', n) or ('none', None)."""
+    if b"chunked" in header_tokens(headers, "transfer-encoding"):
+        return "chunked", None
+    cl = [v for n, v in headers if n.lower() == b"content-length"]
+    if cl:
+        values = {x.strip() for v in cl for x in v.split(b",")}
+        if len(values) != 1 or not next(iter(values)).isdigit():
+            raise ProtocolError("bad Content-Length")
+        return "length", int(next(iter(values)))
+    return "none", None
+
+
+async def copy_n(reader, writer, n):
+    while n > 0:
+        data = await reader.read(min(n, 65536))
+        if not data:
+            raise ProtocolError("connection closed inside a body")
+        writer.write(data)
+        await writer.drain()
+        n -= len(data)
+
+
+async def copy_chunked(reader, writer):
+    while True:
+        line = await reader.readuntil(b"\r\n")
+        writer.write(line)
+        try:
+            size = int(line.split(b";")[0].strip(), 16)
+        except ValueError:
+            raise ProtocolError("bad chunk size")
+        if size == 0:
+            while True:  # trailers, then the empty line
+                line = await reader.readuntil(b"\r\n")
+                writer.write(line)
+                if line == b"\r\n":
+                    await writer.drain()
+                    return
+        await copy_n(reader, writer, size + 2)
+
+
+async def copy_all(reader, writer):
+    while True:
+        data = await reader.read(65536)
+        if not data:
+            break
+        writer.write(data)
+        await writer.drain()
+    try:
+        if writer.can_write_eof():
+            writer.write_eof()
+    except (OSError, RuntimeError):
+        pass
+
+
+def unavailable_page(port):
+    body = (
+        "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>"
+        "<meta http-equiv=refresh content=3><title>Waiting for localhost:%d</title>"
+        "<body style='font:16px/1.5 system-ui;margin:3rem auto;max-width:34rem;padding:0 1rem'>"
+        "<h1 style='font-size:1.3rem'>Nothing is answering on localhost:%d yet</h1>"
+        "<p>The preview link works, but the dev server on the VPS is not running or still starting. "
+        "This page reloads every 3 seconds.</p>" % (port, port)
+    ).encode()
+    return (b"HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\n"
+            b"Connection: close\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+
+
+class Proxy:
+    def __init__(self, target_port, public_base=None, target_hosts=("127.0.0.1", "::1")):
+        self.target_port = target_port
+        self.target_host_header = f"localhost:{target_port}".encode()
+        self.public_base = public_base.rstrip("/").encode() if public_base else None
+        self.target_hosts = target_hosts
+
+    async def connect_upstream(self):
+        last = None
+        for host in self.target_hosts:
+            try:
+                return await asyncio.open_connection(host, self.target_port, limit=1 << 20)
+            except OSError as e:
+                last = e
+        raise last or OSError("no upstream")
+
+    async def handle(self, creader, cwriter):
+        peer = cwriter.get_extra_info("peername")
+        peer_ip = peer[0] if peer else None
+        uwriter = None
+        try:
+            head = await read_head(creader)
+            if head is None:
+                return
+            try:
+                ureader, uwriter = await self.connect_upstream()
+            except OSError:
+                cwriter.write(unavailable_page(self.target_port))
+                await cwriter.drain()
+                return
+            pending = asyncio.Queue()
+            up = asyncio.ensure_future(self.client_to_upstream(head, creader, uwriter, pending, peer_ip))
+            down = asyncio.ensure_future(self.upstream_to_client(ureader, cwriter, pending))
+            done, _ = await asyncio.wait({up, down}, return_when=asyncio.FIRST_COMPLETED)
+            if down in done:
+                up.cancel()
+            else:
+                await down
+            for t in (up, down):
+                if t.done() and not t.cancelled() and t.exception():
+                    pass
+        except (ProtocolError, OSError, asyncio.IncompleteReadError, asyncio.LimitOverrunError):
+            pass
+        finally:
+            for w in (cwriter, uwriter):
+                if w is not None:
+                    w.close()
+
+    async def client_to_upstream(self, head, creader, uwriter, pending, peer_ip):
+        try:
+            while head is not None:
+                start, headers = split_head(head)
+                method = start.split(b" ", 1)[0].upper()
+                headers = rewrite_request(headers, self.target_host_header, peer_ip)
+                upgrade = b"upgrade" in header_tokens(headers, "connection") and header(headers, "upgrade") is not None
+                pending.put_nowait(method)
+                uwriter.write(join_head(start, headers))
+                await uwriter.drain()
+                if upgrade or method == b"CONNECT":
+                    await copy_all(creader, uwriter)  # WebSocket: raw bytes both ways from here
+                    return
+                kind, n = body_length(headers)
+                if kind == "chunked":
+                    await copy_chunked(creader, uwriter)
+                elif kind == "length":
+                    await copy_n(creader, uwriter, n)
+                head = await read_head(creader)
+            if uwriter.can_write_eof():
+                uwriter.write_eof()
+        except (ProtocolError, OSError, asyncio.IncompleteReadError, asyncio.LimitOverrunError):
+            try:
+                uwriter.close()
+            except Exception:
+                pass
+
+    async def upstream_to_client(self, ureader, cwriter, pending):
+        try:
+            while True:
+                head = await read_head(ureader)
+                if head is None:
+                    return
+                start, headers = split_head(head)
+                parts = start.split(b" ", 2)
+                code = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+                if 100 <= code < 200 and code != 101:
+                    cwriter.write(join_head(start, headers))
+                    await cwriter.drain()
+                    continue
+                method = pending.get_nowait() if not pending.empty() else b"GET"
+                headers = rewrite_response(headers, self.target_port, self.public_base)
+                cwriter.write(join_head(start, headers))
+                await cwriter.drain()
+                if code == 101 or (method == b"CONNECT" and 200 <= code < 300):
+                    await copy_all(ureader, cwriter)
+                    return
+                if method == b"HEAD" or code in (204, 304):
+                    continue
+                kind, n = body_length(headers)
+                if kind == "chunked":
+                    await copy_chunked(ureader, cwriter)
+                elif kind == "length":
+                    await copy_n(ureader, cwriter, n)
+                else:  # body ends when the server closes the connection
+                    await copy_all(ureader, cwriter)
+                    return
+        except (ProtocolError, OSError, asyncio.IncompleteReadError, asyncio.LimitOverrunError):
+            return
+
+
+async def start_proxy_server(listen_host, listen_port, proxy):
+    listen_host = check_listen_host(listen_host)  # the bind-address guarantee, enforced at the socket
+    return await asyncio.start_server(proxy.handle, listen_host, listen_port, limit=1 << 20, reuse_address=True)
+
+
+def cmd_serve(args):
+    host, port = parse_hostport(args.listen)
+    try:
+        check_listen_host(host)
+    except UnsafeListenAddress as e:
+        print(f"preview: {e}", file=sys.stderr)
+        return EXIT_CONFIG
+    proxy = Proxy(args.target, args.public_url)
+
+    async def main():
+        try:
+            server = await start_proxy_server(host, port, proxy)
+        except OSError as e:
+            print(f"preview: cannot listen on {host}:{port}: {e.strerror or e}", file=sys.stderr)
+            return EXIT_CONFIG
+        stop = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, stop.set)
+        print(f"preview: {host}:{port} -> localhost:{args.target}" + (f" ({args.public_url})" if args.public_url else ""), flush=True)
+        await stop.wait()
+        server.close()
+        if hasattr(server, "close_clients"):  # Python 3.13: do not wait for idle keep-alive clients
+            server.close_clients()
+        return 0
+
+    return asyncio.run(main())
+
+
+# ---------------------------------------------------------------------------
+# System access (tailscale, systemd --user, ss). Tests replace this class.
+# ---------------------------------------------------------------------------
+
+class System:
+    def __init__(self):
+        self._ts = None
+
+    def run(self, argv, timeout=30):
+        try:
+            return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        except FileNotFoundError:
+            return subprocess.CompletedProcess(argv, 127, "", f"{argv[0]}: not found")
+        except subprocess.TimeoutExpired:
+            return subprocess.CompletedProcess(argv, 124, "", f"{argv[0]}: timed out")
+
+    def tailnet(self):
+        if self._ts is None:
+            ip, name = FALLBACK_TS_IP, FALLBACK_TS_NAME
+            r = self.run(["tailscale", "status", "--self", "--peers=false", "--json"], timeout=10)
+            if r.returncode == 0:
+                try:
+                    me = json.loads(r.stdout)["Self"]
+                    name = me.get("DNSName", "").rstrip(".") or name
+                    ip = next((a for a in me.get("TailscaleIPs", []) if "." in a), ip)
+                except (ValueError, KeyError, TypeError):
+                    pass
+            self._ts = (ip, name)
+        return self._ts
+
+    def operator_ok(self):
+        """True/False if we can tell whether this user may change Tailscale Serve, None if unknown."""
+        if os.geteuid() == 0:
+            return True
+        r = self.run(["tailscale", "debug", "prefs"], timeout=10)
+        if r.returncode != 0:
+            return None
+        try:
+            op = json.loads(r.stdout).get("OperatorUser") or ""
+        except ValueError:
+            return None
+        return op == current_user()
+
+    def serve_ports(self):
+        """Ports that have a Tailscale Serve entry (anyone's)."""
+        r = self.run(["tailscale", "serve", "status", "--json"], timeout=10)
+        if r.returncode != 0:
+            return set()
+        try:
+            return {int(p) for p in (json.loads(r.stdout or "{}").get("TCP") or {})}
+        except (ValueError, AttributeError):
+            return set()
+
+    def serve_add(self, port, internal_port):
+        r = self.run(["tailscale", "serve", "--bg", "--yes", f"--https={port}", f"http://127.0.0.1:{internal_port}"], timeout=30)
+        return r.returncode == 0, (r.stderr or r.stdout).strip()
+
+    def serve_remove(self, port):
+        r = self.run(["tailscale", "serve", f"--https={port}", "off"], timeout=30)
+        return r.returncode == 0, (r.stderr or r.stdout).strip()
+
+    def unit_state(self, unit):
+        r = self.run(["systemctl", "--user", "is-active", unit], timeout=10)
+        return (r.stdout or "").strip() or "unknown"
+
+    def unit_start(self, unit, description, argv):
+        self.run(["systemctl", "--user", "stop", unit], timeout=20)
+        self.run(["systemctl", "--user", "reset-failed", unit], timeout=10)
+        r = self.run([
+            "systemd-run", "--user", "--quiet", f"--unit={unit}", f"--description={description}",
+            "-p", "Restart=on-failure", "-p", "RestartSec=2", "-p", f"RestartPreventExitStatus={EXIT_CONFIG}",
+            "-p", "StartLimitIntervalSec=0", "--setenv=PYTHONUNBUFFERED=1", *argv,
+        ], timeout=30)
+        return r.returncode == 0, (r.stderr or r.stdout).strip()
+
+    def unit_stop(self, unit):
+        self.run(["systemctl", "--user", "stop", unit], timeout=20)
+        self.run(["systemctl", "--user", "reset-failed", unit], timeout=10)
+
+    def unit_log(self, unit, lines=5):
+        r = self.run(["journalctl", "--user", "-u", unit, "-n", str(lines), "--no-pager", "-o", "cat"], timeout=10)
+        return (r.stdout or "").strip()
+
+    def listeners(self, port):
+        """[(address, process)] of TCP listeners on a port."""
+        r = self.run(["ss", "-Hltnp", f"sport = :{port}"], timeout=10)
+        out = []
+        for line in (r.stdout or "").splitlines():
+            cols = line.split()
+            if len(cols) < 4:
+                continue
+            addr = cols[3].rsplit(":", 1)[0].strip("[]").split("%")[0]
+            m = re.search(r'users:\(\("([^"]+)"', line)
+            out.append((addr, m.group(1) if m else ""))
+        return out
+
+    def can_connect(self, host, port, timeout=0.5):
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except OSError:
+            return False
+
+    def free_local_port(self):
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+
+    def sleep(self, seconds):
+        time.sleep(seconds)
+
+    def firewall_tailnet_ports(self, path="/etc/nftables.conf"):
+        """Ports the host firewall lets in from the tailnet, or None if it does not restrict them (or is unreadable).
+
+        Tailscale Serve is not affected: tailscaled accepts those connections itself, before this firewall."""
+        try:
+            text = Path(path).read_text()
+        except OSError:
+            return None
+        if "policy drop" not in text or re.search(r'iifname "tailscale0"\s+accept', text):
+            return None
+        ports = set()
+        for m in re.finditer(r'iifname "tailscale0"[^\n]*?tcp dport (\{[^}]*\}|\d+)[^\n]*accept', text):
+            ports.update(int(x) for x in re.findall(r"\d+", m.group(1)))
+        return ports
+
+
+def current_user():
+    try:
+        import pwd
+        return pwd.getpwuid(os.geteuid()).pw_name
+    except (ImportError, KeyError):
+        return os.environ.get("USER", "")
+
+
+# ---------------------------------------------------------------------------
+# State (one JSON file per preview; only these previews are ever stopped)
+# ---------------------------------------------------------------------------
+
+def state_dir():
+    return Path(os.environ.get("PREVIEW_STATE_DIR") or Path.home() / ".local/state/preview")
+
+
+def load_state(port):
+    try:
+        return json.loads((state_dir() / f"{port}.json").read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def save_state(entry):
+    d = state_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    tmp = d / f".{entry['port']}.json.tmp"
+    tmp.write_text(json.dumps(entry, indent=2) + "\n")
+    tmp.replace(d / f"{entry['port']}.json")
+
+
+def drop_state(port):
+    try:
+        (state_dir() / f"{port}.json").unlink()
+    except FileNotFoundError:
+        pass
+
+
+def all_states():
+    d = state_dir()
+    out = []
+    for f in sorted(d.glob("*.json"), key=lambda p: int(p.stem) if p.stem.isdigit() else 0) if d.exists() else []:
+        try:
+            out.append(json.loads(f.read_text()))
+        except (OSError, ValueError):
+            pass
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+def self_path():
+    return os.path.realpath(__file__)
+
+
+def links(sysm, port):
+    _, name = sysm.tailnet()
+    return f"https://{name}:{port}", f"http://{name}:{port}"
+
+
+def target_listening(sysm, port):
+    return sysm.can_connect("127.0.0.1", port) or sysm.can_connect("::1", port)
+
+
+def wildcard_or_public(addr, ts_ip):
+    if addr in ("*", "0.0.0.0", "::"):
+        return True
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return False
+    return not (ip.is_loopback or any(ip in n for n in TAILNET_NETS) or ip.is_link_local)
+
+
+def guess_label(sysm, port):
+    for addr, proc in sysm.listeners(port):
+        if proc and addr in ("127.0.0.1", "::1"):
+            return proc
+    return f"port {port}"
+
+
+def wait_listening(sysm, host, port, seconds=4.0):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if sysm.can_connect(host, port, timeout=0.3):
+            return True
+        sysm.sleep(0.15)
+    return False
+
+
+def start_unit(sysm, entry):
+    unit = entry["unit"]
+    host, lport = parse_hostport(entry["listen"])
+    argv = ["/usr/bin/python3", "-I", self_path(), "_serve", "--listen", entry["listen"],
+            "--target", str(entry["port"]), "--public-url", entry["link"]]
+    ok, err = sysm.unit_start(unit, f"preview {entry['port']}: {entry['label']}", argv)
+    if not ok:
+        return False, err or "systemd-run failed"
+    if not wait_listening(sysm, host, lport):
+        log = sysm.unit_log(unit)
+        sysm.unit_stop(unit)
+        return False, log or f"proxy did not start listening on {entry['listen']}"
+    return True, ""
+
+
+def entry_healthy(sysm, entry):
+    if sysm.unit_state(entry["unit"]) != "active":
+        return False
+    host, lport = parse_hostport(entry["listen"])
+    if not sysm.can_connect(host, lport, timeout=0.5):
+        return False
+    if entry["backend"] == "https" and entry["port"] not in sysm.serve_ports():
+        return False
+    return True
+
+
+def note_for(entry, listening, sysm=None):
+    port = entry["port"]
+    parts = []
+    if entry["backend"] == "https":
+        parts.append(f"HTTPS via Tailscale Serve to localhost:{port}, tailnet devices only.")
+    else:
+        parts.append(f"HTTP to localhost:{port}, tailnet devices only. HTTP until Tailscale Serve is enabled (preview doctor).")
+        allowed = sysm.firewall_tailnet_ports() if sysm else None
+        if allowed is not None and port not in allowed:
+            parts.append(f"Warning: the VPS firewall only lets tailnet traffic reach ports {', '.join(map(str, sorted(allowed))) or 'none'}, "
+                         f"so this HTTP link will not load. Fix: enable Tailscale Serve (preview doctor), then run preview {port} again.")
+    if not listening:
+        parts.append(f"Nothing listens on localhost:{port} yet; the page waits for it.")
+    parts.append(f"Stop: preview stop {port}")
+    return "  " + " ".join(parts)
+
+
+def cmd_start(sysm, port, label=None, out=None, err=None):
+    out, err = out or sys.stdout, err or sys.stderr
+    ts_ip, _ = sysm.tailnet()
+    https_link, http_link = links(sysm, port)
+    existing = load_state(port)
+
+    exposed = [a for a, _ in sysm.listeners(port) if wildcard_or_public(a, ts_ip)]
+    if exposed:
+        print(f"preview: something on this VPS already listens on {exposed[0]}:{port}, which includes the public "
+              f"internet. Restart the dev server bound to 127.0.0.1 (for example --host 127.0.0.1), then run "
+              f"preview {port} again.", file=err)
+        return 1
+    others_serve = sysm.serve_ports() - ({port} if existing and existing.get("backend") == "https" else set())
+    if port in others_serve:
+        print(f"preview: Tailscale Serve already uses port {port} for something else; pick another port.", file=err)
+        return 1
+
+    label = label or (existing or {}).get("label") or guess_label(sysm, port)
+    operator = sysm.operator_ok()
+    forced = os.environ.get("PREVIEW_BACKEND", "")
+
+    if existing and entry_healthy(sysm, existing):
+        upgrade = existing["backend"] == "http" and operator is True and forced != "http"
+        if not upgrade:
+            if label != existing.get("label"):
+                existing["label"] = label
+                save_state(existing)
+            print(existing["link"], file=out)
+            print(note_for(existing, target_listening(sysm, port), sysm), file=err)
+            return 0
+    if existing:
+        stop_entry(sysm, existing, quiet=True)
+
+    entry = None
+    serve_error = ""
+    if forced != "http" and (operator is not False or forced == "https"):
+        internal = sysm.free_local_port()
+        ok, serve_error = sysm.serve_add(port, internal)
+        if ok:
+            entry = {"port": port, "label": label, "backend": "https", "link": https_link,
+                     "listen": f"127.0.0.1:{internal}", "unit": f"{UNIT_PREFIX}{port}", "created": int(time.time())}
+            started, msg = start_unit(sysm, entry)
+            if not started:
+                sysm.serve_remove(port)
+                print(f"preview: could not start the proxy for port {port}: {msg}", file=err)
+                return 1
+    if entry is None:
+        if forced == "https":
+            print(f"preview: Tailscale Serve is not available: {serve_error or 'not permitted'}", file=err)
+            return 1
+        entry = {"port": port, "label": label, "backend": "http", "link": http_link,
+                 "listen": f"{ts_ip}:{port}", "unit": f"{UNIT_PREFIX}{port}", "created": int(time.time())}
+        started, msg = start_unit(sysm, entry)
+        if not started:
+            print(f"preview: could not start the proxy for port {port}: {msg}", file=err)
+            return 1
+    save_state(entry)
+    print(entry["link"], file=out)
+    print(note_for(entry, target_listening(sysm, port), sysm), file=err)
+    return 0
+
+
+def stop_entry(sysm, entry, quiet=False):
+    sysm.unit_stop(entry["unit"])
+    if entry.get("backend") == "https":
+        sysm.serve_remove(entry["port"])
+    drop_state(entry["port"])
+
+
+def cmd_stop(sysm, port=None, all_=False, out=None, err=None):
+    out, err = out or sys.stdout, err or sys.stderr
+    if all_:
+        entries = all_states()
+        for e in entries:
+            stop_entry(sysm, e)
+            print(f"stopped {e['port']} ({e['label']})", file=out)
+        if not entries:
+            print("no previews running", file=out)
+        return 0
+    entry = load_state(port)
+    if not entry:
+        print(f"preview: no preview on port {port} (see preview list)", file=err)
+        return 1
+    stop_entry(sysm, entry)
+    print(f"stopped {port} ({entry['label']})", file=out)
+    return 0
+
+
+def cmd_list(sysm, as_json=False, out=None):
+    out = out or sys.stdout
+    rows = []
+    for e in all_states():
+        rows.append({**e, "target_listening": target_listening(sysm, e["port"]),
+                     "proxy": sysm.unit_state(e["unit"])})
+    if as_json:
+        print(json.dumps(rows, indent=2), file=out)
+        return 0
+    if not rows:
+        print("no previews running (start one with: preview <port>)", file=out)
+        return 0
+    table = [("PORT", "LABEL", "BACKEND", "TARGET", "PROXY", "LINK")]
+    for r in rows:
+        table.append((str(r["port"]), r["label"], r["backend"], "listening" if r["target_listening"] else "not listening",
+                      r["proxy"], r["link"]))
+    widths = [max(len(row[i]) for row in table) for i in range(len(table[0]))]
+    for row in table:
+        print("  ".join(c.ljust(w) for c, w in zip(row, widths)).rstrip(), file=out)
+    return 0
+
+
+def cmd_doctor(sysm, out=None):
+    out = out or sys.stdout
+    ts_ip, name = sysm.tailnet()
+    operator = sysm.operator_ok()
+    user = current_user()
+    print(f"tailnet name   {name}", file=out)
+    print(f"tailnet IP     {ts_ip}", file=out)
+    if operator is True:
+        print("backend        https (Tailscale Serve is allowed for this user)", file=out)
+        print(f"links look like https://{name}:<port>", file=out)
+        stale = [e["port"] for e in all_states() if e.get("backend") == "http"]
+        if stale:
+            print(f"upgrade        these previews are still HTTP; run preview <port> again: {', '.join(map(str, stale))}", file=out)
+    else:
+        why = "not allowed for this user" if operator is False else "could not check"
+        print(f"backend        http (Tailscale Serve {why}; links look like http://{name}:<port>)", file=out)
+        print("enable HTTPS   run once on the VPS as an admin (needs sudo):", file=out)
+        print(f"                 sudo tailscale set --operator={user}", file=out)
+        print("               then run preview <port> again for each open preview; it switches to https://", file=out)
+    allowed = sysm.firewall_tailnet_ports()
+    if allowed is not None:
+        print(f"firewall       tailnet traffic to the VPS itself is limited to ports {', '.join(map(str, sorted(allowed)))};", file=out)
+        print("               the HTTP backend only works on those ports, HTTPS via Tailscale Serve works on any port", file=out)
+    r = sysm.run(["systemctl", "--user", "is-system-running"], timeout=10)
+    print(f"systemd --user {(r.stdout or r.stderr).strip() or 'unknown'}", file=out)
+    linger = sysm.run(["loginctl", "show-user", user, "-p", "Linger", "--value"], timeout=10).stdout.strip()
+    print(f"linger         {linger or 'unknown'} (yes = previews keep running after logout)", file=out)
+    print(f"previews       {len(all_states())} open (preview list)", file=out)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="preview", description=HELP, formatter_class=argparse.RawDescriptionHelpFormatter,
+                                usage="preview <port> [--name LABEL] | list [--json] | stop <port>|--all | doctor")
+    p.add_argument("--version", action="version", version=f"preview {VERSION}")
+    return p
+
+
+def parse(argv):
+    """Small hand-rolled dispatcher so `preview 5173` works without a subcommand word."""
+    parser = build_parser()
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        parser.print_help()
+        raise SystemExit(0)
+    if argv[0] == "--version":
+        parser.parse_args(argv)
+    cmd = argv[0]
+    if cmd == "list":
+        sp = argparse.ArgumentParser(prog="preview list")
+        sp.add_argument("--json", action="store_true")
+        a = sp.parse_args(argv[1:])
+        return "list", a
+    if cmd == "stop":
+        sp = argparse.ArgumentParser(prog="preview stop", usage="preview stop <port> | preview stop --all")
+        sp.add_argument("port", nargs="?", type=check_port)
+        sp.add_argument("--all", action="store_true", help="stop every preview created by this tool")
+        a = sp.parse_args(argv[1:])
+        if bool(a.port) == bool(a.all):
+            sp.error("give exactly one of <port> or --all")
+        return "stop", a
+    if cmd == "doctor":
+        argparse.ArgumentParser(prog="preview doctor").parse_args(argv[1:])
+        return "doctor", None
+    if cmd == "_serve":
+        sp = argparse.ArgumentParser(prog="preview _serve")
+        sp.add_argument("--listen", required=True)
+        sp.add_argument("--target", required=True, type=int)
+        sp.add_argument("--public-url")
+        return "_serve", sp.parse_args(argv[1:])
+    if cmd == "start":
+        argv = argv[1:]
+    sp = argparse.ArgumentParser(prog="preview", usage="preview <port> [--name LABEL]")
+    sp.add_argument("port", type=check_port)
+    sp.add_argument("--name", "--label", dest="name", help="short label shown in preview list")
+    return "start", sp.parse_args(argv)
+
+
+def main(argv=None, sysm=None):
+    cmd, a = parse(sys.argv[1:] if argv is None else argv)
+    if cmd == "_serve":
+        return cmd_serve(a)
+    sysm = sysm or System()
+    if cmd == "list":
+        return cmd_list(sysm, a.json)
+    if cmd == "stop":
+        return cmd_stop(sysm, a.port, a.all)
+    if cmd == "doctor":
+        return cmd_doctor(sysm)
+    return cmd_start(sysm, a.port, a.name)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
