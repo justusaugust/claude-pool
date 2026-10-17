@@ -135,7 +135,8 @@ class ServeTests(ServeBase):
         text = self.state.read_text()
         self.assertEqual(json.loads(text)['sessionId'], 'cse_' + SESSION)
         for word in ['claude.ai', 'https', 'SECRET-OUTPUT', 'View it']: self.assertNotIn(word, text)
-        self.assertEqual(sorted(p.name for p in self.state.parent.iterdir()), ['conductor.json'])
+        self.assertEqual(sorted(p.name for p in self.state.parent.iterdir()), ['.conductor.json.lock', 'conductor.json'])
+        self.assertEqual((self.state.parent / '.conductor.json.lock').read_bytes(), b'')
 
     def test_recorded_session_is_reattached_and_an_exit_when_complete_restarts_it(self):
         self.serve(([URL_LINE], 1))
@@ -146,14 +147,38 @@ class ServeTests(ServeBase):
         self.assertEqual([c.argv for c in children], [resume, resume])
         self.assertEqual(self.sleeps[-1], 10)
 
-    def test_a_session_that_cannot_be_reattached_falls_back_to_server_mode_once_and_is_marked_fresh(self):
+    def test_one_quick_reattach_failure_keeps_the_session(self):
         self.serve(([URL_LINE], 1))
-        self.stop.clear()
-        children = self.serve(([b'Session not found\r\n', 5], 1), ([b'Connected\r\n'], 0))
-        self.assertEqual(children[0].argv[2:4], ['--session-id', 'cse_' + SESSION])
-        self.assertEqual(children[1].argv, ['/opt/claude', *SERVER_ARGV])
-        self.assertTrue(self.states[-1]['fresh'])
-        self.assertNotIn('sessionId', self.states[-1])
+        children = self.serve(([b'network unreachable\r\n', 5], 1), ([b'Single session\r\n'], 0))
+        resume = ['/opt/claude', 'remote-control', '--session-id', 'cse_' + SESSION, '--permission-mode', 'auto']
+        self.assertEqual([c.argv for c in children], [resume, resume])
+        self.assertEqual(json.loads(self.state.read_text())['sessionId'], 'cse_' + SESSION)
+        self.assertFalse(json.loads(self.state.read_text()).get('fresh'))
+
+    def test_three_quick_reattach_failures_fall_back_to_server_mode_and_a_later_reattach_clears_fresh(self):
+        self.serve(([URL_LINE], 1))
+        fail = ([b'Session not found\r\n', 5], 1)
+        children = self.serve(fail, fail, ([b'Single session\r\n', 40], 1), fail, fail, fail,
+                              ([b'Connected\r\n', b'https://claude.ai/code/session_02New\r\n'], 0))
+        self.assertEqual([c.argv[2:4] for c in children[:6]], [['--session-id', 'cse_' + SESSION]] * 6)  # a success resets the count
+        self.assertEqual(children[6].argv, ['/opt/claude', *SERVER_ARGV])
+        state = json.loads(self.state.read_text())
+        self.assertEqual((state['sessionId'], state['previousSessionId'], state['fresh']), ('cse_02New', 'cse_' + SESSION, True))
+        children = self.serve(([b'Single session\r\n'], 0))
+        self.assertEqual(children[0].argv[3], 'cse_02New')
+        self.assertFalse(json.loads(self.state.read_text()).get('fresh'))
+
+    def test_serve_rereads_the_recorded_session_before_each_start_and_never_overwrites_it(self):
+        def adopt(): conductor._update(self.state, sessionId='cse_03Adopted')
+        children = self.serve(([b'Connected\r\n', adopt], 1), ([b'Single session\r\n', lambda: conductor._update(self.state, sessionId='cse_04Later')], 0))
+        self.assertEqual(children[0].argv, ['/opt/claude', *SERVER_ARGV])
+        self.assertEqual(children[1].argv[2:4], ['--session-id', 'cse_03Adopted'])
+        self.assertEqual(json.loads(self.state.read_text())['sessionId'], 'cse_04Later')
+
+    def test_a_state_file_with_a_wrong_mode_is_an_error_not_an_empty_state(self):
+        self.state.parent.mkdir(mode=0o700); self.state.write_text('{"sessionId": "cse_05Keep"}'); self.state.chmod(0o644)
+        with self.assertRaises(RuntimeError): conductor.read_state(self.state)
+        self.assertEqual(conductor.read_state(self.root / 'missing.json'), {})
 
     def test_only_the_configured_directory_trust_prompt_is_answered(self):
         prompt = ('\x1b[1mTrust ' + str(self.cwd) + '? [y/N]\x1b[0m ').encode()
@@ -170,7 +195,7 @@ class ServeTests(ServeBase):
 
     def test_real_pty_child_gets_the_trust_answer_and_a_scrubbed_environment(self):
         native = self.root / 'native'
-        native.write_text('#!/bin/sh\nprintf "%s" "${ANTHROPIC_BASE_URL-unset} $*" > seen.txt\n'
+        native.write_text('#!/bin/sh\nprintf "%s" "${ANTHROPIC_BASE_URL-unset} $*" > seen.txt\nstty size > size.txt\n'
                           'printf "Trust %s? [y/N] " "$(pwd -P)"\nread answer\nprintf "%s" "$answer" > answer.txt\n'
                           'printf "Connected\\r\\n"\nexit 3\n')
         native.chmod(0o755)
@@ -179,6 +204,7 @@ class ServeTests(ServeBase):
             conductor.serve(str(native), cwd, state=self.state, sleep=lambda seconds: self.stop.set(), stop=self.stop)
         self.assertEqual((cwd / 'answer.txt').read_text(), 'y')
         self.assertEqual((cwd / 'seen.txt').read_text(), 'unset ' + ' '.join(SERVER_ARGV))
+        self.assertEqual((cwd / 'size.txt').read_text().split(), ['50', '300'])
         self.assertTrue(any(s['ready'] for s in self.states))
         self.assertEqual((self.states[-1]['lastExit'], self.states[-1]['ready']), (3, False))
 
@@ -197,12 +223,29 @@ class DefinitionTests(unittest.TestCase):
         self.assertTrue(d['RunAtLoad']); self.assertEqual(d['KeepAlive'], {'SuccessfulExit': False})
         self.assertEqual(d['ProgramArguments'][1:], [str(ROOT / 'run.py'), 'device', 'conductor', 'serve'])
         self.assertEqual(d['WorkingDirectory'], str(cwd))
-        self.assertEqual(d['EnvironmentVariables'], {'CLAUDE_POOL_CONFIG': str(settings.CONFIG)})
+        path = str(Path.home() / '.local/bin') + ':/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin'
+        self.assertEqual(d['EnvironmentVariables'], {'CLAUDE_POOL_CONFIG': str(settings.CONFIG), 'PATH': path})
         self.assertTrue(conductor.LABEL.endswith('.conductor'))
         self.assertEqual(d['Label'], conductor.LABEL)
         with mock.patch.object(service, 'platform', return_value='linux'):
             unit = service.render(d).decode()
         self.assertIn('WantedBy=default.target', unit); self.assertIn('Restart=on-failure', unit)
+        self.assertIn('After=network-online.target\nWants=network-online.target', unit)
+        self.assertIn('PATH=' + path, unit)
+        with mock.patch.object(service, 'platform', return_value='linux'):
+            self.assertEqual(service.load(service.render(d)), d)
+            pool = {key: value for key, value in d.items() if key != 'WaitForNetwork'}
+            self.assertNotIn('network-online', service.render(pool).decode())
+            self.assertEqual(service.render(pool), service.render({**pool}))
+        with mock.patch.object(service, 'platform', return_value='darwin'):
+            plist = service.render(d)
+            self.assertNotIn(b'WaitForNetwork', plist); self.assertEqual(service.render(pool), plist)
+
+    def test_install_helpers_are_shared_with_the_pool_service(self):
+        import launch
+        self.assertEqual(conductor.LABEL, launch.SERVICE_LABEL + '.conductor')
+        self.assertEqual(conductor.definition(ROOT, Path('/x'))['ProgramArguments'][0], launch.service_definition()['ProgramArguments'][0])
+        self.assertIs(conductor.service.python, launch.service.python)
 
     def test_phone_chat_environment_is_unchanged(self):
         import control_main
@@ -217,14 +260,13 @@ class DefinitionTests(unittest.TestCase):
         self.assertEqual(seen, {'HOME': '/srv/justus', 'LANG': 'C.UTF-8', 'PATH': '/usr/bin:/bin'})
 
 
-PS = '''  PID ARGS
-    1 /sbin/init
- {pid} /opt/native/claude {args}
+PS = '''    1     0 /sbin/init
+ {pid}     1 /opt/native/claude {args}
 '''
 FAKE_PS = '#!/bin/sh\ncat "$FAKE_PS_OUT"\n'
 FAKE_MANAGER = '''#!/bin/sh
 printf '%s\\n' "$(basename "$0") $*" >> "$FAKE_LOG"
-case "$1 $2" in print*|"--user is-active"|"--user is-enabled") exit 1 ;; esac
+case "$1 $2" in print*|"--user is-active"|"--user is-enabled") [ -e "$FAKE_LOADED" ] && exit 0; exit 1 ;; esac
 exit 0
 '''
 SHUNT = '#!/bin/sh\n[ "$3" = check ] && exit 0\nexit 3\n'
@@ -241,7 +283,7 @@ class ServiceBase(unittest.TestCase):
         for name, text in [('ps', FAKE_PS), ('launchctl', FAKE_MANAGER), ('systemctl', FAKE_MANAGER), ('shunt', SHUNT)]:
             (self.bin / name).write_text(text); (self.bin / name).chmod(0o755)
         self.log = self.root / 'manager.log'; self.log.write_text('')
-        self.ps = self.root / 'ps.txt'; self.ps.write_text('  PID ARGS\n    1 /sbin/init\n')
+        self.ps = self.root / 'ps.txt'; self.ps.write_text('    1     0 /sbin/init\n')
         self.home = self.root / 'home'; self.home.mkdir()
         self.cfg = self.root / 'cfg'; self.cfg.mkdir(mode=0o700)
         self.config = self.cfg / 'config.json'
@@ -249,7 +291,9 @@ class ServiceBase(unittest.TestCase):
         self.runtime = self.root / 'runtime'; self.runtime.mkdir(mode=0o700)
         self.toml = self.runtime / 'shunt.toml'; self.toml.write_text(TOML)
         self.cwd = self.root / 'projects' / 'conductor'
-        env = {'PATH': str(self.bin) + ':/usr/bin:/bin', 'HOME': str(self.home), 'FAKE_LOG': str(self.log), 'FAKE_PS_OUT': str(self.ps)}
+        self.loaded = self.root / 'loaded'
+        env = {'PATH': str(self.bin) + os.pathsep + os.environ['PATH'], 'HOME': str(self.home), 'FAKE_LOG': str(self.log),
+               'FAKE_PS_OUT': str(self.ps), 'FAKE_LOADED': str(self.loaded)}
         patches = [mock.patch.dict(os.environ, env),
                    mock.patch.object(settings, 'REGISTRY', self.cfg / 'devices.json'),
                    mock.patch.object(settings, 'CONFIG', self.config),
@@ -293,14 +337,45 @@ class InstallTests(ServiceBase):
         self.assertEqual(conductor.install().status, 'ok')
         with self.assertRaises(ValueError): conductor.install(session_id='cse_x; rm -rf ~')
 
-    def test_duplicates_exclude_our_own_child_and_other_remote_controls(self):
-        ps = ('  PID ARGS\n 10 claude remote-control --name Conductor Claude --spawn same-dir\n'
-              ' 11 claude remote-control --session-id cse_' + SESSION + ' --permission-mode auto\n'
-              ' 12 claude remote-control --name Other --spawn same-dir\n 13 vim notes-about-remote-control --name Conductor Claude\n'
-              ' 14 python3 run.py device conductor serve\n')
-        self.assertEqual(conductor.duplicates(ps, None), [10])
+    def test_duplicates_exclude_our_own_child_its_descendants_and_other_remote_controls(self):
+        ps = (' 10  9 claude remote-control --name Conductor Claude --spawn same-dir\n'
+              ' 11  1 claude remote-control --session-id cse_' + SESSION + ' --permission-mode auto\n'
+              ' 12  1 claude remote-control --name Other --spawn same-dir\n 13  1 vim notes-about-remote-control --name Conductor Claude\n'
+              '  9  1 python3 run.py device conductor serve\n'
+              ' 15 10 claude remote-control --name Conductor Claude --spawn same-dir\n'
+              ' 16 15 claude remote-control --name Conductor Claude --spawn same-dir\n')
+        self.assertEqual(conductor.duplicates(ps, None), [10, 15, 16])
         self.assertEqual(conductor.duplicates(ps, 10), [])
-        self.assertEqual(conductor.duplicates(ps, None, session_id='cse_' + SESSION), [10, 11])
+        self.assertEqual(conductor.duplicates(ps, None, session_id='cse_' + SESSION), [10, 11, 15, 16])
+
+    def test_install_refuses_on_a_device_the_registry_does_not_name_unless_moving(self):
+        with mock.patch.object(registry, 'self_name', return_value='mac'):
+            step = conductor.install()
+            self.assertEqual(step.status, 'failed'); self.assertIn('move', step.fix)
+            self.assertFalse(self.unit().exists())
+            self.assertEqual(conductor.install(moving=True, fresh=True).status, 'ok')
+
+    def test_fresh_install_drops_the_recorded_session_and_marks_fresh(self):
+        conductor._update(settings.CONDUCTOR_STATE, sessionId='cse_' + SESSION)
+        self.assertEqual(conductor.install(fresh=True).status, 'ok')
+        state = json.loads(settings.CONDUCTOR_STATE.read_text())
+        self.assertNotIn('sessionId', state); self.assertEqual((state['previousSessionId'], state['fresh']), ('cse_' + SESSION, True))
+
+    def test_install_restarts_a_running_conductor_only_when_the_recorded_session_changes(self):
+        self.assertEqual(conductor.install().status, 'ok')
+        self.loaded.write_text(''); self.log.write_text('')
+        self.assertEqual(conductor.install().status, 'ok')
+        self.assertFalse([argv for argv in self.calls() if 'restart' in argv or 'kickstart' in argv])
+        self.assertEqual(conductor.install(session_id='cse_' + SESSION).status, 'ok')
+        restarts = [argv for argv in self.calls() if 'restart' in argv or 'kickstart' in argv]
+        self.assertEqual(len(restarts), 1); self.assertTrue(any(conductor.LABEL in word for word in restarts[0]))
+
+    def test_a_reserve_that_fails_leaves_the_service_installed_and_asks_for_the_reserve(self):
+        (self.bin / 'shunt').write_text('#!/bin/sh\nexit 1\n')
+        step = conductor.install()
+        self.assertEqual(step.status, 'manual')
+        self.assertEqual(step.fix, 'claude-pool account reserve team 85')
+        self.assertTrue(self.unit().exists())
 
     def test_install_writes_only_its_own_unit_and_reserves_the_conductor_account_at_85_unless_set(self):
         pool_unit = service.service_file('io.github.claude-pool'); pool_unit.parent.mkdir(parents=True)
@@ -338,6 +413,8 @@ class InstallTests(ServiceBase):
         self.assertIn('conductor', value)
         self.assertEqual(set(value['conductor']), {'installed', 'running', 'ready', 'fresh', 'duplicates'})
         self.assertFalse(value['conductor']['running'])
+        with mock.patch.object(conductor, 'read_state', side_effect=RuntimeError('Credential must be your private 0600 file')):
+            self.assertEqual(conductor.status()['error'], 'RuntimeError')
 
 
 RUNNING = {'platform': 'linux', 'linger': True, 'conductor': {'installed': True, 'running': True, 'ready': True, 'fresh': False, 'duplicates': []}}
@@ -397,6 +474,9 @@ class ContextTests(unittest.TestCase):
         with mock.patch.object(registry, 'self_name', return_value='personal-vps'): conductor.apply_hook(value)
         self.assertIn(conductor.START, (self.cwd / 'CLAUDE.md').read_text())
         self.assertIn(conductor.apply_hook, device_sync.INTEGRATION_HOOKS)
+        missing = Path(self.tmp.name) / 'gone'
+        with mock.patch.object(registry, 'self_name', return_value='personal-vps'): conductor.apply_hook(value_with(cwd=str(missing)))
+        self.assertFalse(missing.exists())
 
 
 def done(out=b'', code=0): return Completed(code, out if isinstance(out, bytes) else json.dumps(out).encode(), b'')
@@ -406,7 +486,7 @@ class MoveTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
         self.cfg = Path(self.tmp.name) / 'cfg'; self.cfg.mkdir(mode=0o700)
-        self.order, self.requested, self.ready_after = [], [], 2
+        self.order, self.requested, self.ready_after, self.install_code = [], [], 2, 0
         self.native = {'personal-vps': {'email': ' justus@AI-Vaerk.de', 'organization': 'AI Vaerk Team'}, 'mac': dict(IDENTITY)}
         self.linger = {'personal-vps': 'yes'}
         self.service = {'personal-vps': 'running', 'mac': 'running'}
@@ -429,8 +509,9 @@ class MoveTests(unittest.TestCase):
                                            'fresh': False, 'duplicates': []}})
             if argv == ['uname', '-s']: return done(b'Linux\n' if name == 'personal-vps' else b'Darwin\n')
             if argv[:2] == ['sh', '-c'] and 'loginctl' in argv[2]: return done((self.linger.get(name, 'no') + '\n').encode())
-            if argv[-3:] == ['device', 'conductor', 'install']:
-                state['installed'] = True; self.order.append((name, 'install')); return done()
+            if argv[-5:] == ['device', 'conductor', 'install', '--move', '--fresh']:
+                state['installed'] = True; self.order.append((name, 'install'))
+                return done(code=self.install_code)
             if argv[-3:] == ['device', 'conductor', 'uninstall']:
                 self.order.append((name, 'uninstall')); return done()
             return done(code=1)
@@ -454,6 +535,15 @@ class MoveTests(unittest.TestCase):
         self.assertLess(self.order.index(('personal-vps', 'install')), self.order.index(('mac', 'uninstall')))
         self.assertLess(self.order.index(('mac', 'uninstall')), self.order.index(('sync',)))
         self.assertEqual(registry.load()['conductor']['device'], 'personal-vps')
+        self.assertIn('new conversation', out)
+
+    def test_a_failed_install_on_the_target_is_removed_again(self):
+        self.install_code = 1
+        code, _ = self.move('personal-vps')
+        self.assertNotEqual(code, 0)
+        self.assertEqual(self.order[-1], ('personal-vps', 'uninstall'))
+        self.assertNotIn(('mac', 'uninstall'), self.order)
+        self.assertEqual(registry.load()['conductor']['device'], 'mac')
 
     def test_move_refuses_a_target_with_another_native_account(self):
         self.native['personal-vps'] = {'email': 'other@ai-vaerk.de', 'organization': 'AI-Vaerk Team'}

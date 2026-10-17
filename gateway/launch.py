@@ -30,9 +30,8 @@ from validation import render as validation_view
 from settings import HERE, RUNTIME, STORES, LONG_LIVED, NATIVE_CLAUDE, CONFIG, BASE_URL, GATEWAY_PORT, BACKEND_PORT, backend_config, connection_ts, SHARED_READINGS, ALIASES, private_directory
 ROOT = HERE.parent
 HEALTH_INTERVAL = 10
-INSTALLATION = json.loads((ROOT / 'installation.json').read_text()) if (ROOT / 'installation.json').is_file() else {}
-SERVICE_LABEL = INSTALLATION.get('serviceLabel', 'io.github.claude-pool')
-if not isinstance(SERVICE_LABEL, str) or not re.fullmatch(r'[a-zA-Z0-9.-]+', SERVICE_LABEL): raise RuntimeError('Invalid installed service label')
+INSTALLATION = service.receipt(ROOT)
+SERVICE_LABEL = service.installed_label(INSTALLATION)
 SERVICE_FILE = service.service_file(SERVICE_LABEL)
 ACCOUNT_SHORTCUTS = ALIASES
 
@@ -45,10 +44,9 @@ def service_command(*args, check=True):
 
 
 def service_definition():
-    receipt = ROOT / 'installation.json'
-    root = Path(json.loads(receipt.read_text()).get('root', ROOT)) if receipt.is_file() else ROOT
+    root = service.install_root(ROOT)
     entry = root / 'run.py' if (root / 'run.py').is_file() else HERE / 'launch.py'
-    return {'Label': SERVICE_LABEL, 'ProgramArguments': ['/opt/homebrew/bin/python3' if Path('/opt/homebrew/bin/python3').exists() else sys.executable, str(entry), '--daemon'],
+    return {'Label': SERVICE_LABEL, 'ProgramArguments': [service.python(), str(entry), '--daemon'],
             'RunAtLoad': True, 'KeepAlive': {'SuccessfulExit': False}, 'ThrottleInterval': 10,
             'ExitTimeOut': 360, 'WorkingDirectory': str(root),
             'EnvironmentVariables': {'POOL_MANAGED': '1', 'CLAUDE_POOL_CONFIG': str(CONFIG)},

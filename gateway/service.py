@@ -5,6 +5,7 @@ WorkingDirectory, EnvironmentVariables, ...). macOS writes it as a plist exactly
 before; Linux renders the same dict as a user unit and parses it back for ownership
 checks. No settings import: the installer uses this before any configuration exists.
 """
+import json
 import os
 from pathlib import Path
 import plistlib
@@ -16,6 +17,30 @@ import tempfile
 DEFAULTS = {'RunAtLoad': True, 'KeepAlive': {'SuccessfulExit': False}, 'ThrottleInterval': 10, 'ExitTimeOut': 360,
             'StandardOutPath': '/dev/null', 'StandardErrorPath': '/dev/null'}
 DESCRIPTION = 'Claude Pool background service '
+DEFAULT_LABEL = 'io.github.claude-pool'
+LINUX_ONLY = {'WaitForNetwork'}  # True: the unit starts after network-online.target; launchd has no equivalent key
+
+
+def receipt(app_root):
+    """The installation receipt next to the gateway, {} when the checkout is not installed."""
+    path = Path(app_root) / 'installation.json'
+    return json.loads(path.read_text()) if path.is_file() else {}
+
+
+def installed_label(value):
+    label = value.get('serviceLabel', DEFAULT_LABEL)
+    if not isinstance(label, str) or not re.fullmatch(r'[a-zA-Z0-9.-]+', label): raise RuntimeError('Invalid installed service label')
+    return label
+
+
+def install_root(app_root):
+    """The stable install root that holds run.py (the receipt's `root`), else the checkout itself."""
+    value = receipt(app_root)
+    return Path(value.get('root', app_root)) if value else Path(app_root)
+
+
+def python():
+    return '/opt/homebrew/bin/python3' if Path('/opt/homebrew/bin/python3').exists() else sys.executable
 
 
 def platform():
@@ -71,9 +96,10 @@ def words(line, exec=False):
 
 
 def render(definition):
-    if platform() == 'darwin': return plistlib.dumps(definition)
-    lines = ['[Unit]', 'Description=' + DESCRIPTION + quote(definition['Label']), '',
-             '[Service]', 'Type=simple', 'ExecStart=' + ' '.join(exec_quote(a) for a in definition['ProgramArguments'])]
+    if platform() == 'darwin': return plistlib.dumps({k: v for k, v in definition.items() if k not in LINUX_ONLY})
+    lines = ['[Unit]', 'Description=' + DESCRIPTION + quote(definition['Label'])]
+    if definition.get('WaitForNetwork'): lines += ['After=network-online.target', 'Wants=network-online.target']
+    lines += ['', '[Service]', 'Type=simple', 'ExecStart=' + ' '.join(exec_quote(a) for a in definition['ProgramArguments'])]
     if 'WorkingDirectory' in definition: lines.append('WorkingDirectory=' + directory(definition['WorkingDirectory']))
     for key, value in definition.get('EnvironmentVariables', {}).items(): lines.append('Environment=' + quote(key + '=' + value))
     if definition.get('KeepAlive') == {'SuccessfulExit': False}: lines.append('Restart=on-failure')
@@ -96,6 +122,7 @@ def load(data):
         key, value = key.strip(), value.strip()
         if section == '[Unit]' and key == 'Description' and value.startswith(DESCRIPTION):
             definition['Label'] = ' '.join(words(value[len(DESCRIPTION):]))
+        elif section == '[Unit]' and key == 'After' and value == 'network-online.target': definition['WaitForNetwork'] = True
         elif section == '[Service]':
             if key == 'ExecStart': definition['ProgramArguments'] = words(value, exec=True)
             elif key == 'WorkingDirectory': definition['WorkingDirectory'] = value.replace('%%', '%')

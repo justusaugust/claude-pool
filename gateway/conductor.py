@@ -9,6 +9,7 @@ custom gateway). Facts from the live Conductor (2026-10-17, controller, read-onl
 - the output names the conversation as `https://claude.ai/code/session_<id>`; its `cse_` id has the same `<id>`;
 - an untrusted directory prompts `Trust <dir>? [y/N]`.
 The supervisor keeps the child's output only in a bounded in-memory ring and stores only the `cse_` id (never the URL)."""
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -16,8 +17,9 @@ import pty
 import re
 import select
 import signal
+import struct
 import subprocess
-import sys
+import termios
 import threading
 import time
 
@@ -51,13 +53,10 @@ HERDR_FIX = 'stop the Conductor in herdr session conductor first'
 START, END = '<!-- claude-pool:devices start -->', '<!-- claude-pool:devices end -->'
 
 
-def _service_label():
-    try: label = json.loads((settings.HERE.parent / 'installation.json').read_text()).get('serviceLabel', 'io.github.claude-pool')
-    except (OSError, ValueError, AttributeError): label = 'io.github.claude-pool'
-    return label if isinstance(label, str) and re.fullmatch(r'[a-zA-Z0-9.-]+', label) else 'io.github.claude-pool'
-
-
-LABEL = _service_label() + '.conductor'
+LABEL = service.installed_label(service.receipt(settings.HERE.parent)) + '.conductor'
+WINDOW = (50, 300)  # rows, columns of the child's terminal: wide enough that no line of interest wraps
+REATTACH_TRIES = 3
+DELETE = object()
 
 
 def native_env(environ):
@@ -85,6 +84,7 @@ class PtyChild:
         pid, fd = pty.fork()
         if pid == 0:
             try:
+                fcntl.ioctl(1, termios.TIOCSWINSZ, struct.pack('HHHH', *WINDOW, 0, 0))
                 os.chdir(cwd)
                 os.execve(argv[0], argv, env)
             finally: os._exit(127)
@@ -121,13 +121,24 @@ class PtyChild:
 
 
 def read_state(path=None):
+    """The supervisor state; {} when there is none yet. A file that is not private 0600 JSON raises, so nothing overwrites it."""
     try: value = read_private(path or settings.CONDUCTOR_STATE, 16384)
-    except (OSError, ValueError, RuntimeError): return {}
-    if not SESSION_ID.fullmatch(str(value.get('sessionId', ''))): value.pop('sessionId', None)
+    except FileNotFoundError: return {}
+    for key in ('sessionId', 'previousSessionId'):
+        if not SESSION_ID.fullmatch(str(value.get(key, ''))): value.pop(key, None)
     return value
 
 
-def _save(path, value): write_private(path, json.dumps(value, sort_keys=True) + '\n')
+def _update(path, **changes):
+    """Merge `changes` (DELETE removes a key) into the state file under its lock; install and serve both write it."""
+    path = Path(path)
+    with registry.locked(path):
+        value = read_state(path)
+        for key, item in changes.items():
+            if item is DELETE: value.pop(key, None)
+            else: value[key] = item
+        write_private(path, json.dumps(value, sort_keys=True) + '\n')
+    return value
 
 
 def _command(native, session):
@@ -136,48 +147,54 @@ def _command(native, session):
 
 
 def serve(native, cwd, state=None, spawn=PtyChild, sleep=None, stop=None, clock=time.monotonic):
-    """Supervise Conductor Claude until `stop` is set: reattach the recorded conversation, restart with backoff."""
+    """Supervise Conductor Claude until `stop` is set: reattach the recorded conversation, restart with backoff.
+    The recorded session is read from the state file before every start, so `install --session-id` takes effect at the next one.
+    Only after three quick reattach failures in a row (under 30 s, never ready) does a new conversation start; the old id is kept
+    as `previousSessionId` and `fresh` is set until a later reattach of the new id is ready."""
     state = Path(state or settings.CONDUCTOR_STATE)
     stop = stop or threading.Event()
     sleep = sleep or stop.wait
     cwd = Path(cwd)
-    record = read_state(state)
-    record.update(ready=False, restarts=0, lastExit=record.get('lastExit'))
-    backoff, server_once = BACKOFF_START, False
+    backoff, failures, restarts, last = BACKOFF_START, 0, 0, read_state(state).get('lastExit')
     while not stop.is_set():
-        session = None if server_once else record.get('sessionId')
-        server_once = False
+        session = read_state(state).get('sessionId')
         child = spawn(_command(native, session), native_env(os.environ), cwd)
-        started = clock()
-        record.update(pid=child.pid, startedAt=int(time.time()), ready=False)
-        _save(state, record)
+        started, ready, known = clock(), False, session
+        _update(state, pid=child.pid, startedAt=int(time.time()), ready=False, restarts=restarts, lastExit=last)
         ring, prompt = Ring(), ''
         while True:
             chunk = child.read(1.0)
             if stop.is_set():
                 child.terminate(); child.wait()
-                record.update(ready=False, pid=None); _save(state, record)
+                _update(state, ready=False, pid=None)
                 return
             if chunk is None: continue
             if not chunk: break
             ring.add(chunk)
             text = ring.text()
-            changed = False
-            if not record['ready'] and READY.search(text): record['ready'] = changed = True
+            changes = {}
+            if not ready and READY.search(text):
+                ready, failures, changes['ready'] = True, 0, True
+                if session: changes['fresh'] = DELETE
             found = SESSION_URL.findall(text)
-            if found and record.get('sessionId') != 'cse_' + found[-1]:
-                record['sessionId'] = 'cse_' + found[-1]; changed = True
+            if found and known != 'cse_' + found[-1]:
+                known = changes['sessionId'] = 'cse_' + found[-1]
             prompt = (prompt + ANSI.sub('', chunk.decode('utf-8', 'replace')))[-PROMPT_WINDOW:]
             if any(match == str(cwd) for match in TRUST.findall(prompt)):
                 child.write(b'y\n'); prompt = ''
-            if changed: _save(state, record)
+            if changes: _update(state, **changes)
         code = child.wait()
         uptime = clock() - started
-        if session and not record['ready'] and uptime < REATTACH_GRACE:
-            # The conversation could not be reattached: start the server once and let the device check report it.
-            record.pop('sessionId', None); record['fresh'] = True; server_once = True
-        record.update(ready=False, pid=None, lastExit=code, restarts=record['restarts'] + 1)
-        _save(state, record)
+        changes = {}
+        if session and not ready and uptime < REATTACH_GRACE:
+            failures += 1
+            if failures >= REATTACH_TRIES:
+                # The conversation could not be reattached three times in a row: start a new one; device check reports it.
+                changes = {'sessionId': DELETE, 'previousSessionId': session, 'fresh': True}
+                failures = 0
+        else: failures = 0
+        restarts, last = restarts + 1, code
+        _update(state, ready=False, pid=None, lastExit=code, restarts=restarts, **changes)
         if uptime >= BACKOFF_RESET: backoff = BACKOFF_START
         sleep(backoff)
         backoff = min(backoff * 2, BACKOFF_MAX)
@@ -191,20 +208,16 @@ def serve_service():
     return 0
 
 
-def _python():
-    return '/opt/homebrew/bin/python3' if Path('/opt/homebrew/bin/python3').exists() else sys.executable
-
-
-def install_root():
-    try: return Path(json.loads((settings.HERE.parent / 'installation.json').read_text()).get('root', settings.HERE.parent))
-    except (OSError, ValueError, AttributeError): return settings.HERE.parent
+def unit_path():
+    """PATH for the Conductor: the user's tools (herdr, ssh, claude-pool, preview, gh) and the system."""
+    return ':'.join([str(Path.home() / '.local/bin'), '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin'])
 
 
 def definition(root, cwd):
-    return {'Label': LABEL, 'ProgramArguments': [_python(), str(Path(root) / 'run.py'), 'device', 'conductor', 'serve'],
+    return {'Label': LABEL, 'ProgramArguments': [service.python(), str(Path(root) / 'run.py'), 'device', 'conductor', 'serve'],
             'RunAtLoad': True, 'KeepAlive': {'SuccessfulExit': False}, 'ThrottleInterval': 10, 'ExitTimeOut': 30,
-            'WorkingDirectory': str(cwd), 'EnvironmentVariables': {'CLAUDE_POOL_CONFIG': str(settings.CONFIG)},
-            'StandardOutPath': '/dev/null', 'StandardErrorPath': '/dev/null'}
+            'WorkingDirectory': str(cwd), 'EnvironmentVariables': {'CLAUDE_POOL_CONFIG': str(settings.CONFIG), 'PATH': unit_path()},
+            'StandardOutPath': '/dev/null', 'StandardErrorPath': '/dev/null', 'WaitForNetwork': True}
 
 
 def _run(argv, timeout=30):
@@ -213,20 +226,30 @@ def _run(argv, timeout=30):
 
 
 def processes():
-    return _run(['ps', '-axww', '-o', 'pid=,args=']).stdout or ''
+    return _run(['ps', '-axww', '-o', 'pid=,ppid=,args=']).stdout or ''
 
 
 def duplicates(ps_output, own_pid, session_id=None):
-    """Conductor processes other than our own child: Remote Control named Conductor Claude, or attached to our session."""
-    found = []
+    """Conductor processes other than our own child and its descendants (`pid ppid args` lines): Remote Control named
+    Conductor Claude, or attached to our recorded session."""
+    rows = []
     for line in ps_output.splitlines():
         parts = line.split()
-        if not parts or not parts[0].isdigit() or 'remote-control' not in parts[1:]: continue
-        pid, words = int(parts[0]), parts[1:]
+        if len(parts) < 3 or not parts[0].isdigit() or not parts[1].isdigit(): continue
+        rows.append((int(parts[0]), int(parts[1]), parts[2:]))
+    ours = {own_pid} if own_pid else set()
+    grew = True
+    while grew:
+        grew = False
+        for pid, parent, _ in rows:
+            if parent in ours and pid not in ours: ours.add(pid); grew = True
+    found = []
+    for pid, _, words in rows:
+        if 'remote-control' not in words or pid in ours: continue
         named = any(words[i:i + 3] == ['--name', 'Conductor', 'Claude'] and (i + 3 == len(words) or words[i + 3].startswith('-'))
                     for i in range(len(words)))
         attached = bool(session_id) and any(words[i:i + 2] == ['--session-id', session_id] for i in range(len(words)))
-        if (named or attached) and pid != own_pid: found.append(pid)
+        if named or attached: found.append(pid)
     return found
 
 
@@ -273,42 +296,55 @@ def reserve_default(entry):
     return done, failed
 
 
-def install(session_id=None):
-    """Install and start the Conductor service on this device. `session_id` adopts a conversation started by hand."""
+def install(session_id=None, fresh=False, moving=False):
+    """Install and start the Conductor service on this device. `session_id` adopts a conversation started by hand; `fresh`
+    starts a new conversation (move); `moving` (internal, from move) allows a device the registry does not name yet."""
     if session_id is not None and not SESSION_ID.fullmatch(session_id): raise ValueError('Invalid Conductor session id')
     entry = registry.load().get('conductor')
     if not entry: return Step(STEP, 'failed', 'the registry names no Conductor', 'claude-pool device add <ssh-target> --usage-owner')
+    me = registry.self_name()
+    if not moving and entry['device'] != me:
+        return Step(STEP, 'failed', 'the registry names ' + entry['device'] + ' as the Conductor device, not this one',
+                    'claude-pool device conductor move ' + str(me or '<this device>'))
     state = settings.CONDUCTOR_STATE
     record = read_state(state)
-    if session_id and record.get('sessionId') != session_id:
-        record.update(sessionId=session_id); record.pop('fresh', None); _save(state, record)
+    changes = {}
+    if session_id and record.get('sessionId') != session_id: changes = {'sessionId': session_id, 'fresh': DELETE}
+    elif fresh:
+        changes = {'fresh': True, 'sessionId': DELETE}
+        if record.get('sessionId'): changes['previousSessionId'] = record['sessionId']
+    if changes: record = _update(state, **changes)
     found = duplicates(processes(), _own_child(record), record.get('sessionId'))
     if found: return Step(STEP, 'failed', 'another Conductor is running (pid ' + ', '.join(map(str, found)) + ')', HERDR_FIX)
     cwd = Path(entry['cwd']).expanduser()
     if not cwd.is_absolute(): return Step(STEP, 'failed', 'the Conductor folder must be an absolute path', None)
     cwd.mkdir(parents=True, exist_ok=True)
-    wanted = definition(install_root(), cwd)
+    wanted = definition(service.install_root(settings.HERE.parent), cwd)
     unit = service.service_file(LABEL)
     unit.parent.mkdir(parents=True, exist_ok=True)
-    changed = not unit.exists() or service.load(unit.read_bytes()) != wanted
+    changed = not unit.exists() or service.load(unit.read_bytes()) != service.load(service.render(wanted))
     fix = 'claude-pool device conductor install'
     if service.platform() == 'darwin':
-        domain = 'gui/' + str(os.getuid())
-        loaded = _manager('print', domain + '/' + LABEL) == 0
-        if changed and loaded: _manager('bootout', domain + '/' + LABEL); loaded = False
+        target = 'gui/' + str(os.getuid()) + '/' + LABEL
+        loaded = _manager('print', target) == 0
+        if changed and loaded: _manager('bootout', target); loaded = False
         if changed: service.write(unit, service.render(wanted))
-        if not loaded and _manager('bootstrap', domain, str(unit)): return Step(STEP, 'failed', 'launchd did not load the Conductor', fix)
+        if not loaded:
+            if _manager('bootstrap', 'gui/' + str(os.getuid()), str(unit)): return Step(STEP, 'failed', 'launchd did not load the Conductor', fix)
+        elif changes: _manager('kickstart', '-k', target)  # reattach the newly recorded conversation now
     else:
+        active = _manager('is-active', '--quiet', LABEL + '.service') == 0
         if changed:
             service.write(unit, service.render(wanted))
             _manager('daemon-reload')
         if _manager('enable', '--now', LABEL + '.service'): return Step(STEP, 'failed', 'systemd did not start the Conductor', fix)
-        if changed: _manager('try-restart', LABEL + '.service')
+        if active and (changed or changes): _manager('restart', LABEL + '.service')
     reserved, failed = reserve_default(entry)
     detail = 'installed in ' + str(cwd)
     if reserved: detail += '; reserved ' + ', '.join(reserved) + ' from ' + str(RESERVE_DEFAULT) + ' %'
     if failed:
-        return Step(STEP, 'failed', detail + '; reserve not applied for ' + ', '.join(failed),
+        # The service runs; only the reserve is missing, and Justus can apply it himself.
+        return Step(STEP, 'manual', detail + '; reserve not applied for ' + ', '.join(failed),
                     'claude-pool account reserve ' + failed[0] + ' ' + str(RESERVE_DEFAULT))
     return Step(STEP, 'ok', detail)
 
@@ -333,8 +369,8 @@ def status():
         own = _own_child(record) if installed else None
         return {'installed': installed, 'running': own is not None, 'ready': own is not None and bool(record.get('ready')),
                 'fresh': bool(record.get('fresh')), 'duplicates': duplicates(processes(), own, record.get('sessionId'))}
-    except Exception:
-        return {'installed': False, 'running': False, 'ready': False, 'fresh': False, 'duplicates': []}
+    except Exception as error:
+        return {'error': type(error).__name__}
 
 
 def status_part(): return {'conductor': status()}
@@ -401,7 +437,7 @@ def write_context(cwd, value):
 
 def apply_hook(value):
     entry = value.get('conductor')
-    if entry and entry['device'] == registry.self_name(): write_context(entry['cwd'], value)
+    if entry and entry['device'] == registry.self_name() and Path(entry['cwd']).expanduser().is_dir(): write_context(entry['cwd'], value)
 
 
 def _status_of(remote):
@@ -442,8 +478,9 @@ def move(target, value, remotes=Remote, local=None, sleep=time.sleep):
     if found.get('service') != 'running':
         print('The pool service on ' + target + ' is not running; start it first (claude-pool --start). Nothing was changed.')
         return 1
-    done = there.pool('device', 'conductor', 'install')
+    done = there.pool('device', 'conductor', 'install', '--move', '--fresh')
     if done.returncode:
+        there.pool('device', 'conductor', 'uninstall')  # it may have started before failing; never leave a second Conductor
         print('Installing the Conductor on ' + target + ' failed; the Conductor stays on ' + source + '.')
         return 1
     for _ in range(MOVE_WAIT // MOVE_POLL):
@@ -464,7 +501,8 @@ def move(target, value, remotes=Remote, local=None, sleep=time.sleep):
         if current.get('conductor'): current['conductor']['device'] = target
     registry.update(note)
     device_sync.sync_all(remotes)
-    print('The Conductor now runs on ' + target + '.')
+    print('The Conductor now runs on ' + target + ' in a new conversation: open Conductor Claude in the Claude app '
+          '(Code, environment of ' + target + ').')
     return 0
 
 
