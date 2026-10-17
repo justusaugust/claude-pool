@@ -420,10 +420,14 @@ def configured_plugin(name):
 def native_identity():
     """This machine's Native login ({'email', 'organization'}), or None when Native is signed out."""
     from native_login import parse_auth_status
+    unreadable = RuntimeError('Could not read the Native login (claude-native auth status --json); nothing was changed')
     try: done = subprocess.run([NATIVE_CLAUDE, 'auth', 'status', '--json'], capture_output=True, text=True, timeout=20)
-    except (OSError, subprocess.TimeoutExpired):
-        raise RuntimeError('Could not read the Native login (claude-native auth status); nothing was changed') from None
-    return parse_auth_status(done.stdout)
+    except (OSError, subprocess.TimeoutExpired): raise unreadable from None
+    try: native = parse_auth_status(done.stdout)
+    except ValueError: raise unreadable from None
+    # A signed-out Native may exit non-zero while still reporting loggedIn false; any other failure is unreadable.
+    if native is not None and done.returncode: raise unreadable
+    return native
 
 
 def main():
@@ -452,11 +456,13 @@ def main():
             argv = ['add', '--name', argv[0]]
         def overview():
             return json.loads(request(token('.pool-client-token'), path='/pool/overview'))
+        live = bool(argv) and argv[0] in ('add', 'remove') and '--help' not in argv and '-h' not in argv and (STORES / '.pool-client-token').is_file()
         try:
-            if not argv or argv[0] not in ('add', 'remove') or '--help' in argv or '-h' in argv or not (STORES / '.pool-client-token').is_file():
-                raise OSError('No live readiness check needed')
+            if not live: raise OSError('No live readiness check needed')
             overview(); available = True
-        except (OSError, RuntimeError, ValueError): available = False
+        except (OSError, RuntimeError, ValueError):
+            # remove never skips its in-flight check while the service runs: an unanswered overview counts as busy.
+            available = live and argv[0] == 'remove' and service.loaded(SERVICE_LABEL)
         raise SystemExit(cli(argv, config=CONFIG, stores=STORES, binary=HERE/'bin/shunt', runtime=RUNTIME,
                              overview=overview if available else None, long_lived=LONG_LIVED, native_identity=native_identity))
     if sys.argv[1:] in [['--help'], ['-h']]: sys.argv[1:] = ['help']

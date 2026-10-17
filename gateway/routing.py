@@ -47,9 +47,12 @@ def session_rows(sessions, now):
 
 
 def in_flight(overview, account=None):
-    """True while the pool serves a request: any request at all, or one served by `account`."""
-    if account is None and (overview.get('health') or {}).get('activeRequests', 0) > 0: return True
-    return any(row.get('busy') and (account is None or row.get('account') == account) for row in overview.get('sessions', []))
+    """True while the pool serves a request: any request at all, or one that may be served by `account`.
+    Only main requests with a session id become busy rows; a request the rows do not account for may be on any account."""
+    active = (overview.get('health') or {}).get('activeRequests', 0)
+    busy = [row for row in overview.get('sessions', []) if row.get('busy')]
+    if account is None: return active > 0 or bool(busy)
+    return any(row.get('account') == account for row in busy) or active > len(busy)
 
 
 def wait_idle(overview, account, wait, sleep=time.sleep, clock=time.monotonic, interval=5, limit=1800):

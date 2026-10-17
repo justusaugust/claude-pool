@@ -188,7 +188,8 @@ def refuse_duplicate(rows, stores, name, info):
             raise RuntimeError('This subscription is already connected as ' + row.get('label', row['name']) + '; a second alias adds no quota.')
 
 
-def apply_change(config, binary, paths, env, change_value, change_toml):
+def apply_change(config, binary, paths, env, change_value, change_toml,
+                 rejected='Backend rejected the change; live membership is unchanged'):
     """The one validated write path for membership: candidates are checked before anything is written."""
     config.parent.mkdir(parents=True, exist_ok=True)
     with (config.parent / ('.' + config.name + '.lock')).open('a') as lock:
@@ -203,7 +204,7 @@ def apply_change(config, binary, paths, env, change_value, change_toml):
                 candidate.write(content); candidate.flush()
                 result = subprocess.run([str(binary), '--config', candidate.name, 'check'], env=env,
                                         capture_output=True, timeout=20)
-                if result.returncode: raise RuntimeError('Backend rejected the change; live membership is unchanged')
+                if result.returncode: raise RuntimeError(rejected)
         # Persist recovery metadata before the watched runtime file activates membership.
         atomic_write(config, json.dumps(value, indent=2) + '\n')
         for path, content in candidates:
@@ -217,14 +218,16 @@ def register(config, stores, binary, paths, entry, info, env):
         old = next((r for r in rows if r['name'] == entry['name']), None)
         if old: rows[rows.index(old)] = entry
         else: rows.append(entry)
-    apply_change(config, binary, paths, env, change, lambda text: add_membership(text, entry['name']))
+    apply_change(config, binary, paths, env, change, lambda text: add_membership(text, entry['name']),
+                 rejected='Backend rejected enrollment; live membership is unchanged')
 
 
 def unregister(config, stores, binary, paths, name, env):
     """Drop `name` from the config and every runtime member list. Idempotent: an absent member changes nothing."""
     def change(value):
         value['accounts'] = [row for row in value.get('accounts', []) if row['name'] != name]
-    apply_change(config, binary, paths, env, change, lambda text: remove_membership(text, name))
+    apply_change(config, binary, paths, env, change, lambda text: remove_membership(text, name),
+                 rejected='Backend rejected the removal; live membership is unchanged')
 
 
 def local_paths_env(runtime, stores, backend_source=None, backend_env=None):
@@ -390,38 +393,61 @@ def stored_kind(path):
     except (OSError, ValueError, RuntimeError): return None
 
 
-def retire(stores, long_lived_dir, name):
+def same_file(a, b):
+    return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+
+
+def retire(stores, long_lived_dir, name, *, after_link=None, tries=3):
     """A refreshable grant is unique: it moves to stores/.retired/<name>-<unix>.json and is never deleted.
-    Long-lived replicas are unlinked. Anything unrecognised is moved aside too, never deleted."""
+    Long-lived replicas are unlinked. Anything unrecognised is moved aside too, never deleted.
+    A file replaced while it is being moved is never unlinked: the step retries, then stops with an error."""
     for path in (Path(stores) / (name + '.json'), Path(long_lived_dir) / (name + '.json')):
-        if not (path.exists() or path.is_symlink()): continue
-        if not path.is_symlink() and stored_kind(path) == 'long-lived':
-            path.unlink(); continue
-        folder = Path(stores) / '.retired'
-        private_directory(folder)
-        stamp, n = str(int(time.time())), 0
-        while True:
-            target = folder / (name + '-' + stamp + ('-' + str(n) if n else '') + '.json')
-            try: os.link(path, target, follow_symlinks=False); break
-            except FileExistsError: n += 1
-        path.unlink()
+        for _ in range(tries):
+            try: before = os.lstat(path)
+            except FileNotFoundError: break
+            if not path.is_symlink() and stored_kind(path) == 'long-lived':
+                if same_file(os.lstat(path), before):
+                    path.unlink(); break
+                continue
+            folder = Path(stores) / '.retired'
+            private_directory(folder)
+            stamp, n = str(int(time.time())), 0
+            while True:
+                target = folder / (name + '-' + stamp + ('-' + str(n) if n else '') + '.json')
+                try: os.link(path, target, follow_symlinks=False); break
+                except FileExistsError: n += 1
+            if after_link: after_link(path, target)
+            try: current = os.lstat(path)
+            except FileNotFoundError:
+                break  # moved away by someone else; the retired link keeps its bytes
+            if same_file(current, os.lstat(target)):
+                path.unlink(); break
+            target.unlink()  # the link points at the old file, not the one now at `path`
+        else:
+            raise RuntimeError(path.name + ' changed while it was being retired; nothing more was removed. Rerun this command.')
 
 
 def matches_native(native, name, value, stores):
-    """Whether account `name` is the Native login (`native` from native_login.parse_auth_status)."""
+    """Whether account `name` is the Native login (`native` from native_login.parse_auth_status).
+    Email must match; organizations are compared only when both sides name one."""
     if not native: return False
     entry = registry.account(value, name) or {}
-    if entry.get('email') and entry.get('organization'):
-        email, organization = entry['email'], entry['organization']
+    if entry.get('email'):
+        email, organization = entry['email'], entry.get('organization') or ''
     else:
         path = Path(stores) / (name + '.json')
         if not (path.exists() or path.is_symlink()): return False
-        if kind(credential(path)) != 'refreshable': return False  # a long-lived token has no profile to compare
+        try: stored = credential(path)
+        except (OSError, ValueError, RuntimeError):
+            raise RuntimeError('Could not read the login of ' + name + ' to check whether it is the Native login; nothing was removed. Fix the file (private 0600 JSON) and rerun.') from None
+        if kind(stored) != 'refreshable': return False  # a long-lived token has no profile to compare
         try: info = profile(path)
         except RuntimeError:
             raise RuntimeError('Could not check whether ' + name + ' is the Native login (identity check unavailable); nothing was removed. Rerun when online.') from None
         email, organization = info['email'], info['organization']
-    return normalized(native['email']) == normalized(email) and normalized(native.get('organization') or '') == normalized(organization)
+    if normalized(native['email']) != normalized(email): return False
+    theirs, ours = normalized(native.get('organization') or ''), normalized(organization or '')
+    return not theirs or not ours or theirs == ours
 
 
 def remove_account(name, wait, *, config, stores, binary, runtime, backend_source, backend_env, overview,

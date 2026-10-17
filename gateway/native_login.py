@@ -8,10 +8,11 @@ import json
 
 
 def parse_auth_status(text):
-    """{'email', 'organization'} of the signed-in Native login, or None when nobody is signed in."""
-    try: value = json.loads(text)
-    except ValueError: return None
-    if not isinstance(value, dict) or value.get('loggedIn') is not True: return None
+    """{'email', 'organization'} of the signed-in Native login; None only when the status says nobody is signed in.
+    Raises ValueError for output it cannot read, so a caller never mistakes a broken status for "signed out"."""
+    value = json.loads(text)  # ValueError on non-JSON
+    if not isinstance(value, dict) or not isinstance(value.get('loggedIn'), bool): raise ValueError('Unreadable Native auth status')
+    if not value['loggedIn']: return None
     email, organization = value.get('email'), value.get('orgName')
-    if not isinstance(email, str) or not email: return None
+    if not isinstance(email, str) or not email: raise ValueError('Native auth status has no email')
     return {'email': email, 'organization': organization if isinstance(organization, str) else ''}

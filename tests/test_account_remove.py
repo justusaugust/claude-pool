@@ -63,8 +63,14 @@ class RoutingTests(unittest.TestCase):
         self.assertTrue(routing.in_flight({'health': {'activeRequests': 0}, 'sessions': [{'busy': True, 'account': 'ops'}]}, 'ops'))
         self.assertFalse(routing.in_flight({'health': {'activeRequests': 0}, 'sessions': [{'busy': True, 'account': 'ops'}]}, 'team'))
         self.assertTrue(routing.in_flight({'health': {'activeRequests': 2}, 'sessions': []}))
-        self.assertFalse(routing.in_flight({'health': {'activeRequests': 2}, 'sessions': []}, 'ops'))
+        self.assertFalse(routing.in_flight({'health': {'activeRequests': 0}, 'sessions': []}, 'ops'))
         self.assertFalse(routing.in_flight({'sessions': [{'busy': False, 'account': 'ops'}]}))
+
+    def test_untracked_requests_count_as_busy_for_every_account(self):
+        # Only main requests with a session id become busy rows; the rest show only in activeRequests.
+        self.assertTrue(routing.in_flight({'health': {'activeRequests': 1}, 'sessions': []}, 'team'))
+        self.assertFalse(routing.in_flight({'health': {'activeRequests': 1}, 'sessions': [{'busy': True, 'account': 'gmail'}]}, 'team'))
+        self.assertTrue(routing.in_flight({'health': {'activeRequests': 2}, 'sessions': [{'busy': True, 'account': 'gmail'}]}, 'team'))
 
     def test_wait_idle_polls_until_idle_or_the_limit(self):
         busy = {'sessions': [{'busy': True, 'account': 'ops'}]}
@@ -88,8 +94,13 @@ class NativeStatusTests(unittest.TestCase):
         self.assertEqual(native_login.parse_auth_status(json.dumps(AUTH_STATUS)), {'email': 'ops@x.de', 'organization': 'Team A'})
 
     def test_parse_auth_status_without_a_login_is_none(self):
-        for text in [json.dumps({**AUTH_STATUS, 'loggedIn': False}), json.dumps({'loggedIn': True}), '', 'not json', '[]']:
-            with self.subTest(text=text): self.assertIsNone(native_login.parse_auth_status(text))
+        self.assertIsNone(native_login.parse_auth_status(json.dumps({**AUTH_STATUS, 'loggedIn': False})))
+        self.assertIsNone(native_login.parse_auth_status(json.dumps({'loggedIn': False})))
+
+    def test_parse_auth_status_refuses_output_it_cannot_read(self):
+        for text in [json.dumps({'loggedIn': True}), json.dumps({'email': 'a@b.de'}), '', 'not json', '[]']:
+            with self.subTest(text=text):
+                with self.assertRaises(ValueError): native_login.parse_auth_status(text)
 
 
 class RemoveTests(unittest.TestCase):
@@ -209,8 +220,47 @@ class RemoveTests(unittest.TestCase):
     def test_backend_rejection_changes_nothing(self):
         self.binary.write_text(shunt(1))
         before = self.snapshot()
-        with self.assertRaisesRegex(RuntimeError, 'Backend rejected'): self.remove()
+        with self.assertRaises(RuntimeError) as error: self.remove()
+        self.assertEqual(str(error.exception), 'Backend rejected the removal; live membership is unchanged')
         self.assertEqual(self.snapshot(), before)
+
+    def test_register_keeps_its_rejection_text(self):
+        self.binary.write_text(shunt(1))
+        paths, env = setup.local_paths_env(self.runtime, self.stores)
+        info = {'email': 'f@x.de', 'organization': 'F', 'plan': 'Max', 'userId': 'user-f', 'organizationId': 'org-f'}
+        with self.assertRaises(RuntimeError) as error:
+            setup.register(self.config, self.stores, self.binary, paths, {'name': 'fresh', 'label': 'Fresh', 'alias': 'fresh'}, info, env)
+        self.assertEqual(str(error.exception), 'Backend rejected enrollment; live membership is unchanged')
+
+    def test_an_unanswered_overview_refuses_and_changes_nothing(self):
+        def overview(): raise OSError('pool did not answer')
+        before = self.snapshot()
+        with self.assertRaisesRegex(RuntimeError, 'did not answer'): self.remove(overview=overview)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_retire_never_unlinks_a_file_replaced_while_it_was_moved(self):
+        store = self.stores / 'operations.json'
+        original = store.read_bytes()
+        def swap(path, target):
+            # Another process installs a new login at the same path between link and unlink.
+            fresh = path.with_name('fresh.tmp'); fresh.write_bytes(b'replacement'); fresh.chmod(0o600); fresh.replace(path)
+        with self.assertRaisesRegex(RuntimeError, 'changed while'):
+            setup.retire(self.stores, self.long_lived, 'operations', after_link=swap)
+        self.assertEqual(store.read_bytes(), b'replacement')
+        self.assertEqual(list((self.stores / '.retired').glob('*')), [])
+        self.assertEqual(original[:1], b'{')
+
+    def test_retire_retries_after_a_single_replacement(self):
+        store = self.stores / 'operations.json'
+        calls = []
+        def swap_once(path, target):
+            calls.append(1)
+            if len(calls) == 1:
+                fresh = path.with_name('fresh.tmp'); fresh.write_bytes(store.read_bytes()); fresh.chmod(0o600); fresh.replace(path)
+        setup.retire(self.stores, self.long_lived, 'operations', after_link=swap_once)
+        self.assertEqual(len(calls), 2)
+        self.assertFalse(store.exists())
+        self.assertEqual(len(list((self.stores / '.retired').glob('operations-*.json'))), 1)
 
     def test_unknown_account_is_refused(self):
         with self.assertRaisesRegex(RuntimeError, 'No account named'): self.remove('nobody')
@@ -241,6 +291,25 @@ class RemoveTests(unittest.TestCase):
         self.assertIn('fresh', self.members())
         self.assertIn(entry, json.loads(self.config.read_text())['accounts'])
 
+    def test_native_match_by_email_when_an_organization_is_missing(self):
+        registry.update(lambda value: value['accounts'].append({'name': 'spare', 'email': 'spare@x.de'}), self.reg)
+        known = registry.load(self.reg)
+        with patch.object(setup, 'profile') as profile:
+            self.assertTrue(setup.matches_native({'email': 'Spare@x.de', 'organization': 'Any Org'}, 'spare', known, self.stores))
+            self.assertFalse(setup.matches_native({'email': 'other@x.de', 'organization': 'Any Org'}, 'spare', known, self.stores))
+            # Native without an organization matches on email alone.
+            self.assertTrue(setup.matches_native({'email': 'ops@x.de', 'organization': ''}, 'operations', known, self.stores))
+        profile.assert_not_called()
+
+    def test_native_check_on_an_unreadable_store_refuses(self):
+        (self.stores / 'spare.json').chmod(0o644)
+        with self.assertRaisesRegex(RuntimeError, 'Could not read'):
+            setup.matches_native({'email': 'x@x.de', 'organization': 'X'}, 'spare', registry.load(self.reg), self.stores)
+        (self.stores / 'spare.json').write_text('not json')
+        (self.stores / 'spare.json').chmod(0o600)
+        with self.assertRaisesRegex(RuntimeError, 'Could not read'):
+            setup.matches_native({'email': 'x@x.de', 'organization': 'X'}, 'spare', registry.load(self.reg), self.stores)
+
     def test_device_is_a_reserved_shortcut(self):
         self.assertIn('device', account_metadata.RESERVED)
 
@@ -263,6 +332,36 @@ class LaunchTests(unittest.TestCase):
         self.assertEqual(result.exception.code, 0)
         self.assertEqual(cli.call_args.args[0], ['remove', 'x'])
         self.assertTrue(callable(kwargs['native_identity']))
+
+    def launch_remove(self, request, loaded):
+        import launch
+        with tempfile.TemporaryDirectory() as folder:
+            stores = Path(folder)
+            fd = os.open(stores / '.pool-client-token', os.O_WRONLY | os.O_CREAT, 0o600)
+            with os.fdopen(fd, 'w') as file: file.write('fixture-client-token-' + 'x' * 32 + '\n')
+            with patch.object(launch.sys, 'argv', ['claude-pool', 'account', 'remove', 'x']), \
+                 patch.object(launch, 'STORES', stores), patch.object(launch, 'request', side_effect=request), \
+                 patch.object(launch.service, 'loaded', return_value=loaded), \
+                 patch.object(setup, 'cli', return_value=0) as cli:
+                with self.assertRaises(SystemExit): launch.main()
+                return cli.call_args.kwargs['overview']
+
+    def test_launch_keeps_the_check_when_the_running_pool_does_not_answer(self):
+        overview = self.launch_remove(OSError('no answer'), loaded=True)
+        self.assertIsNotNone(overview)
+        self.assertFalse(routing.wait_idle(overview, 'x', False))
+
+    def test_launch_skips_the_check_only_when_the_pool_is_not_running(self):
+        self.assertIsNone(self.launch_remove(OSError('no answer'), loaded=False))
+
+    def test_launch_native_identity_refuses_unreadable_status(self):
+        import launch
+        for done in [Mock(returncode=1, stdout=''), Mock(returncode=0, stdout='not json'), Mock(returncode=2, stdout=json.dumps(AUTH_STATUS))]:
+            with self.subTest(done=done), patch.object(launch.subprocess, 'run', return_value=done):
+                with self.assertRaisesRegex(RuntimeError, 'Native login'): launch.native_identity()
+        logged_out = Mock(returncode=1, stdout=json.dumps({**AUTH_STATUS, 'loggedIn': False}))
+        with patch.object(launch.subprocess, 'run', return_value=logged_out):
+            self.assertIsNone(launch.native_identity())
 
     def test_launch_native_identity_reads_native_auth_status(self):
         import launch
