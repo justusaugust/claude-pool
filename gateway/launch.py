@@ -486,11 +486,14 @@ def main():
         raise SystemExit(cli(argv, config=CONFIG, stores=STORES, binary=HERE/'bin/shunt', runtime=RUNTIME,
                              overview=overview if available else None, long_lived=LONG_LIVED, native_identity=native_identity,
                              on_change=on_change))
+    if len(sys.argv) > 1 and sys.argv[1] == 'conductor':
+        from conductor_tools import cli
+        raise SystemExit(cli(sys.argv[2:]))
     if sys.argv[1:] in [['--help'], ['-h']]: sys.argv[1:] = ['help']
     if sys.argv[1:] == ['--version']:
         raise SystemExit(subprocess.call([NATIVE_CLAUDE, *sys.argv[1:]]))
     if sys.argv[1:] == ['help']:
-        print('claude-pool [account-alias] [Claude arguments]\nCommands: update, usage [--once], history, forecast-check, doctor, account add <email>, account list, account remove <name> [--wait], account reserve <name> --at <pct>|--off, login <name>, phone, respawn <id>\nUpdates: claude update = Claude Code; claude-pool update or claude pool update = Claude Pool\nService: --start, --stop\nSetup: ' + str(ROOT / 'docs/SETUP.md'))
+        print('claude-pool [account-alias] [Claude arguments]\nCommands: update, usage [--once], history, forecast-check, doctor, account add <email>, account list, account remove <name> [--wait], account reserve <name> --at <pct>|--off, login <name>, phone, respawn <id>, conductor snapshot|events|tell|journal\nUpdates: claude update = Claude Code; claude-pool update or claude pool update = Claude Pool\nService: --start, --stop\nSetup: ' + str(ROOT / 'docs/SETUP.md'))
         return
     if len(sys.argv) > 1 and sys.argv[1] == 'phone':
         from control_main import cli
