@@ -246,11 +246,10 @@ def set_account_option(text, name, key, value):
         block = tomllib.loads(''.join(lines[index:stop]))['providers']['anthropic']['accounts']
         if block and block[0].get('name') == name: start, end = index, stop; break
     if start is None: raise RuntimeError('The runtime configuration lists ' + name + ' in a form this command cannot edit')
-    own = re.compile(r'\s*' + re.escape(key) + r'\s*=')
+    own = re.compile(r'\s*(?:' + re.escape(key) + '|"' + re.escape(key) + '"|\'' + re.escape(key) + r'\')\s*=')
     at = next((i for i in range(start + 1, end) if own.match(lines[i])), None)
     if value is None:
-        if at is None: return text
-        del lines[at]
+        if at is not None: del lines[at]  # no matching line: the verification below refuses a key it could not find
     else:
         line = key + ' = ' + repr(float(value)) + '\n'
         if at is not None: lines[at] = line
@@ -295,16 +294,19 @@ def local_context():
 
 
 def reserve_hook(value, context=None):
-    """Device sync: apply each registry `reserveAt` that differs from this device. Never raises, never syncs onward."""
+    """Device sync: apply each registry `reserveAt` that differs from this device (never syncs onward). Tries every account,
+    then raises one error naming the failed ones (names only) so device sync records the hook as failed."""
     try:
         config, binary, paths, env = context or local_context()
         local = {r['name']: r.get('reserveAt', 0) for r in load(config).get('accounts', [])}
     except (OSError, ValueError, RuntimeError, ImportError): return
+    failed = []
     for row in value.get('accounts', []):
         name, want = row.get('name'), row.get('reserveAt')
         if name not in local or want is None or want == local[name]: continue
         try: reserve(config, binary, paths, env, name, want or None, registry_path=False)
-        except Exception: continue
+        except Exception: failed.append(name)
+    if failed: raise RuntimeError('Reserve not applied for: ' + ', '.join(failed))
 
 
 def local_paths_env(runtime, stores, backend_source=None, backend_env=None):

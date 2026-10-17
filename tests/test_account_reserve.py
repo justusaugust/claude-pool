@@ -62,6 +62,19 @@ class RoutingTests(unittest.TestCase):
         self.assertFalse(routing.reserve_blocked({'name': 'team', 'reserveAt': 85, 'fiveHour': None}))
         decision = decide([account('team', five=86, reserve=85), account('other', five=97)])
         self.assertEqual(decision['reason'], 'no eligible account')
+        rows = [account('team', five=86, reserve=85), account('other', five=97)]
+        for kwargs in ({'previous': 'team'}, {'pin': 'team'}):
+            with self.subTest(**kwargs):
+                decision = decide(rows, **kwargs)
+                self.assertEqual((decision['account'], decision['reason']), (None, 'no eligible account'))
+        self.assertEqual(decide([account('team', five=10, reserve=85), account('other', five=97)], previous='team')['account'], 'team')
+
+    def test_a_blocked_previous_account_names_its_reserve_as_the_reason(self):
+        self.assertIn('reserved account', routing.REASONS)
+        self.assertEqual(routing.unavailable(account('team', five=86, reserve=85)), 'reserved account')
+        self.assertEqual(routing.unavailable(account('team', five=96, reserve=85)), 'five-hour quota exhausted')
+        decision = decide([account('team', five=86, reserve=85), account('other', five=40)], previous='team')
+        self.assertEqual((decision['account'], decision['reason']), ('other', 'reserved account'))
 
     def test_session_on_reserved_account_moves_at_its_next_request(self):
         decision = decide([account('team', five=86, reserve=85), account('other', five=40)], previous='team')
@@ -88,6 +101,17 @@ class RoutingTests(unittest.TestCase):
         rows[0]['seenAt'] = 1
         readings.merge(rows, shared, NOW * 1000)
         self.assertTrue(routing.reserve_blocked(rows[0]))
+
+
+class QuotedKeyTests(unittest.TestCase):
+    def test_a_quoted_key_is_removed_or_refused_never_left_in_place(self):
+        text = BASE.replace('name = "team"\n', 'name = "team"\n"max_utilization" = 0.5\n')
+        try: out = setup.set_account_option(text, 'team', 'max_utilization', None)
+        except RuntimeError: return
+        self.assertNotIn('max_utilization', out)
+        self.assertEqual(out.replace('"max_utilization" = 0.5\n', ''), text.replace('"max_utilization" = 0.5\n', ''))
+        set_out = setup.set_account_option(text, 'team', 'max_utilization', 0.7)
+        self.assertEqual(setup.tomllib.loads(set_out)['providers']['anthropic']['accounts'][1]['max_utilization'], 0.7)
 
 
 class MetadataTests(unittest.TestCase):
@@ -238,10 +262,21 @@ class ReserveTests(unittest.TestCase):
         self.assertEqual(self.row('team')['reserveAt'], 0)
         self.assertNotIn('max_utilization', self.block('team'))
 
-    def test_hook_never_raises_and_is_registered_for_device_sync(self):
+    def test_hook_attempts_every_account_then_raises_one_error_naming_the_failures(self):
+        picky = self.root / 'picky-shunt'
+        picky.write_text('#!' + sys.executable + '\nimport sys\ntext = open(sys.argv[2]).read()\nsys.exit(1 if "max_utilization = 0.7" in text else 0)\n')
+        picky.chmod(0o700)
+        paths, env = setup.local_paths_env(self.runtime, self.stores)
+        value = {'accounts': [{'name': 'ops', 'reserveAt': 70}, {'name': 'team', 'reserveAt': 85}]}
+        with self.assertRaisesRegex(RuntimeError, 'ops') as raised: setup.reserve_hook(value, (self.config, picky, paths, env))
+        self.assertNotIn('team', str(raised.exception))
+        self.assertEqual(self.row('team')['reserveAt'], 85)
+        self.assertNotIn('reserveAt', self.row('ops'))
+
+    def test_hook_leaves_state_alone_on_rejection_and_is_registered_for_device_sync(self):
         bad = self.root / 'bad-shunt'; bad.write_text(shunt(1)); bad.chmod(0o700)
         paths, env = setup.local_paths_env(self.runtime, self.stores)
-        setup.reserve_hook({'accounts': [{'name': 'team', 'reserveAt': 70}]}, (self.config, bad, paths, env))
+        with self.assertRaises(RuntimeError): setup.reserve_hook({'accounts': [{'name': 'team', 'reserveAt': 70}]}, (self.config, bad, paths, env))
         self.assertNotIn('reserveAt', self.row('team'))
         import device_sync
         self.assertIn(setup.reserve_hook, device_sync.INTEGRATION_HOOKS)

@@ -149,6 +149,11 @@ def receive_account(name, data):
     if row.get('plan'): entry['plan'] = row['plan']
     info = {'userId': value['shuntAccountUuid'], 'organizationId': value['shuntOrganizationUuid']}
     accounts_cli.register_local(entry, info)
+    if (row.get('reserveAt') or 0) > 0:
+        try:
+            config, binary, paths, env = accounts_cli.local_context()
+            accounts_cli.reserve(config, binary, paths, env, name, row['reserveAt'], registry_path=False)
+        except Exception as error: return 'installed (reserve not applied: ' + type(error).__name__ + ')'
     return 'installed'
 
 

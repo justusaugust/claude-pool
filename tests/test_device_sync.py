@@ -92,6 +92,31 @@ class DeviceSyncTests(unittest.TestCase):
         self.assertEqual(mode(self.stores / 'team.json'), 0o600); self.assertEqual(mode(self.directory / 'team.json'), 0o600)
         self.assertEqual(device_sync.receive_account('team', self.blob()), 'unchanged')
 
+    def test_receive_account_applies_the_registry_reserve(self):
+        self.devices(MAC, VPS, accounts=[{**ROW, 'reserveAt': 85}])
+        self.assertEqual(device_sync.receive_account('team', self.blob()), 'installed')
+        self.assertEqual(next(r for r in json.loads(self.config.read_text())['accounts'] if r['name'] == 'team')['reserveAt'], 85)
+        self.assertIn('max_utilization = 0.85', self.runtime_toml.read_text())
+
+    def test_a_rejected_reserve_is_reported_but_the_install_stands(self):
+        self.devices(MAC, VPS, accounts=[{**ROW, 'reserveAt': 85}])
+        shunt = self.here / 'bin/shunt'
+        shunt.write_text('#!' + sys.executable + '\nimport sys\nsys.exit(1 if "max_utilization" in open(sys.argv[2]).read() else 0 if "check" in sys.argv else 3)\n')
+        result = device_sync.receive_account('team', self.blob())
+        self.assertTrue(result.startswith('installed (reserve not applied'))
+        self.assertIn('team', self.config_names())
+        self.assertNotIn('max_utilization', self.runtime_toml.read_text())
+
+    def test_a_failing_reserve_hook_is_reported_by_receive_registry(self):
+        import accounts_cli
+        self.devices(MAC, VPS, accounts=[{**ROW, 'reserveAt': 0}])
+        accounts_cli.register_local({'name': 'team', 'label': 'Team'}, {'userId': 'u', 'organizationId': 'o'})
+        shunt = self.here / 'bin/shunt'
+        shunt.write_text('#!' + sys.executable + '\nimport sys\nsys.exit(1 if "max_utilization" in open(sys.argv[2]).read() else 0 if "check" in sys.argv else 3)\n')
+        device_sync.INTEGRATION_HOOKS[:] = [accounts_cli.reserve_hook]
+        report = device_sync.receive_registry(self.newer([{**ROW, 'reserveAt': 85}]))
+        self.assertTrue(report['hooks']['reserve_hook'].startswith('failed'))
+
     def test_receive_account_without_a_usage_owner_installs(self):
         self.devices(MAC, accounts=[ROW])
         self.assertEqual(device_sync.receive_account('team', self.blob()), 'installed')

@@ -6,7 +6,7 @@ ACTIVE_SECONDS = 300
 REASONS = {'manual selection', 'cache affinity', 'shared capacity', 'new session',
            'five-hour quota exhausted', 'weekly quota exhausted', 'account paused',
            'account cooling down', 'account needs sign-in', 'quota or upstream failover',
-           'upstream failover', 'no eligible account'}
+           'upstream failover', 'no eligible account', 'reserved account'}
 
 
 def profile(request):
@@ -30,6 +30,7 @@ def unavailable(account):
     if account.get('quotaLimits', {}).get('sevenDay', {}).get('status') == 'rejected': return 'weekly quota exhausted'
     if account.get('sevenDay') and account['sevenDay']['pct'] >= 95: return 'weekly quota exhausted'
     if account.get('fiveHour') and account['fiveHour']['pct'] >= 95: return 'five-hour quota exhausted'
+    if reserve_blocked(account): return 'reserved account'
     return 'quota or upstream failover'
 
 
@@ -86,7 +87,8 @@ def choose(accounts, sessions, session_id, forecast, now):
     if pin and any(a['name'] == pin for a in ready):
         return {'account': pin, 'reason': 'manual selection', 'peers': loads[pin]}
     if not ready:
-        return {'account': pin or previous, 'reason': 'no eligible account', 'peers': 0}
+        keep = pin or previous  # a reserved account at its limit is never the preferred account: no header steers to it
+        return {'account': None if keep in by_name and reserve_blocked(by_name[keep]) else keep, 'reason': 'no eligible account', 'peers': 0}
     # Remaining time is comparable across plans; percentages are not.
     def score(a):
         name = a['name']; capacity = seconds.get(name)
