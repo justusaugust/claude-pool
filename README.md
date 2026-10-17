@@ -4,7 +4,7 @@ One Claude Code workflow, backed by your connected subscription accounts.
 
 Keep using the normal Claude Code terminal, tools and conversation. The local pool selects a serving subscription, keeps requests on it while it is eligible, and routes to another account when necessary. Cockpit shows account usage inside Claude; `claude usage` opens a live terminal monitor.
 
-**macOS alpha.** The private implementation has real task-level validation. This package has also been source-built and installed from its exported archive in an isolated environment on the maintainer's Mac, using empty credential storage and no inference. A full second-machine OAuth acceptance run remains outstanding. Installation builds the pinned backend locally; no prebuilt downloads are used. Claude Code is installed separately.
+**macOS and Linux alpha.** The private implementation has real task-level validation. This package has also been source-built and installed from its exported archive in an isolated environment on the maintainer's Mac, using empty credential storage and no inference. The Linux port (systemd user service, XDG paths, rustup in the user's home) was built, fixture-tested and installed the same way on a headless Debian 13 server. A full second-machine OAuth acceptance run remains outstanding on both. Installation builds the pinned backend locally; no prebuilt downloads are used. Claude Code is installed separately.
 
 ## What it does
 
@@ -15,7 +15,7 @@ Keep using the normal Claude Code terminal, tools and conversation. The local po
 - Stable Native claude.ai identity for connectors and artifacts, independent of the serving inference account.
 - Background handoff and targeted worker respawn, with model/effort preservation and guarded automatic continuation.
 - Waiting for confirmed quota resets while the same streaming request remains connected, before model output begins. A closed Claude process cannot be revived by this mechanism.
-- Optional private phone Cockpit for supported approvals and targeted instructions, over Tailscale. It is a separate web interface; it does not enable Native Remote Control on a custom gateway.
+- Optional private phone Cockpit for supported approvals and targeted instructions, over Tailscale, on macOS or Linux. It is a separate web interface; it does not enable Native Remote Control on a custom gateway.
 
 ## Start here
 
@@ -23,7 +23,7 @@ Keep using the normal Claude Code terminal, tools and conversation. The local po
 curl -fsSL https://raw.githubusercontent.com/justusaugust/claude-pool/main/install.sh | sh
 ```
 
-On macOS with Native Claude Code and Git installed, this installs or updates the pool. It uses Python 3.11+ or Homebrew to obtain it, builds missing backend dependencies, and verifies an existing backend before reusing it. The first source build takes longer; unchanged backends are reused on later updates. Review [install.sh](install.sh) before running downloaded code.
+On macOS or Linux with Native Claude Code and Git installed, this installs or updates the pool. It uses Python 3.11+ (macOS can obtain it through Homebrew), builds missing backend dependencies (Linux: rustup into `~/.cargo`, no root), and verifies an existing backend before reusing it. The first source build takes longer; unchanged backends are reused on later updates. Review [install.sh](install.sh) before running downloaded code.
 
 ```sh
 claude-pool account add             # guided login and live enrollment
@@ -67,9 +67,9 @@ Loopback-server tests use temporary ports and fixture credentials. Do not run mo
 
 The Mods also have Native fixture tests. Run `python3 scripts/test_mods.py` after installing Native Claude (or pass `--native-claude /path/to/claude`). This tests all five generated Mods with temporary configuration, phone controls configured and unconfigured, and paths containing spaces and quotes. It does not use live pool state or credentials, make model requests, or reload running sessions. Native generates its version-specific SDK declarations when a Mod loads interactively; those generated files are excluded from Git and source exports.
 
-GitHub Actions runs these tests on pushes and pull requests, with a manual run option. Python fixtures run on macOS with Python 3.11 and 3.14; Mod fixtures use pinned Native Claude 2.1.301 with an isolated home and configuration. A separate clean-install smoke test builds the pinned backend, runs `install.sh` in an empty home, then exercises the installed `claude-pool update` command against a second local source release. It checks backend reuse, repeat updates, preserved configuration and launchers, and an existing disposable worker finishing from the retained release. Run it with `python3 scripts/smoke_install_update.py --native-claude /path/to/claude`; an existing source-checkout backend is reused for local checks. Jobs use GitHub-hosted runners, read-only repository permissions and no account secrets. Live OAuth, inference, connector and artifact acceptance tests remain manual.
+GitHub Actions runs these tests on pushes and pull requests, with a manual run option. Python fixtures run on macOS and Ubuntu with Python 3.11 and 3.14; Mod fixtures use pinned Native Claude 2.1.301 with an isolated home and configuration on both systems. A separate clean-install smoke test builds the pinned backend, runs `install.sh` in an empty home, then exercises the installed `claude-pool update` command against a second local source release. It checks backend reuse, repeat updates, preserved configuration and launchers, and an existing disposable worker finishing from the retained release. Run it with `python3 scripts/smoke_install_update.py --native-claude /path/to/claude`; an existing source-checkout backend is reused for local checks. Jobs use GitHub-hosted runners, read-only repository permissions and no account secrets. Live OAuth, inference, connector and artifact acceptance tests remain manual.
 
-`main` requires `Python 3.11`, `Python 3.14`, `Native Mod fixtures`, and `Clean install and update` from GitHub Actions, up to date with `main`. There are no bypass actors. Push changes to a branch and merge after CI passes; unchecked direct pushes to `main` are rejected.
+`main` requires the Python, `Native Mod fixtures` and `Clean install and update` jobs for both macOS and Ubuntu from GitHub Actions, up to date with `main`. There are no bypass actors. Push changes to a branch and merge after CI passes; unchecked direct pushes to `main` are rejected.
 
 CI caches npm downloads and Rust dependency builds, keyed by the runner image, architecture and pinned backend inputs. It never caches the installed pool, account state, Native installation or a completed Shunt backend. With a shared `CARGO_TARGET_DIR`, the builder cleans the `shunt-gateway` package before compiling and after copying out the new binary. Each smoke run still uses an empty home, fresh source and installation, runs `npm ci` and `cargo build --locked`, and exercises every update and preservation check even on a cache hit. A cache miss builds normally; cache hits never skip tests.
 

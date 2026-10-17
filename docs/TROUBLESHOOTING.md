@@ -4,13 +4,17 @@
 
 **An update is installed but the backend is still old.** This is deliberate: the updater never restarts the live service or reloads Native sessions. New commands use the selected release. Gateway/backend changes activate at the next service start; loaded Mods keep their old files until you choose to reload or start another session. Early alpha launchd definitions may need a deliberate reload after tasks finish.
 
+**Linux: `systemctl --user` says it cannot connect.** The pool needs a user service manager. Log in through a login that starts one (SSH with pam_systemd does), check `echo $XDG_RUNTIME_DIR` is set, and for a server that should keep serving after logout ask a root user for `loginctl enable-linger <user>` once. The installer never changes this.
+
 **Installation finds an existing launcher or directory it does not own.** It stops before replacing it. Use a separate `--prefix` and `--bin-dir` for an isolated test, or deliberately resolve ownership first. The private development wrapper is not a managed public installation.
 
-**The build needs tools.** The one-command installer can use Homebrew for Python, Node and Rustup. Without Homebrew, install the requirements in setup and rerun. An unchanged checksum-verified backend is reused on updates.
+**The build needs tools.** The one-command installer can use Homebrew for Python, Node and Rustup on macOS. Without Homebrew, install the requirements in setup and rerun. On Linux it fetches rustup into `~/.cargo` itself; Node/npm and a C compiler (`build-essential`) must already be installed. An unchanged checksum-verified backend is reused on updates.
 
 **Account setup is waiting or was interrupted.** Rerun the same `claude-pool account add <email>` command with the same name. A saved login is reused; no existing credential is overwritten. The provider's first usage poll can take five minutes. Until it arrives, setup reports pending rather than claiming the account is ready.
 
 **The browser selected the wrong account or organization.** Nothing is enrolled when email or requested organization checks fail. Keep the saved file private; do not paste it into support messages. Use the correct account name or deliberately resolve that saved login with its owner. The CLI never replaces an existing refresh token automatically.
+
+**No browser opens on a server.** Expected over SSH: copy the printed authorization URL into a browser on any machine, finish the login there, and paste the shown code into the hidden terminal prompt. Do not forward ports or copy credential files between machines.
 
 **Authorization shows a redirect error.** The guided CLI uses the registered manual-code browser flow from the start. Start a fresh `account add` flow and use its complete code in the hidden dialog; old codes and codes from another login are rejected.
 
@@ -24,7 +28,7 @@
 
 **The monitor keeps changing but observations are old.** The UI refreshes more often than the provider cache. Look at checked/observation age. Offline readings are marked stale and retried; a changing clock does not mean a new quota reading.
 
-**The pool is unavailable.** Run `claude-pool doctor`. The launcher can start its own launchd service, so this is not a passive process-only diagnostic. Check port conflicts, configuration, backend build and private-file permissions. This alpha refuses a differing service definition rather than replacing it. Do not kill unrelated listeners or restart active Native tasks.
+**The pool is unavailable.** Run `claude-pool doctor`. The launcher can start its own launchd or systemd user service, so this is not a passive process-only diagnostic. Check port conflicts, configuration, backend build and private-file permissions. This alpha refuses a differing service definition rather than replacing it. Do not kill unrelated listeners or restart active Native tasks.
 
 **A plugin update seems absent.** Installed files and loaded session code are different states. Use a user-managed `/reload-plugins` checkpoint or start a fresh disposable session. A tool-list change can require confirmation; do not force it past Native's check.
 

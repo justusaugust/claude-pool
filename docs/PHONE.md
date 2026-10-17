@@ -1,8 +1,8 @@
 # Optional private phone Cockpit
 
-This surface is experimental. The Mac must remain running and reachable. A physical phone acceptance test is still required; desktop responsive-browser tests alone do not establish iOS backgrounding or network recovery.
+This surface is experimental. The host (Mac or Linux server) must remain running and reachable. A physical phone acceptance test is still required; desktop responsive-browser tests alone do not establish iOS backgrounding or network recovery.
 
-Install and sign in to Tailscale on the Mac and phone, then run:
+Install and sign in to Tailscale on the host and phone, then run:
 
 ```sh
 claude-pool phone --status

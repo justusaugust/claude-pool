@@ -1,6 +1,6 @@
 # Compatibility and proof boundaries
 
-The following task-level tests were run on the original macOS installation before portable packaging. They establish behavior of that tested implementation, not acceptance on every machine or with every plugin. Portable-launcher changes require separate validation.
+The following task-level tests were run on the original macOS installation before portable packaging. They establish behavior of that tested implementation, not acceptance on every machine or with every plugin. Portable-launcher changes require separate validation. The Linux port shares every gateway, Mod and backend code path; only service control (systemd --user), the Cockpit machine pane's host commands and the Rust toolchain bootstrap differ, and those were fixture-tested and installed on Debian 13 without live accounts.
 
 | Surface | What was tested | What remains outside that evidence |
 | --- | --- | --- |

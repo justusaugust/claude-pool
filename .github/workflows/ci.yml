@@ -18,12 +18,13 @@ env:
 
 jobs:
   python:
-    name: Python ${{ matrix.python-version }}
-    runs-on: macos-15
+    name: Python ${{ matrix.python-version }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
+        os: [macos-15, ubuntu-24.04]
         python-version: ['3.11', '3.14']
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -36,9 +37,13 @@ jobs:
         run: python3 scripts/test.py
 
   mods:
-    name: Native Mod fixtures
-    runs-on: macos-15
+    name: Native Mod fixtures on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-24.04]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -62,9 +67,13 @@ jobs:
         run: python3 scripts/test_mods.py --native-claude "$RUNNER_TEMP/claude-code/node_modules/.bin/claude"
 
   install:
-    name: Clean install and update
-    runs-on: macos-15
+    name: Clean install and update on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-24.04]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

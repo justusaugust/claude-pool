@@ -1,26 +1,26 @@
 # Setup
 
-This is a source-built macOS alpha. Tested runtime work used Claude Code 2.1.300. The original implementation was validated on Apple Silicon; a second physical Mac, Intel, Linux and Windows have not been accepted.
+This is a source-built macOS and Linux alpha. Tested runtime work used Claude Code 2.1.300. The original implementation was validated on Apple Silicon; the Linux port was built and fixture-tested on Debian 13 (x86_64, headless). A second physical Mac, Intel Macs, other distributions and Windows have not been accepted.
 
 ## Requirements
 
-- macOS with a logged-in graphical user session for user launchd services.
-- Python 3.11+, Git, Rustup with Rust 1.96.1, Node.js 22.12+ and npm for the source build.
+- macOS with a logged-in graphical user session for user launchd services, or Linux with systemd and a user service manager (`systemctl --user status` answers). For a server that should keep the pool running after you log out, a human with root runs `loginctl enable-linger <user>` once.
+- Python 3.11+, Git, Rustup with Rust 1.96.1, Node.js 22.12+ and npm for the source build. Linux additionally needs a C compiler and linker for the Rust build (Debian: `build-essential`) and `ps` (procps); the installer fetches rustup into `~/.cargo` itself when it is missing.
 - Native Claude Code 2.1.300+ installed and authenticated through its ordinary browser flow. The installer checks this floor; the tested version is 2.1.300.
 - At least one authorized subscription identity; two independently provisioned accounts to test switching. The Native owner's user/organization identity must be configured too.
-- Optional: Tailscale on the Mac and phone for private phone Cockpit.
+- Optional: Tailscale on the host and phone for private phone Cockpit.
 
 Use only accounts and organization access you are authorized to operate. The software does not change a provider's subscription policies.
 
 ## 1. Install in one command
 
-With Native Claude Code and Git already installed on macOS:
+With Native Claude Code and Git already installed on macOS or Linux:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/justusaugust/claude-pool/main/install.sh | sh
 ```
 
-The command downloads public source, checks Native compatibility, installs Python 3.11+ through Homebrew if needed, and builds the exact pinned backend. Missing Node/Rustup build tools can also be installed through Homebrew. Without Homebrew, install the listed requirements yourself and rerun. Native Claude is never installed, updated or logged in by this installer.
+The command downloads public source, checks Native compatibility, installs Python 3.11+ through Homebrew if needed, and builds the exact pinned backend. On macOS, missing Node/Rustup build tools can also be installed through Homebrew; without Homebrew, install the listed requirements yourself and rerun. On Linux, Node and npm come from your distribution or nodejs.org, and a missing Rust toolchain is installed by the official `rustup-init` into `~/.cargo` and `~/.rustup` without touching your shell files or needing root. Native Claude is never installed, updated or logged in by this installer.
 
 The first build may take several minutes. Rust uses two jobs and runs at lower scheduling priority. Updates reuse the existing backend only when its upstream pin and binary checksum match; an altered patch is rejected. A failed download, build or staged-code check leaves the installed version selected.
 
@@ -53,10 +53,10 @@ Defaults:
 | Non-secret configuration | `~/.config/claude-pool/config.json` |
 | Private subscription credentials | `~/.shunt/accounts/claude` |
 | Runtime metadata and usage history | `~/.local/state/claude-pool` |
-| Service label | `io.github.claude-pool` |
+| Service label | `io.github.claude-pool` (macOS: `~/Library/LaunchAgents/<label>.plist`, Linux: `~/.config/systemd/user/<label>.service`) |
 | Loopback backend / gateway / controls | `18340` / `18341` / `18342` |
 
-Application, launcher and configuration locations can be selected with installer flags. Runtime, credential directory, ports and Native path can be changed in configuration before starting a service. `CLAUDE_POOL_CONFIG` selects another configuration file; the generated launcher and launchd definition retain that selection. Do not move credentials or change ports beneath running sessions.
+Application, launcher and configuration locations can be selected with installer flags. Runtime, credential directory, ports and Native path can be changed in configuration before starting a service. `CLAUDE_POOL_CONFIG` selects another configuration file; the generated launcher and service definition retain that selection. Do not move credentials or change ports beneath running sessions.
 
 Add `~/.local/bin` to PATH if it is not already present.
 
@@ -71,7 +71,9 @@ claude-pool account add you@company.example --name work --label Work --organizat
 
 Or run `claude-pool account add` and enter your email when prompted. The name and shortcut default to the part before `@`; use `--name` to distinguish accounts with the same email prefix. `--label` selects the readable display name. No configuration editing is needed.
 
-The command opens browser authorization. Confirm the selected account and subscription organization, then paste the complete code into the private macOS dialog (a hidden terminal prompt on other supported terminals). Never paste it into chat or a command argument. The CLI verifies the returned email and organization identity, stores refreshable credentials privately, registers the account and creates its session shortcut. `--organization` additionally requires the selected organization name to match.
+The command opens browser authorization. Confirm the selected account and subscription organization, then paste the complete code into the private macOS dialog (a hidden terminal prompt on Linux and other supported terminals). Never paste it into chat or a command argument.
+
+On a headless Linux host (SSH, no browser) the command prints the authorization URL under "If the browser did not open". Open that URL in a browser on another machine, sign in, copy the complete code the page shows, and paste it into the hidden prompt in the SSH terminal. The code is bound to that one login attempt; nothing else needs to reach the server, and no port forwarding is required. The CLI verifies the returned email and organization identity, stores refreshable credentials privately, registers the account and creates its session shortcut. `--organization` additionally requires the selected organization name to match.
 
 With a running pool, enrollment hot-reloads backend membership without restarting Claude or changing existing session pins. The command waits for the backend's first quota reading and reports the actual status, including `limited` if exhausted. This can take up to five minutes. A pending result means readiness is still unconfirmed; rerunning the same command resumes with the saved login instead of opening another browser. If the pool is stopped, the account is saved for its next normal start.
 
@@ -126,7 +128,7 @@ Or rerun the one-command installer. Updates download source, reuse or build the 
 
 New commands and sessions use the selected CLI and Mods. Already-running sessions retain their code and files; no plugin reload, Native restart, drain, model call or service restart is requested. A gateway/backend change is **installed but not active** until the service next starts. The updater does not force that boundary. Retained versions consume disk space and are not automatically deleted while tasks may reference them.
 
-New installations use a stable launchd entry point, so later natural starts select the new backend. An early alpha installation may still have a loaded launchd definition pointing at its original directory. The updater prepares its on-disk definition for the stable entry point but leaves the loaded job alone. The next login adopts it; to adopt it earlier, finish tasks and deliberately run `claude-pool --stop`, `launchctl bootout "gui/$(id -u)/io.github.claude-pool"`, then `claude-pool --start` once. Unmanaged development wrappers are never silently converted or overwritten.
+New installations use a stable service entry point, so later natural starts select the new backend. An early alpha installation may still have a loaded launchd definition pointing at its original directory. The updater prepares its on-disk definition for the stable entry point but leaves the loaded job alone. The next login adopts it; to adopt it earlier, finish tasks and deliberately run `claude-pool --stop`, `launchctl bootout "gui/$(id -u)/io.github.claude-pool"` (Linux: `systemctl --user disable --now io.github.claude-pool.service`), then `claude-pool --start` once. Unmanaged development wrappers are never silently converted or overwritten.
 
 To inspect the selected source version, read `build-info.json` in the application root or its `current` release. Source checkouts need the bootstrap installer rather than `claude-pool update`. A new version cannot change code already loaded by a Native session.
 
@@ -136,12 +138,17 @@ Once tasks have finished:
 
 ```sh
 claude-pool --stop
-launchctl bootout "gui/$(id -u)/io.github.claude-pool"
+launchctl bootout "gui/$(id -u)/io.github.claude-pool"      # macOS
+systemctl --user disable --now io.github.claude-pool.service  # Linux
 python3 install.py --uninstall
 ```
 
 Run the uninstall command from the retained source checkout, using `--prefix` if you chose another application directory. It refuses while the service is loaded or if a launcher changed. Configuration, credentials, usage history and Native Claude are retained. Remove the shell function yourself. No user chat is restarted or replayed by uninstall.
 
 After reinstalling, reuse the existing credential names and run `claude-pool --start`. The deliberate-stop marker is retained until that explicit start; logging in again is not required for valid retained credentials.
+
+## Linux notes
+
+The pool runs as your ordinary user through `systemd --user`: the first `claude-pool` start writes `~/.config/systemd/user/io.github.claude-pool.service`, enables it and starts it; `claude-pool --stop` drains it and the unit does not restart after a deliberate stop (`Restart=on-failure`). The daemon receives SIGTERM alone (`KillMode=mixed`) so it can finish active responses before stopping the backend. Inspect it with `systemctl --user status io.github.claude-pool.service`; the service writes no log of its own, `claude-pool doctor` reports health. Without linger the user manager, and with it the pool, stops when your last session ends; running Claude tasks are children of your terminal, not of the service, and keep running until the pool is needed again. Credentials stay in `~/.shunt/accounts/claude` as 0600 files inside a 0700 directory, exactly as on macOS; no keyring is used. The Cockpit `/machine` pane reads `/proc` and needs no `lsof`.
 
 For private phone access and its extra configuration, see [phone controls](PHONE.md). For stale readings and authentication failures, see [troubleshooting](TROUBLESHOOTING.md).
