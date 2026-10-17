@@ -291,6 +291,37 @@ class ReleaseTests(unittest.TestCase):
                 installer.uninstall(app)
             self.assertFalse(plist.exists()); self.assertTrue(config.exists()); self.assertTrue(native.exists())
 
+    def test_linux_install_uses_systemd_unit_paths_and_removes_only_its_own_unit(self):
+        with tempfile.TemporaryDirectory(prefix='pool linux home ') as folder:
+            root = Path(folder); native = root / 'native-claude'
+            native.write_text('#!/bin/sh\nif [ "$1" = "--version" ]; then echo "2.1.300 (Claude Code)"; fi\n'); native.chmod(0o755)
+            app, binaries, config = root / 'app', root / 'bin', root / 'private/config.json'
+            with patch.object(installer.sys, 'platform', 'linux'):
+                self.assertEqual(installer.service_path({'serviceLabel': 'io.github.claude-pool'})[1].name, 'io.github.claude-pool.service')
+                self.assertIn('.config/systemd/user', str(installer.service_path({})[1]))
+                installer.install(app, binaries, config, native, skip_backend=True)
+                self.assertFalse((root / 'Library').exists()); self.assertFalse((root / '.config/systemd').exists())
+                unit = root / '.config/systemd/user/io.github.claude-pool.service'; unit.parent.mkdir(parents=True)
+                unit.write_bytes(installer.service.render({'Label': 'io.github.claude-pool', 'ProgramArguments': ['/usr/bin/python3', '/another/app/launch.py', '--daemon']}))
+                with patch.object(installer.Path, 'home', return_value=root), patch.object(installer.subprocess, 'run', return_value=Mock(returncode=1)):
+                    with self.assertRaisesRegex(RuntimeError, 'another installation'): installer.uninstall(app)
+                    self.assertTrue(app.exists())
+                    unit.write_bytes(installer.service.render({'Label': 'io.github.claude-pool', 'ProgramArguments': ['/usr/bin/python3', str(app / 'run.py'), '--daemon']}))
+                    self.assertIn('"', unit.read_text(), 'paths with spaces are quoted')
+                    with patch.object(installer.subprocess, 'run', return_value=Mock(returncode=0)) as run:
+                        with self.assertRaisesRegex(RuntimeError, 'systemctl --user disable --now io.github.claude-pool.service'): installer.uninstall(app)
+                        self.assertEqual(run.call_args_list[0].args[0][:3], ['systemctl', '--user', 'is-active'])
+                    installer.uninstall(app)
+            self.assertFalse(unit.exists()); self.assertFalse(app.exists()); self.assertTrue(config.exists())
+
+    def test_unsupported_platform_is_refused_before_any_change(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder); native = root / 'native'; native.write_text('#!/bin/sh\necho "2.1.300 (Claude Code)"\n'); native.chmod(0o755)
+            with patch.object(installer.sys, 'platform', 'win32'):
+                with self.assertRaisesRegex(RuntimeError, 'macOS and Linux'):
+                    installer.install(root / 'app', root / 'bin', root / 'config.json', native, skip_backend=True)
+            self.assertFalse((root / 'app').exists()); self.assertFalse((root / 'config.json').exists())
+
     def test_no_machine_home_paths_or_private_keys_in_source(self):
         forbidden = ['/Us' + 'ers/', '/ho' + 'me/', '-----BEGIN ' + 'PRIVATE KEY-----']
         for path in ROOT.rglob('*'):

@@ -54,7 +54,7 @@ def prepare():
     login = status.get('User', {}).get(str(own.get('UserID')), {}).get('LoginName')
     dns = own.get('DNSName', '').rstrip('.')
     if status.get('BackendState') != 'Running' or not login or not dns.endswith('.ts.net'):
-        raise RuntimeError('Connect Tailscale on this Mac before enabling phone controls.')
+        raise RuntimeError('Connect Tailscale on this machine before enabling phone controls.')
     private_directory(RUNTIME)
     value = {'host': dns + ':8443', 'login': login}
     atomic_write(RUNTIME / 'phone-config.json', json.dumps(value))

@@ -15,7 +15,6 @@ import subprocess
 import sys
 import time
 import threading
-import plistlib
 import tomllib
 import uuid
 import re
@@ -24,6 +23,7 @@ from views import usage, history
 
 from bridge import PoolBridge, atomic_write
 from native_auth import NativeAuth
+import service
 from validation import render as validation_view
 
 from settings import HERE, RUNTIME, STORES, NATIVE_CLAUDE, CONFIG, BASE_URL, GATEWAY_PORT, BACKEND_PORT, backend_config, connection_ts, ALIASES, private_directory
@@ -32,12 +32,14 @@ HEALTH_INTERVAL = 10
 INSTALLATION = json.loads((ROOT / 'installation.json').read_text()) if (ROOT / 'installation.json').is_file() else {}
 SERVICE_LABEL = INSTALLATION.get('serviceLabel', 'io.github.claude-pool')
 if not isinstance(SERVICE_LABEL, str) or not re.fullmatch(r'[a-zA-Z0-9.-]+', SERVICE_LABEL): raise RuntimeError('Invalid installed service label')
-SERVICE_PLIST = Path.home() / 'Library/LaunchAgents' / (SERVICE_LABEL + '.plist')
+SERVICE_FILE = service.service_file(SERVICE_LABEL)
+SERVICE_PLIST = SERVICE_FILE
 ACCOUNT_SHORTCUTS = ALIASES
 
 
 def service_command(*args, check=True):
-    result = subprocess.run(['launchctl', *args], capture_output=True, text=True)
+    manager = ['launchctl'] if service.platform() == 'darwin' else ['systemctl', '--user']
+    result = subprocess.run([*manager, *args], capture_output=True, text=True)
     if check and result.returncode: raise RuntimeError('Background service control failed')
     return result.returncode
 
@@ -54,20 +56,25 @@ def service_definition():
 
 
 def install_service():
-    SERVICE_PLIST.parent.mkdir(parents=True, exist_ok=True)
+    SERVICE_FILE.parent.mkdir(parents=True, exist_ok=True)
     definition = service_definition()
-    if SERVICE_PLIST.exists() and plistlib.loads(SERVICE_PLIST.read_bytes()) != definition:
+    if SERVICE_FILE.exists() and service.load(SERVICE_FILE.read_bytes()) != definition:
         raise RuntimeError('Existing pool service definition differs; review before replacing')
-    if not SERVICE_PLIST.exists(): SERVICE_PLIST.write_bytes(plistlib.dumps(definition))
+    if not SERVICE_FILE.exists(): SERVICE_FILE.write_bytes(service.render(definition))
+    if service.platform() == 'linux':
+        # Enabling mirrors RunAtLoad: the unit starts at login and, with linger, at boot.
+        service_command('daemon-reload')
+        service_command('enable', SERVICE_LABEL + '.service')
+        return SERVICE_LABEL + '.service'
     domain = f'gui/{os.getuid()}'
     if service_command('print', domain + '/' + SERVICE_LABEL, check=False):
-        service_command('bootstrap', domain, str(SERVICE_PLIST))
+        service_command('bootstrap', domain, str(SERVICE_FILE))
     return domain + '/' + SERVICE_LABEL
 
 
 def managed_start():
-    service = install_service()
-    service_command('kickstart', service)
+    unit = install_service()
+    service_command('start' if service.platform() == 'linux' else 'kickstart', unit)
 
 
 
@@ -227,7 +234,7 @@ def recover_orphan():
     expected = f"{HERE / 'bin/shunt'} --config {RUNTIME / 'shunt.toml'} run"
     if process_command(pid) != expected: return False
     parent = subprocess.run(["ps", "-p", str(pid), "-o", "ppid="], capture_output=True, text=True).stdout.strip()
-    if parent != "1": return False
+    if not orphaned(parent): return False
     try: os.kill(pid, signal.SIGTERM)
     except ProcessLookupError: return False
     for _ in range(30):
@@ -235,6 +242,14 @@ def recover_orphan():
         time.sleep(.1)
     if process_command(pid) == expected: os.kill(pid, signal.SIGKILL)
     return False
+
+
+def orphaned(parent):
+    """An orphan is reparented to init, or on Linux to the user's own systemd instance."""
+    if parent == "1": return True
+    if service.platform() != 'linux' or not parent.isdigit(): return False
+    command = process_command(int(parent)).split()
+    return bool(command) and Path(command[0]).name == 'systemd' and '--user' in command
 
 
 def restart_idle(server, process):
@@ -564,7 +579,7 @@ def main():
         claude_args = ['--session-id', session, *claude_args]
     if not any(arg in {'--safe-mode', '--bare'} for arg in options):
         claude_args = ['--plugin-dir', str(configured_plugin('cockpit')), *claude_args]
-    # launchd owns recovery; a TUI never launches a second background watcher.
+    # The service manager owns recovery; a TUI never launches a second background watcher.
     raise SystemExit(subprocess.call([NATIVE_CLAUDE, *claude_args], env=env))
 
 
