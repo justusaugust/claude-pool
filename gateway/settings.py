@@ -34,6 +34,7 @@ STORES = Path(OPTIONS.get('credential_dir', Path.home() / '.shunt/accounts/claud
 LONG_LIVED = STORES.parent / 'claude-long-lived'  # 0700; long-lived token files before they join STORES
 REGISTRY = CONFIG.parent / 'devices.json'  # non-secret, generation-numbered device registry
 SELF = CONFIG.parent / 'device.json'  # this machine's registry name
+SHARED_READINGS = RUNTIME / 'shared-readings.json'  # usage readings pulled from the usage owner
 NATIVE_CLAUDE = str(Path(OPTIONS.get('native_claude', shutil.which('claude') or Path.home() / '.local/bin/claude')).expanduser().absolute())
 GATEWAY_PORT = OPTIONS.get('gateway_port', 18341)
 BACKEND_PORT = OPTIONS.get('backend_port', 18340)

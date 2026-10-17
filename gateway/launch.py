@@ -22,11 +22,12 @@ import tempfile
 from views import usage, history
 
 from bridge import PoolBridge, atomic_write
+import readings
 from native_auth import NativeAuth
 import service
 from validation import render as validation_view
 
-from settings import HERE, RUNTIME, STORES, LONG_LIVED, NATIVE_CLAUDE, CONFIG, BASE_URL, GATEWAY_PORT, BACKEND_PORT, backend_config, connection_ts, ALIASES, private_directory
+from settings import HERE, RUNTIME, STORES, LONG_LIVED, NATIVE_CLAUDE, CONFIG, BASE_URL, GATEWAY_PORT, BACKEND_PORT, backend_config, connection_ts, SHARED_READINGS, ALIASES, private_directory
 ROOT = HERE.parent
 HEALTH_INTERVAL = 10
 INSTALLATION = json.loads((ROOT / 'installation.json').read_text()) if (ROOT / 'installation.json').is_file() else {}
@@ -155,7 +156,8 @@ def daemon(client, admin):
     server, stop, watcher = None, threading.Event(), None
     try:
         names = [a['name'] for a in tomllib.loads(config).get('providers', {}).get('anthropic', {}).get('accounts', [])]
-        server = PoolBridge(("127.0.0.1", GATEWAY_PORT), BACKEND_PORT, client, admin, RUNTIME / "sessions.json", native_auth=NativeAuth(STORES, names))
+        server = PoolBridge(("127.0.0.1", GATEWAY_PORT), BACKEND_PORT, client, admin, RUNTIME / "sessions.json", native_auth=NativeAuth(STORES, names), shared_readings=SHARED_READINGS)
+        readings.Puller(SHARED_READINGS, server.journal).start(stop)
         def drain(signum, frame):
             server.draining = True
             server.journal.record('service_draining', requests=len(server.requests))

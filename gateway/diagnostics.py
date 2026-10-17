@@ -22,6 +22,7 @@ CODES = {
     'client_disconnected': 'Claude connection closed; upstream cancelled',
     'request_idle_timeout': 'Response stalled; connection closed',
     'history_index_rebuilt': 'History index rebuilt from the preserved archive',
+    'readings_sync_failed': 'Shared usage readings could not be fetched',
     'storage_failed': 'Recovery metadata could not be saved',
 }
 

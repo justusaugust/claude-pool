@@ -18,6 +18,7 @@ from forecast import estimate, renewal_scenario, workload_estimates
 from routing import choose, profile, session_rows, unavailable, REASONS
 from validation import archive, HistoryIndex
 from diagnostics import Journal
+import readings
 from native_auth import NativeAuthUnavailable
 from telemetry import fable_windows, capacity
 from private_files import atomic_write
@@ -49,10 +50,11 @@ class PoolBridge(ThreadingHTTPServer):
     daemon_threads = False
     allow_reuse_address = True
 
-    def __init__(self, address, upstream_port, client_token, admin_token, state_path=None, native_auth=None):
+    def __init__(self, address, upstream_port, client_token, admin_token, state_path=None, native_auth=None, shared_readings=None):
         super().__init__(address, Handler)
         self.upstream_port, self.client_token, self.admin_token = upstream_port, client_token, admin_token
         self.native_auth = native_auth
+        self.shared_readings = Path(shared_readings) if shared_readings else None
         self.lock = threading.RLock()
         self.sessions, self.observations, self.paused_names = {}, {}, set()
         self.traffic = []
@@ -250,6 +252,7 @@ class PoolBridge(ThreadingHTTPServer):
                              "fiveHour": window("5h"), "sevenDay": window("7d"), "fableWeekly": fable.get((provider['provider'], source['name'], source['account_ref'])), "status": status,
                              "plan": source.get("plan"), "seenAt": (source.get("observed_at_5h") or 0) * 1000,
                              "paused": source.get("paused", False), "cooldownSeconds": source.get("cooldown_secs_remaining", 0) or 0})
+        if self.shared_readings: readings.merge(rows, readings.load_shared(self.shared_readings), int(time.time() * 1000))
         from account_metadata import decorate
         decorate({'accounts': rows}, CONFIG)
         with self.lock:
