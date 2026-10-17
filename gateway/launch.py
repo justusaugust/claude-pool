@@ -460,6 +460,14 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == 'update':
         from update import cli
         raise SystemExit(cli(sys.argv[2:], HERE))
+    if len(sys.argv) > 1 and sys.argv[1] == 'device':
+        # Device verbs never start or stop the local pool (only `device switch` does, through the launcher).
+        from devices_cli import cli
+        raise SystemExit(cli(sys.argv[2:]))
+    if sys.argv[1:] == ['help', 'device']:
+        from devices_cli import DEVICE_HELP
+        print(DEVICE_HELP)
+        return
     if len(sys.argv) > 1 and sys.argv[1] in {'account', 'login'}:
         from accounts_cli import cli
         argv = sys.argv[2:]
@@ -493,7 +501,7 @@ def main():
     if sys.argv[1:] == ['--version']:
         raise SystemExit(subprocess.call([NATIVE_CLAUDE, *sys.argv[1:]]))
     if sys.argv[1:] == ['help']:
-        print('claude-pool [account-alias] [Claude arguments]\nCommands: update, usage [--once], history, forecast-check, doctor, account add <email>, account list, account remove <name> [--wait], account reserve <name> --at <pct>|--off, login <name>, phone, respawn <id>, conductor snapshot|events|tell|journal\nUpdates: claude update = Claude Code; claude-pool update or claude pool update = Claude Pool\nService: --start, --stop\nSetup: ' + str(ROOT / 'docs/SETUP.md'))
+        print('claude-pool [account-alias] [Claude arguments]\nCommands: update, usage [--once], history, forecast-check, doctor, account add <email>, account list, account remove <name> [--wait], account reserve <name> --at <pct>|--off, login <name>, device add|check|remove|list, phone, respawn <id>, conductor snapshot|events|tell|journal\nUpdates: claude update = Claude Code; claude-pool update or claude pool update = Claude Pool\nService: --start, --stop\nSetup: ' + str(ROOT / 'docs/SETUP.md'))
         return
     if len(sys.argv) > 1 and sys.argv[1] == 'phone':
         from control_main import cli
