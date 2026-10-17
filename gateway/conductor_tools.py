@@ -44,10 +44,11 @@ MAX_TEXT_LINES, MAX_TEXT_BYTES = 60, 6 * 1024
 MAX_LAST = 160          # per-agent last line
 MAX_SESSIONS, MAX_AGENTS, MAX_PREVIEWS, MAX_REPOS, MAX_PRS = 20, 40, 20, 10, 10
 IDLE = ('idle', 'done')
-ATTEMPTS = 3            # delivery attempts per queued task before it is dropped
+ATTEMPTS = 3            # failed prompts to a present agent before a queued task is dropped
+ORPHAN_KEEP = 86400     # a task whose agent is gone is kept this long from when it was queued
 STATE_LIMIT = 1 << 20
 
-ANSI = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]')
+ANSI = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()*+][0-9A-Za-z]|\x1b[@-Z\\-_]')
 CONTROL = re.compile(r'[\x00-\x1f\x7f-\x9f]')
 SECRETS = [(re.compile(r'sk-ant-[A-Za-z0-9_-]+'), '<redacted>'),
            (re.compile(r'(?i)\bBearer\s+\S+'), 'Bearer <redacted>'),
@@ -403,9 +404,10 @@ def _event_line(kind, subject, detail, tools, new):
     return clean('conductor-event ' + kind + ' ' + subject + (' ' + detail if detail else ''), 300)
 
 
-def _deliver(tools, agents, queue_path):
-    """Prompt idle agents with their oldest queued task (one per agent per poll). A failed prompt, or a poll on which the
-    agent is gone (reported once as orphaned), counts as an attempt; after ATTEMPTS the task is dropped as undeliverable."""
+def _deliver(tools, agents, queue_path, now):
+    """Prompt idle agents with their oldest queued task (one per agent per poll); a task gets ATTEMPTS failed prompts.
+    A task whose agent is gone is reported once as orphaned, delivered if the agent comes back, and dropped as
+    undeliverable ORPHAN_KEEP after it was queued; polls without the agent are not attempts."""
     with _locked(queue_path):
         items = _read(queue_path).get('items') or []
     lines, busy, changes = [], set(), {}
@@ -413,22 +415,27 @@ def _deliver(tools, agents, queue_path):
         key = item.get('session', '') + '/' + item.get('pane', '')
         label = item.get('session', '') + '/' + (item.get('agent') or item.get('pane', ''))
         row = agents.get(key)
-        if row is not None and (row['status'] not in IDLE or key in busy):
+        if row is None:
+            if now - float(item.get('at') or 0) >= ORPHAN_KEEP:
+                changes[item['id']] = None
+                lines.append(clean('conductor-event undeliverable ' + label + ' ' + item['task'], 200))
+            elif not item.get('orphaned'):
+                changes[item['id']] = {**item, 'orphaned': True}
+                lines.append(clean('conductor-event orphaned ' + label + ' ' + item['task'], 200))
+            continue
+        if row['status'] not in IDLE or key in busy:
             if item.get('orphaned'): changes[item['id']] = {**item, 'orphaned': False}
             continue
-        if row is None:
-            if not item.get('orphaned'): lines.append(clean('conductor-event orphaned ' + label + ' ' + item['task'], 200))
-        else:
-            busy.add(key)
-            if tools.prompt(row['session'], row['pane'], item['task']):
-                changes[item['id']] = None
-                lines.append(clean('conductor-event delivered ' + agent_label(row) + ' ' + item['task'], 200))
-                continue
+        busy.add(key)
+        if tools.prompt(row['session'], row['pane'], item['task']):
+            changes[item['id']] = None
+            lines.append(clean('conductor-event delivered ' + agent_label(row) + ' ' + item['task'], 200))
+            continue
         attempts = int(item.get('attempts') or 0) + 1
         if attempts >= ATTEMPTS:
             changes[item['id']] = None
             lines.append(clean('conductor-event undeliverable ' + label + ' ' + item['task'], 200))
-        else: changes[item['id']] = {**item, 'attempts': attempts, 'orphaned': row is None}
+        else: changes[item['id']] = {**item, 'attempts': attempts, 'orphaned': False}
     if changes:
         with _locked(queue_path):
             value = _read(queue_path)
@@ -463,7 +470,7 @@ def _tick(state_path, queue_path, tools, now, first, with_prs):
         lines.append('conductor-event batch ' + str(new['pending']) + ' changes')
         new['pending'], new['batchAt'] = 0, now
     _write(state_path, new)
-    if not (first or not old) and queue_path.exists(): lines += _deliver(tools, new['agents'], queue_path)
+    if not (first or not old) and queue_path.exists(): lines += _deliver(tools, new['agents'], queue_path, now)
     return lines, True
 
 

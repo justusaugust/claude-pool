@@ -175,6 +175,7 @@ class CleanTests(unittest.TestCase):
         self.assertEqual(ct.clean(keep), keep)
         self.assertEqual(ct.clean('a\tb\x07c\rd'), 'a b c d')
         self.assertEqual(len(ct.clean('x' * 500, limit=160)), 160)
+        self.assertEqual(ct.clean('\x1b(Bplain\x1b)0 x'), 'plain x')
 
     def test_standard_base64_with_slashes_is_redacted_but_plain_paths_survive(self):
         aws = 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY'
@@ -481,7 +482,7 @@ class TellTests(ToolsBase):
         self.assertNotIn('delivered', ' '.join(self.tick(1040)))
         self.assertEqual(json.loads(self.queue_path.read_text())['items'][0]['attempts'], 1)
 
-    def test_orphaned_queue_item_is_listed_reported_once_and_dropped_after_three_polls(self):
+    def orphan(self):
         self.tick(1000, first=True)
         ct.tell('reviewer', 'Review PR 12', tools=ct.Tools(), queue_path=self.queue_path, now=1010)
         value = base_state(); del value['agents']['dashboard'][0]
@@ -490,9 +491,24 @@ class TellTests(ToolsBase):
         self.assertIn('dashboard/reviewer Review PR 12', ct.snapshot(ct.Tools(), queue_path=self.queue_path))
         orphaned = json.loads(ct.snapshot(ct.Tools(), as_json=True, queue_path=self.queue_path))['orphaned']
         self.assertEqual(orphaned, [{'agent': 'dashboard/reviewer', 'task': 'Review PR 12'}])
-        self.assertEqual(self.tick(1040), [])
-        self.assertEqual(self.tick(1060), ['conductor-event undeliverable dashboard/reviewer Review PR 12'])
+
+    def test_orphaned_queue_item_is_reported_once_and_delivered_when_the_agent_comes_back(self):
+        self.orphan()
+        for poll in range(10): self.assertEqual(self.tick(1040 + 20 * poll), [])
+        self.assertEqual(len(json.loads(self.queue_path.read_text())['items']), 1)
+        value = base_state(); value['agents']['dashboard'][0]['agent_status'] = 'idle'
+        self.set_state(value)
+        self.assertIn('conductor-event delivered dashboard/reviewer Review PR 12', self.tick(1300))
         self.assertEqual(json.loads(self.queue_path.read_text())['items'], [])
+        self.assertEqual(len([c for c in self.herdr_calls() if c[4:5] == ['prompt']]), 1)
+
+    def test_orphaned_queue_item_is_dropped_with_one_line_after_a_day(self):
+        self.orphan()
+        # The agent vanishing is one unimportant change; its batch line is due by now.
+        self.assertEqual(self.tick(1010 + 86400 - 20), ['conductor-event batch 1 changes'])
+        self.assertEqual(self.tick(1010 + 86400), ['conductor-event undeliverable dashboard/reviewer Review PR 12'])
+        self.assertEqual(json.loads(self.queue_path.read_text())['items'], [])
+        self.assertEqual(self.tick(1010 + 86420), [])
         self.assertFalse([c for c in self.herdr_calls() if c[4:5] == ['prompt']])
 
     def test_parallel_starts_a_pool_agent_in_a_new_workspace_of_the_same_session(self):
