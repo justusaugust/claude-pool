@@ -33,7 +33,6 @@ INSTALLATION = json.loads((ROOT / 'installation.json').read_text()) if (ROOT / '
 SERVICE_LABEL = INSTALLATION.get('serviceLabel', 'io.github.claude-pool')
 if not isinstance(SERVICE_LABEL, str) or not re.fullmatch(r'[a-zA-Z0-9.-]+', SERVICE_LABEL): raise RuntimeError('Invalid installed service label')
 SERVICE_FILE = service.service_file(SERVICE_LABEL)
-SERVICE_PLIST = SERVICE_FILE
 ACCOUNT_SHORTCUTS = ALIASES
 
 
