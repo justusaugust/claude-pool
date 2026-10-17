@@ -28,7 +28,7 @@ class RegistryTests(unittest.TestCase):
         self.path = self.dir / 'devices.json'
 
     def test_empty_registry_defaults(self):
-        self.assertEqual(registry.load(self.path), {'version': 1, 'generation': 0, 'updatedAt': 0, 'devices': [], 'accounts': [], 'leitstand': None})
+        self.assertEqual(registry.load(self.path), {'version': 1, 'generation': 0, 'updatedAt': 0, 'devices': [], 'accounts': [], 'conductor': None})
 
     def test_update_bumps_generation_and_writes_0600(self):
         value = registry.update(lambda v: v['devices'].append(MAC), self.path)
@@ -71,14 +71,26 @@ class RegistryTests(unittest.TestCase):
         self.path.write_text(' ' * (256 * 1024 + 1)); self.path.chmod(0o600)
         with self.assertRaises(ValueError): registry.load(self.path)
 
-    def test_exactly_one_usage_owner_and_leitstand_on_a_known_device(self):
+    def test_exactly_one_usage_owner_and_conductor_on_a_known_device(self):
         with self.assertRaises(ValueError): registry.update(lambda v: v['devices'].extend([MAC, {**VPS, 'roles': ['usage']}]), self.path)
-        leit = {'device': 'mac', 'email': 'a@example.com', 'organization': 'AI Værk Team', 'cwd': '/work'}
-        with self.assertRaises(ValueError): registry.update(lambda v: v.update(devices=[MAC], leitstand={**leit, 'device': 'ghost'}), self.path)
-        with self.assertRaises(ValueError): registry.update(lambda v: v['devices'].append({**VPS, 'roles': ['leitstand']}), self.path)
+        entry = {'device': 'mac', 'email': 'a@example.com', 'organization': 'AI Værk Team', 'cwd': '/work'}
+        with self.assertRaises(ValueError): registry.update(lambda v: v.update(devices=[MAC], conductor={**entry, 'device': 'ghost'}), self.path)
+        with self.assertRaises(ValueError): registry.update(lambda v: v['devices'].append({**VPS, 'roles': ['conductor']}), self.path)
         with self.assertRaises(ValueError): registry.update(lambda v: v['devices'].extend([MAC, {**VPS, 'name': 'mac'}]), self.path)
-        value = registry.update(lambda v: v.update(devices=[MAC], leitstand=leit), self.path)
-        self.assertEqual(value['leitstand'], leit)
+        value = registry.update(lambda v: v.update(devices=[MAC], conductor=entry), self.path)
+        self.assertEqual(value['conductor'], entry)
+
+    def test_an_old_leitstand_entry_is_read_as_the_conductor_and_written_back_renamed(self):
+        entry = {'device': 'mac', 'email': 'a@example.com', 'organization': 'AI Værk Team', 'cwd': '/work'}
+        old = {**registry.EMPTY(), 'generation': 3, 'devices': [MAC], 'leitstand': entry}
+        del old['conductor']
+        self.path.write_text(json.dumps(old)); self.path.chmod(0o600)
+        self.assertEqual(registry.load(self.path)['conductor'], entry)
+        self.assertNotIn('leitstand', registry.load(self.path))
+        registry.update(lambda v: None, self.path)
+        stored = json.loads(self.path.read_text())
+        self.assertEqual(stored['conductor'], entry); self.assertNotIn('leitstand', stored)
+        self.assertEqual(registry.validate({**old, 'generation': 4})['conductor'], entry)  # an older peer's registry still arrives
 
     def test_local_device_without_ssh_is_valid(self):
         self.assertIsNone(registry.update(lambda v: v['devices'].append({**MAC, 'ssh': None}), self.path)['devices'][0]['ssh'])

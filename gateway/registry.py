@@ -12,15 +12,15 @@ import settings
 LIMIT = 256 * 1024
 NAME = re.compile(r'[a-z0-9-]{1,40}')
 TOKEN_PREFIX = 'sk-' + 'ant-'
-TOP = {'version', 'generation', 'updatedAt', 'devices', 'accounts', 'leitstand'}
+TOP = {'version', 'generation', 'updatedAt', 'devices', 'accounts', 'conductor'}
 DEVICE_KEYS = {'name', 'ssh', 'platform', 'roles', 'tailscaleIp', 'cua', 'herdrSession', 'addedAt'}
 ACCOUNT_TEXT = ['label', 'alias', 'plan', 'email', 'organization', 'userId', 'organizationId', 'fingerprint']
 ACCOUNT_KEYS = {'name', 'expiresAt', 'reserveAt', *ACCOUNT_TEXT}
-LEITSTAND_KEYS = {'device', 'email', 'organization', 'cwd'}
+CONDUCTOR_KEYS = {'device', 'email', 'organization', 'cwd'}
 
 
 def EMPTY():
-    return {'version': 1, 'generation': 0, 'updatedAt': 0, 'devices': [], 'accounts': [], 'leitstand': None}
+    return {'version': 1, 'generation': 0, 'updatedAt': 0, 'devices': [], 'accounts': [], 'conductor': None}
 
 
 def is_int(value): return type(value) is int
@@ -63,7 +63,16 @@ def check_account(row):
     if 'reserveAt' in row and not (is_int(row['reserveAt']) and 0 <= row['reserveAt'] <= 99): raise ValueError('reserveAt must be an integer from 0 to 99')
 
 
+def migrate(value):
+    """A registry written before the rename names the Conductor `leitstand`; read it once as `conductor`."""
+    if isinstance(value, dict) and 'leitstand' in value:
+        old = value.pop('leitstand')
+        if value.get('conductor') is None: value['conductor'] = old
+    return value
+
+
 def validate(value):
+    migrate(value)
     keys(value, TOP, 'registry')
     if value.get('version') != 1: raise ValueError('Unsupported registry version')
     for key in ['generation', 'updatedAt']:
@@ -75,11 +84,11 @@ def validate(value):
         names = [row['name'] for row in rows]
         if len(set(names)) != len(names): raise ValueError('Duplicate ' + what + ' name')
     if sum('usage' in row.get('roles', []) for row in value['devices']) > 1: raise ValueError('Only one device can be the usage owner')
-    leitstand = value.get('leitstand')
-    if leitstand is not None:
-        keys(leitstand, LEITSTAND_KEYS, 'leitstand')
-        if set(leitstand) != LEITSTAND_KEYS or any(not isinstance(item, str) for item in leitstand.values()): raise ValueError('leitstand needs device, email, organization and cwd as text')
-        if leitstand['device'] not in {row['name'] for row in value['devices']}: raise ValueError('leitstand.device must be a registered device')
+    entry = value.get('conductor')
+    if entry is not None:
+        keys(entry, CONDUCTOR_KEYS, 'conductor')
+        if set(entry) != CONDUCTOR_KEYS or any(not isinstance(item, str) for item in entry.values()): raise ValueError('conductor needs device, email, organization and cwd as text')
+        if entry['device'] not in {row['name'] for row in value['devices']}: raise ValueError('conductor.device must be a registered device')
     no_tokens(value)
     return value
 

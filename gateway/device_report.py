@@ -4,7 +4,7 @@ from typing import NamedTuple, Optional
 STATUSES = ('ok', 'missing', 'manual', 'skipped', 'failed', 'unreachable')
 BLOCKING = {'missing', 'failed', 'unreachable'}
 ADD_ORDER = CHECK_NAMES = ('reachable', 'native-claude', 'install', 'version', 'linger', 'shell', 'accounts', 'service', 'doctor',
-                           'native-login', 'herdr', 'app', 'cua', 'leitstand', 'readings', 'preview')
+                           'native-login', 'herdr', 'app', 'cua', 'conductor', 'readings', 'preview')
 
 
 class Step(NamedTuple):
