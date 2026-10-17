@@ -66,6 +66,30 @@ with os.fdopen(fd,'w') as f:json.dump({'claudeAiOauth':{'accessToken':'fixture-a
         self.assertNotIn('fixture-code',out.getvalue())
         self.assertNotIn('DO-NOT-LOG',out.getvalue())
 
+    def test_ssh_login_on_linux_never_hands_the_url_to_an_invisible_display(self):
+        probe=self.root/'env-probe'
+        self.binary.write_text('#!'+sys.executable+'''\nimport os,sys,json
+from pathlib import Path
+Path(sys.argv[-1]).write_text(json.dumps({k:os.environ.get(k) for k in ['DISPLAY','WAYLAND_DISPLAY','BROWSER','SSH_CONNECTION']}))
+name=sys.argv[sys.argv.index('--name')+1]
+print('https://claude.com/cai/oauth/authorize?state=fixture-state',flush=True)
+print('Paste authorization code (input hidden): ',flush=True); sys.stdin.readline()
+p=Path(os.environ['SHUNT_CLAUDE_ACCOUNTS_DIR'])/(name+'.json')
+fd=os.open(p,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+with os.fdopen(fd,'w') as f:json.dump({'claudeAiOauth':{'accessToken':'a','refreshToken':'r'}},f)
+''')
+        for platform,ssh,expect_display in [('linux','203.0.113.1 1 203.0.113.2 22',None),('linux',None,':1'),('darwin','203.0.113.1 1 203.0.113.2 22',':1')]:
+            with self.subTest(platform=platform,ssh=ssh):
+                (self.stores/'operations.json').unlink(missing_ok=True)
+                env={'DISPLAY':':1','WAYLAND_DISPLAY':'wayland-0'}
+                if ssh: env['SSH_CONNECTION']=ssh
+                with patch.dict(os.environ,env,clear=False),patch('account_login.sys.platform',platform),contextlib.redirect_stdout(io.StringIO()):
+                    if not ssh: os.environ.pop('SSH_CONNECTION',None); os.environ.pop('SSH_TTY',None)
+                    account_login.login(self.binary,self.stores,'operations','Operations',code_reader=lambda _:'x#fixture-state',timeout=5,extra_args=[str(probe)])
+                seen=json.loads(probe.read_text())
+                self.assertEqual(seen['DISPLAY'],expect_display)
+                self.assertEqual(seen['WAYLAND_DISPLAY'],None if expect_display is None else 'wayland-0')
+
     def test_wrong_state_reprompt_does_not_replace_login(self):
         codes=iter(['wrong#another-state','fixture-code#fixture-state'])
         with contextlib.redirect_stdout(io.StringIO()):
