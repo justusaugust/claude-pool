@@ -466,7 +466,8 @@ def main():
         on_change = None
         try:
             import registry
-            if any(row['name'] != registry.self_name() for row in registry.load()['devices']):
+            me = registry.self_name()
+            if me is not None and any(row['name'] != me for row in registry.load()['devices']):
                 import device_sync, functools
                 on_change = functools.partial(device_sync.sync_all)
         except ValueError: pass  # an unreadable registry never blocks adding or removing an account

@@ -68,8 +68,9 @@ def _kind_of(path):
 
 
 def switch_pending(stores, directory, value, self_name):
-    """Accounts this device could serve from a long-lived token but still serves from its own refreshable login.
-    Derived from the files, never stored. The usage owner keeps its refreshable logins, so it has none."""
+    """Accounts this device should serve from the synced long-lived token but does not yet: its store is its own
+    refreshable login, or an older long-lived token of the same subscription. Derived from the files, never stored.
+    The usage owner keeps its refreshable logins, so it has none."""
     owner = registry.owner(value)
     if owner is not None and owner['name'] == self_name: return []
     names = []
@@ -77,5 +78,11 @@ def switch_pending(stores, directory, value, self_name):
         name = path.stem
         if name.startswith('.') or _kind_of(path) != 'long-lived': continue
         store = Path(stores) / (name + '.json')
-        if not store.is_symlink() and _kind_of(store) == 'refreshable': names.append(name)
+        if store.is_symlink(): continue
+        held = _kind_of(store)
+        if held == 'refreshable': names.append(name)
+        elif held == 'long-lived':
+            new, old = read_private(path), read_private(store)
+            same = (new.get('shuntAccountUuid'), new.get('shuntOrganizationUuid')) == (old.get('shuntAccountUuid'), old.get('shuntOrganizationUuid'))
+            if same and fingerprint(new) != fingerprint(old): names.append(name)
     return names

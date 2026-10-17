@@ -88,6 +88,7 @@ def load(path=None):
     path = path or settings.REGISTRY
     try: size = path.stat().st_size
     except FileNotFoundError: return EMPTY()
+    except OSError as error: raise ValueError('Registry file is unreadable: ' + type(error).__name__) from None
     if size > LIMIT: raise ValueError('Registry is larger than 256 KiB')
     try: value = read_private(path, LIMIT)
     except (RuntimeError, OSError, ValueError) as error:

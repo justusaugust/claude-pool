@@ -62,7 +62,7 @@ class DeviceSyncTests(unittest.TestCase):
                    [('STORES', self.stores), ('LONG_LIVED', self.directory), ('RUNTIME', self.runtime), ('CONFIG', self.config),
                     ('REGISTRY', self.reg), ('SELF', self.self_path), ('HERE', self.here)]]
         patches += [patch.dict(os.environ, {'PATH': str(self.bin) + os.pathsep + os.environ['PATH']}),
-                    patch.object(device_sync, 'service_state', lambda: 'stopped'),
+                    patch.object(device_sync, 'default_native_identity', lambda: None),
                     patch.object(device_sync, 'STATUS_PARTS', []), patch.object(device_sync, 'INTEGRATION_HOOKS', [])]
         for item in patches: item.start(); self.addCleanup(item.stop)
         registry.set_self('mac', self.self_path)
@@ -169,6 +169,106 @@ class DeviceSyncTests(unittest.TestCase):
         registry.set_self('me', self.self_path)
         self.assertEqual(device_sync.sync_all(remotes=Mock()), {'phone': 'unreachable'})
 
+    def test_a_refused_local_gateway_means_idle_but_other_failures_mean_busy(self):
+        import urllib.error
+        self.devices(MAC, VPS, accounts=[ROW]); device_sync.receive_account('team', self.blob())
+        def down(): raise urllib.error.URLError(ConnectionRefusedError())
+        def broken(): raise OSError('weird')
+        report = device_sync.receive_registry(self.newer([]), overview=broken)
+        self.assertEqual(report['kept_busy'], ['team'])
+        report = device_sync.receive_registry(self.newer([]), overview=down)
+        self.assertEqual(report['removed'], ['team'])
+
+    def test_rotation_is_staged_and_switch_serves_the_new_token(self):
+        self.devices(MAC, VPS, accounts=[ROW])
+        device_sync.receive_account('team', self.blob())
+        old = (self.stores / 'team.json').read_bytes()
+        new = self.blob(token=fixture_token('b'))
+        self.assertEqual(device_sync.receive_account('team', new), 'staged')
+        row = next(r for r in device_sync.status()['accounts'] if r['name'] == 'team')
+        self.assertEqual(row['servingFingerprint'], long_lived.fingerprint(json.loads(old)))
+        self.assertEqual(row['fingerprint'], long_lived.fingerprint(json.loads(new)))
+        self.assertEqual(device_sync.status()['switchPending'], ['team'])
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(device_sync.switch(False, lambda: {'sessions': []}, Mock(return_value=0)), 0)
+        self.assertEqual((self.stores / 'team.json').read_bytes(), new)
+        self.assertEqual([p.read_bytes() for p in (self.stores / '.retired').glob('team-*.json')], [old])
+
+    def test_native_login_account_is_kept_when_the_registry_drops_it(self):
+        self.devices(MAC, VPS, accounts=[ROW]); device_sync.receive_account('team', self.blob())
+        report = device_sync.receive_registry(self.newer([]), native_identity=lambda: {'email': 'team@x.de', 'organization': 'Team A'})
+        self.assertEqual(report['kept_native'], ['team']); self.assertIn('team', self.config_names())
+        self.assertEqual(report['removed'], [])
+
+    def test_an_unreadable_native_login_keeps_the_account(self):
+        self.devices(MAC, VPS, accounts=[ROW]); device_sync.receive_account('team', self.blob())
+        def boom(): raise RuntimeError('Could not read the Native login')
+        report = device_sync.receive_registry(self.newer([]), native_identity=boom)
+        self.assertIn('team', report['failed']); self.assertIn('team', self.config_names())
+
+    def test_a_token_for_an_account_the_registry_does_not_list_is_only_staged(self):
+        self.devices(MAC, VPS)
+        self.assertEqual(device_sync.receive_account('team', self.blob()), 'staged')
+        self.assertFalse((self.stores / 'team.json').exists()); self.assertNotIn('team', self.config_names())
+        self.assertTrue((self.directory / 'team.json').exists())
+
+    def test_a_device_that_is_behind_gets_the_removal_and_never_resurrects_the_account(self):
+        # This device (B) is at an older generation and still has team; the peer (A) removed it at generation 6.
+        self.devices(MAC, VPS, accounts=[ROW]); device_sync.receive_account('team', self.blob())
+        peer = {**registry.load(self.reg), 'generation': 6, 'accounts': []}
+        status = {'accounts': [], 'registryGeneration': 6}
+        def handler(argv, stdin):
+            return Completed(0, json.dumps(status if argv[2] == 'status' else peer).encode(), b'')
+        fake = FakeRemote('vps', handler)
+        self.assertEqual(device_sync.push(fake), 'ok')
+        self.assertEqual(device_sync.pull(fake), 'ok')
+        self.assertEqual([argv[2] for argv, _ in fake.calls if argv[2] != 'status' and argv[2] != 'registry'], [])
+        self.assertNotIn('team', self.config_names()); self.assertEqual(registry.load(self.reg)['generation'], 6)
+
+    def test_a_newer_peer_gets_nothing_pushed(self):
+        self.devices(MAC, VPS, accounts=[ROW]); long_lived_file(self.directory, 'team')
+        fake = FakeRemote('vps', ok(json.dumps({'accounts': [], 'registryGeneration': 99}).encode()))
+        device_sync.push(fake)
+        self.assertEqual([argv[2] for argv, _ in fake.calls], ['status'])
+
+    def test_switch_stop_failure_touches_nothing(self):
+        self.switch_setup(); pool = Mock(return_value=1); before = (self.stores / 'team.json').read_bytes()
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertNotEqual(device_sync.switch(False, lambda: {'sessions': []}, pool), 0)
+        pool.assert_called_once_with('--stop'); self.assertEqual((self.stores / 'team.json').read_bytes(), before)
+        self.assertNotIn('Switched', out.getvalue()); self.assertFalse((self.stores / '.retired').exists())
+
+    def test_switch_start_failure_prints_the_restart_command_and_no_success(self):
+        self.switch_setup(); pool = Mock(side_effect=[0, 1])
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertNotEqual(device_sync.switch(False, lambda: {'sessions': []}, pool), 0)
+        self.assertIn('claude-pool --start', out.getvalue()); self.assertNotIn('Switched', out.getvalue())
+
+    def test_a_pending_removal_is_dropped_when_the_account_was_added_again_locally(self):
+        self.devices(MAC, VPS, accounts=[ROW]); device_sync.receive_account('team', self.blob())
+        device_sync.receive_registry(self.newer([]), overview=lambda: {'sessions': [{'busy': True, 'account': 'team'}]})
+        self.assertIn('team', json.loads(device_sync.pending_file().read_text()))
+        # Re-added locally with another token while the removal was pending.
+        for folder in (self.stores, self.directory): (folder / 'team.json').unlink()
+        long_lived_file(self.stores, 'team', token=fixture_token('c')); long_lived_file(self.directory, 'team', token=fixture_token('c'))
+        report = device_sync.receive_registry(self.newer([]), overview=lambda: {'sessions': []})
+        self.assertEqual(report['removed'], []); self.assertIn('team', self.config_names())
+        self.assertFalse(device_sync.pending_file().exists())
+
+    def test_a_held_add_lock_counts_as_busy(self):
+        import fcntl
+        self.devices(MAC, VPS, accounts=[ROW]); device_sync.receive_account('team', self.blob())
+        with (self.stores / '.team.add.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            report = device_sync.receive_registry(self.newer([]), overview=lambda: {'sessions': []})
+        self.assertEqual(report['kept_busy'], ['team']); self.assertIn('team', self.config_names())
+
+    def test_a_device_without_a_name_syncs_nothing(self):
+        self.self_path.unlink(); self.devices(MAC, VPS)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(device_sync.sync_all(remotes=Mock()), {})
+        self.assertIn('no name', out.getvalue())
+
     def newer(self, accounts, generation=5):
         return json.dumps({**registry.load(self.reg), 'generation': generation, 'accounts': accounts}).encode()
 
@@ -189,10 +289,9 @@ class DeviceSyncTests(unittest.TestCase):
         self.devices(MAC, VPS, accounts=[ROW])
         device_sync.receive_account('team', self.blob())
         busy = {'sessions': [{'busy': True, 'account': 'team'}]}
-        with patch.object(device_sync, 'service_state', lambda: 'running'):
-            report = device_sync.receive_registry(self.newer([]), overview=lambda: busy)
-            self.assertEqual(report['kept_busy'], ['team']); self.assertIn('team', self.config_names())
-            report = device_sync.receive_registry(self.newer([]), overview=lambda: {'sessions': []})
+        report = device_sync.receive_registry(self.newer([]), overview=lambda: busy)
+        self.assertEqual(report['kept_busy'], ['team']); self.assertIn('team', self.config_names())
+        report = device_sync.receive_registry(self.newer([]), overview=lambda: {'sessions': []})
         self.assertEqual(report['removed'], ['team']); self.assertNotIn('team', self.config_names())
 
     def test_an_older_registry_changes_nothing(self):
@@ -202,8 +301,12 @@ class DeviceSyncTests(unittest.TestCase):
         self.assertEqual(self.reg.read_bytes(), before)
 
     def test_receive_never_calls_service_controls(self):
+        # Real code, real installation.json, fake launchctl/systemctl on PATH that leave a marker when run.
+        (self.root / 'installation.json').write_text(json.dumps({'serviceLabel': 'io.example.pool'}))
         self.devices(MAC, VPS, accounts=[ROW])
-        device_sync.receive_account('team', self.blob()); device_sync.receive_registry(self.newer([]))
+        device_sync.receive_account('team', self.blob())
+        device_sync.receive_registry(self.newer([]), native_identity=lambda: None)
+        self.assertNotIn('team', self.config_names())
         self.assertFalse(self.marker.exists())
 
     def test_failing_integration_hook_is_reported_and_others_still_run(self):
@@ -259,7 +362,8 @@ class DeviceSyncTests(unittest.TestCase):
         team = next(row for row in status['accounts'] if row['name'] == 'team')
         self.assertEqual((team['kind'], team['active']), ('long-lived', False))
         self.assertEqual(len(team['fingerprint']), 12)
-        self.assertEqual(status['service'], 'stopped')
+        self.assertIn(status['service'], ('running', 'stopped', 'missing'))
+        self.assertEqual(team['servingFingerprint'], None)
         SecretWatch(fixture_token()).text(json.dumps(status))
 
 

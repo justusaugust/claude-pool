@@ -1,11 +1,13 @@
 """Move long-lived accounts and the registry between devices. Tokens travel only on ssh stdin or an ssh stdout pipe.
 Receiving never stops or starts the service; only `switch` does, and only while nothing is in flight."""
+import fcntl
 import json
 import os
 from pathlib import Path
 import re
 import sys
 import time
+import urllib.error
 import urllib.request
 
 import accounts_cli
@@ -64,6 +66,23 @@ def pool_overview():
     with urllib.request.urlopen(request, timeout=5) as response: return json.loads(response.read(4 * 1024 * 1024))
 
 
+def local_overview(overview):
+    """The local gateway's overview. A gateway that is not there (refused connection, no token file) serves nothing,
+    so it reads as idle; any other failure propagates and counts as busy. Never asks the service manager."""
+    def read():
+        try: return (overview or pool_overview)()
+        except (ConnectionRefusedError, FileNotFoundError): return {}
+        except urllib.error.URLError as error:
+            if isinstance(error.reason, ConnectionRefusedError): return {}
+            raise
+    return read
+
+
+def default_native_identity():
+    from launch import native_identity
+    return native_identity()
+
+
 def build_version():
     try: return json.loads((settings.HERE.parent / 'build-info.json').read_text()).get('version')
     except (OSError, ValueError, AttributeError): return None
@@ -78,8 +97,12 @@ def account_rows():
         path = replica_path if have else store
         try: value = read_private(path)
         except (OSError, ValueError, RuntimeError): continue
-        try: row = {'name': name, 'kind': 'long-lived' if have else kind(value), 'fingerprint': fingerprint(value),
-                    'expiresAt': long_lived.expires_at_ms(value), 'active': name in members}
+        try:
+            row = {'name': name, 'kind': 'long-lived' if have else kind(value), 'fingerprint': fingerprint(value),
+                   'expiresAt': long_lived.expires_at_ms(value), 'active': name in members, 'servingFingerprint': None}
+            if name in members and store.exists() and not store.is_symlink():
+                try: row['servingFingerprint'] = fingerprint(read_private(store))
+                except (OSError, ValueError, RuntimeError): pass
         except RuntimeError: continue
         rows.append(row)
     return rows
@@ -114,7 +137,7 @@ def receive_account(name, data):
     same = accounts_cli.stored_kind(path) == 'long-lived' and fingerprint(read_private(path)) == fp
     if not same: write_private(path, data)
     held = 'unchanged' if same else 'staged'
-    if is_owner(known): return held
+    if is_owner(known) or registry.account(known, name) is None: return held
     store = settings.STORES / path.name
     if store.is_symlink(): raise RuntimeError('Credential file must not be a symlink: ' + store.name)
     if store.exists():
@@ -133,41 +156,71 @@ def pending_file(): return settings.REGISTRY.parent / 'device-pending-removals.j
 
 
 def read_pending():
-    try: names = json.loads(pending_file().read_text())
-    except (OSError, ValueError): return []
-    return [n for n in names if isinstance(n, str) and NAME.fullmatch(n)] if isinstance(names, list) else []
+    """name -> the registry row and local fingerprint recorded when the removal was first seen."""
+    try: value = json.loads(pending_file().read_text())
+    except (OSError, ValueError): return {}
+    return {n: r for n, r in value.items() if NAME.fullmatch(n) and isinstance(r, dict)} if isinstance(value, dict) else {}
+
+
+def local_fingerprint(name):
+    for path in (settings.LONG_LIVED / (name + '.json'), settings.STORES / (name + '.json')):
+        try: return fingerprint(read_private(path))
+        except (OSError, ValueError, RuntimeError): continue
+    return None
+
+
+class Busy(Exception): pass
 
 
 def remove_local(name):
-    paths, env = accounts_cli.local_paths_env(settings.RUNTIME, settings.STORES)
-    accounts_cli.unregister(settings.CONFIG, settings.STORES, settings.HERE / 'bin/shunt', paths, name, env)
-    accounts_cli.retire(settings.STORES, settings.LONG_LIVED, name)
+    private_directory(settings.STORES)
+    with (settings.STORES / ('.' + name + '.add.lock')).open('a') as lock:
+        try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError: raise Busy() from None
+        paths, env = accounts_cli.local_paths_env(settings.RUNTIME, settings.STORES)
+        accounts_cli.unregister(settings.CONFIG, settings.STORES, settings.HERE / 'bin/shunt', paths, name, env)
+        accounts_cli.retire(settings.STORES, settings.LONG_LIVED, name)
 
 
-def receive_registry(data, overview=None):
+def receive_registry(data, overview=None, native_identity=None):
     if not isinstance(data, bytes) or len(data) > registry.LIMIT: raise ValueError('Registry is larger than 256 KiB')
     try: incoming = registry.validate(json.loads(data))
     except ValueError as error: raise ValueError('Invalid registry: ' + str(error)) from None
     previous = registry.load()
-    report = {'result': 'unchanged', 'removed': [], 'kept_busy': [], 'failed': {}, 'hooks': {}}
+    report = {'result': 'unchanged', 'removed': [], 'kept_busy': [], 'kept_native': [], 'failed': {}, 'hooks': {}}
     if registry.diverged(previous, incoming): report['result'] = 'merged'
     replaced = incoming['generation'] > previous['generation'] and registry.replace(incoming)
     if replaced: report['result'] = 'replaced'
     now = registry.load()
     listed = {row['name'] for row in now['accounts']}
-    wanted = [row['name'] for row in previous['accounts'] if row['name'] not in listed] if replaced else []
-    pending = sorted((set(read_pending()) | set(wanted)) - listed)
-    left = []
-    for name in pending:
+    pending = {n: r for n, r in read_pending().items() if n not in listed}
+    for row in (previous['accounts'] if replaced else []):
+        if row['name'] not in listed: pending.setdefault(row['name'], {'row': row, 'local': local_fingerprint(row['name'])})
+    left = {}
+    native = {'done': False}
+    for name, record in sorted(pending.items()):
         try:
+            if local_fingerprint(name) != record.get('local'): continue  # connected again here since; it is not ours to remove
             if name not in config_names() and not any((folder / (name + '.json')).exists() for folder in (settings.STORES, settings.LONG_LIVED)): continue
-            if service_state() == 'running' and not routing.wait_idle(overview or pool_overview, name, False):
-                report['kept_busy'].append(name); left.append(name); continue
+            left[name] = record
+            if not routing.wait_idle(local_overview(overview), name, False):
+                report['kept_busy'].append(name); continue
+            if not native['done']:
+                native['value'] = (native_identity or default_native_identity)(); native['done'] = True
+            row = record.get('row') or {}
+            if not row.get('email') and accounts_cli.stored_kind(settings.STORES / (name + '.json')) == 'refreshable':
+                raise RuntimeError('Cannot tell whether ' + name + ' is the Native login of this machine; it was not removed')
+            if accounts_cli.matches_native(native['value'], name, {'accounts': [row]}, settings.STORES):
+                report['kept_native'].append(name)
+                report['failed'][name] = ((row.get('label') or name) + ' is the Native login of this machine and must stay connected. '
+                                          'Sign Native in with another connected account first (claude-native auth login). Nothing was removed.')
+                continue
             if name in config_names() and len(config_names()) == 1:
-                report['failed'][name] = 'it is the last account on this device'; left.append(name); continue
-            remove_local(name); report['removed'].append(name)
+                report['failed'][name] = 'it is the last account on this device'; continue
+            remove_local(name); report['removed'].append(name); del left[name]
+        except Busy: report['kept_busy'].append(name)
         except Exception as error:
-            report['failed'][name] = type(error).__name__ + ': ' + str(error); left.append(name)
+            report['failed'][name] = type(error).__name__ + ': ' + str(error)
     if left != read_pending():
         if left: write_private(pending_file(), json.dumps(left))
         else: pending_file().unlink(missing_ok=True)
@@ -216,6 +269,7 @@ def push(remote):
         theirs = peer_status(remote)
         known = registry.load()
         generation = theirs.get('registryGeneration')
+        if isinstance(generation, int) and generation > known['generation']: return  # the peer is ahead; pull brings this device up to date
         if not isinstance(generation, int) or known['generation'] > generation:
             peer(remote, 'device', 'receive-registry', stdin=json.dumps(known).encode())
         for row in known['accounts']:
@@ -242,6 +296,9 @@ def pull(remote):
 
 def sync_all(remotes=Remote):
     known, me, results = registry.load(), registry.self_name(), {}
+    if me is None:
+        print('This device has no name in the registry yet, so nothing was synced.')
+        return {}
     for row in known['devices']:
         if row['name'] == me: continue
         if not row.get('ssh'): results[row['name']] = 'unreachable'; continue
@@ -271,9 +328,12 @@ def switch(wait, overview, pool):
         return 3
     pending = switch_pending(settings.STORES, settings.LONG_LIVED, registry.load(), registry.self_name())
     if not pending:
-        print('Nothing to switch: no account here still uses its own refreshable login.')
+        print('Nothing to switch: every account here already serves its synced long-lived token.')
         return 0
-    pool('--stop')
+    if pool('--stop'):
+        print('The pool service did not stop; nothing was changed. Rerun claude-pool device switch.')
+        return 1
+    done, error = [], None
     try:
         for name in pending:
             store, copy = settings.STORES / (name + '.json'), settings.LONG_LIVED / (name + '.json')
@@ -282,7 +342,11 @@ def switch(wait, overview, pool):
             try: write_private(store, data)
             except Exception:
                 os.replace(target, store); raise
-            print('Switched ' + name + ' to its long-lived token; the old login is kept in ' + str(target.parent))
-    finally:
-        pool('--start')
+            done.append('Switched ' + name + ' to its synced long-lived token; the old one is kept in ' + str(target.parent))
+    except Exception as caught: error = caught
+    started = pool('--start')
+    if started: print('The pool service did not restart. Run: claude-pool --start')
+    if error is not None: raise error
+    if started: return 1
+    for line in done: print(line)
     return 0

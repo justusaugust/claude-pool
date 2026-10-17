@@ -142,5 +142,10 @@ class RegistryTests(unittest.TestCase):
         path.write_text('{"name": "mac"}'); path.chmod(0o644)
         self.assertIsNone(registry.self_name(path))
 
+    def test_load_wraps_a_stat_failure_as_the_registry_error(self):
+        from unittest.mock import patch
+        with patch.object(Path, 'stat', side_effect=PermissionError('denied')):
+            with self.assertRaisesRegex(ValueError, 'Registry file is unreadable'): registry.load(self.path)
+
 
 if __name__ == '__main__': unittest.main()
