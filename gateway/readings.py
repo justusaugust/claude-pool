@@ -19,11 +19,10 @@ def integer(value): return type(value) is int and value >= 0
 
 
 def clean_window(value):
-    if value is None: return None
-    if not isinstance(value, dict) or not number(value.get('pct')) or not 0 <= value['pct'] <= 100: raise ValueError('bad window')
+    """A valid window in its exact shape, or None. Out-of-range or non-finite readings are dropped, not the file."""
+    if not isinstance(value, dict) or not number(value.get('pct')) or not 0 <= value['pct'] <= 100: return None
     reset = value.get('resetsAt')
-    if reset is not None and not number(reset): raise ValueError('bad window')
-    return {'pct': value['pct'], 'resetsAt': reset}
+    return {'pct': value['pct'], 'resetsAt': int(reset) if number(reset) and reset >= 0 else None}
 
 
 def check(value):
@@ -35,9 +34,9 @@ def check(value):
         accounts = {}
         for name, entry in value['accounts'].items():
             if not isinstance(name, str) or not isinstance(entry, dict) or set(entry) != ENTRY or not integer(entry['seenAt']): return None
-            accounts[name] = {**{key: clean_window(entry[key]) for key in KEYS}, 'seenAt': entry['seenAt']}
+            accounts[name] = {**{key: clean_window(entry[key]) for key in KEYS}, 'seenAt': min(entry['seenAt'], value['at'])}
         return {'version': 1, 'device': value['device'], 'at': value['at'], 'accounts': accounts}
-    except (ValueError, TypeError, KeyError): return None
+    except (TypeError, KeyError): return None
 
 
 def export(overview, device, now_ms):
@@ -48,15 +47,18 @@ def export(overview, device, now_ms):
         entry = {}
         for key in KEYS:
             window = row.get(key)
-            entry[key] = {'pct': window['pct'], 'resetsAt': window.get('resetsAt')} if isinstance(window, dict) and 'pct' in window else None
-        entry['seenAt'] = seen if type(seen) is int and seen >= 0 else 0
+            if isinstance(window, dict) and number(window.get('pct')):
+                reset = window.get('resetsAt')
+                entry[key] = {'pct': min(100, max(0, window['pct'])), 'resetsAt': int(reset) if number(reset) and reset >= 0 else None}
+            else: entry[key] = None
+        entry['seenAt'] = int(seen) if number(seen) and seen >= 0 else 0
         accounts[row['name']] = entry
     return {'version': 1, 'device': device, 'at': now_ms, 'accounts': accounts}
 
 
 def merge(rows, shared, now_ms, max_age_ms=900_000):
     shared = check(shared)
-    if not shared or not 0 <= now_ms - shared['at'] <= max_age_ms: return rows
+    if not shared or not -60_000 <= now_ms - shared['at'] <= max_age_ms: return rows
     for row in rows:
         entry = shared['accounts'].get(row.get('name'))
         if not entry or entry['seenAt'] <= (row.get('seenAt') or 0): continue
@@ -78,7 +80,7 @@ class Puller:
         self.successes, self.failing = 0, False
 
     def fail(self, reason):
-        if not self.failing: self.journal.record('readings_sync_failed')
+        if not self.failing: self.journal.record('readings_sync_failed', reason=reason)
         self.failing = True
         return False
 
@@ -86,7 +88,11 @@ class Puller:
         try: value = registry.load()
         except ValueError: return False
         owner, me = registry.owner(value), registry.self_name()
-        if not owner or not me or owner['name'] == me: return False
+        if owner and me and owner['name'] == me:
+            try: self.path.unlink(missing_ok=True)
+            except OSError: pass
+            return False
+        if not owner or not me: return False
         if not owner.get('ssh'): return self.fail('no ssh target')
         remote = self.remotes(owner['ssh'])
         done = remote.pool('device', 'readings', timeout=60)
@@ -98,8 +104,9 @@ class Puller:
         self.failing = False
         self.successes += 1
         if self.successes % self.registry_every == 0:
-            import device_sync
-            try: device_sync.pull(remote)
+            try:
+                import device_sync
+                device_sync.pull(remote)
             except Exception: pass  # sync reports its own problems
         return True
 

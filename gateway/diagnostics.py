@@ -53,6 +53,8 @@ class Journal:
             if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 1000000: result[key] = value
         value = row.get('account')
         if isinstance(value, str) and re.fullmatch(r'[a-z0-9-]{1,80}', value): result['account'] = value
+        value = row.get('reason')
+        if isinstance(value, str) and re.fullmatch(r'[a-z0-9 :_.-]{1,80}', value): result['reason'] = value
         return result
 
     def record(self, code, **details):

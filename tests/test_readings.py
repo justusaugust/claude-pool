@@ -71,6 +71,36 @@ class MergeTests(unittest.TestCase):
             path.chmod(0o644); self.assertIsNone(readings.load_shared(path))
             self.assertIsNone(readings.load_shared(Path(tmp) / 'missing.json'))
 
+    def test_export_clamps_and_round_trips_through_check(self):
+        over = {'accounts': [{'name': 'team', 'fiveHour': W(101.5), 'sevenDay': {'pct': float('nan'), 'resetsAt': None}, 'fableWeekly': None, 'seenAt': NOW},
+                             {'name': 'b', 'fiveHour': W(5), 'sevenDay': None, 'fableWeekly': None, 'seenAt': NOW}]}
+        out = readings.check(readings.export(over, 'vps', NOW))
+        self.assertEqual(out['accounts']['team']['fiveHour']['pct'], 100)
+        self.assertIsNone(out['accounts']['team']['sevenDay']); self.assertIn('b', out['accounts'])
+
+    def test_check_nulls_one_bad_window_not_the_file(self):
+        data = shared(); data['accounts']['team']['fiveHour'] = {'pct': 500, 'resetsAt': None}
+        out = readings.check(data)
+        self.assertIsNone(out['accounts']['team']['fiveHour']); self.assertEqual(out['accounts']['team']['fableWeekly']['pct'], 5)
+
+    def test_export_accepts_a_float_seen_at(self):
+        over = {'accounts': [{'name': 'team', 'fiveHour': None, 'seenAt': 1234.7}]}
+        self.assertEqual(readings.export(over, 'vps', NOW)['accounts']['team']['seenAt'], 1234)
+
+    def test_entry_seen_at_after_file_time_is_clamped(self):
+        out = readings.check(shared(at=NOW - 5000, seen=NOW + 10_000_000))
+        self.assertEqual(out['accounts']['team']['seenAt'], NOW - 5000)
+
+    def test_small_clock_skew_is_accepted_large_is_not(self):
+        self.assertEqual(readings.merge([dict(LOCAL_OLD)], shared(at=NOW + 50_000, seen=NOW + 50_000), NOW)[0].get('readingSource'), 'shared:vps')
+        self.assertEqual(readings.merge([dict(LOCAL_OLD)], shared(at=NOW + 70_000, seen=NOW + 70_000), NOW), [LOCAL_OLD])
+
+    def test_reset_is_an_integer_or_none(self):
+        data = shared(); data['accounts']['team']['fiveHour'] = {'pct': 3, 'resetsAt': 1.5e12 + 0.5}
+        data['accounts']['team']['sevenDay'] = {'pct': 3, 'resetsAt': -4.0}
+        out = readings.check(data)['accounts']['team']
+        self.assertIs(type(out['fiveHour']['resetsAt']), int); self.assertIsNone(out['sevenDay']['resetsAt'])
+
     def test_importing_readings_does_not_import_device_sync(self):
         code = 'import sys; sys.path.insert(0, %r); import readings; print("device_sync" in sys.modules)' % str(Path(__file__).resolve().parents[1] / 'gateway')
         out = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'})
@@ -84,8 +114,8 @@ class MergeTests(unittest.TestCase):
 
 
 class Journal:
-    def __init__(self): self.codes = []
-    def record(self, code, **details): self.codes.append(code)
+    def __init__(self): self.codes, self.rows = [], []
+    def record(self, code, **details): self.codes.append(code); self.rows.append((code, details))
 
 
 class PullTests(unittest.TestCase):
@@ -122,26 +152,30 @@ class PullTests(unittest.TestCase):
         puller = self.make(lambda argv, stdin: Completed(255, b'', b'boom'))
         self.assertFalse(puller.run_once()); self.assertFalse(puller.run_once())
         self.assertEqual(self.journal.codes, ['readings_sync_failed'])
+        self.assertEqual(self.journal.rows[0][1], {'reason': 'pull failed'})
         self.assertIn('readings_sync_failed', diagnostics.CODES)
         self.assertFalse(self.path.exists())
-        self.assertIn('accounts', self.fake_bridge_overview())
+        overview = self.fake_bridge_overview()
+        self.assertIn('accounts', overview); self.assertNotEqual(overview['accounts'][0]['status'], 'unknown')
+        self.assertNotEqual(self.last_bridge.health['backend'], 'unresponsive')
 
     def fake_bridge_overview(self):
         class Upstream(BaseHTTPRequestHandler):
             def log_message(self, *args): pass
             def do_GET(self):
-                rows = [{'name': 'team', 'account_ref': 'team', 'has_state': True, 'observed_at_5h': 1900000000, 'utilization_5h': .2, 'reset_5h': 2000000000}]
+                rows = [{'name': 'team', 'account_ref': 'team', 'has_state': True, 'observed_at_5h': 1000000000, 'utilization_5h': .2, 'reset_5h': 2000000000}]
                 body = json.dumps({'providers': [{'provider': 'anthropic', 'auth': 'claude_oauth', 'accounts': rows}]}).encode()
                 self.send_response(200); self.end_headers(); self.wfile.write(body)
         upstream = ThreadingHTTPServer(('127.0.0.1', 0), Upstream)
         bridge = PoolBridge(('127.0.0.1', 0), upstream.server_port, 'c', 'a', Path(self.tmp.name) / 'state.json', shared_readings=self.path)
         threading.Thread(target=upstream.serve_forever, daemon=True).start()
+        self.last_bridge = bridge
         try: return bridge.overview()
         finally:
             bridge.monitor_stop.set(); bridge.server_close(); upstream.shutdown(); upstream.server_close()
 
     def test_bridge_merges_a_newer_shared_reading(self):
-        write_private(self.path, json.dumps(shared(at=int(__import__('time').time() * 1000), seen=1_999_999_999_000)))
+        write_private(self.path, json.dumps(shared(at=int(__import__('time').time() * 1000), seen=int(__import__('time').time() * 1000))))
         row = self.fake_bridge_overview()['accounts'][0]
         self.assertEqual(row['readingSource'], 'shared:vps'); self.assertEqual(row['fiveHour']['pct'], 20)
 
@@ -168,7 +202,29 @@ class PullTests(unittest.TestCase):
 
     def test_start_stops_when_the_event_is_set(self):
         stop = threading.Event(); stop.set()
-        self.make().start(stop).join(5)
+        thread = self.make().start(stop); thread.join(5)
+        self.assertFalse(thread.is_alive())
+
+    def test_loop_survives_a_raising_run_once(self):
+        puller = self.make(); puller.interval = 0.01
+        runs, stop = [], threading.Event()
+        def boom():
+            runs.append(1)
+            if len(runs) >= 3: stop.set()
+            raise OSError('x')
+        puller.run_once = boom
+        thread = puller.start(stop); thread.join(5)
+        self.assertGreaterEqual(len(runs), 3); self.assertFalse(thread.is_alive())
+        self.assertEqual(self.journal.codes, ['readings_sync_failed'])
+
+    def test_reason_survives_the_real_journal(self):
+        j = diagnostics.Journal(None, None); j.record('readings_sync_failed', reason='pull failed')
+        self.assertEqual(j.snapshot()[0]['reason'], 'pull failed')
+
+    def test_owner_removes_a_leftover_shared_file(self):
+        self.add({'name': 'mac', 'ssh': None, 'platform': 'darwin', 'roles': ['usage'], 'addedAt': 0})
+        write_private(self.path, json.dumps(shared()))
+        self.assertFalse(self.make().run_once()); self.assertFalse(self.path.exists())
 
 
 if __name__ == '__main__': unittest.main()
