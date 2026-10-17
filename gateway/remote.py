@@ -39,7 +39,9 @@ class Remote:
 
     def call(self, argv, stdin=None, timeout=120):
         try:
-            done = self._run(self._command(argv), input=stdin, capture_output=True, timeout=timeout)
+            # With no stdin the child gets /dev/null, so ssh never swallows the caller's own stdin.
+            feed = {'stdin': subprocess.DEVNULL} if stdin is None else {'input': stdin}
+            done = self._run(self._command(argv), capture_output=True, timeout=timeout, **feed)
         except subprocess.TimeoutExpired:
             return Completed(255, b'', b'timed out')
         except OSError as error:

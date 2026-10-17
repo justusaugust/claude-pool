@@ -463,8 +463,16 @@ def main():
         except (OSError, RuntimeError, ValueError):
             # remove never skips its in-flight check while the service runs: an unanswered overview counts as busy.
             available = live and argv[0] == 'remove' and service.loaded(SERVICE_LABEL)
+        on_change = None
+        try:
+            import registry
+            if any(row['name'] != registry.self_name() for row in registry.load()['devices']):
+                import device_sync, functools
+                on_change = functools.partial(device_sync.sync_all)
+        except ValueError: pass  # an unreadable registry never blocks adding or removing an account
         raise SystemExit(cli(argv, config=CONFIG, stores=STORES, binary=HERE/'bin/shunt', runtime=RUNTIME,
-                             overview=overview if available else None, long_lived=LONG_LIVED, native_identity=native_identity))
+                             overview=overview if available else None, long_lived=LONG_LIVED, native_identity=native_identity,
+                             on_change=on_change))
     if sys.argv[1:] in [['--help'], ['-h']]: sys.argv[1:] = ['help']
     if sys.argv[1:] == ['--version']:
         raise SystemExit(subprocess.call([NATIVE_CLAUDE, *sys.argv[1:]]))

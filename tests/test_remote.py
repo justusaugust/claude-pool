@@ -23,6 +23,11 @@ class RemoteTests(unittest.TestCase):
         Remote('personal-vps', run=self.run).call(['echo', 'a b'])
         self.assertEqual(self.run.call_args.args[0], ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', '-T', 'personal-vps', "echo 'a b'"])
 
+    def test_without_stdin_the_child_reads_devnull_not_the_parents_stdin(self):
+        Remote('vps', run=self.run).call(['true'])
+        self.assertEqual(self.run.call_args.kwargs.get('stdin'), subprocess.DEVNULL)
+        self.assertNotIn('input', self.run.call_args.kwargs)
+
     def test_targets_that_look_like_options_or_contain_spaces_are_refused(self):
         for target in ['-oProxyCommand=x', 'a b', '', 'x;y']:
             with self.assertRaises(ValueError): Remote(target)

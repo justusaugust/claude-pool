@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from private_files import read_private, write_private
+import registry
 
 DAY_MS = 86_400_000
 
@@ -59,3 +60,22 @@ def adopt(source, directory, name):
         raise RuntimeError('The saved token did not verify; the staged file was kept')
     source.unlink()
     return target
+
+
+def _kind_of(path):
+    try: return kind(read_private(path))
+    except (OSError, ValueError, RuntimeError): return None
+
+
+def switch_pending(stores, directory, value, self_name):
+    """Accounts this device could serve from a long-lived token but still serves from its own refreshable login.
+    Derived from the files, never stored. The usage owner keeps its refreshable logins, so it has none."""
+    owner = registry.owner(value)
+    if owner is not None and owner['name'] == self_name: return []
+    names = []
+    for path in sorted(Path(directory).glob('*.json')):
+        name = path.stem
+        if name.startswith('.') or _kind_of(path) != 'long-lived': continue
+        store = Path(stores) / (name + '.json')
+        if not store.is_symlink() and _kind_of(store) == 'refreshable': names.append(name)
+    return names

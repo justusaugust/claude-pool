@@ -494,8 +494,20 @@ def remove_account(name, wait, *, config, stores, binary, runtime, backend_sourc
     return 0
 
 
-def cli(argv, *, config, stores, binary, runtime, backend_source=None, backend_env=None, overview=None,
-        long_lived=None, registry_path=None, self_path=None, lookup=None, native_identity=None):
+def cli(argv, *, on_change=None, **options):
+    """Run an account command. After a successful add or remove, `on_change()` (a device sync) reports one line per
+    device; a failing sync never changes the exit code of a change that already succeeded."""
+    code = run_cli(argv, **options)
+    if code == 0 and on_change is not None and argv[:1] in (['add'], ['remove']):
+        try: results = on_change()
+        except Exception as error: print('Device sync failed (' + type(error).__name__ + '); run claude-pool device sync later.')
+        else:
+            for device, result in sorted(results.items()): print('  ' + device + ': ' + result)
+    return code
+
+
+def run_cli(argv, *, config, stores, binary, runtime, backend_source=None, backend_env=None, overview=None,
+            long_lived=None, registry_path=None, self_path=None, lookup=None, native_identity=None):
     parser = argparse.ArgumentParser(prog='claude account')
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('list', help='Show connected names and shortcuts')

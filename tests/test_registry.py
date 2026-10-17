@@ -129,5 +129,18 @@ class RegistryTests(unittest.TestCase):
         with self.assertRaises(ValueError): registry.update(lambda v: v['devices'].append({**MAC}), self.path)
         self.assertEqual(self.path.read_bytes(), before)
 
+    def test_load_reports_a_registry_specific_error_for_corrupt_or_loose_files(self):
+        self.path.write_text('{not json'); self.path.chmod(0o600)
+        with self.assertRaisesRegex(ValueError, 'Registry file is unreadable'): registry.load(self.path)
+        self.path.write_text(json.dumps(registry.EMPTY())); self.path.chmod(0o644)
+        with self.assertRaisesRegex(ValueError, 'Registry file is unreadable'): registry.load(self.path)
+
+    def test_self_name_is_none_for_an_unreadable_or_corrupt_file(self):
+        path = self.dir / 'device.json'
+        path.write_text('{oops'); path.chmod(0o600)
+        self.assertIsNone(registry.self_name(path))
+        path.write_text('{"name": "mac"}'); path.chmod(0o644)
+        self.assertIsNone(registry.self_name(path))
+
 
 if __name__ == '__main__': unittest.main()

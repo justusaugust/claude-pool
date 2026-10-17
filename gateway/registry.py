@@ -89,7 +89,10 @@ def load(path=None):
     try: size = path.stat().st_size
     except FileNotFoundError: return EMPTY()
     if size > LIMIT: raise ValueError('Registry is larger than 256 KiB')
-    return validate(read_private(path, LIMIT))
+    try: value = read_private(path, LIMIT)
+    except (RuntimeError, OSError, ValueError) as error:
+        raise ValueError('Registry file is unreadable (it must be your private 0600 JSON file): ' + type(error).__name__) from None
+    return validate(value)
 
 
 def write(value, path):
@@ -144,7 +147,7 @@ def diverged(a, b):
 def self_name(path=None):
     path = path or settings.SELF
     try: name = read_private(path, 4096).get('name')
-    except FileNotFoundError: return None
+    except (RuntimeError, OSError, ValueError): return None
     return name if isinstance(name, str) and NAME.fullmatch(name) else None
 
 
