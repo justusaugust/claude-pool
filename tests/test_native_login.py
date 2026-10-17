@@ -15,10 +15,11 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'gateway'))
+import accounts_cli
 import device_sync
 import native_login
 from device_report import Step
-from fakes import FakeRemote, SecretWatch
+from fakes import FakeRemote, SecretWatch, refreshable_file
 from remote import Completed
 
 ANY = mock.ANY
@@ -34,6 +35,7 @@ if '-M' in argv:
     with open(os.environ['FAKE_SSH_LOG'] + '.mode', 'w') as out: out.write(oct(os.stat(os.path.dirname(socket)).st_mode & 0o777))
     sys.exit(int(os.environ.get('FAKE_SSH_MASTER_CODE', '0')))
 if '-O' in argv: sys.exit(int(os.environ.get('FAKE_SSH_FORWARD_CODE', '0')) if 'forward' in argv else 0)
+if os.environ.get('FAKE_SSH_SESSION_CODE'): sys.exit(int(os.environ['FAKE_SSH_SESSION_CODE']))  # e.g. 255: host unreachable
 # A session: the last word is the command the remote shell would run. "The remote machine" has Native at /opt/claude.
 words = [os.environ['FAKE_NATIVE'] if word == '/opt/claude' else word for word in shlex.split(argv[-1])]
 os.execvp(words[0], words)
@@ -48,9 +50,14 @@ echo "If the browser did not open, visit: https://claude.com/cai/oauth/authorize
 case "$FAKE_NATIVE_MODE" in
   loopback|fail) "$BROWSER" "https://claude.com/cai/oauth/authorize?code=true&redirect_uri=http%3A%2F%2Flocalhost%3A54545%2Fcallback&state=fixture-state" ;;
   platform) "$BROWSER" "https://claude.com/cai/oauth/authorize?code=true&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&state=fixture-state" ;;
+  evil) "$BROWSER" "https://evil.example/phish?redirect_uri=http://localhost:5432/callback" ;;
+  detached)
+    # A launcher that detaches from the terminal: the helper has no /dev/tty and its output goes nowhere.
+    "$FAKE_PYTHON" -c 'import os, sys; os.setsid(); fd = os.open(os.devnull, os.O_RDWR); [os.dup2(fd, n) for n in (0, 1, 2)]; os.execv(sys.argv[1], sys.argv[1:])' \
+      "$BROWSER" "https://claude.com/cai/oauth/authorize?code=true&redirect_uri=http%3A%2F%2Flocalhost%3A54545%2Fcallback&state=fixture-state" ;;
 esac
 case "$FAKE_NATIVE_MODE" in
-  loopback|fail)
+  loopback|fail|detached)
     i=0
     while [ ! -e "$FAKE_CLICKED" ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done
     echo "Login successful CHILD-SECRET"
@@ -91,23 +98,28 @@ class LoginTests(unittest.TestCase):
         self.log, self.clicked = self.folder / 'ssh.log', self.folder / 'clicked'
         self.env = {'FAKE_SSH_LOG': str(self.log), 'FAKE_NATIVE': str(native), 'FAKE_CLICKED': str(self.clicked),
                     'FAKE_BROWSER_SEEN': str(self.folder / 'browser'), 'FAKE_DISPLAY_SEEN': str(self.folder / 'display'),
-                    'DISPLAY': ':0'}
+                    'DISPLAY': ':0', 'FAKE_PYTHON': sys.executable}
         self.opener = mock.Mock(side_effect=lambda url: self.clicked.touch() or True)
 
-    def login(self, mode, **env):
+    def login(self, mode, timeout=30, **env):
         with mock.patch.dict(os.environ, {**self.env, 'FAKE_NATIVE_MODE': mode, **env}), \
                 mock.patch.object(native_login, 'MARKER_WAIT', 2), captured_output() as out:
-            step = native_login.login('vps', '/opt/claude', opener=self.opener, ssh=str(self.ssh), timeout=30)
+            step = native_login.login('vps', '/opt/claude', opener=self.opener, ssh=str(self.ssh), timeout=timeout)
         self.output = out['text']
         return step
 
     def calls(self):
         return [json.loads(line) for line in self.log.read_text().splitlines()]
 
+    def assert_closed(self):
+        calls = self.calls()
+        socket = calls[0][2]
+        self.assertEqual(calls[-1], ['-S', socket, '-O', 'exit', 'vps']); self.assertFalse(Path(socket).parent.exists())
+
     def test_loopback_login_forwards_the_callback_port_and_needs_only_the_click(self):
         step = self.login('loopback')
         forwarded = [argv[2:6] for argv in self.calls()]
-        self.assertIn(['-O', 'forward', '-L', '54545:127.0.0.1:54545'], forwarded)
+        self.assertIn(['-O', 'forward', '-L', '127.0.0.1:54545:127.0.0.1:54545'], forwarded)
         self.opener.assert_called_once()
         self.assertIn('redirect_uri=http%3A%2F%2Flocalhost%3A54545%2Fcallback', self.opener.call_args.args[0])
         self.assertEqual(step, Step('native-login', 'ok', ANY, None))
@@ -137,6 +149,8 @@ class LoginTests(unittest.TestCase):
                 calls = self.calls()
                 master = calls[0]
                 self.assertEqual(master[:4], ['-M', '-S', master[2], '-fN'])
+                for option in ['ClearAllForwardings=yes', 'GatewayPorts=no', 'BatchMode=yes']:
+                    self.assertEqual(master[master.index(option) - 1], '-o')
                 self.assertEqual(calls[-1], ['-S', master[2], '-O', 'exit', 'vps'])
                 self.assertFalse(Path(master[2]).parent.exists())
 
@@ -147,6 +161,42 @@ class LoginTests(unittest.TestCase):
     def test_child_that_fails_after_the_click_is_failed(self):
         step = self.login('fail')
         self.assertEqual(step.status, 'failed'); self.assertIn('claude-pool device add vps', step.fix)
+
+    def test_a_marker_for_another_site_opens_nothing_and_forwards_nothing(self):
+        step = self.login('evil')
+        self.assertEqual(step.status, 'manual'); self.opener.assert_not_called()
+        self.assertFalse([argv for argv in self.calls() if 'forward' in argv]); self.assert_closed()
+
+    def test_a_detached_browser_launcher_still_hands_over_the_url(self):
+        step = self.login('detached')
+        self.assertEqual(step.status, 'ok'); self.opener.assert_called_once()
+
+    def test_a_marker_seen_twice_is_handled_once(self):
+        self.assertEqual(self.login('loopback').status, 'ok')
+        self.assertEqual(len([argv for argv in self.calls() if 'forward' in argv]), 1); self.opener.assert_called_once()
+
+    def test_a_session_that_cannot_reach_the_target_is_unreachable(self):
+        step = self.login('loopback', FAKE_SSH_SESSION_CODE='255')
+        self.assertEqual(step, Step('native-login', 'unreachable', ANY, 'ssh vps true must work without a password prompt (BatchMode)'))
+        self.opener.assert_not_called(); self.assert_closed()
+
+    def test_overall_deadline_kills_the_child_and_closes(self):
+        self.opener = mock.Mock(return_value=True)  # the browser opened but nobody clicked Authorize
+        step = self.login('loopback', timeout=1.5)
+        self.assertEqual(step.status, 'failed'); self.assertIn('claude-pool device add vps', step.fix); self.assert_closed()
+
+    def test_an_opener_that_returns_false_is_manual_and_closes(self):
+        self.opener = mock.Mock(return_value=False)
+        self.assertEqual(self.login('loopback').status, 'manual'); self.assert_closed()
+
+    def test_an_opener_that_raises_is_manual_and_closes(self):
+        self.opener = mock.Mock(side_effect=OSError('no browser'))
+        self.assertEqual(self.login('loopback').status, 'manual'); self.assert_closed()
+
+    def test_an_exception_mid_session_still_closes(self):
+        with mock.patch.object(native_login, 'loopback_port', side_effect=RuntimeError('boom')):
+            with self.assertRaises(RuntimeError): self.login('loopback')
+        self.assert_closed()
 
     def test_unreachable_target_starts_no_login_and_still_closes(self):
         step = self.login('loopback', FAKE_SSH_MASTER_CODE='255')
@@ -189,10 +239,17 @@ class LoopbackTests(unittest.TestCase):
         base = 'https://claude.com/cai/oauth/authorize?code=true&redirect_uri='
         self.assertEqual(native_login.loopback_port(base + 'http%3A%2F%2Flocalhost%3A54545%2Fcallback'), 54545)
         self.assertEqual(native_login.loopback_port(base + 'http%3A%2F%2F127.0.0.1%3A4000%2Fcallback'), 4000)
+        self.assertEqual(native_login.loopback_port('https://claude.ai/oauth/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A4000%2Fcallback'), 4000)
         for redirect in ['https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback', 'http%3A%2F%2Flocalhost%2Fcallback',
-                         'http%3A%2F%2Fevil.example%3A54545%2Fcallback', 'http%3A%2F%2Flocalhost%3Axyz%2F']:
+                         'http%3A%2F%2Fevil.example%3A54545%2Fcallback', 'http%3A%2F%2Flocalhost%3Axyz%2F',
+                         'http%3A%2F%2Flocalhost%3A4000%2Fother', 'http%3A%2F%2Flocalhost%3A4000%2Fcallback%3Fx%3D1',
+                         'http%3A%2F%2Flocalhost%3A0%2Fcallback', 'http%3A%2F%2Flocalhost%3A70000%2Fcallback']:
             with self.subTest(redirect=redirect): self.assertIsNone(native_login.loopback_port(base + redirect))
-        self.assertIsNone(native_login.loopback_port('file:///etc/passwd?redirect_uri=http%3A%2F%2Flocalhost%3A1%2F'))
+        callback = 'redirect_uri=http%3A%2F%2Flocalhost%3A5432%2Fcallback'
+        for url in ['file:///etc/passwd?' + callback, 'https://evil.example/phish?redirect_uri=http://localhost:5432/callback',
+                    'https://claude.com.evil.example/cai/oauth/authorize?' + callback, 'https://claude.com/cai/oauth/other?' + callback,
+                    'http://claude.com/cai/oauth/authorize?' + callback, 'https://user@claude.com:8443/cai/oauth/authorize?' + callback]:
+            with self.subTest(url=url): self.assertIsNone(native_login.loopback_port(url))
 
 
 class CheckTests(unittest.TestCase):
@@ -218,6 +275,26 @@ class CheckTests(unittest.TestCase):
         fake = fake_status('ops@x.de', 'Team A')
         native_login.check(fake, '/opt/claude', ACCOUNTS)
         self.assertEqual(fake.calls[0][0], ['/opt/claude', 'auth', 'status', '--json'])
+
+    def test_unreachable_target_is_unreachable_with_the_batchmode_fix(self):
+        fake = FakeRemote('vps', lambda argv, stdin: Completed(255, b'', b'ssh: connect to host vps: timed out'))
+        self.assertEqual(native_login.check(fake, '/opt/claude', ACCOUNTS),
+                         Step('native-login', 'unreachable', ANY, 'ssh vps true must work without a password prompt (BatchMode)'))
+
+    def test_row_without_email_matches_through_its_stored_profile(self):
+        stores = Path(tempfile.mkdtemp(prefix='native-login-stores-')); self.addCleanup(shutil.rmtree, stores, True)
+        refreshable_file(stores, 'spare', 'user-s', 'org-s')
+        rows = [{'name': 'spare'}]
+        with mock.patch.object(accounts_cli, 'profile', return_value={'email': 'spare@x.de', 'organization': 'Spare Org'}):
+            self.assertEqual(native_login.check(fake_status('Spare@x.de', 'Spare Org'), '/opt/claude', rows, stores=stores).status, 'ok')
+
+    def test_row_without_email_whose_profile_cannot_be_read_is_skipped(self):
+        stores = Path(tempfile.mkdtemp(prefix='native-login-stores-')); self.addCleanup(shutil.rmtree, stores, True)
+        refreshable_file(stores, 'spare', 'user-s', 'org-s')
+        rows = [{'name': 'spare'}, *ACCOUNTS]
+        with mock.patch.object(accounts_cli, 'profile', side_effect=RuntimeError('Identity check unavailable')):
+            self.assertEqual(native_login.check(fake_status('ops@x.de', 'Team A'), '/opt/claude', rows, stores=stores).status, 'ok')
+            self.assertEqual(native_login.check(fake_status('nobody@x.de', 'N'), '/opt/claude', rows, stores=stores).status, 'failed')
 
     def test_unreadable_status_is_failed_without_its_output(self):
         fake = FakeRemote('vps', lambda argv, stdin: Completed(1, b'boom CHILD-SECRET', b'CHILD-SECRET'))

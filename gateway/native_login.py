@@ -32,26 +32,38 @@ import webbrowser
 import accounts_cli
 from device_report import Step
 import device_sync
+from remote import _TARGET
+import settings
 
 STEP = 'native-login'
 MARKER_WAIT = 60  # seconds the target's Native gets to hand its authorize URL to the browser helper
-_TARGET = re.compile(r'[A-Za-z0-9._@:-]{1,253}')
 _MARKER = re.compile(rb'claude-pool-open (\S+)[\r\n]')
-_LOOPBACK = {'localhost', '127.0.0.1'}
+_AUTHORIZE_HOSTS = {'claude.com', 'claude.ai'}
+_CALLBACK = re.compile(r'http://(?:localhost|127\.0\.0\.1):([0-9]{1,5})/callback')
 
 # Runs on the target as `sh -c REMOTE_SCRIPT claude-pool-login <native>`; the Native path arrives as $1, never in the text.
+# The helper reports the URL twice: on /dev/tty, and through "$d/url", which a background loop prints on the script's
+# own stdout, so a browser launcher that detaches from the terminal still hands it over. The local side acts once.
 REMOTE_SCRIPT = r'''set -u
+w=
 d=$(mktemp -d) || exit 1
-chmod 700 "$d"
-trap 'rm -rf "$d"' EXIT
+trap 'kill $w 2>/dev/null; rm -rf "$d"' EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
+chmod 700 "$d"
 cat > "$d/open" <<'HELPER'
 #!/bin/sh
+dir=$(dirname "$0")
+printf '%s\n' "$1" > "$dir/url.$$" && mv -f "$dir/url.$$" "$dir/url"
 { printf 'claude-pool-open %s\n' "$1" > /dev/tty; } 2>/dev/null || printf 'claude-pool-open %s\n' "$1" >&2
 HELPER
 chmod 700 "$d/open"
+(
+  while kill -0 $$ 2>/dev/null && [ -d "$d" ] && [ ! -e "$d/url" ]; do sleep 0.2; done
+  [ -e "$d/url" ] && printf 'claude-pool-open %s\n' "$(cat "$d/url")"
+) &
+w=$!
 unset DISPLAY WAYLAND_DISPLAY
 BROWSER="$d/open" "$1" auth login
 '''
@@ -68,44 +80,52 @@ def parse_auth_status(text):
     return {'email': email, 'organization': organization if isinstance(organization, str) else ''}
 
 
-def _served(identity, account):
-    """Email must match; organizations are compared only when both sides name one (as accounts_cli.matches_native)."""
-    email = account.get('email')
-    if not isinstance(email, str) or not email: return False
-    if accounts_cli.normalized(identity['email']) != accounts_cli.normalized(email): return False
-    theirs = accounts_cli.normalized(identity.get('organization') or '')
-    ours = accounts_cli.normalized(account.get('organization') or '')
-    return not theirs or not ours or theirs == ours
+def _unreachable_fix(target):
+    return 'ssh ' + target + ' true must work without a password prompt (BatchMode)'
 
 
-def check(remote, native: str, accounts: list) -> Step:
+def _served(identity, accounts, stores):
+    """Whether a registry account is this login: by its email (normalized; organizations compared only when both sides
+    name one), or by the stored profile for a row without an email. A row whose profile cannot be read is skipped."""
+    value = {'accounts': [row for row in accounts if isinstance(row, dict) and isinstance(row.get('name'), str)]}
+    for row in value['accounts']:
+        try:
+            if accounts_cli.matches_native(identity, row['name'], value, stores): return True
+        except RuntimeError:
+            continue
+    return False
+
+
+def check(remote, native: str, accounts: list, stores=None) -> Step:
     """Whether `remote` has a Native login, and whether the pool serves that account."""
     device = remote.name
     done = remote.call([native, 'auth', 'status', '--json'], timeout=30)
+    if done.returncode == 255 and not done.stdout.strip():
+        return Step(STEP, 'unreachable', 'could not reach ' + device + ' over ssh', _unreachable_fix(device))
     unreadable = Step(STEP, 'failed', 'could not read the Native login on ' + device, 'claude-native auth status')
     try: identity = parse_auth_status(done.stdout.decode('utf-8', 'replace'))
     except ValueError: return unreadable
     if identity is None: return Step(STEP, 'missing', 'no Native login on ' + device, 'claude-pool device add ' + device)
     if done.returncode: return unreadable
     shown = identity['email'] + (' (' + identity['organization'] + ')' if identity['organization'] else '')
-    if any(_served(identity, account) for account in accounts): return Step(STEP, 'ok', shown)
+    if _served(identity, accounts, settings.STORES if stores is None else stores): return Step(STEP, 'ok', shown)
     return Step(STEP, 'failed', shown + ' is not an account the pool serves',
                 'log in on ' + device + ' with an account the pool serves: claude-native auth login')
 
 
 def loopback_port(url):
-    """The local callback port of an https authorize URL whose redirect_uri is http://localhost:<port>/..., else None."""
+    """The callback port of a Claude authorize URL (https, host claude.com or claude.ai, path ending in /oauth/authorize)
+    whose redirect_uri is exactly http://localhost:<port>/callback or http://127.0.0.1:<port>/callback, else None."""
     try:
         parts = urlsplit(url)
-        if parts.scheme != 'https' or not parts.hostname: return None
+        if parts.scheme != 'https' or parts.hostname not in _AUTHORIZE_HOSTS or parts.netloc.lower() != parts.hostname: return None
+        if not parts.path.endswith('/oauth/authorize'): return None
         redirects = parse_qs(parts.query).get('redirect_uri', [])
-        if len(redirects) != 1: return None
-        redirect = urlsplit(redirects[0])
-        port = redirect.port
     except ValueError:
         return None
-    if redirect.scheme != 'http' or redirect.hostname not in _LOOPBACK or not port: return None
-    return port
+    match = _CALLBACK.fullmatch(redirects[0]) if len(redirects) == 1 else None
+    port = int(match.group(1)) if match else 0
+    return port if 1 <= port <= 65535 else None
 
 
 def _manual(target, native):
@@ -174,7 +194,7 @@ def _session(target, native, opener, spawn, ssh, socket, timeout):
             url = match.group(1).decode('ascii', 'replace')
             port = loopback_port(url)
             if port is None: return _manual(target, native)
-            spec = '%d:127.0.0.1:%d' % (port, port)
+            spec = '127.0.0.1:%d:127.0.0.1:%d' % (port, port)
             if _quiet([ssh, '-S', socket, '-O', 'forward', '-L', spec, target], 30) != 0: return _manual(target, native)
             try: shown = opener(url)
             except Exception: shown = False
@@ -187,6 +207,7 @@ def _session(target, native, opener, spawn, ssh, socket, timeout):
         except OSError: pass
         if code is None: _stop(pid)
     if code == 0: return Step(STEP, 'ok', 'logged in on ' + target)
+    if code == 255 and not opened: return Step(STEP, 'unreachable', 'could not reach ' + target + ' over ssh', _unreachable_fix(target))
     if not opened: return _manual(target, native)
     return Step(STEP, 'failed', 'the Native login on ' + target + ' did not finish after the browser opened',
                 'claude-pool device add ' + target)
@@ -200,9 +221,10 @@ def login(target: str, native: str, opener=webbrowser.open, spawn=pty.fork, ssh=
     folder = tempfile.mkdtemp(prefix='cpl-')  # 0700; holds only the control socket
     socket = os.path.join(folder, 'm')
     try:
-        if _quiet([ssh, '-M', '-S', socket, '-fN', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', target], 30) != 0:
-            return Step(STEP, 'unreachable', 'could not open an ssh connection to ' + target,
-                        'check that ssh ' + target + ' works, then rerun claude-pool device add ' + target)
+        master = [ssh, '-M', '-S', socket, '-fN', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
+                  '-o', 'ClearAllForwardings=yes', '-o', 'GatewayPorts=no', target]
+        if _quiet(master, 30) != 0:
+            return Step(STEP, 'unreachable', 'could not open an ssh connection to ' + target, _unreachable_fix(target))
         return _session(target, native, opener, spawn, ssh, socket, timeout)
     finally:
         _quiet([ssh, '-S', socket, '-O', 'exit', target], 15)
