@@ -7,7 +7,7 @@ import time
 
 from private_files import read_private, write_private
 import registry
-from remote import Remote
+from remote import OUTDATED, Remote
 
 LIMIT = 65536
 KEYS = ('fiveHour', 'sevenDay', 'fableWeekly')
@@ -95,7 +95,8 @@ class Puller:
         if not owner or not me: return False
         if not owner.get('ssh'): return self.fail('no ssh target')
         remote = self.remotes(owner['ssh'])
-        done = remote.pool('device', 'readings', timeout=60)
+        done = remote.device('readings', timeout=60)
+        if done.returncode == OUTDATED: return self.fail('outdated')  # journaled once; the owner needs claude-pool device add
         if done.returncode != 0 or len(done.stdout) > LIMIT: return self.fail('pull failed')
         try: shared = check(json.loads(done.stdout))
         except ValueError: shared = None

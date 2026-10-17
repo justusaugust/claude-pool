@@ -2,6 +2,9 @@
 secrets travel only on stdin and stdout pipes."""
 import contextlib
 import http.server
+import shlex
+import socket
+import subprocess
 import io
 import json
 import os
@@ -23,9 +26,11 @@ from device_report import Step
 import device_sync
 import devices_cli
 import launch
+import readings
+import remote
 import registry
 import settings
-from remote import Completed
+from remote import Completed, Local, Remote
 from fakes import FakeRemote, SecretWatch, fixture_token, long_lived_file, refreshable_file
 
 MAC = {'name': 'mac', 'ssh': 'justus@mac', 'platform': 'darwin', 'roles': [], 'addedAt': 1}
@@ -179,7 +184,11 @@ class InternalVerbTests(DeviceCliBase):
             value = json.loads(out)
             self.assertEqual(code, 0); self.assertEqual(value['name'], 'mac')
             self.assertEqual(value['registryGeneration'], registry.load(self.reg)['generation'])
-            self.assertEqual(len(next(r for r in value['accounts'] if r['name'] == 'team')['fingerprint']), 12)
+            self.assertEqual(value['registryHash'], registry.digest(registry.load(self.reg)))
+            self.assertIn(value['service'], ('running', 'stopped', 'missing'))
+            team = next(r for r in value['accounts'] if r['name'] == 'team')
+            self.assertEqual(len(team['fingerprint']), 12); self.assertIn('servingFingerprint', team)
+            self.assertIsNone(team['servingFingerprint'])
             SecretWatch(fixture_token()).text(out)
 
     def test_registry_prints_the_registry(self):
@@ -263,7 +272,53 @@ class InternalVerbTests(DeviceCliBase):
         self.assertEqual(self.run_cli(['preview-rules', 'remove'])[0], 0)
         self.assertEqual(self.run_cli(['preview-rules', 'check'])[0], 1)
 
-    def test_forget_accounts_drops_long_lived_copies_and_never_a_refreshable_file(self):
+    def pool_stopped(self):
+        (self.runtime / 'maintenance').write_text('Deliberately stopped\n')
+        probe = socket.socket(); probe.bind(('127.0.0.1', 0)); port = probe.getsockname()[1]; probe.close()
+        item = patch.object(settings, 'GATEWAY_PORT', port); item.start(); self.addCleanup(item.stop)
+
+    def strict_shunt(self):
+        """Like the real backend: `check` rejects an empty member list. Every run leaves a marker."""
+        shunt = self.here / 'bin/shunt'
+        shunt.write_text('#!' + sys.executable + '\nimport sys, tomllib\nopen(' + repr(str(self.root / 'shunt-ran')) + ', "a").write("x")\n'
+                         'a = sys.argv\nc = tomllib.load(open(a[a.index("--config") + 1], "rb"))\n'
+                         'sys.exit(0 if c["providers"]["anthropic"].get("accounts") else 1)\n')
+        shunt.chmod(0o700)
+
+    def tree(self):
+        return {str(p): (p.read_bytes() if p.is_file() else None) for p in self.root.rglob('*') if 'home' not in p.parts}
+
+    def test_forget_accounts_on_a_device_with_only_long_lived_accounts_empties_the_membership(self):
+        self.pool_stopped(); self.strict_shunt()
+        self.config.write_text(json.dumps({'accounts': [{'name': 'team', 'label': 'Team'}]}))
+        (self.runtime / 'shunt.toml').write_text('[providers.anthropic]\nkind = "anthropic"\nauth = "claude_oauth"\n\n'
+                                                 '[[providers.anthropic.accounts]]\nname = "team"\n')
+        long_lived_file(self.stores, 'team'); long_lived_file(self.directory, 'team')
+        code, out, err = self.run_cli(['forget-accounts'])
+        self.assertEqual(code, 0, out + err); self.assertEqual(json.loads(out)['removed'], ['team'])
+        self.assertFalse((self.stores / 'team.json').exists()); self.assertFalse((self.directory / 'team.json').exists())
+        self.assertEqual(json.loads(self.config.read_text())['accounts'], [])
+        import tomllib
+        self.assertEqual(tomllib.loads((self.runtime / 'shunt.toml').read_text())['providers']['anthropic']['accounts'], [])
+        self.assertEqual(list(self.stores.glob('.*.lock')), [])
+        self.assertFalse((self.root / 'shunt-ran').exists())  # the live-backend check is skipped, nothing else is
+        SecretWatch(fixture_token()).text(out, err)
+        self.assertEqual(self.run_cli(['forget-accounts'])[0], 0)  # idempotent
+
+    def test_forget_accounts_refuses_while_the_pool_runs_and_changes_nothing(self):
+        self.config.write_text(json.dumps({'accounts': [{'name': 'team', 'label': 'Team'}]}))
+        long_lived_file(self.stores, 'team'); long_lived_file(self.directory, 'team')
+        before = self.tree()
+        code, out, err = self.run_cli(['forget-accounts'])  # no maintenance marker: the pool counts as running
+        self.assertEqual(code, 1); self.assertIn('stop', out + err); self.assertEqual(self.tree(), before)
+        (self.runtime / 'maintenance').write_text('Deliberately stopped\n'); before = self.tree()
+        listener = socket.socket(); listener.bind(('127.0.0.1', 0)); listener.listen(); self.addCleanup(listener.close)
+        with patch.object(settings, 'GATEWAY_PORT', listener.getsockname()[1]):
+            code, out, err = self.run_cli(['forget-accounts'])  # marker present, but something still answers the port
+        self.assertEqual(code, 1); self.assertEqual(self.tree(), before)
+
+    def test_forget_accounts_never_touches_a_refreshable_file(self):
+        self.pool_stopped()
         self.config.write_text(json.dumps({'accounts': [{'name': 'personal', 'label': 'Personal'}, {'name': 'team', 'label': 'Team'}]}))
         (self.runtime / 'shunt.toml').write_text(BASE + '\n[[providers.anthropic.accounts]]\nname = "team"\n')
         personal = refreshable_file(self.stores, 'personal', 'user-p', 'org-p'); before = personal.read_bytes()
@@ -276,9 +331,8 @@ class InternalVerbTests(DeviceCliBase):
         self.assertFalse((self.directory / 'personal.json').exists())
         self.assertEqual(personal.read_bytes(), before); self.assertFalse((self.stores / '.retired').exists())
         self.assertEqual([r['name'] for r in json.loads(self.config.read_text())['accounts']], ['personal'])
-        self.assertNotIn('"team"', (self.runtime / 'shunt.toml').read_text())
+        self.assertNotIn('"team"', (self.runtime / 'shunt.toml').read_text()); self.assertIn('"personal"', (self.runtime / 'shunt.toml').read_text())
         SecretWatch(fixture_token(), fixture_token('r')).text(out, err)
-        self.assertEqual(self.run_cli(['forget-accounts'])[0], 0)  # idempotent
 
     def test_self_names_this_device(self):
         self.assertEqual(self.run_cli(['self', 'vps'])[0], 0); self.assertEqual(registry.self_name(self.self_path), 'vps')
@@ -390,20 +444,114 @@ class UserVerbTests(DeviceCliBase):
                       'conductor': {'installed': True, 'running': True, 'ready': True, 'fresh': False, 'duplicates': []}}
 
         def vps(argv, data):
-            if argv[:2] == ['sh', '-c'] and argv[2] == device_install.LAUNCHER_SCRIPT: return answer(0)
-            if argv[1:] == ['device', 'status', '--json']: return answer(0, json.dumps(vps_status).encode())
+            if argv[1:3] == ['device', 'status']: return answer(0, json.dumps(vps_status).encode())
             return answer(97)
         fakes = {'justus@vps': FakeRemote('justus@vps', vps),
-                 'justus@old': FakeRemote('justus@old', lambda argv, data: answer(11))}
+                 'justus@old': FakeRemote('justus@old', lambda argv, data: answer(97), device_exit=86)}
         with patch.object(device_sync, 'status', return_value={'name': 'mac', 'conductor': {'installed': False, 'running': False}}):
             code, out, _ = self.run_cli(['conductor', 'status'], remotes=fakes.__getitem__)
         self.assertEqual(code, 0, out); self.assertIn('ready on vps', out)
-        self.assertFalse([a for a, _ in fakes['justus@old'].calls if 'device' in a])
+        self.assertIn('outdated launcher on old', out); self.assertIn('claude-pool device add justus@old', out)
+        self.assertEqual(fakes['justus@old'].calls, [])
+
+    def test_conductor_status_names_an_outdated_conductor_device(self):
+        self.devices(MAC, VPS, conductor_entry={'device': 'vps', 'email': 'team@x.de', 'organization': 'Team A', 'cwd': '/srv/c'})
+        fakes = {'justus@vps': FakeRemote('justus@vps', lambda argv, data: answer(97), device_exit=86)}
+        with patch.object(device_sync, 'status', return_value={'name': 'mac', 'conductor': {}}):
+            code, out, _ = self.run_cli(['conductor', 'status'], remotes=fakes.__getitem__)
+        self.assertEqual(code, 2); self.assertIn('outdated launcher', out); self.assertRegex(out, r'fix: claude-pool device add justus@vps')
 
     def test_conductor_status_without_a_conductor(self):
         self.devices(MAC)
         code, out, _ = self.run_cli(['conductor', 'status'])
         self.assertEqual(code, 0); self.assertIn('no Conductor', out)
+
+
+
+def layout(home, current=True, support=True, wrapper=True):
+    """A target HOME as install.py lays it out; the wrapper logs every argv it is run with."""
+    prefix = home / '.local/share/claude pool'; (home / '.local/bin').mkdir(parents=True); prefix.mkdir(parents=True)
+    release = prefix / 'versions/abc' if current else prefix
+    (release / 'gateway').mkdir(parents=True)
+    if support: (release / 'gateway/devices_cli.py').write_text('')
+    if current: (prefix / 'current').symlink_to(release)
+    run = prefix / 'run.py'
+    run.write_text('import sys\nopen(sys.argv[1] if False else ' + repr(str(home / 'launcher.log')) + ', "a").write(" ".join(sys.argv[1:]) + "\\n")\n')
+    if wrapper:
+        (home / '.local/bin/claude-pool').write_text('#!/bin/sh\n# managed by claude-pool installer\nexec ' + shlex.quote(sys.executable) +
+                                                     ' ' + shlex.quote(str(run)) + ' "$@"\n')
+        (home / '.local/bin/claude-pool').chmod(0o755)
+    return home / 'launcher.log'
+
+
+def over_ssh(home):
+    """Stands in for ssh: runs the remote command line with `sh` in `home`, exactly as the far side would."""
+    def run(argv, **options):
+        assert argv[0] == 'ssh' and '-T' in argv
+        return subprocess.run(['sh', '-c', argv[-1]], cwd=home, env={'HOME': str(home), 'PATH': '/usr/bin:/bin'}, **options)
+    return run
+
+
+class DeviceScriptTests(DeviceCliBase):
+    def setUp(self):
+        super().setUp(); self.parts_off()
+
+    def target(self, **kwargs):
+        home = Path(tempfile.mkdtemp(prefix='target-', dir=self.root))
+        return home, layout(home, **kwargs)
+
+    def test_the_device_script_runs_only_a_launcher_with_device_support(self):
+        for kwargs, code in [({'current': True}, 0), ({'current': False}, 0), ({'current': True, 'support': False}, 86),
+                             ({'current': False, 'support': False}, 86), ({'wrapper': False}, 87)]:
+            with self.subTest(**kwargs):
+                home, log = self.target(**kwargs)
+                done = Remote('justus@vps', run=over_ssh(home)).device('status', '--json', 'a b; touch pwned')
+                self.assertEqual(done.returncode, code, done.stderr)
+                self.assertFalse((home / 'pwned').exists())
+                self.assertEqual(log.read_text() if log.exists() else '', 'device status --json a b; touch pwned\n' if code == 0 else '')
+
+    def test_the_device_script_resolves_the_release_like_the_install_check(self):
+        lines = lambda script: script.split('\n')[2:10]  # from `line=$(grep ...` to the devices_cli.py lookup
+        self.assertEqual(lines(remote.DEVICE_SCRIPT), lines(device_install.LAUNCHER_SCRIPT))
+
+    def test_local_device_uses_the_launcher_from_the_receipt(self):
+        home, log = self.target()
+        receipt = self.root / 'installation.json'
+        receipt.write_text(json.dumps({'launchers': {str(home / '.local/bin/claude-pool'): 'x'}}))
+        def run(argv, **options): return subprocess.run(argv, env={'HOME': str(self.home), 'PATH': '/usr/bin:/bin'}, **options)
+        self.assertEqual(Local(run=run, receipt=receipt).device('registry').returncode, 0)
+        self.assertEqual(log.read_text(), 'device registry\n')
+
+    def old_vps(self):
+        self.devices(MAC, VPS)
+        home, log = self.target(support=False)
+        return (lambda target: Remote(target, run=over_ssh(home))), log
+
+    def test_sync_never_hands_device_words_to_an_old_launcher(self):
+        remotes, log = self.old_vps()
+        code, out, _ = self.run_cli(['sync'], remotes=remotes)
+        self.assertEqual(code, 1); self.assertIn('vps: outdated: run claude-pool device add justus@vps', out)
+        self.assertFalse(log.exists())
+
+    def test_owner_lookup_never_hands_device_words_to_an_old_launcher(self):
+        remotes, log = self.old_vps()
+        self.assertIsNone(accounts_cli.owner_lookup('user-a', 'team-a', remotes=remotes))
+        self.assertFalse(log.exists())
+
+    def test_the_readings_puller_journals_an_outdated_owner_once(self):
+        remotes, log = self.old_vps()
+        journal = Mock()
+        puller = readings.Puller(self.root / 'shared.json', journal, remotes)
+        self.assertFalse(puller.run_once()); self.assertFalse(puller.run_once())
+        journal.record.assert_called_once_with('readings_sync_failed', reason='outdated')
+        self.assertFalse(log.exists())
+
+    def test_peer_results_name_outdated_and_missing_launchers(self):
+        self.devices(MAC, VPS)
+        for code, result in [(86, 'outdated: run claude-pool device add justus@vps'), (87, 'missing')]:
+            fake = FakeRemote('justus@vps', lambda argv, data: answer(97), device_exit=code)
+            self.assertEqual(device_sync.sync_all(lambda target: fake), {'vps': result})
+            self.assertEqual(fake.calls, [])
 
 
 if __name__ == '__main__':

@@ -7,6 +7,22 @@ import subprocess
 from typing import Iterable, NamedTuple
 
 POOL = '.local/bin/claude-pool'
+OUTDATED, NO_LAUNCHER = 86, 87
+# Runs `<wrapper> device "$@"` only when the release the wrapper starts has gateway/devices_cli.py (resolved exactly like
+# device_install.LAUNCHER_SCRIPT). An older launcher would take the words as a Claude prompt and start its pool, so it is never run.
+# $1 is the wrapper path ('' = ~/.local/bin/claude-pool); every argument is positional, never interpolated.
+DEVICE_SCRIPT = r'''wrapper=${1:-"$HOME/.local/bin/claude-pool"}; shift
+[ -f "$wrapper" ] || exit 87
+line=$(grep '^exec ' "$wrapper" | tail -n 1)
+rest=${line% \"\$@\"}
+case "$rest" in
+  *\') run=${rest%\'}; run=${run##*\'} ;;
+  *) run=${rest##* } ;;
+esac
+dir=$(dirname "$run")
+if [ -L "$dir/current" ]; then cli="$dir/current/gateway/devices_cli.py"; else cli="$dir/gateway/devices_cli.py"; fi
+[ -n "$run" ] && [ -f "$cli" ] || exit 86
+exec "$wrapper" device "$@"'''
 _TARGET = re.compile(r'[A-Za-z0-9._@:-]{1,253}')
 _RECEIPT = Path(__file__).resolve().parent.parent / 'installation.json'
 
@@ -51,6 +67,10 @@ class Remote:
     def pool(self, *args, stdin=None, timeout=120):
         return self.call([POOL, *args], stdin=stdin, timeout=timeout)
 
+    def device(self, *args, stdin=None, timeout=120):
+        """`claude-pool device <args>` on the target; exit 86 (outdated launcher) or 87 (none) without running anything."""
+        return self.call(['sh', '-c', DEVICE_SCRIPT, 'claude-pool-device', '', *args], stdin=stdin, timeout=timeout)
+
     def reachable(self):
         return self.call(['true'], timeout=15).returncode == 0
 
@@ -72,5 +92,8 @@ class Local(Remote):
 
     def pool(self, *args, stdin=None, timeout=120):
         return self.call([self._launcher(), *args], stdin=stdin, timeout=timeout)
+
+    def device(self, *args, stdin=None, timeout=120):
+        return self.call(['sh', '-c', DEVICE_SCRIPT, 'claude-pool-device', self._launcher(), *args], stdin=stdin, timeout=timeout)
 
     def reachable(self): return True

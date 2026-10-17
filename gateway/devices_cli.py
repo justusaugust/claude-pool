@@ -5,8 +5,12 @@ import contextlib
 import fcntl
 import json
 import os
+from pathlib import Path
+import socket
 import sys
+import tempfile
 import time
+import tomllib
 
 import accounts_cli
 # Every module that contributes a STATUS_PARTS or INTEGRATION_HOOKS entry, imported here so registration never depends on call order.
@@ -15,12 +19,13 @@ import device_cua
 import device_install
 import device_integrations  # noqa: F401  (registers herdrProfiles and its hook)
 import device_preview
-from device_report import ready, render
+from account_metadata import load as load_config
+from device_report import Step, ready, render
 import device_sync
 import native_login  # noqa: F401  (registers nativeLogin)
 import readings
 import registry
-from private_files import private_directory
+from private_files import atomic_write, private_directory
 from remote import Local, Remote
 import settings
 
@@ -144,32 +149,79 @@ def _unlink_long_lived(path):
     return True
 
 
+def pool_stopped():
+    """Deliberately stopped (`--stop` left the maintenance marker) and nothing answers the pool port."""
+    if not (settings.RUNTIME / 'maintenance').exists(): return False
+    try:
+        with socket.create_connection(('127.0.0.1', settings.GATEWAY_PORT), timeout=1): return False
+    except OSError: return True
+
+
+def drop_members(names):
+    """`accounts_cli.apply_change` for a stopped pool: the config and runtime TOML are parsed and validated, but the live-backend
+    `shunt check` is skipped, so the member list may become empty (a device that is being removed)."""
+    config = settings.CONFIG
+    paths, _env = accounts_cli.local_paths_env(settings.RUNTIME, settings.STORES)
+    config.parent.mkdir(parents=True, exist_ok=True)
+    with (config.parent / ('.' + config.name + '.lock')).open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        value = load_config(config)
+        value['accounts'] = [row for row in value.get('accounts', []) if row['name'] not in names]
+        candidates = []
+        for path in paths:
+            if not path.exists(): continue
+            text = path.read_text()
+            for name in sorted(names): text = accounts_cli.remove_membership(text, name)
+            tomllib.loads(text)
+            candidates.append((path, text))
+        with tempfile.NamedTemporaryFile(mode='w', dir=config.parent) as candidate:
+            candidate.write(json.dumps(value)); candidate.flush(); load_config(Path(candidate.name))
+        atomic_write(config, json.dumps(value, indent=2) + '\n')
+        for path, text in candidates:
+            if path.read_text() != text: atomic_write(path, text)
+
+
 def forget_accounts(argv, out, **_):
-    """Run on a device that is being removed: drop every long-lived copy and its membership. A refreshable grant is unique
-    to its machine and stays byte-identical, with its membership."""
+    """Run on a device that is being removed, after its pool was stopped: drop every long-lived copy and its membership.
+    A refreshable grant is unique to its machine and stays byte-identical, with its membership."""
     parse('forget-accounts', argv)
+    if not pool_stopped():
+        print('The pool on this device is not stopped; run claude-pool --stop first. Nothing was changed.', file=sys.stderr)
+        return 1
     names = set(device_sync.config_names())
     for folder in (settings.STORES, settings.LONG_LIVED):
         names |= {p.stem for p in folder.glob('*.json') if not p.stem.startswith('.')}
+    names = sorted(name for name in names if device_sync.NAME.fullmatch(name))
     report = {'removed': [], 'kept': [], 'failed': {}}
-    for name in sorted(names):
-        if not device_sync.NAME.fullmatch(name): continue
-        store, copy = settings.STORES / (name + '.json'), settings.LONG_LIVED / (name + '.json')
+    private_directory(settings.STORES)
+    with contextlib.ExitStack() as held:
+        created = []
+        for name in names:  # never race an `account add` of these names
+            path = settings.STORES / ('.' + name + '.add.lock')
+            if not path.exists(): created.append(path)
+            lock = held.enter_context(path.open('a'))
+            try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print('An account add of ' + name + ' is running; rerun later. Nothing was changed.', file=sys.stderr)
+                for item in created: item.unlink(missing_ok=True)
+                return 1
         try:
-            private_directory(settings.STORES)
-            with (settings.STORES / ('.' + name + '.add.lock')).open('a') as lock:  # never race an `account add` of this name
-                try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError: raise RuntimeError('an account add of ' + name + ' is running; rerun later') from None
-                done = False
-                if not store.is_symlink() and accounts_cli.stored_kind(store) == 'long-lived':
-                    if name in device_sync.config_names():
-                        paths, env = accounts_cli.local_paths_env(settings.RUNTIME, settings.STORES)
-                        accounts_cli.unregister(settings.CONFIG, settings.STORES, settings.HERE / 'bin/shunt', paths, name, env)
-                    done = _unlink_long_lived(store)
-                done = _unlink_long_lived(copy) or done
-            (report['removed'] if done else report['kept']).append(name)
+            members = set(device_sync.config_names())
+            served = [n for n in names if not (settings.STORES / (n + '.json')).is_symlink()
+                      and accounts_cli.stored_kind(settings.STORES / (n + '.json')) == 'long-lived']
+            # Membership goes first, so no member list points at a file while it is unlinked.
+            drop_members({n for n in served if n in members})
+            for name in names:
+                try:
+                    done = _unlink_long_lived(settings.STORES / (name + '.json')) if name in served else False
+                    done = _unlink_long_lived(settings.LONG_LIVED / (name + '.json')) or done
+                    (report['removed'] if done else report['kept']).append(name)
+                except Exception as error:
+                    report['failed'][name] = type(error).__name__ + ': ' + str(error)[:200]
         except Exception as error:
-            report['failed'][name] = type(error).__name__ + ': ' + str(error)[:200]
+            report['failed']['membership'] = type(error).__name__ + ': ' + str(error)[:200]
+        finally:
+            for item in created: item.unlink(missing_ok=True)
     print_json(report)
     return 1 if report['failed'] else 0
 
@@ -241,35 +293,27 @@ def switch(argv, out, local, **_):
     return device_sync.switch(args.wait, device_sync.local_overview(None), pool)
 
 
-def supports_device(remote):
-    """Never send a `device` verb to an older launcher: it would hand the words to Claude as a prompt."""
-    return remote.call(['sh', '-c', device_install.LAUNCHER_SCRIPT]).returncode == 0
-
-
-def peer_status(remote):
-    if not supports_device(remote): return None
-    done = remote.pool('device', 'status', '--json')
-    if done.returncode: return None
-    try: value = json.loads(done.stdout)
-    except ValueError: return None
-    return value if isinstance(value, dict) else None
-
-
 def conductor_user(action, argv, remotes, local):
     value = registry.load()
     if action == 'move':
         target = parse('conductor move', argv, (['device'], {})).device
         return conductor.move(target, value, remotes=remotes, local=local)
     parse('conductor status', argv)
-    me, statuses = registry.self_name(), {}
+    me, statuses, outdated = registry.self_name(), {}, {}
     for row in value['devices']:
         if row['name'] == me: statuses[row['name']] = device_sync.status()
         elif row.get('ssh'):
-            try: found = peer_status(remotes(row['ssh']))
-            except ValueError: found = None
-            if found is not None: statuses[row['name']] = found
-    step = conductor.check(statuses, value)
-    print(render('Conductor' + (' (' + value['conductor']['device'] + ')' if value.get('conductor') else ''), [step]))
+            # Through Remote.device: a launcher without device support is never handed the words.
+            try: statuses[row['name']] = device_sync.peer_status(remotes(row['ssh']))
+            except device_sync.Outdated: outdated[row['name']] = row['ssh']
+            except (ValueError, RuntimeError, OSError, device_sync.Failed, device_sync.Unreachable, device_sync.Missing): pass
+    lead = (value.get('conductor') or {}).get('device')
+    if lead in outdated:
+        step = Step(conductor.STEP, 'failed', 'outdated launcher on ' + lead + ' (no device support)', 'claude-pool device add ' + outdated[lead])
+    else: step = conductor.check(statuses, value)
+    print(render('Conductor' + (' (' + lead + ')' if lead else ''), [step]))
+    for name, ssh in sorted(outdated.items()):
+        if name != lead: print('  outdated launcher on ' + name + ', its Conductor state is unknown; fix: claude-pool device add ' + ssh)
     return 0 if ready([step]) else 2
 
 

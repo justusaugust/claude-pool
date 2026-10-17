@@ -15,7 +15,7 @@ import long_lived
 from long_lived import fingerprint, kind
 from private_files import private_directory, read_private, write_private
 import registry
-from remote import Remote, redact, require_pipe
+from remote import NO_LAUNCHER, OUTDATED, Remote, redact, require_pipe
 import routing
 import service
 import settings
@@ -29,6 +29,8 @@ switch_pending = long_lived.switch_pending
 
 class Unreachable(Exception): pass
 class Failed(Exception): pass
+class Outdated(Exception): pass  # the target's launcher has no `device` verb; it is never handed one
+class Missing(Exception): pass   # no claude-pool launcher on the target
 
 
 def check_name(name):
@@ -251,14 +253,17 @@ def secrets():
 
 
 def peer(remote, *args, stdin=None):
-    done = remote.pool(*args, stdin=stdin)
+    """`claude-pool device <args>` on another device, only through a launcher that has device support."""
+    done = remote.device(*args, stdin=stdin)
     if done.returncode == 255: raise Unreachable()
-    if done.returncode: raise Failed('claude-pool device ' + ' '.join(args[1:2]) + ' exited ' + str(done.returncode))
+    if done.returncode == OUTDATED: raise Outdated()
+    if done.returncode == NO_LAUNCHER: raise Missing()
+    if done.returncode: raise Failed('claude-pool device ' + ' '.join(args[0:1]) + ' exited ' + str(done.returncode))
     return done.stdout
 
 
 def peer_status(remote):
-    try: value = json.loads(peer(remote, 'device', 'status'))
+    try: value = json.loads(peer(remote, 'status'))
     except ValueError: raise Failed('the other device sent an unreadable status') from None
     if not isinstance(value, dict): raise Failed('the other device sent an unreadable status')
     rows = value.get('accounts') if isinstance(value.get('accounts'), list) else []
@@ -266,9 +271,11 @@ def peer_status(remote):
     return value
 
 
-def guarded(work):
+def guarded(work, target=''):
     try: work(); return 'ok'
     except Unreachable: return 'unreachable'
+    except Outdated: return 'outdated: run claude-pool device add ' + target
+    except Missing: return 'missing'
     except (Failed, ValueError, RuntimeError, OSError) as error:
         return 'failed: ' + redact(str(error), secrets())[:200]
 
@@ -280,27 +287,27 @@ def push(remote):
         generation = theirs.get('registryGeneration')
         if isinstance(generation, int) and generation > known['generation']: return  # the peer is ahead; pull brings this device up to date
         if not isinstance(generation, int) or known['generation'] > generation:
-            peer(remote, 'device', 'receive-registry', stdin=json.dumps(known).encode())
+            peer(remote, 'receive-registry', stdin=json.dumps(known).encode())
         for row in known['accounts']:
             path = settings.LONG_LIVED / (row['name'] + '.json')
             if accounts_cli.stored_kind(path) != 'long-lived': continue
             data = path.read_bytes()
             if theirs['accounts'].get(row['name'], {}).get('fingerprint') == fingerprint(json.loads(data)): continue
-            peer(remote, 'device', 'receive-account', row['name'], stdin=data)
-    return guarded(work)
+            peer(remote, 'receive-account', row['name'], stdin=data)
+    return guarded(work, remote.name)
 
 
 def pull(remote):
     def work():
         theirs = peer_status(remote)
-        receive_registry(peer(remote, 'device', 'registry'))
+        receive_registry(peer(remote, 'registry'))
         known = {row['name'] for row in registry.load()['accounts']}
         for name, row in sorted(theirs['accounts'].items()):
             path = settings.LONG_LIVED / (name + '.json')
             if row.get('kind') != 'long-lived' or name not in known or not NAME.fullmatch(name): continue
             if accounts_cli.stored_kind(path) == 'long-lived' and fingerprint(read_private(path)) == row.get('fingerprint'): continue
-            receive_account(name, peer(remote, 'device', 'send-account', name))
-    return guarded(work)
+            receive_account(name, peer(remote, 'send-account', name))
+    return guarded(work, remote.name)
 
 
 def sync_all(remotes=Remote):
@@ -314,7 +321,7 @@ def sync_all(remotes=Remote):
         try: remote = remotes(row['ssh'])
         except ValueError: results[row['name']] = 'failed: invalid ssh target'; continue
         pushed = push(remote)
-        if pushed == 'unreachable': results[row['name']] = pushed; continue
+        if pushed == 'unreachable' or pushed == 'missing' or pushed.startswith('outdated'): results[row['name']] = pushed; continue
         pulled = pull(remote)
         results[row['name']] = pushed if pushed != 'ok' else pulled
     return results

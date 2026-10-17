@@ -31,8 +31,9 @@ def refreshable_file(directory, name, user, org):
 
 class FakeRemote:
     """Records calls instead of running ssh. The handler answers each call."""
-    def __init__(self, name, handler):
+    def __init__(self, name, handler, device_exit=None):
         self.name, self.handler, self.calls = name, handler, []
+        self.device_exit = device_exit  # 86 outdated launcher, 87 no launcher: the device script never reaches the launcher
 
     def call(self, argv, stdin=None, timeout=120):
         self.calls.append((list(argv), stdin))
@@ -40,6 +41,12 @@ class FakeRemote:
 
     def pool(self, *args, stdin=None, timeout=120):
         return self.call(['.local/bin/claude-pool', *args], stdin=stdin, timeout=timeout)
+
+    def device(self, *args, stdin=None, timeout=120):
+        if self.device_exit is not None:
+            from remote import Completed
+            return Completed(self.device_exit, b'', b'')
+        return self.pool('device', *args, stdin=stdin, timeout=timeout)
 
     def reachable(self): return True
 

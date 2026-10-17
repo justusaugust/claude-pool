@@ -106,7 +106,7 @@ def owner_lookup(user_id, org_id, remotes=Remote):
     value = registry.load()
     owner = registry.owner(value)
     if owner is None or owner['name'] == registry.self_name() or not owner.get('ssh'): return None
-    try: done = remotes(owner['ssh']).pool('device', 'identity', user_id, org_id)
+    try: done = remotes(owner['ssh']).device('identity', user_id, org_id)  # never reaches a launcher without device support
     except ValueError: return None  # an ssh target the transport refuses
     if done.returncode: return None
     try: info = json.loads(done.stdout)
