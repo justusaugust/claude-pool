@@ -14,7 +14,7 @@
 
 **The browser selected the wrong account or organization.** Nothing is enrolled when email or requested organization checks fail. Keep the saved file private; do not paste it into support messages. Use the correct account name or deliberately resolve that saved login with its owner. The CLI never replaces an existing refresh token automatically.
 
-**No browser opens on a server.** Expected over SSH: copy the printed authorization URL into a browser on any machine, finish the login there, and paste the shown code into the hidden terminal prompt. Do not forward ports or copy credential files between machines.
+**No browser opens on a server.** Expected over SSH: copy the printed authorization URL into a browser on any machine, finish the login there, and paste the shown code into the hidden terminal prompt. Do not forward ports or copy credential files between machines. If the hidden prompt never appears, something handled the URL locally: the login child drops `DISPLAY` and `WAYLAND_DISPLAY` in SSH sessions on Linux so `xdg-open` cannot block on a browser you cannot see; outside SSH, unset them yourself or set `BROWSER=true` for that command.
 
 **Authorization shows a redirect error.** The guided CLI uses the registered manual-code browser flow from the start. Start a fresh `account add` flow and use its complete code in the hidden dialog; old codes and codes from another login are rejected.
 

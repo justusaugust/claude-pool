@@ -20,7 +20,7 @@ With Native Claude Code and Git already installed on macOS or Linux:
 curl -fsSL https://raw.githubusercontent.com/justusaugust/claude-pool/main/install.sh | sh
 ```
 
-The command downloads public source, checks Native compatibility, installs Python 3.11+ through Homebrew if needed, and builds the exact pinned backend. On macOS, missing Node/Rustup build tools can also be installed through Homebrew; without Homebrew, install the listed requirements yourself and rerun. On Linux, Node and npm come from your distribution or nodejs.org, and a missing Rust toolchain is installed by the official `rustup-init` into `~/.cargo` and `~/.rustup` without touching your shell files or needing root. Native Claude is never installed, updated or logged in by this installer.
+The command downloads public source, checks Native compatibility and builds the exact pinned backend. On macOS it installs Python 3.11+ through Homebrew if needed, and missing Node/Rustup build tools can also be installed through Homebrew; without Homebrew, install the listed requirements yourself and rerun. On Linux a missing Python 3.11+ stops the script with a package hint, Node and npm come from your distribution or nodejs.org, and a missing Rust toolchain is installed by the official `rustup-init` into `~/.cargo` and `~/.rustup` without touching your shell files or needing root. Native Claude is never installed, updated or logged in by this installer.
 
 The first build may take several minutes. Rust uses two jobs and runs at lower scheduling priority. Updates reuse the existing backend only when its upstream pin and binary checksum match; an altered patch is rejected. A failed download, build or staged-code check leaves the installed version selected.
 
@@ -73,7 +73,7 @@ Or run `claude-pool account add` and enter your email when prompted. The name an
 
 The command opens browser authorization. Confirm the selected account and subscription organization, then paste the complete code into the private macOS dialog (a hidden terminal prompt on Linux and other supported terminals). Never paste it into chat or a command argument. The CLI verifies the returned email and organization identity, stores refreshable credentials privately, registers the account and creates its session shortcut. `--organization` additionally requires the selected organization name to match.
 
-On a headless Linux host (SSH, no browser) the command prints the authorization URL under "If the browser did not open". Open that URL in a browser on another machine, sign in, copy the complete code the page shows, and paste it into the hidden prompt in the SSH terminal. The code is bound to that one login attempt; nothing else needs to reach the server, and no port forwarding is required.
+On a headless Linux host (SSH, no browser) the command prints the authorization URL under "If the browser did not open". Open that URL in a browser on another machine, sign in, copy the complete code the page shows, and paste it into the hidden prompt in the SSH terminal. Copy the URL from a plain SSH window: a terminal multiplexer may insert line breaks at the wrap; join them if the browser complains. Over SSH the login child never receives `DISPLAY`/`WAYLAND_DISPLAY`, so a headless X server or a desktop-file browser on the host cannot swallow the URL. Check the Native identity first with `claude-native auth status`; that user/organization must be among the enrolled accounts. The code is bound to that one login attempt; nothing else needs to reach the server, and no port forwarding is required.
 
 With a running pool, enrollment hot-reloads backend membership without restarting Claude or changing existing session pins. The command waits for the backend's first quota reading and reports the actual status, including `limited` if exhausted. This can take up to five minutes. A pending result means readiness is still unconfirmed; rerunning the same command resumes with the saved login instead of opening another browser. If the pool is stopped, the account is saved for its next normal start.
 
@@ -142,6 +142,8 @@ launchctl bootout "gui/$(id -u)/io.github.claude-pool"      # macOS
 systemctl --user disable --now io.github.claude-pool.service  # Linux
 python3 install.py --uninstall
 ```
+
+On Linux the uninstaller also runs `systemctl --user daemon-reload` so the removed unit no longer appears in `list-units`.
 
 Run the uninstall command from the retained source checkout, using `--prefix` if you chose another application directory. It refuses while the service is loaded or if a launcher changed. Configuration, credentials, usage history and Native Claude are retained. Remove the shell function yourself. No user chat is restarted or replayed by uninstall.
 
