@@ -32,6 +32,8 @@ except (OSError, ValueError) as error: raise SystemExit('Invalid pool configurat
 RUNTIME = Path(OPTIONS.get('state_dir', Path.home() / '.local/state/claude-pool')).expanduser().resolve()
 STORES = Path(OPTIONS.get('credential_dir', Path.home() / '.shunt/accounts/claude')).expanduser().resolve()
 LONG_LIVED = STORES.parent / 'claude-long-lived'  # 0700; long-lived token files before they join STORES
+REGISTRY = CONFIG.parent / 'devices.json'  # non-secret, generation-numbered device registry
+SELF = CONFIG.parent / 'device.json'  # this machine's registry name
 NATIVE_CLAUDE = str(Path(OPTIONS.get('native_claude', shutil.which('claude') or Path.home() / '.local/bin/claude')).expanduser().absolute())
 GATEWAY_PORT = OPTIONS.get('gateway_port', 18341)
 BACKEND_PORT = OPTIONS.get('backend_port', 18340)
