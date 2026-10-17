@@ -37,9 +37,12 @@ if args == ['agent', 'list']:
 if args == ['workspace', 'list']:
     out({'result': {'type': 'workspace_list', 'workspaces': state.get('workspaces', {}).get(session, [])}})
 if args[:2] == ['agent', 'read']:
-    out({'result': {'type': 'pane_read', 'read': {'text': state.get('reads', {}).get(args[2], '')}}})
+    text = state.get('reads', {}).get(args[2], '')
+    if state.get('raw_reads'): print(text); sys.exit(0)
+    out({'result': {'type': 'pane_read', 'read': {'text': text}}})
 if args[:2] == ['agent', 'prompt']:
     if state.get('prompt_fails'): sys.exit(1)
+    if state.get('prompt_error'): out({'id': 'cli:agent:prompt', 'error': {'code': 'agent_blocked', 'message': 'blocked'}})
     out({'result': {'type': 'agent_prompted', 'agent': {}}})
 if args[:2] == ['workspace', 'create']:
     out({'result': {'type': 'workspace_created', 'workspace': {'workspace_id': 'w9'}, 'tab': {'tab_id': 'w9:t1'},
@@ -69,7 +72,8 @@ if state.get('gh_unauthenticated'): print('To get started with GitHub CLI, pleas
 if args[:2] == ['pr', 'list']:
     repo = args[args.index('--repo') + 1]
     rows = state.get('prs', {}).get(repo, [])
-    if '--state' not in args: rows = [row for row in rows if row['state'] == 'OPEN']
+    wanted = args[args.index('--state') + 1].upper() if '--state' in args else 'OPEN'
+    rows = [row for row in rows if row['state'] == wanted]
     print(json.dumps(rows)); sys.exit(0)
 sys.exit(2)
 '''
@@ -172,11 +176,30 @@ class CleanTests(unittest.TestCase):
         self.assertEqual(ct.clean('a\tb\x07c\rd'), 'a b c d')
         self.assertEqual(len(ct.clean('x' * 500, limit=160)), 160)
 
+    def test_standard_base64_with_slashes_is_redacted_but_plain_paths_survive(self):
+        aws = 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY'
+        self.assertEqual(len(aws), 40)
+        run = 'aB3/' * 15
+        self.assertEqual(ct.clean('secret ' + aws), 'secret <redacted>')
+        self.assertEqual(ct.clean('key ' + run + '=='), 'key <redacted>')
+        path = '/srv/justus/dev/claude-pool-devices/gateway/Conductor2Tools/Module3'
+        self.assertEqual(ct.clean('open ' + path), 'open ' + path)
+
     def test_last_line_skips_chrome_and_blank_lines(self):
         text = 'Done: committed abc\n\n───────────\n> \n? for shortcuts\n⏵⏵ auto mode on (shift+tab to cycle)\n'
         self.assertEqual(ct.last_line(text), 'Done: committed abc')
         self.assertEqual(ct.last_line('│ Reading files │\n'), 'Reading files')
         self.assertEqual(ct.last_line(''), '')
+
+
+class HerdrCallTests(unittest.TestCase):
+    def test_success_is_exit_zero_without_an_error_key(self):
+        def runner(code, out):
+            return lambda argv, timeout: subprocess.CompletedProcess(argv, code, out, '')
+        self.assertTrue(ct.Tools(runner(0, 'ok\n')).prompt('s', 'w1:p1', 'task'))
+        self.assertTrue(ct.Tools(runner(0, json.dumps({'result': {'type': 'agent_prompted'}}))).prompt('s', 'w1:p1', 'task'))
+        self.assertFalse(ct.Tools(runner(0, json.dumps({'error': {'code': 'agent_blocked'}}))).prompt('s', 'w1:p1', 'task'))
+        self.assertFalse(ct.Tools(runner(1, '')).prompt('s', 'w1:p1', 'task'))
 
 
 class SnapshotTests(ToolsBase):
@@ -196,7 +219,7 @@ class SnapshotTests(ToolsBase):
         rows = [a for w in dashboard['workspaces'] for a in w['agents']]
         reviewer = next(a for a in rows if a['name'] == 'reviewer')
         self.assertEqual((reviewer['status'], reviewer['repo'], reviewer['last']), ('working', 'ai-vaerk/website', 'Running tests 3/9'))
-        self.assertEqual(value['previews'][0]['link'], 'https://personal-vps.tail1.ts.net:8443/')
+        self.assertEqual(value['previews'][0], {'port': 5173, 'label': 'web', 'link': 'https://personal-vps.tail1.ts.net:8443/'})
         self.assertEqual(value['prs']['ai-vaerk/website'][0]['number'], 12)
         stopped = next(s for s in value['sessions'] if s['name'] == 'old')
         self.assertEqual(stopped['workspaces'], [])
@@ -230,6 +253,12 @@ class SnapshotTests(ToolsBase):
         self.assertNotIn('preview', text.lower()); self.assertNotIn('pull request', text.lower())
         self.assertEqual((value['previews'], value['prs']), ([], {}))
 
+    def test_agent_read_plain_text_output_is_used_as_is(self):
+        self.set_state({**base_state(), 'raw_reads': True})
+        value = json.loads(ct.snapshot(ct.Tools(), as_json=True))
+        rows = [a for s in value['sessions'] for w in s['workspaces'] for a in w['agents']]
+        self.assertEqual(next(a for a in rows if a['name'] == 'reviewer')['last'], 'Running tests 3/9')
+
     def test_missing_herdr_is_one_line_not_an_error(self):
         (self.bin / 'herdr').unlink()
         self.assertIn('herdr is not available', ct.snapshot(ct.Tools()))
@@ -262,8 +291,8 @@ class EventsTests(ToolsBase):
         self.assertIn('conductor-event session-started old', lines)
         self.assertIn('conductor-event pr-merged ai-vaerk/website#12 Über uns: neu u12', lines)
         self.assertIn('conductor-event pr-opened ai-vaerk/website#13 Kontakt u13', lines)
-        self.assertIn('conductor-event preview-started docs https://personal-vps.tail1.ts.net:9443/', lines)
-        self.assertIn('conductor-event preview-stopped web https://personal-vps.tail1.ts.net:8443/', lines)
+        self.assertIn('conductor-event preview-started 3000 docs https://personal-vps.tail1.ts.net:9443/', lines)
+        self.assertIn('conductor-event preview-stopped 5173 web https://personal-vps.tail1.ts.net:8443/', lines)
         # A new agent appearing as done is important; nothing unimportant prints before the batch window.
         self.assertIn('agent-done dashboard/writer', '\n'.join(lines))
         self.assertFalse([line for line in lines if ' batch ' in line])
@@ -321,8 +350,47 @@ class EventsTests(ToolsBase):
         self.assertFalse([c for c in self.calls() if c[0] == 'gh'])
         self.assertEqual(self.tick(1020, with_prs=True), [])  # first sight of a repo seeds it
         gh = [c for c in self.calls() if c[0] == 'gh']
-        self.assertEqual(gh, [['gh', 'pr', 'list', '--repo', 'ai-vaerk/website', '--json', 'number,title,state,url,headRefName',
-                               '--limit', '20', '--state', 'all']])
+        fields = ['--json', 'number,title,state,url,headRefName', '--limit', '20']
+        self.assertEqual(gh, [['gh', 'pr', 'list', '--repo', 'ai-vaerk/website', *fields],
+                              ['gh', 'pr', 'list', '--repo', 'ai-vaerk/website', *fields, '--state', 'merged',
+                               '--search', 'merged:>=' + time.strftime('%Y-%m-%d', time.gmtime(1020 - 86400))]])
+
+    def test_a_merge_older_than_the_last_twenty_prs_is_not_missed(self):
+        value = base_state()
+        value['prs']['ai-vaerk/website'] = [{'number': n, 'title': 'p%d' % n, 'state': 'CLOSED', 'url': 'u', 'headRefName': 'b'}
+                                            for n in range(100, 140)] + value['prs']['ai-vaerk/website']
+        self.set_state(value)
+        self.tick(1000, first=True)
+        value['prs']['ai-vaerk/website'][-1]['state'] = 'MERGED'
+        self.set_state(value)
+        self.assertIn('pr-merged ai-vaerk/website#12', '\n'.join(self.tick(1020)))
+
+    def test_unreadable_state_file_reseeds_silently_and_then_reports_again(self):
+        for spoil in ('{not json', 'mode', 'big'):
+            with self.subTest(spoil=spoil):
+                self.set_state(base_state())
+                self.tick(1000, first=True)
+                if spoil == 'mode': self.events_path.chmod(0o644)
+                else:
+                    self.events_path.write_text(spoil if spoil != 'big' else json.dumps({'x': 'y' * (2 << 20)}))
+                    self.events_path.chmod(0o600)
+                value = base_state(); value['agents']['dashboard'][0]['agent_status'] = 'blocked'
+                self.set_state(value)
+                self.assertEqual(self.tick(1020), [])
+                self.assertEqual(stat.S_IMODE(self.events_path.stat().st_mode), 0o600)
+                value['agents']['dashboard'][0]['agent_status'] = 'idle'
+                self.set_state(value)
+                self.assertEqual([line.split()[1] for line in self.tick(1040)], ['agent-waiting'])
+
+    def test_a_second_watcher_exits_at_once_with_one_line(self):
+        self.runtime.mkdir(mode=0o700)
+        lines = []
+        with ct._watcher_lock(self.events_path) as held:
+            self.assertTrue(held)
+            code = ct.events(self.events_path, self.queue_path, interval=0.01, tools=ct.Tools(), write=lines.append)
+        self.assertEqual(code, 1)
+        self.assertEqual(len(lines), 1); self.assertIn('already running', lines[0])
+        self.assertFalse(self.events_path.exists())
 
     def test_events_command_exits_cleanly_on_sigterm_and_prints_nothing_at_start(self):
         config = self.dir / 'config.json'
@@ -358,8 +426,9 @@ class TellTests(ToolsBase):
                 code, line = ct.tell(target, 'Fix the flaky test', tools=ct.Tools(), queue_path=self.queue_path)
                 self.assertEqual((code, line), (0, 'prompted dashboard/pooler'))
                 self.assertIn(['herdr', '--session', 'dashboard', 'agent', 'prompt', 'w2:p1', 'Fix the flaky test'], self.herdr_calls())
-        # A session target picks its one idle agent.
-        self.assertEqual(ct.tell('dashboard', 'x', tools=ct.Tools(), queue_path=self.queue_path), (0, 'prompted dashboard/pooler'))
+        # A session with several agents is ambiguous even when only one of them is idle.
+        code, line = ct.tell('dashboard', 'x', tools=ct.Tools(), queue_path=self.queue_path)
+        self.assertEqual(code, 1); self.assertIn('dashboard/reviewer (working)', line); self.assertIn('dashboard/pooler (idle)', line)
         self.assert_never_creates_sessions()
 
     def test_ambiguous_or_unknown_target_fails_with_candidates(self):
@@ -397,6 +466,34 @@ class TellTests(ToolsBase):
         self.set_state(value)
         self.assertNotIn('delivered', ' '.join(self.tick(1040)))
         self.assertEqual(len(json.loads(self.queue_path.read_text())['items']), 1)
+        self.assertEqual(self.tick(1060), [])
+        self.assertEqual(self.tick(1080), ['conductor-event undeliverable dashboard/reviewer Later'])
+        self.assertEqual(json.loads(self.queue_path.read_text())['items'], [])
+        prompts = [c for c in self.herdr_calls() if c[4:5] == ['prompt']]
+        self.assertEqual(len(prompts), 3)
+        self.assertEqual(self.tick(1100), [])
+
+    def test_herdr_error_reply_counts_as_a_failed_delivery(self):
+        ct.tell('reviewer', 'Later', tools=ct.Tools(), queue_path=self.queue_path, now=1010)
+        self.tick(1000, first=True)
+        value = base_state(); value['agents']['dashboard'][0]['agent_status'] = 'idle'; value['prompt_error'] = True
+        self.set_state(value)
+        self.assertNotIn('delivered', ' '.join(self.tick(1040)))
+        self.assertEqual(json.loads(self.queue_path.read_text())['items'][0]['attempts'], 1)
+
+    def test_orphaned_queue_item_is_listed_reported_once_and_dropped_after_three_polls(self):
+        self.tick(1000, first=True)
+        ct.tell('reviewer', 'Review PR 12', tools=ct.Tools(), queue_path=self.queue_path, now=1010)
+        value = base_state(); del value['agents']['dashboard'][0]
+        self.set_state(value)
+        self.assertEqual(self.tick(1020), ['conductor-event orphaned dashboard/reviewer Review PR 12'])
+        self.assertIn('dashboard/reviewer Review PR 12', ct.snapshot(ct.Tools(), queue_path=self.queue_path))
+        orphaned = json.loads(ct.snapshot(ct.Tools(), as_json=True, queue_path=self.queue_path))['orphaned']
+        self.assertEqual(orphaned, [{'agent': 'dashboard/reviewer', 'task': 'Review PR 12'}])
+        self.assertEqual(self.tick(1040), [])
+        self.assertEqual(self.tick(1060), ['conductor-event undeliverable dashboard/reviewer Review PR 12'])
+        self.assertEqual(json.loads(self.queue_path.read_text())['items'], [])
+        self.assertFalse([c for c in self.herdr_calls() if c[4:5] == ['prompt']])
 
     def test_parallel_starts_a_pool_agent_in_a_new_workspace_of_the_same_session(self):
         code, line = ct.tell('reviewer', 'Write the docs', parallel=True, tools=ct.Tools(), queue_path=self.queue_path, sleep=lambda s: None)
@@ -406,7 +503,7 @@ class TellTests(ToolsBase):
                        '--no-focus'], calls)
         self.assertIn(['herdr', '--session', 'dashboard', 'agent', 'start', 'reviewer-2', '--kind', 'claude', '--pane', 'w9:p1'], calls)
         self.assertIn(['herdr', '--session', 'dashboard', 'pane', 'process-info', '--pane', 'w9:p1'], calls)
-        self.assertEqual(calls[-1], ['herdr', '--session', 'dashboard', 'agent', 'prompt', 'reviewer-2', 'Write the docs'])
+        self.assertEqual(calls[-1], ['herdr', '--session', 'dashboard', 'agent', 'prompt', 'w9:p1', 'Write the docs'])
         self.assertFalse(self.queue_path.exists())
         self.assert_never_creates_sessions()
 
@@ -418,6 +515,13 @@ class TellTests(ToolsBase):
         calls = self.herdr_calls()
         self.assertEqual(calls[-1], ['herdr', '--session', 'dashboard', 'workspace', 'close', 'w9'])
         self.assertFalse([c for c in calls if c[4:5] == ['prompt']])
+
+    def test_tell_lines_are_cleaned(self):
+        value = base_state(); value['agents']['dashboard'][1]['name'] = 'pool' + ESC + '[31mer'
+        value['agents']['dashboard'][0]['agent_status'] = 'idle'
+        self.set_state(value)
+        code, line = ct.tell('dashboard', 'x', tools=ct.Tools(), queue_path=self.queue_path)
+        self.assertEqual(code, 1); self.assertNotIn(ESC, line)
 
     def test_busy_agent_without_parallel_never_creates_a_workspace(self):
         ct.tell('reviewer', 'x', tools=ct.Tools(), queue_path=self.queue_path)

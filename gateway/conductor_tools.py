@@ -44,6 +44,7 @@ MAX_TEXT_LINES, MAX_TEXT_BYTES = 60, 6 * 1024
 MAX_LAST = 160          # per-agent last line
 MAX_SESSIONS, MAX_AGENTS, MAX_PREVIEWS, MAX_REPOS, MAX_PRS = 20, 40, 20, 10, 10
 IDLE = ('idle', 'done')
+ATTEMPTS = 3            # delivery attempts per queued task before it is dropped
 STATE_LIMIT = 1 << 20
 
 ANSI = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]')
@@ -52,7 +53,11 @@ SECRETS = [(re.compile(r'sk-ant-[A-Za-z0-9_-]+'), '<redacted>'),
            (re.compile(r'(?i)\bBearer\s+\S+'), 'Bearer <redacted>'),
            (re.compile(r'\b[0-9a-fA-F]{40,}\b'), '<redacted>'),
            # base64/base64url runs of 40+ with a digit; slashes split paths, so a long path survives
-           (re.compile(r'(?<![A-Za-z0-9+_-])(?=[A-Za-z0-9+_-]*\d)[A-Za-z0-9+_-]{40,}={0,2}'), '<redacted>')]
+           (re.compile(r'(?<![A-Za-z0-9+_-])(?=[A-Za-z0-9+_-]*\d)[A-Za-z0-9+_-]{40,}={0,2}'), '<redacted>'),
+           # standard base64 (AWS-style keys contain `/`): upper, lower and a digit, and not a path (no leading `/`)
+           (re.compile(r'(?<![A-Za-z0-9+/=_-])[A-Za-z0-9+/]{40,}={0,2}'),
+            lambda m: m.group() if m.group().startswith('/') or not (re.search(r'[A-Z]', m.group()) and re.search(r'[a-z]', m.group())
+                                                                      and re.search(r'\d', m.group())) else '<redacted>')]
 CHROME = re.compile(r'^(?:[>❯›$#]\s*|\? for shortcuts.*|.*esc to interrupt.*|⏵⏵.*|.*shift\+tab to cycle.*)$', re.I)
 GITHUB = re.compile(r'github\.com[:/]+([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?$')
 AGENT_NAME = re.compile(r'[a-z][a-z0-9_-]{0,31}')
@@ -96,9 +101,12 @@ class Tools:
     def __init__(self, run=run_tool): self.run = run
 
     def herdr(self, session, *args, timeout=15):
+        """The reply on success (exit 0 and no `error` key; plain-text output reads as {}), None on failure."""
         done = self.run(['herdr', *(['--session', session] if session else []), *args], timeout)
-        data = _json(done.stdout) if done.returncode == 0 else None
-        if not isinstance(data, dict): return None
+        if done.returncode: return None
+        data = _json(done.stdout)
+        if not isinstance(data, dict): return {}
+        if 'error' in data: return None
         return data['result'] if isinstance(data.get('result'), dict) else data
 
     def sessions(self):
@@ -150,8 +158,9 @@ class Tools:
         for row in data:
             if not isinstance(row, dict): continue
             link = clean(row.get('link') or row.get('url') or row.get('proxy') or '', 200)
-            key = clean(row.get('label') or row.get('port') or link, 60)
-            if key: rows[key] = {'port': row.get('port'), 'link': link}
+            label = clean(row.get('label') or '', 60)
+            key = clean(row['port'] if row.get('port') is not None else label or link, 60)
+            if key: rows[key] = {'port': row.get('port'), 'label': label, 'link': link}
         return rows
 
     def repo(self, cwd):
@@ -162,14 +171,22 @@ class Tools:
         match = GITHUB.search(origin.stdout.strip()) if origin.returncode == 0 else None
         return {'name': Path(top.stdout.strip()).name, 'slug': match.group(1) + '/' + match.group(2) if match else ''}
 
-    def prs(self, slug, state_all=False):
-        done = self.run(['gh', 'pr', 'list', '--repo', slug, '--json', 'number,title,state,url,headRefName', '--limit', '20',
-                         *(['--state', 'all'] if state_all else [])], 30)
-        data = _json(done.stdout) if done.returncode == 0 else None
-        if not isinstance(data, list): return None
-        return {str(row['number']): {'state': str(row.get('state', '')), 'title': clean(row.get('title', ''), 100),
-                                     'url': clean(row.get('url', ''), 200), 'branch': clean(row.get('headRefName', ''), 60)}
-                for row in data if isinstance(row, dict) and isinstance(row.get('number'), int)}
+    def prs(self, slug, merged_since=None):
+        """{number: row} of open PRs, plus PRs merged since `merged_since` (two calls, so a merge behind twenty newer PRs
+        is not missed); None when gh is missing, unauthenticated or fails."""
+        fields = ['gh', 'pr', 'list', '--repo', slug, '--json', 'number,title,state,url,headRefName', '--limit', '20']
+        calls = [fields]
+        if merged_since is not None:
+            calls.append(fields + ['--state', 'merged', '--search', 'merged:>=' + time.strftime('%Y-%m-%d', time.gmtime(merged_since))])
+        rows = {}
+        for argv in calls:
+            done = self.run(argv, 30)
+            data = _json(done.stdout) if done.returncode == 0 else None
+            if not isinstance(data, list): return None
+            rows.update({str(row['number']): {'state': str(row.get('state', '')), 'title': clean(row.get('title', ''), 100),
+                                              'url': clean(row.get('url', ''), 200), 'branch': clean(row.get('headRefName', ''), 60)}
+                         for row in data if isinstance(row, dict) and isinstance(row.get('number'), int)})
+        return rows
 
 
 # --- shared state files -------------------------------------------------------------------------------------------
@@ -227,22 +244,25 @@ def _bounded(lines):
 
 # --- snapshot -----------------------------------------------------------------------------------------------------
 
-def snapshot(tools=None, as_json=False, now=None, state_path=None):
+def snapshot(tools=None, as_json=False, now=None, state_path=None, queue_path=None):
     tools, now = tools or Tools(), time.time() if now is None else now
     seen, queued = {}, []
     with contextlib.suppress(OSError, RuntimeError, ValueError): seen = _read(state_path or EVENTS).get('agents') or {}
-    with contextlib.suppress(OSError, RuntimeError, ValueError): queued = _read(QUEUE).get('items') or []
+    with contextlib.suppress(OSError, RuntimeError, ValueError): queued = _read(queue_path or QUEUE).get('items') or []
     sessions = tools.sessions()
     if sessions is None:
         return json.dumps({'error': 'herdr is not available'}) if as_json else 'herdr is not available on this machine'
-    repos, value, shown = {}, {'sessions': [], 'previews': [], 'prs': {}}, 0
+    repos, value, shown, present, unknown = {}, {'sessions': [], 'previews': [], 'prs': {}}, 0, set(), set()
     for session in sessions[:MAX_SESSIONS]:
         entry = {'name': clean(session['name'], 60), 'running': bool(session.get('running')), 'workspaces': []}
         value['sessions'].append(entry)
         if not entry['running']: continue
         labels = tools.workspaces(session['name'])
         groups = {}
-        for agent in tools.agents(session['name']) or []:
+        agents = tools.agents(session['name'])
+        if agents is None: unknown.add(session['name'])
+        present.update(session['name'] + '/' + agent['pane_id'] for agent in agents or [])
+        for agent in agents or []:
             if shown >= MAX_AGENTS: entry['more'] = entry.get('more', 0) + 1; continue
             shown += 1
             cwd = agent.get('cwd') or ''
@@ -258,7 +278,10 @@ def snapshot(tools=None, as_json=False, now=None, state_path=None):
                 'last': last_line(tools.read(session['name'], agent['pane_id'])),
                 'queued': sum(1 for item in queued if item.get('session') == session['name'] and item.get('pane') == agent['pane_id'])})
         entry['workspaces'] = list(groups.values())
-    value['previews'] = [{'label': key, **row} for key, row in list((tools.previews() or {}).items())[:MAX_PREVIEWS]]
+    value['previews'] = [dict(row) for row in list((tools.previews() or {}).values())[:MAX_PREVIEWS]]
+    value['orphaned'] = [{'agent': item.get('session', '') + '/' + (item.get('agent') or item.get('pane', '')), 'task': clean(item.get('task', ''), 100)}
+                         for item in queued if item.get('session') not in unknown
+                         and item.get('session', '') + '/' + item.get('pane', '') not in present][:MAX_PREVIEWS]
     for slug in sorted({repo['slug'] for repo in repos.values() if repo['slug']})[:MAX_REPOS]:
         rows = tools.prs(slug)
         if rows: value['prs'][slug] = [{'number': int(n), **row} for n, row in list(rows.items())[:MAX_PRS] if row['state'] in ('', 'OPEN')]
@@ -278,7 +301,11 @@ def snapshot(tools=None, as_json=False, now=None, state_path=None):
         if entry.get('more'): lines.append('  ... ' + str(entry['more']) + ' more agents (use --json)')
     if value['previews']:
         lines.append('previews:')
-        lines += ['  ' + row['label'] + ' ' + row['link'] for row in value['previews']]
+        lines += ['  ' + ' '.join(str(part) for part in (row['label'], row['port'], row['link']) if part not in ('', None))
+                  for row in value['previews']]
+    if value['orphaned']:
+        lines.append('queued for missing agents:')
+        lines += ['  ' + row['agent'] + ' ' + row['task'] for row in value['orphaned']]
     if value['prs']:
         lines.append('open pull requests:')
         lines += ['  ' + slug + ' #' + str(row['number']) + ' ' + row['title'] + ' ' + row['url'] for slug, rows in value['prs'].items() for row in rows]
@@ -287,7 +314,7 @@ def snapshot(tools=None, as_json=False, now=None, state_path=None):
 
 # --- events -------------------------------------------------------------------------------------------------------
 
-def _observe(tools, previous, with_prs):
+def _observe(tools, previous, with_prs, now):
     """Current sessions, agents, previews and PRs; parts that could not be read keep their previous value."""
     sessions = tools.sessions()
     if sessions is None: return None
@@ -313,7 +340,7 @@ def _observe(tools, previous, with_prs):
         slugs = sorted({slug for slug in value['repos'].values() if slug})[:MAX_REPOS]
         value['prs'] = {slug: rows for slug, rows in value['prs'].items() if slug in slugs}
         for slug in slugs:
-            rows = tools.prs(slug, state_all=True)
+            rows = tools.prs(slug, merged_since=now - 86400)
             if rows is not None: value['prs'][slug] = rows
     return value
 
@@ -321,6 +348,10 @@ def _observe(tools, previous, with_prs):
 def _project(row, repos):
     slug = repos.get(row.get('cwd'))
     return (slug.split('/')[-1] if slug else Path(row['cwd']).name) if row.get('cwd') else ''
+
+
+def _preview_text(row):
+    return ' '.join(part for part in (row.get('label') or '', row.get('link') or '') if part)
 
 
 def _changes(old, new, now, first):
@@ -347,9 +378,9 @@ def _changes(old, new, now, first):
     minor += sum(1 for key, row in old_agents.items() if key not in new['agents'] and row.get('session') not in ended)
     if old.get('previews') is not None and new.get('previews') is not None:
         for key, row in new['previews'].items():
-            if key not in old['previews']: events.append(('preview-started', key, row['link']))
+            if key not in old['previews']: events.append(('preview-started', key, _preview_text(row)))
         for key, row in old['previews'].items():
-            if key not in new['previews']: events.append(('preview-stopped', key, row['link']))
+            if key not in new['previews']: events.append(('preview-stopped', key, _preview_text(row)))
     for slug, rows in new['prs'].items():
         known = (old.get('prs') or {}).get(slug)
         if known is None: continue
@@ -357,7 +388,7 @@ def _changes(old, new, now, first):
             before = known.get(number)
             subject = slug + '#' + number
             if before is None and row['state'] == 'OPEN': events.append(('pr-opened', subject, row))
-            elif before and before['state'] == 'OPEN' and row['state'] == 'MERGED': events.append(('pr-merged', subject, row))
+            elif row['state'] == 'MERGED' and (before is None or before['state'] == 'OPEN'): events.append(('pr-merged', subject, row))
             elif before and before['state'] != row['state']: minor += 1
     return events, minor
 
@@ -373,21 +404,40 @@ def _event_line(kind, subject, detail, tools, new):
 
 
 def _deliver(tools, agents, queue_path):
-    """Prompt idle agents with their oldest queued task; one task per agent per poll. Returns event lines."""
+    """Prompt idle agents with their oldest queued task (one per agent per poll). A failed prompt, or a poll on which the
+    agent is gone (reported once as orphaned), counts as an attempt; after ATTEMPTS the task is dropped as undeliverable."""
     with _locked(queue_path):
         items = _read(queue_path).get('items') or []
-    lines, done = [], set()
+    lines, busy, changes = [], set(), {}
     for item in items:
         key = item.get('session', '') + '/' + item.get('pane', '')
+        label = item.get('session', '') + '/' + (item.get('agent') or item.get('pane', ''))
         row = agents.get(key)
-        if not row or row['status'] not in IDLE or key in done: continue
-        done.add(key)
-        if tools.prompt(row['session'], row['pane'], item['task']):
-            with _locked(queue_path):
-                value = _read(queue_path)
-                value['items'] = [other for other in value.get('items') or [] if other.get('id') != item.get('id')]
-                _write(queue_path, value)
-            lines.append(clean('conductor-event delivered ' + agent_label(row) + ' ' + item['task'], 200))
+        if row is not None and (row['status'] not in IDLE or key in busy):
+            if item.get('orphaned'): changes[item['id']] = {**item, 'orphaned': False}
+            continue
+        if row is None:
+            if not item.get('orphaned'): lines.append(clean('conductor-event orphaned ' + label + ' ' + item['task'], 200))
+        else:
+            busy.add(key)
+            if tools.prompt(row['session'], row['pane'], item['task']):
+                changes[item['id']] = None
+                lines.append(clean('conductor-event delivered ' + agent_label(row) + ' ' + item['task'], 200))
+                continue
+        attempts = int(item.get('attempts') or 0) + 1
+        if attempts >= ATTEMPTS:
+            changes[item['id']] = None
+            lines.append(clean('conductor-event undeliverable ' + label + ' ' + item['task'], 200))
+        else: changes[item['id']] = {**item, 'attempts': attempts, 'orphaned': row is None}
+    if changes:
+        with _locked(queue_path):
+            value = _read(queue_path)
+            kept = []
+            for other in value.get('items') or []:
+                if other.get('id') not in changes: kept.append(other)
+                elif changes[other['id']] is not None: kept.append(changes[other['id']])
+            value['items'] = kept
+            _write(queue_path, value)
     return lines
 
 
@@ -401,8 +451,9 @@ def _tick(state_path, queue_path, tools, now, first, with_prs):
     """(lines, observed): observed is False when herdr could not be read and nothing was compared or saved."""
     state_path, queue_path = state_path or EVENTS, queue_path or QUEUE
     tools, now = tools or Tools(), time.time() if now is None else now
-    old = _read(state_path)
-    new = _observe(tools, old, with_prs)
+    try: old = _read(state_path)
+    except (OSError, RuntimeError, ValueError): old = {}  # bad JSON, too big or wrong mode: reseed instead of going silent
+    new = _observe(tools, old, with_prs, now)
     if new is None: return [], False
     events, minor = _changes(old, new, now, first or not old)
     new['batchAt'] = old.get('batchAt') or now
@@ -416,10 +467,30 @@ def _tick(state_path, queue_path, tools, now, first, with_prs):
     return lines, True
 
 
+@contextlib.contextmanager
+def _watcher_lock(state_path):
+    """Held for a watcher's lifetime; yields False when another watcher holds it."""
+    private_directory(state_path.parent)
+    fd = os.open(str(state_path) + '.watch.lock', os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try: fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False; return
+        yield True
+    finally: os.close(fd)
+
+
 def events(state_path=None, queue_path=None, interval=POLL, tools=None, stop=None, clock=time.time, write=None):
-    """The Monitor watcher: polls until SIGTERM/SIGINT (or `stop`), one line per important event."""
-    stop = stop or threading.Event()
+    """The Monitor watcher: polls until SIGTERM/SIGINT (or `stop`), one line per important event. One per machine."""
     write = write or (lambda line: print(line, flush=True))
+    with _watcher_lock(state_path or EVENTS) as held:
+        if not held:
+            write('conductor-events: another watcher is already running on this machine'); return 1
+        return _watch(state_path, queue_path, interval, tools, stop, clock, write)
+
+
+def _watch(state_path, queue_path, interval, tools, stop, clock, write):
+    stop = stop or threading.Event()
     if threading.current_thread() is threading.main_thread():
         for number in (signal.SIGTERM, signal.SIGINT): signal.signal(number, lambda *_: stop.set())
     count, first = 0, True
@@ -451,8 +522,6 @@ def _resolve(target, rows, tools):
                                                                        repos[row['cwd']]['slug'].split('/')[-1])]
     if not found: return None, 'no agent matches ' + target + ' (try `claude-pool conductor snapshot`)'
     if len(found) == 1: return found[0], None
-    idle = [row for row in found if row['status'] in IDLE]
-    if len(idle) == 1: return idle[0], None
     return None, 'ambiguous ' + target + ': ' + ', '.join(agent_label(row) + ' (' + row['status'] + ')' for row in found)
 
 
@@ -483,13 +552,19 @@ def _parallel(row, task, rows, tools, sleep):
         if workspace: tools.close_workspace(session, workspace)
         if not started: return 1, 'could not start an agent in a new workspace of ' + session + '; closed it'
         return 1, 'stopped ' + session + '/' + name + ': it did not run through the pool (launch.py exec); check the claude shell function'
-    if not tools.prompt(session, name, task): return 1, 'started ' + session + '/' + name + ' through the pool but could not prompt it'
+    if not tools.prompt(session, pane, task): return 1, 'started ' + session + '/' + name + ' through the pool but could not prompt it'
     return 0, 'started ' + session + '/' + name + ' in a new workspace through the pool and prompted it'
 
 
 def tell(target, task, parallel=False, tools=None, queue_path=None, now=None, sleep=time.sleep):
     """(exit code, one line). Idle agent: prompt it. Busy: start a second pool agent in a new workspace of the same session
-    with `parallel`, otherwise queue for `events` to deliver. Never creates herdr sessions or projects."""
+    with `parallel`, otherwise queue for `events` to deliver. Several matches fail with the candidates. Never creates
+    herdr sessions or projects."""
+    code, line = _tell(target, task, parallel, tools, queue_path, now, sleep)
+    return code, clean(line, 600)
+
+
+def _tell(target, task, parallel, tools, queue_path, now, sleep):
     tools, queue_path, now = tools or Tools(), queue_path or QUEUE, time.time() if now is None else now
     task = ' '.join(str(task).split())
     if not task: return 1, 'empty task'
@@ -497,7 +572,7 @@ def tell(target, task, parallel=False, tools=None, queue_path=None, now=None, sl
     if sessions is None: return 1, 'herdr is not available on this machine'
     rows = _agent_rows(tools, sessions)
     row, problem = _resolve(target, rows, tools)
-    if problem: return 1, clean(problem, 600)
+    if problem: return 1, problem
     if row['status'] in IDLE:
         if tools.prompt(row['session'], row['pane'], task): return 0, 'prompted ' + agent_label(row)
         return 1, 'could not prompt ' + agent_label(row) + ' (herdr refused; it may be at a question)'
