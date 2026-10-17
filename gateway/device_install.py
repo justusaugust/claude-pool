@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tarfile
 
 import device_sync
@@ -19,17 +20,24 @@ FUNCTION = 'claude() { command claude-pool exec "$@"; }'
 NATIVE_FIX = 'curl -fsSL https://claude.ai/install.sh | bash'
 SKIP = ('gateway/bin/', '.superpowers/')
 
-NATIVE_SCRIPT = '''for c in "$HOME/.local/bin/claude" "$(command -v claude 2>/dev/null)"; do
+NATIVE_SCRIPT = '''PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; export PATH
+for c in "$HOME/.local/bin/claude" "$(command -v claude 2>/dev/null)"; do
   [ -n "$c" ] && [ -f "$c" ] && [ -x "$c" ] || continue
   grep -q 'managed by claude-pool installer' "$c" 2>/dev/null && continue
   printf '%s\\n' "$c"; exit 0
 done
 exit 1'''
 INSTALL_SCRIPT = '''set -e
+PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; export PATH
+py=
+for c in python3.14 python3.13 python3.12 python3.11 python3; do
+  if command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null; then py=$(command -v "$c"); break; fi
+done
+[ -n "$py" ] || { echo 'Python 3.11 or newer is required' >&2; exit 3; }
 dir=$(mktemp -d)
 trap 'rm -rf "$dir"' EXIT
 tar -xzf - -C "$dir"
-python3 "$dir/claude-pool/install.py" --bootstrap --native-claude "$1"'''
+"$py" "$dir/claude-pool/install.py" --bootstrap --native-claude "$1"'''
 
 
 def _text(data): return (data or b'').decode('utf-8', 'replace').strip()
@@ -46,7 +54,7 @@ def source_archive(root):
     source_files = package.source_files
     files = {}
     for name in source_files(root):
-        if name.startswith(SKIP) or '.pool-client-token' in name or name.endswith('.pyc'): continue
+        if name.startswith(SKIP) or '.pool-client-token' in name or name.endswith('.pyc') or not (root / name).is_file(): continue
         files[name] = (root / name).read_bytes()
     raw = io.BytesIO()
     with gzip.GzipFile(filename='', mode='wb', fileobj=raw, mtime=0) as compressed, tarfile.open(fileobj=compressed, mode='w') as archive:
@@ -72,10 +80,21 @@ def _status(remote):
     return done, value if isinstance(value, dict) else None
 
 
+LAUNCHER_SCRIPT = '''wrapper="$HOME/.local/bin/claude-pool"
+[ -f "$wrapper" ] || exit 10
+run=$(tr -d "'" < "$wrapper" | grep -o '[^ ]*run\\.py' | head -n 1)
+[ -n "$run" ] && [ -f "$(dirname "$run")/gateway/devices_cli.py" ] || exit 11
+exit 0'''
+
+
 def check_install(remote):
+    fix = 'claude-pool device add ' + remote.name
+    done = remote.call(['sh', '-c', LAUNCHER_SCRIPT])
+    if done.returncode == 10: return Step('install', 'missing', 'claude-pool is not installed', fix)
+    if done.returncode == 11: return Step('install', 'missing', 'older claude-pool without device support', fix)
+    if done.returncode: return Step('install', 'failed', 'could not inspect the install: ' + _tail(done), fix)
     done, value = _status(remote)
-    if done.returncode == 127: return Step('install', 'missing', 'claude-pool is not installed', 'claude-pool device add ' + remote.name)
-    if value is None: return Step('install', 'failed', 'claude-pool did not report its status: ' + _tail(done), 'claude-pool device add ' + remote.name)
+    if value is None: return Step('install', 'failed', 'claude-pool did not report its status: ' + _tail(done), fix)
     return Step('install', 'ok', 'claude-pool installed', None)
 
 
@@ -88,6 +107,7 @@ def check_version(remote, version):
 
 def install(remote, archive, native):
     done = remote.call(['sh', '-c', INSTALL_SCRIPT, 'install', native], stdin=archive, timeout=3600)
+    if done.returncode == 3: return Step('install', 'failed', 'Python 3.11 or newer is missing', 'install Python 3.11 or newer on ' + remote.name)
     if done.returncode: return Step('install', 'failed', 'install failed: ' + _tail(done), 'claude-pool device add ' + remote.name)
     return Step('install', 'ok', 'installed from this checkout', None)
 
@@ -99,9 +119,9 @@ def check_service(remote):
     return Step('service', 'missing', 'service is ' + (state or 'unknown'), 'claude-pool device add ' + remote.name)
 
 
-def start_service(remote):
+def start_service(remote, target=None):
     done = remote.pool('--start')
-    if done.returncode: return Step('service', 'failed', 'start failed: ' + _tail(done), 'claude-pool --start')
+    if done.returncode: return Step('service', 'failed', 'start failed: ' + _tail(done), f'ssh {target or remote.name} claude-pool --start')
     return check_service(remote)
 
 
@@ -124,8 +144,9 @@ def _linger_value(remote):
 def check_linger(remote):
     if _text(remote.call(['uname', '-s']).stdout) == 'Darwin': return Step('linger', 'skipped', 'launchd keeps services running', None)
     done, value = _linger_value(remote)
-    if done.returncode == 127: return Step('linger', 'skipped', 'no systemd here', None)
+    if done.returncode: return Step('linger', 'skipped', 'no systemd login manager: ' + _tail(done), None)
     if value == 'yes': return Step('linger', 'ok', 'services survive logout', None)
+    if value != 'no': return Step('linger', 'skipped', 'no systemd login manager', None)
     return Step('linger', 'missing', 'services stop at logout', 'claude-pool device add ' + remote.name)
 
 
@@ -145,12 +166,7 @@ def shell_rc(env=os.environ):
 
 
 def _legacy(rc):
-    try: text = Path(rc).read_text()
-    except OSError: return False
-    outside = text
-    lines, first, last = managed_block._split(text, START, END)
-    if first is not None and last is not None: outside = ''.join(lines[:first] + lines[last + 1:])
-    return any(line.strip() == FUNCTION for line in outside.splitlines())
+    return any(line.strip() == FUNCTION.encode() for line in managed_block.outside(rc, START, END).splitlines())
 
 
 def shell_check(rc):
@@ -181,10 +197,11 @@ def remove_shell(remote):
 
 
 def _local_status():
-    value = {'linger': None, 'shell': False}
+    value = {'linger': None, 'shell': None}
     try:
-        if os.uname().sysname != 'Darwin':
-            done = subprocess.run(['loginctl', 'show-user', os.environ.get('USER', ''), '-p', 'Linger', '--value'], capture_output=True, text=True, timeout=10)
+        if sys.platform.startswith('linux'):
+            user = os.environ.get('USER')
+            done = subprocess.run(['loginctl', 'show-user', *([user] if user else []), '-p', 'Linger', '--value'], capture_output=True, text=True, timeout=10)
             if done.returncode == 0: value['linger'] = done.stdout.strip() == 'yes'
     except Exception: pass
     try: value['shell'] = shell_check(shell_rc())
