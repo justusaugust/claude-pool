@@ -75,7 +75,8 @@ DEVICE_HELP = '\n'.join([
     '      Exit 3: tasks are running there, use --wait. --forget drops a lost machine from the registry of every device and touches nothing on it.',
     '      The Conductor device and the usage owner cannot be removed first.',
     '  device list                              Devices, roles and the account count',
-    '  device sync [--force-registry]           Pushes the registry and long-lived tokens to every device. --force-registry makes this device\'s list win.',
+    '  device sync [--force-registry]           Merges the registry row by row and copies long-lived tokens between devices.',
+    '                                           --force-registry makes this device\'s list win; other devices retire, never delete, tokens it drops.',
     '  device switch [--wait]                   Restarts the local pool when no request is in flight, to apply a pending membership change',
     '  device conductor move <device>           Moves the one Conductor to a device whose Native login is the Conductor account, linger is on and the pool runs.',
     '                                           It starts a new conversation: open "Conductor Claude" in the Claude app.',
@@ -380,7 +381,16 @@ def sync(argv, out, remotes, **_):
     if registry.self_name() is None:
         print('This device has no name in the registry yet; add it with claude-pool device add, then sync.')
         return 1
-    if args.force_registry: registry.update(lambda value: None)  # a newer generation makes this list win everywhere
+    if args.force_registry:
+        # Every row here is stamped above every list that can be read; rows only another device has get tombstones that
+        # name their token, so a receiving device retires exactly that token and never unlinks one.
+        peers, me = [], registry.self_name()
+        for row in registry.load()['devices']:
+            if row['name'] == me or not row.get('ssh'): continue
+            try: peers.append(registry.validate(json.loads(device_sync.peer(remotes(row['ssh']), 'registry'))))
+            except (ValueError, RuntimeError, OSError, device_sync.Failed, device_sync.Unreachable, device_sync.Outdated, device_sync.Missing):
+                print(row['name'] + ': its list could not be read; rows only it has stay')
+        registry.force(peers)
     results = device_sync.sync_all(remotes)
     if not results: print('No other devices to sync with.')
     for name, result in sorted(results.items()): print(name + ': ' + result)
@@ -617,6 +627,7 @@ def check_accounts(t):
     generation, mine = st.get('registryGeneration'), registry.digest(value)
     if generation == value['generation'] and st.get('registryHash') != mine:
         issues.append(('failed', 'registry diverged ' + mine + ' ' + str(st.get('registryHash')),
+                       'claude-pool device sync (merges both lists row by row); if a list is wrong afterwards: '
                        'claude-pool device sync --force-registry on the device whose list is right'))
     elif not isinstance(generation, int) or generation < value['generation']:
         issues.append(('missing', 'registry generation ' + str(generation) + ' there, ' + str(value['generation']) + ' here',

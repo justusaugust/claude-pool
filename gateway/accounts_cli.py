@@ -476,15 +476,16 @@ def same_file(a, b):
     return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
 
 
-def retire(stores, long_lived_dir, name, *, after_link=None, tries=3):
+def retire(stores, long_lived_dir, name, *, after_link=None, tries=3, keep_long_lived=False):
     """A refreshable grant is unique: it moves to stores/.retired/<name>-<unix>.json and is never deleted.
-    Long-lived replicas are unlinked. Anything unrecognised is moved aside too, never deleted.
+    Long-lived replicas are unlinked, unless `keep_long_lived` (a removal received from another device): then they are
+    moved aside like everything else. Anything unrecognised is moved aside too, never deleted.
     A file replaced while it is being moved is never unlinked: the step retries, then stops with an error."""
     for path in (Path(stores) / (name + '.json'), Path(long_lived_dir) / (name + '.json')):
         for _ in range(tries):
             try: before = os.lstat(path)
             except FileNotFoundError: break
-            if not path.is_symlink() and stored_kind(path) == 'long-lived':
+            if not keep_long_lived and not path.is_symlink() and stored_kind(path) == 'long-lived':
                 if same_file(os.lstat(path), before):
                     path.unlink(); break
                 continue

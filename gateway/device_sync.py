@@ -154,8 +154,16 @@ def receive_account(name, data, journal=None):
     if kind(value) != 'long-lived': raise RuntimeError('Only a long-lived token can be received')
     fp = fingerprint(value)
     known = registry.load()
-    same = accounts_cli.stored_kind(path) == 'long-lived' and fingerprint(read_private(path)) == fp
-    if not same: write_private(path, data)
+    have = fingerprint(read_private(path)) if accounts_cli.stored_kind(path) == 'long-lived' else None
+    want = (registry.account(known, name) or {}).get('fingerprint')
+    # A replica that already is the token the registry names is never overwritten by an older one.
+    if want and have == want and fp != want: return 'unchanged'
+    same = have == fp
+    if not same:
+        # The replica it replaces may be the only copy of that token (enrolled here while another device enrolled a newer
+        # one); it is moved aside, never overwritten.
+        if path.exists() or path.is_symlink(): retire_store(path, settings.STORES / '.retired')
+        write_private(path, data)
     held = 'unchanged' if same else 'staged'
     if is_owner(known) or registry.account(known, name) is None: return held
     store = settings.STORES / path.name
@@ -181,16 +189,6 @@ def receive_account(name, data, journal=None):
     return 'installed'
 
 
-def pending_file(): return settings.REGISTRY.parent / 'device-pending-removals.json'
-
-
-def read_pending():
-    """name -> the registry row and local fingerprint recorded when the removal was first seen."""
-    try: value = json.loads(pending_file().read_text())
-    except (OSError, ValueError): return {}
-    return {n: r for n, r in value.items() if NAME.fullmatch(n) and isinstance(r, dict)} if isinstance(value, dict) else {}
-
-
 def local_fingerprint(name):
     for path in (settings.LONG_LIVED / (name + '.json'), settings.STORES / (name + '.json')):
         try: return fingerprint(read_private(path))
@@ -198,45 +196,56 @@ def local_fingerprint(name):
     return None
 
 
+def long_lived_fingerprint(name):
+    """The fingerprint of this device's long-lived copy of `name` (the synced replica first), or None when it holds none."""
+    for path in (settings.LONG_LIVED / (name + '.json'), settings.STORES / (name + '.json')):
+        if not path.is_symlink() and accounts_cli.stored_kind(path) == 'long-lived': return fingerprint(read_private(path))
+    return None
+
+
 class Busy(Exception): pass
 
 
 def remove_local(name):
+    """Drop `name` from this device. Every file is moved aside to stores/.retired, never unlinked: a removal that arrives
+    from another device must never destroy a token this device might hold the only copy of."""
     private_directory(settings.STORES)
     with (settings.STORES / ('.' + name + '.add.lock')).open('a') as lock:
         try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError: raise Busy() from None
         paths, env = accounts_cli.local_paths_env(settings.RUNTIME, settings.STORES)
         accounts_cli.unregister(settings.CONFIG, settings.STORES, settings.HERE / 'bin/shunt', paths, name, env)
-        accounts_cli.retire(settings.STORES, settings.LONG_LIVED, name)
+        accounts_cli.retire(settings.STORES, settings.LONG_LIVED, name, keep_long_lived=True)
 
 
-def receive_registry(data, overview=None, native_identity=None):
+def receive_registry(data, overview=None, native_identity=None, elsewhere=()):
+    """Merge another device's registry into this one (registry.merge: per row, tombstones, never a whole-list replace),
+    then apply the removals the tombstones name. An account goes only when a tombstone names it and the long-lived
+    token this device holds is the one the tombstone names (or `elsewhere`, the fingerprints the sending device holds,
+    includes it); its files are moved aside, never unlinked. A removal that has to wait (busy) is retried on the next
+    receive, because the tombstone stays."""
     if not isinstance(data, bytes) or len(data) > registry.LIMIT: raise ValueError('Registry is larger than 256 KiB')
     try: incoming = registry.validate(json.loads(data))
     except ValueError as error: raise ValueError('Invalid registry: ' + str(error)) from None
-    previous = registry.load()
-    report = {'result': 'unchanged', 'removed': [], 'kept_busy': [], 'kept_native': [], 'failed': {}, 'hooks': {}}
-    if registry.diverged(previous, incoming): report['result'] = 'merged'
-    replaced = incoming['generation'] > previous['generation'] and registry.replace(incoming)
-    if replaced: report['result'] = 'replaced'
-    now = registry.load()
+    previous, now = registry.receive(incoming)
+    report = {'result': 'unchanged', 'removed': [], 'kept': [], 'kept_busy': [], 'kept_native': [], 'failed': {}, 'hooks': {}}
+    if now != previous: report['result'] = 'replaced' if now == registry.canonical(incoming) else 'merged'
     listed = {row['name'] for row in now['accounts']}
-    pending = {n: r for n, r in read_pending().items() if n not in listed}
-    for row in (previous['accounts'] if replaced else []):
-        if row['name'] not in listed: pending.setdefault(row['name'], {'row': row, 'local': local_fingerprint(row['name'])})
-    left = {}
+    tombs = {row['name']: row for row in now.get('removed', []) if row['kind'] == 'account' and row['name'] not in listed}
     native = {'done': False}
-    for name, record in sorted(pending.items()):
+    for name, tomb in sorted(tombs.items()):
+        if not NAME.fullmatch(name): continue
         try:
-            if local_fingerprint(name) != record.get('local'): continue  # connected again here since; it is not ours to remove
             if name not in config_names() and not any((folder / (name + '.json')).exists() for folder in (settings.STORES, settings.LONG_LIVED)): continue
-            left[name] = record
+            held = long_lived_fingerprint(name)
+            if held is not None and held != tomb.get('fingerprint') and held not in set(elsewhere):
+                report['kept'].append(name)  # another token than the one removed, and maybe its only copy
+                continue
             if not routing.wait_idle(local_overview(overview), name, False):
                 report['kept_busy'].append(name); continue
             if not native['done']:
                 native['value'] = (native_identity or default_native_identity)(); native['done'] = True
-            row = record.get('row') or {}
+            row = next((r for r in previous['accounts'] if r['name'] == name), {})
             if not row.get('email') and accounts_cli.stored_kind(settings.STORES / (name + '.json')) == 'refreshable':
                 raise RuntimeError('Cannot tell whether ' + name + ' is the Native login of this machine; it was not removed')
             if accounts_cli.matches_native(native['value'], name, {'accounts': [row]}, settings.STORES):
@@ -246,14 +255,11 @@ def receive_registry(data, overview=None, native_identity=None):
                 continue
             if name in config_names() and len(config_names()) == 1:
                 report['failed'][name] = 'it is the last account on this device'; continue
-            remove_local(name); report['removed'].append(name); del left[name]
+            remove_local(name); report['removed'].append(name)
         except Busy: report['kept_busy'].append(name)
         except Exception as error:
             report['failed'][name] = type(error).__name__ + ': ' + str(error)
-    if left != read_pending():
-        if left: write_private(pending_file(), json.dumps(left))
-        else: pending_file().unlink(missing_ok=True)
-    if replaced:
+    if now != previous:
         for hook in list(INTEGRATION_HOOKS):
             label = getattr(hook, '__name__', repr(hook))
             try: hook(now); report['hooks'][label] = 'ok'
@@ -298,19 +304,31 @@ def guarded(work, target=''):
         return 'failed: ' + redact(str(error), secrets())[:200]
 
 
+def held_fingerprints(theirs):
+    return {row.get('fingerprint') for row in theirs['accounts'].values() if row.get('kind') == 'long-lived' and row.get('fingerprint')}
+
+
+def merge_from(remote, theirs):
+    """Fetch the peer's registry and merge it here first, so what is pushed back already holds the peer's changes."""
+    receive_registry(peer(remote, 'registry'), elsewhere=held_fingerprints(theirs))
+
+
 def push(remote):
     def work():
         theirs = peer_status(remote)
+        if theirs.get('registryHash') != registry.digest(registry.load()):
+            merge_from(remote, theirs)
+            known = registry.load()
+            if theirs.get('registryHash') != registry.digest(known):
+                peer(remote, 'receive-registry', stdin=json.dumps(known).encode())
         known = registry.load()
-        generation = theirs.get('registryGeneration')
-        if isinstance(generation, int) and generation > known['generation']: return  # the peer is ahead; pull brings this device up to date
-        if not isinstance(generation, int) or known['generation'] > generation:
-            peer(remote, 'receive-registry', stdin=json.dumps(known).encode())
         for row in known['accounts']:
             path = settings.LONG_LIVED / (row['name'] + '.json')
             if accounts_cli.stored_kind(path) != 'long-lived': continue
             data = path.read_bytes()
-            if theirs['accounts'].get(row['name'], {}).get('fingerprint') == fingerprint(json.loads(data)): continue
+            mine = fingerprint(json.loads(data))
+            if row.get('fingerprint') and mine != row['fingerprint']: continue  # not the token the registry names; never push an older one
+            if theirs['accounts'].get(row['name'], {}).get('fingerprint') == mine: continue
             peer(remote, 'receive-account', row['name'], stdin=data)
     return guarded(work, remote.name)
 
@@ -318,14 +336,23 @@ def push(remote):
 def pull(remote):
     def work():
         theirs = peer_status(remote)
-        receive_registry(peer(remote, 'registry'))
-        known = {row['name'] for row in registry.load()['accounts']}
+        merge_from(remote, theirs)
+        known = {row['name']: row for row in registry.load()['accounts']}
         for name, row in sorted(theirs['accounts'].items()):
             path = settings.LONG_LIVED / (name + '.json')
             if row.get('kind') != 'long-lived' or row.get('stray') or name not in known or not NAME.fullmatch(name): continue
+            if known[name].get('fingerprint') and row.get('fingerprint') != known[name]['fingerprint']: continue
             if accounts_cli.stored_kind(path) == 'long-lived' and fingerprint(read_private(path)) == row.get('fingerprint'): continue
             receive_account(name, peer(remote, 'send-account', name))
     return guarded(work, remote.name)
+
+
+def sync_one(remote):
+    """Push, then pull: both registries end merged and each side holds the other's long-lived tokens."""
+    pushed = push(remote)
+    if pushed == 'unreachable' or pushed == 'missing' or pushed.startswith('outdated'): return pushed
+    pulled = pull(remote)
+    return pushed if pushed != 'ok' else pulled
 
 
 def sync_all(remotes=Remote):
@@ -338,10 +365,7 @@ def sync_all(remotes=Remote):
         if not row.get('ssh'): results[row['name']] = 'unreachable'; continue
         try: remote = remotes(row['ssh'])
         except ValueError: results[row['name']] = 'failed: invalid ssh target'; continue
-        pushed = push(remote)
-        if pushed == 'unreachable' or pushed == 'missing' or pushed.startswith('outdated'): results[row['name']] = pushed; continue
-        pulled = pull(remote)
-        results[row['name']] = pushed if pushed != 'ok' else pulled
+        results[row['name']] = sync_one(remote)
     return results
 
 

@@ -1,4 +1,10 @@
-"""Non-secret, generation-numbered device registry (devices.json), copied between machines over SSH."""
+"""Non-secret, generation-numbered device registry (devices.json), copied between machines over SSH.
+
+Machines merge it row by row, so a change made while a peer was unreachable is never undone by the peer's later changes:
+every device and account row carries the `generation` it last changed in, a removal leaves a tombstone
+(`removed`: kind, name, generation and, for an account, the token fingerprint), the newer of row and tombstone wins
+(the row on a tie), and ties between two rows go to the larger digest. The merge is commutative, associative and
+idempotent, so every order of syncs between any number of devices ends with the same registry."""
 import copy
 import fcntl
 import hashlib
@@ -12,10 +18,12 @@ import settings
 LIMIT = 256 * 1024
 NAME = re.compile(r'[a-z0-9-]{1,40}')
 TOKEN_PREFIX = 'sk-' + 'ant-'
-TOP = {'version', 'generation', 'updatedAt', 'devices', 'accounts', 'conductor'}
-DEVICE_KEYS = {'name', 'ssh', 'platform', 'roles', 'tailscaleIp', 'cua', 'herdrSession', 'addedAt'}
+TOP = {'version', 'generation', 'updatedAt', 'devices', 'accounts', 'conductor', 'conductorGeneration', 'removed'}
+DEVICE_KEYS = {'name', 'ssh', 'platform', 'roles', 'tailscaleIp', 'cua', 'herdrSession', 'addedAt', 'generation'}
 ACCOUNT_TEXT = ['label', 'alias', 'plan', 'email', 'organization', 'userId', 'organizationId', 'fingerprint']
-ACCOUNT_KEYS = {'name', 'expiresAt', 'reserveAt', *ACCOUNT_TEXT}
+ACCOUNT_KEYS = {'name', 'expiresAt', 'reserveAt', 'generation', *ACCOUNT_TEXT}
+TOMBSTONE_KEYS = {'kind', 'name', 'generation', 'fingerprint'}
+KINDS = {'device': 'devices', 'account': 'accounts'}
 CONDUCTOR_KEYS = {'device', 'email', 'organization', 'cwd'}
 
 
@@ -53,6 +61,19 @@ def check_device(row):
     if not isinstance(roles, list) or any(role != 'usage' for role in roles) or len(set(roles)) != len(roles): raise ValueError("Device roles may only be ['usage']")
     if not isinstance(row.get('cua', False), bool): raise ValueError('cua must be true or false')
     if 'addedAt' in row and not is_int(row['addedAt']): raise ValueError('addedAt must be an integer')
+    check_generation(row)
+
+
+def check_generation(row):
+    if 'generation' in row and not (is_int(row['generation']) and row['generation'] >= 0): raise ValueError('generation must be a non-negative integer')
+
+
+def check_tombstone(row):
+    keys(row, TOMBSTONE_KEYS, 'tombstone')
+    if row.get('kind') not in KINDS: raise ValueError('Tombstone kind must be device or account')
+    if not isinstance(row.get('name'), str) or not row['name']: raise ValueError('Tombstone needs a name')
+    if not is_int(row.get('generation')) or row['generation'] < 0: raise ValueError('Tombstone generation must be a non-negative integer')
+    optional_text(row, 'fingerprint')
 
 
 def check_account(row):
@@ -61,6 +82,7 @@ def check_account(row):
     for key in ACCOUNT_TEXT: optional_text(row, key)
     if row.get('expiresAt') is not None and not is_int(row['expiresAt']): raise ValueError('expiresAt must be an integer or null')
     if 'reserveAt' in row and not (is_int(row['reserveAt']) and 0 <= row['reserveAt'] <= 99): raise ValueError('reserveAt must be an integer from 0 to 99')
+    check_generation(row)
 
 
 def migrate(value):
@@ -84,6 +106,11 @@ def validate(value):
         names = [row['name'] for row in rows]
         if len(set(names)) != len(names): raise ValueError('Duplicate ' + what + ' name')
     if sum('usage' in row.get('roles', []) for row in value['devices']) > 1: raise ValueError('Only one device can be the usage owner')
+    if not isinstance(value.get('removed', []), list): raise ValueError('removed must be a list')
+    for row in value.get('removed', []): check_tombstone(row)
+    if len({(row['kind'], row['name']) for row in value.get('removed', [])}) != len(value.get('removed', [])): raise ValueError('Duplicate tombstone')
+    if 'conductorGeneration' in value and not (is_int(value['conductorGeneration']) and value['conductorGeneration'] >= 0):
+        raise ValueError('conductorGeneration must be a non-negative integer')
     entry = value.get('conductor')
     if entry is not None:
         keys(entry, CONDUCTOR_KEYS, 'conductor')
@@ -122,27 +149,136 @@ class locked:
     def __exit__(self, *exc): self.file.close()
 
 
+def gen(row): return row.get('generation', 0) if row else 0
+
+
+def _without_generation(row): return {key: item for key, item in row.items() if key != 'generation'}
+
+
+def canonical(value):
+    """Rows sorted by name and tombstones by kind and name; the empty extras left out, so equal content has one digest."""
+    out = copy.deepcopy(value)
+    for field in KINDS.values(): out[field] = sorted(out[field], key=lambda row: row['name'])
+    removed = sorted(out.pop('removed', []), key=lambda row: (row['kind'], row['name']))
+    if removed: out['removed'] = removed
+    if not out.get('conductorGeneration'): out.pop('conductorGeneration', None)
+    return out
+
+
+def stamp(before, after, generation):
+    """Mark what `after` changed against `before` with `generation`: changed or new rows, a tombstone per removed row
+    (an account's carries its fingerprint), the Conductor entry. A row that comes back drops its tombstone."""
+    tombs = {(row['kind'], row['name']): row for row in after.get('removed', [])}
+    for kind, field in KINDS.items():
+        old = {row['name']: row for row in before[field]}
+        names = set()
+        for row in after[field]:
+            names.add(row['name'])
+            if row['name'] not in old or _without_generation(row) != _without_generation(old[row['name']]):
+                row['generation'] = generation
+            tomb = tombs.get((kind, row['name']))
+            if tomb is not None and tomb['generation'] <= gen(row): del tombs[(kind, row['name'])]
+        for name, row in old.items():
+            if name in names: continue
+            tomb = {'kind': kind, 'name': name, 'generation': generation}
+            if kind == 'account': tomb['fingerprint'] = row.get('fingerprint')
+            tombs[(kind, name)] = tomb
+    after['removed'] = list(tombs.values())
+    if before.get('conductor') != after.get('conductor'): after['conductorGeneration'] = generation
+
+
 def update(change, path=None):
     path = path or settings.REGISTRY
     with locked(path):
-        value = copy.deepcopy(load(path))
+        before = load(path)
+        value = copy.deepcopy(before)
         change(value)
-        value['generation'] += 1; value['updatedAt'] = int(time.time())
+        validate(value)
+        generation = before['generation'] + 1
+        stamp(before, value, generation)
+        value['generation'] = generation; value['updatedAt'] = int(time.time())
+        value = canonical(validate(value))
         write(value, path)
         return value
 
 
-def replace(value, path=None):
-    path = path or settings.REGISTRY
-    validate(value)
-    with locked(path):
-        if value['generation'] <= load(path)['generation']: return False
-        write(value, path)
-        return True
+def _key(row): return (gen(row), len(row.get('roles') or []), digest(row))
+
+
+def _pick(rows):
+    best = {}
+    for row in rows:
+        if row['name'] not in best or _key(row) > _key(best[row['name']]): best[row['name']] = row
+    return best
 
 
 def merge(local, incoming):
-    return copy.deepcopy(incoming if incoming['generation'] > local['generation'] else local)
+    """The join of two registries (see the module docstring). Never infers a removal from a missing row."""
+    a, b = validate(copy.deepcopy(local)), validate(copy.deepcopy(incoming))
+    tombs = {}
+    for row in a.get('removed', []) + b.get('removed', []):
+        key = (row['kind'], row['name'])
+        if key not in tombs or (row['generation'], digest(row)) > (tombs[key]['generation'], digest(tombs[key])): tombs[key] = row
+    out = {'version': 1, 'generation': max(a['generation'], b['generation']), 'updatedAt': max(a['updatedAt'], b['updatedAt'])}
+    for kind, field in KINDS.items():
+        rows = []
+        for name, row in _pick(a[field] + b[field]).items():
+            tomb = tombs.get((kind, name))
+            if tomb is not None and tomb['generation'] > gen(row): continue  # removed after this row last changed
+            tombs.pop((kind, name), None)  # the row is newer: it was added or changed again after the removal
+            rows.append(row)
+        out[field] = rows
+    owners = [row for row in out['devices'] if 'usage' in row.get('roles', [])]
+    if len(owners) > 1:  # two devices took the role while apart: the newest move wins
+        keep = max(owners, key=_key)
+        out['devices'] = [row if row is keep or row not in owners else {**row, 'roles': [r for r in row['roles'] if r != 'usage']}
+                          for row in out['devices']]
+    entries = [(value.get('conductorGeneration', 0), value.get('conductor')) for value in (a, b)]
+    generation, entry = max(entries, key=lambda item: (item[0], digest(item[1])))
+    if entry is not None and entry['device'] not in {row['name'] for row in out['devices']}: entry = None
+    out['conductor'] = entry
+    if generation: out['conductorGeneration'] = generation
+    out['removed'] = list(tombs.values())
+    return canonical(validate(out))
+
+
+def receive(incoming, path=None):
+    """Merge `incoming` into the registry at `path` under its lock; writes only when the merge changed it.
+    Returns (previous, merged)."""
+    path = path or settings.REGISTRY
+    validate(copy.deepcopy(incoming))
+    with locked(path):
+        previous = load(path)
+        merged = merge(previous, incoming)
+        if merged != previous: write(merged, path)
+        return previous, merged
+
+
+def force(peers, path=None):
+    """`device sync --force-registry`: this device's list wins on every device that has one of `peers`' registries.
+    Every local row is stamped above every generation seen; a row only a peer has gets a tombstone (with the peer's
+    fingerprint), so receivers retire only the exact token it names and never unlink it."""
+    path = path or settings.REGISTRY
+    with locked(path):
+        value = copy.deepcopy(load(path))
+        generation = max([value['generation']] + [peer['generation'] for peer in peers]) + 1
+        tombs = {(row['kind'], row['name']): row for row in value.get('removed', [])}
+        for kind, field in KINDS.items():
+            names = {row['name'] for row in value[field]}
+            for row in value[field]:
+                row['generation'] = generation; tombs.pop((kind, row['name']), None)
+            for peer in peers:
+                for row in peer[field]:
+                    if row['name'] in names: continue
+                    tomb = {'kind': kind, 'name': row['name'], 'generation': generation}
+                    if kind == 'account': tomb['fingerprint'] = row.get('fingerprint')
+                    tombs[(kind, row['name'])] = tomb
+        value['removed'] = list(tombs.values())
+        value['conductorGeneration'] = generation
+        value['generation'] = generation; value['updatedAt'] = int(time.time())
+        value = canonical(validate(value))
+        write(value, path)
+        return value
 
 
 def digest(value): return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode()).hexdigest()[:12]

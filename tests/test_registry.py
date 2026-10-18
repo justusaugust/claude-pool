@@ -39,21 +39,82 @@ class RegistryTests(unittest.TestCase):
     def test_merge_keeps_higher_generation(self):
         self.assertEqual(registry.merge(gen(3), gen(4))['generation'], 4)
         self.assertEqual(registry.merge(gen(4), gen(3))['generation'], 4)
-        local = gen(4, devices=[MAC])
-        self.assertEqual(registry.merge(local, gen(4, devices=[VPS])), local)
 
-    def test_replace_ignores_older_or_equal_generations(self):
+    def test_a_row_added_while_a_peer_moved_ahead_survives_the_merge(self):
+        base = registry.update(lambda v: v['devices'].append(MAC), self.path)
+        mine = registry.update(lambda v: v['accounts'].append(ENTRY), self.path)
+        theirs = {**copy.deepcopy(base), 'generation': 3}  # two unrelated changes ahead, never saw team, no tombstone
+        for merged in (registry.merge(mine, theirs), registry.merge(theirs, mine)):
+            self.assertEqual([r['name'] for r in merged['accounts']], ['team'])
+            self.assertEqual(merged['generation'], 3)
+
+    def test_removal_writes_a_tombstone_with_the_fingerprint_that_wins_over_the_older_row(self):
+        old = registry.update(lambda v: (v['devices'].append(MAC), v['accounts'].append(ENTRY)), self.path)
+        removed = registry.update(lambda v: v.update(accounts=[]), self.path)
+        self.assertEqual(removed['removed'], [{'kind': 'account', 'name': 'team', 'generation': 2, 'fingerprint': '0123456789ab'}])
+        self.assertEqual(registry.merge(old, removed)['accounts'], [])
+        self.assertEqual(registry.merge(removed, old)['accounts'], [])
+        self.assertEqual(registry.merge(old, removed), registry.merge(removed, old))
+
+    def test_a_row_added_again_after_its_tombstone_wins_and_drops_it(self):
+        registry.update(lambda v: (v['devices'].append(MAC), v['accounts'].append(ENTRY)), self.path)
+        removed = registry.update(lambda v: v.update(accounts=[]), self.path)
+        again = registry.update(lambda v: v['accounts'].append({**ENTRY, 'fingerprint': 'ba9876543210'}), self.path)
+        self.assertNotIn('removed', again)
+        self.assertEqual(registry.merge(removed, again)['accounts'][0]['fingerprint'], 'ba9876543210')
+
+    def test_concurrent_changes_to_different_rows_both_survive(self):
+        base = registry.update(lambda v: (v['devices'].extend([MAC, VPS]), v['accounts'].append(ENTRY)), self.path)
+        a = copy.deepcopy(base); b = copy.deepcopy(base)
+        other = self.dir / 'other.json'
+        registry.write(b, other)
+        a = registry.update(lambda v: registry.account(v, 'team').update(reserveAt=85), self.path)
+        b = registry.update(lambda v: registry.device(v, 'personal-vps').update(cua=True), other)
+        merged = registry.merge(a, b)
+        self.assertEqual(registry.account(merged, 'team')['reserveAt'], 85)
+        self.assertTrue(registry.device(merged, 'personal-vps')['cua'])
+        self.assertEqual(merged, registry.merge(b, a))
+        self.assertEqual(registry.merge(merged, a), merged); self.assertEqual(registry.merge(merged, merged), merged)
+
+    def test_concurrent_usage_moves_keep_exactly_one_owner(self):
+        base = registry.update(lambda v: v['devices'].extend([MAC, VPS, {**VPS, 'name': 'third', 'ssh': 'third'}]), self.path)
+        other = self.dir / 'other.json'; registry.write(copy.deepcopy(base), other)
+        def move(name):
+            def change(v):
+                for row in v['devices']: row['roles'] = ['usage'] if row['name'] == name else []
+            return change
+        a = registry.update(move('personal-vps'), self.path)
+        b = registry.update(move('third'), other)
+        merged = registry.merge(a, b)
+        self.assertEqual(sum('usage' in r.get('roles', []) for r in merged['devices']), 1)
+        self.assertEqual(merged, registry.merge(b, a))
+
+    def test_receive_merges_under_the_lock_and_writes_only_a_change(self):
         current = registry.update(lambda v: v['devices'].append(MAC), self.path)
-        self.assertFalse(registry.replace(gen(1), self.path))
-        self.assertFalse(registry.replace(gen(0), self.path))
-        self.assertEqual(registry.load(self.path), current)
-        self.assertTrue(registry.replace(gen(5, devices=[VPS]), self.path))
-        self.assertEqual(registry.load(self.path)['generation'], 5)
+        before = self.path.read_bytes()
+        self.assertEqual(registry.receive(gen(0), self.path), (current, current))
+        self.assertEqual(self.path.read_bytes(), before)
+        previous, merged = registry.receive(gen(5, devices=[VPS]), self.path)
+        self.assertEqual(previous, current)
+        self.assertEqual([r['name'] for r in merged['devices']], ['mac', 'personal-vps'])
+        self.assertEqual(registry.load(self.path), merged)
 
-    def test_replace_rejects_invalid_values(self):
-        with self.assertRaises(ValueError): registry.replace({**gen(5), 'extra': 1}, self.path)
+    def test_receive_rejects_invalid_values(self):
+        with self.assertRaises(ValueError): registry.receive({**gen(5), 'extra': 1}, self.path)
+
+    def test_force_puts_this_list_above_every_peer_and_tombstones_rows_only_peers_have(self):
+        registry.update(lambda v: (v['devices'].append(MAC), v['accounts'].append(ENTRY)), self.path)
+        peer = gen(9, devices=[{**MAC, 'addedAt': 5, 'generation': 9}, {**VPS, 'generation': 9}],
+                   accounts=[{**ENTRY, 'name': 'ops', 'userId': 'u-o', 'fingerprint': 'aaaaaaaaaaaa', 'generation': 9}])
+        forced = registry.force([peer], self.path)
+        self.assertEqual(forced['generation'], 10)
+        merged = registry.merge(peer, forced)
+        self.assertEqual([r['name'] for r in merged['devices']], ['mac']); self.assertEqual(registry.device(merged, 'mac')['addedAt'], 1)
+        self.assertEqual([r['name'] for r in merged['accounts']], ['team'])
+        self.assertIn({'kind': 'account', 'name': 'ops', 'generation': 10, 'fingerprint': 'aaaaaaaaaaaa'}, merged['removed'])
 
     def test_equal_generation_with_different_content_is_reported_as_diverged(self):
+
         a, b = registry.diverged(gen(5, devices=[MAC]), gen(5, devices=[VPS]))
         self.assertRegex(a, r'^[0-9a-f]{12}$'); self.assertNotEqual(a, b)
         self.assertIsNone(registry.diverged(gen(5), gen(5)))

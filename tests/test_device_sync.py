@@ -150,7 +150,8 @@ class DeviceSyncTests(unittest.TestCase):
     def test_push_sends_tokens_only_on_stdin(self):
         self.devices(MAC, VPS, accounts=[{**ROW, 'fingerprint': long_lived.fingerprint(json.loads(self.blob()))}])
         long_lived_file(self.directory, 'team')
-        fake = FakeRemote('vps', lambda argv, stdin: Completed(0, json.dumps({'accounts': [], 'registryGeneration': 0}).encode(), b''))
+        empty = registry.canonical({**registry.EMPTY(), 'devices': registry.load(self.reg)['devices']})
+        fake = FakeRemote('vps', lambda argv, stdin: Completed(0, json.dumps(empty if argv[2] == 'registry' else {'accounts': [], 'registryGeneration': 0}).encode(), b''))
         self.assertEqual(device_sync.push(fake), 'ok')
         SecretWatch(fixture_token()).argv(fake.calls)
         self.assertTrue(any(stdin and fixture_token().encode() in stdin for argv, stdin in fake.calls))
@@ -159,7 +160,8 @@ class DeviceSyncTests(unittest.TestCase):
     def test_push_skips_accounts_the_peer_already_has(self):
         token = long_lived_file(self.directory, 'team'); fp = long_lived.fingerprint(json.loads(token.read_text()))
         self.devices(MAC, VPS, accounts=[{**ROW, 'fingerprint': fp}])
-        status = {'accounts': [{'name': 'team', 'kind': 'long-lived', 'fingerprint': fp}], 'registryGeneration': 99}
+        status = {'accounts': [{'name': 'team', 'kind': 'long-lived', 'fingerprint': fp}], 'registryGeneration': 99,
+                  'registryHash': registry.digest(registry.load(self.reg))}
         fake = FakeRemote('vps', ok(json.dumps(status).encode()))
         self.assertEqual(device_sync.push(fake), 'ok')
         self.assertEqual([argv[1:3] for argv, _ in fake.calls], [['device', 'status']])
@@ -221,7 +223,8 @@ class DeviceSyncTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(device_sync.switch(False, lambda: {'sessions': []}, Mock(return_value=0)), 0)
         self.assertEqual((self.stores / 'team.json').read_bytes(), new)
-        self.assertEqual([p.read_bytes() for p in (self.stores / '.retired').glob('team-*.json')], [old])
+        # The old replica (moved aside when the new one arrived) and the old served copy, never deleted.
+        self.assertEqual([json.loads(p.read_bytes()) for p in (self.stores / '.retired').glob('team-*.json')], [json.loads(old)] * 2)
 
     def test_native_login_account_is_kept_when_the_registry_drops_it(self):
         self.devices(MAC, VPS, accounts=[ROW]); device_sync.receive_account('team', self.blob())
@@ -244,8 +247,8 @@ class DeviceSyncTests(unittest.TestCase):
     def test_a_device_that_is_behind_gets_the_removal_and_never_resurrects_the_account(self):
         # This device (B) is at an older generation and still has team; the peer (A) removed it at generation 6.
         self.devices(MAC, VPS, accounts=[ROW]); device_sync.receive_account('team', self.blob())
-        peer = {**registry.load(self.reg), 'generation': 6, 'accounts': []}
-        status = {'accounts': [], 'registryGeneration': 6}
+        peer = json.loads(self.newer([], generation=6))
+        status = {'accounts': [], 'registryGeneration': 6, 'registryHash': registry.digest(registry.canonical(peer))}
         def handler(argv, stdin):
             return Completed(0, json.dumps(status if argv[2] == 'status' else peer).encode(), b'')
         fake = FakeRemote('vps', handler)
@@ -254,9 +257,12 @@ class DeviceSyncTests(unittest.TestCase):
         self.assertEqual([argv[2] for argv, _ in fake.calls if argv[2] != 'status' and argv[2] != 'registry'], [])
         self.assertNotIn('team', self.config_names()); self.assertEqual(registry.load(self.reg)['generation'], 6)
 
-    def test_a_newer_peer_gets_nothing_pushed(self):
-        self.devices(MAC, VPS, accounts=[ROW]); long_lived_file(self.directory, 'team')
-        fake = FakeRemote('vps', ok(json.dumps({'accounts': [], 'registryGeneration': 99}).encode()))
+    def test_a_peer_with_the_same_registry_and_tokens_gets_nothing_pushed(self):
+        token = long_lived_file(self.directory, 'team'); fp = long_lived.fingerprint(json.loads(token.read_text()))
+        self.devices(MAC, VPS, accounts=[ROW])
+        status = {'accounts': [{'name': 'team', 'kind': 'long-lived', 'fingerprint': fp}], 'registryGeneration': 99,
+                  'registryHash': registry.digest(registry.load(self.reg))}
+        fake = FakeRemote('vps', ok(json.dumps(status).encode()))
         device_sync.push(fake)
         self.assertEqual([argv[2] for argv, _ in fake.calls], ['status'])
 
@@ -273,16 +279,16 @@ class DeviceSyncTests(unittest.TestCase):
             self.assertNotEqual(device_sync.switch(False, lambda: {'sessions': []}, pool), 0)
         self.assertIn('claude-pool --start', out.getvalue()); self.assertNotIn('Switched', out.getvalue())
 
-    def test_a_pending_removal_is_dropped_when_the_account_was_added_again_locally(self):
+    def test_a_waiting_removal_is_dropped_when_the_account_was_added_again_locally(self):
         self.devices(MAC, VPS, accounts=[ROW]); device_sync.receive_account('team', self.blob())
-        device_sync.receive_registry(self.newer([]), overview=lambda: {'sessions': [{'busy': True, 'account': 'team'}]})
-        self.assertIn('team', json.loads(device_sync.pending_file().read_text()))
-        # Re-added locally with another token while the removal was pending.
+        removal = self.newer([])
+        report = device_sync.receive_registry(removal, overview=lambda: {'sessions': [{'busy': True, 'account': 'team'}]})
+        self.assertEqual(report['kept_busy'], ['team'])
+        # Re-added locally with another token while the removal waited; the tombstone names the old token only.
         for folder in (self.stores, self.directory): (folder / 'team.json').unlink()
         long_lived_file(self.stores, 'team', token=fixture_token('c')); long_lived_file(self.directory, 'team', token=fixture_token('c'))
-        report = device_sync.receive_registry(self.newer([]), overview=lambda: {'sessions': []})
-        self.assertEqual(report['removed'], []); self.assertIn('team', self.config_names())
-        self.assertFalse(device_sync.pending_file().exists())
+        report = device_sync.receive_registry(removal, overview=lambda: {'sessions': []})
+        self.assertEqual(report['removed'], []); self.assertEqual(report['kept'], ['team']); self.assertIn('team', self.config_names())
 
     def test_a_held_add_lock_counts_as_busy(self):
         import fcntl
@@ -298,8 +304,89 @@ class DeviceSyncTests(unittest.TestCase):
             self.assertEqual(device_sync.sync_all(remotes=Mock()), {})
         self.assertIn('no name', out.getvalue())
 
-    def newer(self, accounts, generation=5):
-        return json.dumps({**registry.load(self.reg), 'generation': generation, 'accounts': accounts}).encode()
+    def newer(self, accounts, generation=5, fingerprint=None):
+        """The registry another device wrote after removing every account not in `accounts` (its tombstones name the
+        fingerprint of the token this device holds, or `fingerprint`)."""
+        value = registry.load(self.reg)
+        kept = {row['name'] for row in accounts}
+        tombs = [{'kind': 'account', 'name': row['name'], 'generation': generation,
+                  'fingerprint': fingerprint or device_sync.local_fingerprint(row['name'])}
+                 for row in value['accounts'] if row['name'] not in kept]
+        out = {**value, 'generation': generation, 'accounts': [{**row, 'generation': generation} for row in accounts]}
+        if tombs: out['removed'] = tombs
+        return json.dumps(out).encode()
+
+    def neu(self):
+        row = {**ROW, 'name': 'neu', 'alias': 'neu', 'label': 'Neu', 'userId': 'user-n', 'organizationId': 'org-n'}
+        blob = long_lived_file(self.root / 'src', 'neu', user='user-n', org='org-n', token=fixture_token('n')).read_bytes()
+        return {**row, 'fingerprint': long_lived.fingerprint(json.loads(blob))}, blob
+
+    def neu_files(self):
+        return sorted(str(p.relative_to(self.root)) for p in self.root.rglob('*') if 'neu' in p.name and p.suffix == '.json'
+                      and not str(p.relative_to(self.root)).startswith('src'))
+
+    def test_a_partitioned_add_survives_a_peer_registry_that_moved_ahead(self):
+        # The final review probe: the peer made two changes while this device enrolled neu; neu and its token stay.
+        self.devices(MAC, VPS)
+        base = registry.load(self.reg)
+        row, blob = self.neu()
+        registry.update(lambda v: v['accounts'].append(row), self.reg)
+        self.assertEqual(device_sync.receive_account('neu', blob), 'installed')
+        before = self.neu_files()
+        report = device_sync.receive_registry(json.dumps({**base, 'generation': 3}).encode(), overview=lambda: {'sessions': []})
+        self.assertEqual(report['removed'], [])
+        self.assertEqual([r['name'] for r in registry.load(self.reg)['accounts']], ['neu'])
+        self.assertEqual(registry.load(self.reg)['generation'], 3)
+        self.assertEqual(self.neu_files(), before); self.assertIn('neu', self.config_names())
+
+    def test_push_to_a_peer_that_is_ahead_merges_first_then_sends_the_merged_registry_and_the_token(self):
+        self.devices(MAC, VPS)
+        base = registry.load(self.reg)
+        row, blob = self.neu()
+        registry.update(lambda v: v['accounts'].append(row), self.reg)
+        device_sync.receive_account('neu', blob)
+        theirs = {**base, 'generation': 3}
+        status = {'accounts': [], 'registryGeneration': 3, 'registryHash': registry.digest(theirs)}
+        def handler(argv, stdin):
+            if argv[2] == 'status': return Completed(0, json.dumps(status).encode(), b'')
+            if argv[2] == 'registry': return Completed(0, json.dumps(theirs).encode(), b'')
+            return Completed(0, b'{}', b'')
+        fake = FakeRemote('vps', handler)
+        self.assertEqual(device_sync.push(fake), 'ok')
+        sent = {argv[2]: stdin for argv, stdin in fake.calls if argv[2] in ('receive-registry', 'receive-account')}
+        self.assertEqual([r['name'] for r in json.loads(sent['receive-registry'])['accounts']], ['neu'])
+        self.assertEqual(json.loads(sent['receive-registry'])['generation'], 3)
+        self.assertEqual(sent['receive-account'], blob)
+        SecretWatch(fixture_token('n')).argv(fake.calls)
+
+    def test_a_tombstoned_account_is_moved_aside_never_unlinked(self):
+        self.devices(MAC, VPS, accounts=[ROW]); device_sync.receive_account('team', self.blob())
+        token = self.blob()
+        report = device_sync.receive_registry(self.newer([]), overview=lambda: {'sessions': []})
+        self.assertEqual(report['removed'], ['team']); self.assertNotIn('team', self.config_names())
+        self.assertFalse((self.stores / 'team.json').exists()); self.assertFalse((self.directory / 'team.json').exists())
+        aside = [p.read_bytes() for p in (self.stores / '.retired').glob('team-*.json')]
+        self.assertEqual(len(aside), 2); self.assertTrue(all(json.loads(b) == json.loads(token) for b in aside))
+
+    def test_a_tombstone_for_another_fingerprint_keeps_the_account_and_its_token(self):
+        self.devices(MAC, VPS, accounts=[ROW]); device_sync.receive_account('team', self.blob())
+        report = device_sync.receive_registry(self.newer([], fingerprint='ffffffffffff'), overview=lambda: {'sessions': []})
+        self.assertEqual(report['removed'], []); self.assertIn('team', report['kept'])
+        self.assertIn('team', self.config_names()); self.assertTrue((self.directory / 'team.json').exists())
+
+    def test_a_tombstone_for_another_fingerprint_is_removed_when_the_peer_holds_this_token(self):
+        self.devices(MAC, VPS, accounts=[ROW]); device_sync.receive_account('team', self.blob())
+        held = {long_lived.fingerprint(json.loads(self.blob()))}
+        report = device_sync.receive_registry(self.newer([], fingerprint='ffffffffffff'), overview=lambda: {'sessions': []}, elsewhere=held)
+        self.assertEqual(report['removed'], ['team'])
+        self.assertEqual(len(list((self.stores / '.retired').glob('team-*.json'))), 2)
+
+    def test_an_account_the_registry_merely_does_not_list_is_never_removed(self):
+        self.devices(MAC, VPS, accounts=[ROW]); device_sync.receive_account('team', self.blob())
+        value = registry.load(self.reg)
+        report = device_sync.receive_registry(json.dumps({**value, 'generation': 9, 'accounts': []}).encode(), overview=lambda: {'sessions': []})
+        self.assertEqual(report['removed'], []); self.assertIn('team', self.config_names())
+        self.assertEqual([r['name'] for r in registry.load(self.reg)['accounts']], ['team'])
 
     def test_account_removed_from_the_registry_is_removed_locally(self):
         self.devices(MAC, VPS, accounts=[ROW])

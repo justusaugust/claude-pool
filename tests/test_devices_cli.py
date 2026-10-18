@@ -434,6 +434,18 @@ class UserVerbTests(DeviceCliBase):
             code, out, _ = self.run_cli(['sync'], remotes=remotes)
         self.assertEqual(code, 1); self.assertIn('vps: unreachable', out)
 
+    def test_force_registry_reads_every_peer_list_and_tombstones_what_only_the_peer_has(self):
+        self.devices(MAC, VPS)
+        theirs = {**registry.load(self.reg), 'generation': 7,
+                  'accounts': [{'name': 'ops', 'label': 'Ops', 'fingerprint': 'aaaaaaaaaaaa', 'generation': 7}]}
+        fake = FakeRemote('vps', lambda argv, data: answer(0, json.dumps(theirs).encode()) if argv[2:3] == ['registry'] else answer(255))
+        with patch.object(device_sync, 'sync_all', return_value={'vps': 'ok'}):
+            code, out, _ = self.run_cli(['sync', '--force-registry'], remotes=lambda target: fake)
+        self.assertEqual(code, 0)
+        value = registry.load(self.reg)
+        self.assertEqual(value['generation'], 8)
+        self.assertIn({'kind': 'account', 'name': 'ops', 'generation': 8, 'fingerprint': 'aaaaaaaaaaaa'}, value['removed'])
+
     def test_switch_pool_callable_runs_the_local_launcher_and_returns_its_exit_code(self):
         local = FakeRemote('local', lambda argv, data: answer(1 if '--stop' in argv else 0))
         seen = {}
@@ -1106,7 +1118,7 @@ class RemoveTests(OrchestrationBase):
                 self.assertEqual(self.mutating(), []); self.assertEqual(registry.load(self.reg), state)
                 self.assertEqual(self.vps.service, 'running')
                 # undo for the next case
-                registry.replace(dict(before, generation=registry.load(self.reg)['generation'] + 1), self.reg)
+                registry.write(registry.canonical(before), self.reg)
                 self.vps.overview = {'health': {'activeRequests': 0}, 'sessions': [], 'accounts': []}
                 if not self.team.exists(): self.team = long_lived_file(self.directory, 'team')
 

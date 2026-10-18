@@ -39,7 +39,7 @@ claude-pool device sync [--force-registry]
 claude-pool device switch [--wait]
 ```
 
-`check` changes nothing; it exits 2 when any step needs work. `--probe` sends one tiny real Claude request per long-lived account. `sync` pushes the registry and the long-lived tokens to every device. If `check` says `registry diverged`, run `sync --force-registry` on the device whose list is right. `switch` restarts the local pool to apply a pending account change, and only when no request is in flight.
+`check` changes nothing; it exits 2 when any step needs work. `--probe` sends one tiny real Claude request per long-lived account. `sync` merges the registry with every device row by row (a change made while a device was unreachable is kept, a removal travels as a tombstone that names the removed token) and copies the long-lived tokens. If `check` says `registry diverged`, run `sync`; only if a list is still wrong afterwards, run `sync --force-registry` on the device whose list is right. A device that receives a removal moves the token aside to `credentials/.retired`, and keeps it in service when it holds another token than the removed one. `switch` restarts the local pool to apply a pending account change, and only when no request is in flight.
 
 ## What each check proves
 

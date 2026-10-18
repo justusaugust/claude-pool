@@ -56,7 +56,7 @@ Start with `claude-pool device check`; each problem has a `fix:` line. See [devi
 
 **Two Conductors, or Conductor not ready.** Only one may run. `claude-pool device conductor status` names where; stop the extra one and run the fix it prints, or `claude-pool device conductor move <device>`.
 
-**`registry diverged`.** Two devices have different lists at the same generation. On the device whose list is right run `claude-pool device sync --force-registry`.
+**`registry diverged`.** Two devices changed their lists while they could not reach each other. Run `claude-pool device sync`: it merges both lists row by row. If a list is still wrong afterwards, run `claude-pool device sync --force-registry` on the device whose list is right; the other devices move the tokens it drops to `credentials/.retired` and never delete them.
 
 **Preview links are HTTP only.** Tailscale Serve is not allowed for that user. A root user runs `sudo tailscale set --operator=<user>`, then `claude-pool device add <ssh-target>`.
 
