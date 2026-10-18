@@ -131,6 +131,13 @@ class UpdateTests(unittest.TestCase):
         (self.source/'backend/shunt.patch').write_text('unreviewed patch')
         with self.assertRaisesRegex(RuntimeError,'patch digest'):installer.prepare_backend(self.app)
 
+    def test_backend_build_never_self_updates_the_users_rustup(self):
+        (self.source/'gateway/bin/shunt').unlink();(self.app/'gateway/bin/shunt').write_text('corrupted')
+        calls=[]
+        with patch.object(installer.shutil,'which',return_value='/usr/bin/tool'),patch.object(installer.subprocess,'run',side_effect=lambda args,**kw:calls.append(args)):
+            installer.prepare_backend(self.app)
+        self.assertEqual(calls[0][:3],['rustup','toolchain','install']);self.assertIn('--no-self-update',calls[0])
+
     def test_cli_update_download_failure_leaves_install_unchanged(self):
         before=(self.bin/'claude-pool').read_bytes()
         with patch.object(update.subprocess,'run',side_effect=subprocess.CalledProcessError(1,'git')):
