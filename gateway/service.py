@@ -144,6 +144,21 @@ def loaded(label, run=subprocess.run):
                for check in ['is-active', 'is-enabled'])
 
 
+def launchd_job(text):
+    """The job as launchd holds it, from `launchctl print` output: {'running': bool, 'arguments': [...] or None}.
+    Only top-level lines count (nested blocks such as endpoints have their own `state`); an unknown format gives None
+    arguments, which never triggers a reload."""
+    running, arguments, block = False, None, None
+    for line in text.splitlines():
+        if block is not None:
+            if line == '\t}': arguments, block = block, None
+            elif line.startswith('\t\t'): block.append(line[2:])
+            else: block = None
+        elif line == '\tstate = running': running = True
+        elif line == '\targuments = {': block = []
+    return {'running': running, 'arguments': arguments}
+
+
 def needs_reload(label, run=subprocess.run):
     """True when the user manager holds an older copy of this unit than the file."""
     result = run(['systemctl', '--user', 'show', '-p', 'NeedDaemonReload', '--value', label + '.service'], capture_output=True, text=True)

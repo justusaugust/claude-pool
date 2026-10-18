@@ -364,6 +364,53 @@ class ServiceTests(unittest.TestCase):
             self.assertTrue(service.needs_reload('x', run=lambda *a, **k: Mock(returncode=0, stdout='yes\n')))
             self.assertFalse(service.needs_reload('x', run=lambda *a, **k: Mock(returncode=0, stdout='no\n')))
 
+    LAUNCHD_PRINT = ('gui/501/io.github.claude-pool = {{\n\tactive count = 0\n\tpath = /h/Library/LaunchAgents/io.github.claude-pool.plist\n'
+                     '\ttype = LaunchAgent\n\tstate = {state}\n\n\tprogram = /opt/homebrew/bin/python3\n\targuments = {{\n{arguments}\t}}\n\n'
+                     '\tendpoints = {{\n\t\t"x" = {{\n\t\t\tstate = running\n\t\t}}\n\t}}\n}}\n')
+
+    def launchd(self, state, arguments):
+        """A launchd that holds the job loaded with `arguments`; records every launchctl call, answers print like launchctl."""
+        calls, loaded = [], {'value': True}
+        text = self.LAUNCHD_PRINT.format(state=state, arguments=''.join('\t\t' + a + '\n' for a in arguments))
+
+        def run(argv, **_):
+            calls.append(tuple(argv[1:]))
+            if argv[1] == 'print': return Mock(returncode=0 if loaded['value'] else 113, stdout=text if loaded['value'] else '', stderr='')
+            if argv[1] == 'bootout': loaded['value'] = False
+            if argv[1] == 'bootstrap': loaded['value'] = True
+            return Mock(returncode=0, stdout='', stderr='')
+        return calls, run
+
+    def test_start_reloads_a_stopped_launchd_job_that_still_holds_an_older_program(self):
+        # An update rewrote the plist (legacy launch.py -> run.py) but left the loaded job alone. `--start` after `--stop`
+        # (device switch) used kickstart, which starts launchd's cached old program: the old daemon without the readings Puller.
+        import service
+        with patch.object(service.sys, 'platform', 'darwin'), tempfile.TemporaryDirectory() as folder, \
+             patch.object(launch, 'SERVICE_FILE', Path(folder) / 'io.github.claude-pool.plist'), patch.object(launch, 'SERVICE_LABEL', 'io.github.claude-pool'), \
+             patch.object(launch.time, 'sleep'):
+            definition = launch.service_definition()
+            service.write(launch.SERVICE_FILE, service.render(definition))
+            target = 'gui/' + str(os.getuid()) + '/io.github.claude-pool'
+            calls, run = self.launchd('not running', ['/opt/homebrew/bin/python3', '/old/pool-gateway/launch.py', '--daemon'])
+            with patch.object(launch.subprocess, 'run', side_effect=run): launch.managed_start()
+            self.assertIn(('bootout', target), calls)
+            self.assertLess(calls.index(('bootout', target)), calls.index(('bootstrap', 'gui/' + str(os.getuid()), str(launch.SERVICE_FILE))))
+            self.assertEqual(calls[-1], ('kickstart', target))
+            # The same program, or a job that is running right now (never killed here), is only kickstarted.
+            for state, arguments in [('not running', definition['ProgramArguments']), ('running', ['/opt/homebrew/bin/python3', '/old/launch.py', '--daemon'])]:
+                calls, run = self.launchd(state, arguments)
+                with patch.object(launch.subprocess, 'run', side_effect=run): launch.managed_start()
+                self.assertNotIn('bootout', [c[0] for c in calls], state)
+                self.assertNotIn('bootstrap', [c[0] for c in calls], state)
+                self.assertEqual(calls[-1], ('kickstart', target))
+
+    def test_launchd_print_parser_reads_the_top_level_state_and_arguments(self):
+        import service
+        text = self.LAUNCHD_PRINT.format(state='not running', arguments='\t\t/usr/bin/python3\n\t\t/a b/run.py\n\t\t--daemon\n')
+        self.assertEqual(service.launchd_job(text), {'running': False, 'arguments': ['/usr/bin/python3', '/a b/run.py', '--daemon']})
+        self.assertTrue(service.launchd_job(text.replace('state = not running', 'state = running'))['running'])
+        self.assertIsNone(service.launchd_job('nothing here\n')['arguments'], 'an unknown format never triggers a reload')
+
     def test_orphan_detection_accepts_the_user_systemd_instance_on_linux(self):
         with patch.object(launch, 'process_command', return_value='/usr/lib/systemd/systemd --user'):
             self.assertTrue(launch.orphaned('1'))

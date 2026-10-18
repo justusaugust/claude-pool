@@ -67,9 +67,20 @@ def install_service():
         service_command('enable', SERVICE_LABEL + '.service')
         return SERVICE_LABEL + '.service'
     domain = f'gui/{os.getuid()}'
-    if service_command('print', domain + '/' + SERVICE_LABEL, check=False):
-        service_command('bootstrap', domain, str(SERVICE_FILE))
-    return domain + '/' + SERVICE_LABEL
+    target = domain + '/' + SERVICE_LABEL
+    printed = subprocess.run(['launchctl', 'print', target], capture_output=True, text=True)
+    if printed.returncode: service_command('bootstrap', domain, str(SERVICE_FILE))
+    else:
+        # An update rewrites the file but leaves the loaded job alone; kickstart would start launchd's cached old program
+        # (the legacy entry point). Reload only a job that is not running: a running daemon is never killed here.
+        job = service.launchd_job(printed.stdout)
+        if not job['running'] and job['arguments'] is not None and job['arguments'] != definition['ProgramArguments']:
+            service_command('bootout', target, check=False)
+            for _ in range(20):  # bootout returns before launchd lets go of the label
+                if not service_command('bootstrap', domain, str(SERVICE_FILE), check=False): break
+                time.sleep(.25)
+            else: raise RuntimeError('Background service control failed')
+    return target
 
 
 def managed_start():
