@@ -707,7 +707,9 @@ class Handler(BaseHTTPRequestHandler):
         except (OSError, ValueError, RuntimeError, http.client.HTTPException):
             if not lease.get('cancelled'):
                 self.server.journal.record('stream_interrupted' if committed else 'upstream_unavailable', account=account)
-            if not committed:
+            # A cancelled request's client socket is being shut down by the monitor; a late 502 would
+            # race that shutdown and reach the client whole or cut off, so cancellation stays a bare close.
+            if not committed and not lease.get('cancelled'):
                 try: self.answer(502, {"type":"error", "error":{"type":"api_error", "message":"Upstream unavailable; retry shortly"}})
                 except OSError: pass
         finally:
