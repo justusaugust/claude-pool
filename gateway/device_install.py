@@ -13,7 +13,7 @@ import tarfile
 import device_sync
 import managed_block
 from device_report import Step
-from remote import redact
+from remote import redact, remote_command
 
 START, END = '# >>> claude-pool >>>', '# <<< claude-pool <<<'
 FUNCTION = 'claude() { command claude-pool exec "$@"; }'
@@ -128,7 +128,7 @@ def check_service(remote):
 
 def start_service(remote, target=None):
     done = remote.pool('--start')
-    if done.returncode: return Step('service', 'failed', 'start failed: ' + _tail(done), f'ssh {target or remote.name} claude-pool --start')
+    if done.returncode: return Step('service', 'failed', 'start failed: ' + _tail(done), remote_command(target or remote.name, 'claude-pool --start'))
     return check_service(remote)
 
 

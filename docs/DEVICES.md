@@ -52,13 +52,13 @@ claude-pool device switch [--wait]
 | `linger` | Linux services survive logout (macOS: skipped) | claude-pool device add <ssh-target> tries it without root; if it stays failed, a root user runs sudo loginctl enable-linger <user> on the device |
 | `shell` | the claude shell function sends claude through the pool | claude-pool device add <ssh-target> |
 | `accounts` | registry, token fingerprints, reserve settings and account health match | claude-pool device sync; claude-pool device sync --force-registry on the device whose list is right; claude-pool account add <email> --long-lived --replace --name <name> on the device that first enrolled it, then device sync; claude-pool account reserve <name> --at <pct>; claude-pool device switch |
-| `service` | the pool service is running | claude-pool device add <ssh-target>; or ssh <ssh-target> claude-pool --start |
-| `doctor` | claude-pool doctor on the device reports nothing | run ssh <device> claude-pool doctor and apply the fix it prints |
+| `service` | the pool service is running | claude-pool device add <ssh-target>; or ssh <ssh-target> .local/bin/claude-pool --start |
+| `doctor` | claude-pool doctor on the device reports nothing | run ssh <device> .local/bin/claude-pool doctor and apply the fix it prints |
 | `native-login` | Native Claude is logged in to an account the pool serves | claude-pool device add <ssh-target> and click Authorize; claude-native auth status if it cannot be read |
 | `herdr` | this machine has a herdr profile for the device | herdr machine add <ssh-target> --label <name> |
 | `app` | the Mac that runs the Claude app lists and trusts the SSH environment | the Claude app clicks printed under Needs you |
 | `cua` | the device shares its desktop through Cua and the machines can reach each other | see docs/DEVICES.md, Cua; macOS: switch on cua-spacesd in Accessibility, then claude-pool device add <ssh-target> --cua |
-| `conductor` | exactly one Conductor runs, on the registry device, connected to Remote Control | ssh <device> claude-pool device conductor install; claude-pool device conductor move <device>; stop the hand-started Conductor (herdr session conductor) |
+| `conductor` | exactly one Conductor runs, on the registry device, connected to Remote Control | ssh <device> .local/bin/claude-pool device conductor install; claude-pool device conductor move <device>; stop the hand-started Conductor (herdr session conductor) |
 | `readings` | usage readings from the usage owner are fresh | ssh -o BatchMode=yes <owner> true must work from the device |
 | `preview` | the preview tool is installed and links are HTTPS (Linux devices only) | claude-pool device add <ssh-target>; a root user runs sudo tailscale set --operator=<user> for HTTPS |
 
@@ -127,13 +127,13 @@ claude-pool device conductor move <device>
 On the Conductor device itself the service is managed with:
 
 ```sh
-ssh <ssh-target> claude-pool device conductor install [--session-id <ID>] [--fresh] [--restart]
-ssh <ssh-target> claude-pool device conductor uninstall
+ssh <ssh-target> .local/bin/claude-pool device conductor install [--session-id <ID>] [--fresh] [--restart]
+ssh <ssh-target> .local/bin/claude-pool device conductor uninstall
 ```
 
 `install` is safe to rerun and reattaches the one conversation with `--session-id`; after three quick failures it starts a fresh conversation. `--session-id` adopts a Conductor you started by hand in herdr session `conductor`: stop that one first, then run the install line `check` prints. `--fresh` starts a new conversation. `--restart` restarts only the Conductor service, never the pool.
 
-If `check` says `running on <device> but not connected to Remote Control`, turn Remote Control on in the Claude app, wait two minutes (the service retries by itself), then run `claude-pool device check <name>`. If it still says not connected, run `ssh <ssh-target> claude-pool device conductor install --restart`.
+If `check` says `running on <device> but not connected to Remote Control`, turn Remote Control on in the Claude app, wait two minutes (the service retries by itself), then run `claude-pool device check <name>`. If it still says not connected, run `ssh <ssh-target> .local/bin/claude-pool device conductor install --restart`.
 
 What Conductor Claude calls to see and act (bounded, redacted output):
 

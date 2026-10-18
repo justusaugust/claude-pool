@@ -162,7 +162,7 @@ class InstallTests(unittest.TestCase):
 
     def test_start_failure_fix_names_the_target(self):
         step = device_install.start_service(remote(lambda argv, stdin: answer(1, err='x')))
-        self.assertEqual(step.fix, 'ssh vps claude-pool --start')
+        self.assertEqual(step.fix, 'ssh vps .local/bin/claude-pool --start')
 
     def test_macos_skips_linger(self):
         self.assertEqual(device_install.check_linger(remote(lambda argv, stdin: answer(0, 'Darwin'))).status, 'skipped')

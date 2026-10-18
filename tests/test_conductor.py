@@ -465,7 +465,7 @@ class CheckTests(unittest.TestCase):
         step = conductor.check({'personal-vps': {**RUNNING, 'conductor': {**RUNNING['conductor'], 'ready': False}}, 'mac': IDLE}, value_with())
         self.assertEqual(step.status, 'failed')
         self.assertRegex(step.fix, r'^turn Remote Control on in the Claude app, wait two minutes, then run claude-pool device check \S+; '
-                                            r'if it still says not connected: ssh \S+ claude-pool device conductor install --restart$')
+                                            r'if it still says not connected: ssh \S+ \.local/bin/claude-pool device conductor install --restart$')
 
     def test_check_is_not_ready_without_linger_or_with_two_conductors(self):
         value = value_with()

@@ -1039,7 +1039,7 @@ class CheckTests(OrchestrationBase):
         self.vps.conductor = {'installed': True, 'running': True, 'ready': True, 'fresh': True, 'duplicates': []}
         code, out, err = self.cli('check', 'vps')
         self.assertEqual(code, 0, out + err)
-        self.assertRegex(out, r'\n  manual +accounts .*switch.*\n      fix: ssh justus@vps claude-pool device switch')
+        self.assertRegex(out, r'\n  manual +accounts .*switch.*\n      fix: ssh justus@vps .local/bin/claude-pool device switch')
         self.assertRegex(out, r'\n  manual +conductor ')
         self.vps.conductor = {'error': 'OSError'}
         code, out, _ = self.cli('check', 'vps')
@@ -1169,7 +1169,7 @@ class LocalPoolTests(OrchestrationBase):
 
 SESSION_FIXTURE = 'cse_' + 'adopt123'
 ADOPT_FIX = ('stop the hand-started Conductor (herdr session conductor), then run: '
-             'ssh justus@vps claude-pool device conductor install --session-id ' + SESSION_FIXTURE)
+             'ssh justus@vps .local/bin/claude-pool device conductor install --session-id ' + SESSION_FIXTURE)
 HAND_STARTED = {'installed': False, 'running': False, 'ready': False, 'fresh': False, 'duplicates': [4242],
                 'adoptSessionId': SESSION_FIXTURE}
 IDLE_CONDUCTOR = {'installed': False, 'running': False, 'ready': False, 'fresh': False, 'duplicates': []}
@@ -1218,7 +1218,7 @@ class ConductorAdoptTests(unittest.TestCase):
         self.assertEqual(step.fix, ADOPT_FIX)
         with patch.object(registry, 'self_name', return_value='vps'):
             step = conductor.check({'vps': {'platform': 'linux', 'linger': True, 'conductor': dict(HAND_STARTED)}}, value)
-        self.assertEqual(step.fix, ADOPT_FIX.replace('ssh justus@vps ', ''))
+        self.assertEqual(step.fix, ADOPT_FIX.replace('ssh justus@vps .local/bin/', ''))
 
 
 class FixRoundCheckTests(OrchestrationBase):
@@ -1243,7 +1243,7 @@ class FixRoundCheckTests(OrchestrationBase):
     def test_doctor_fixes_are_run_on_the_device(self):
         self.vps.doctor = False
         code, out, _ = self.cli('check', 'vps')
-        self.assertRegex(out, r'\n  failed +doctor +fail tokens.*\n      fix: ssh justus@vps claude-pool account add x')
+        self.assertRegex(out, r'\n  failed +doctor +fail tokens.*\n      fix: ssh justus@vps .local/bin/claude-pool account add x')
 
     def test_a_peer_whose_registry_is_ahead_is_reported(self):
         ahead = json.loads(json.dumps(self.vps.registry)); ahead['generation'] += 3
@@ -1286,7 +1286,7 @@ class FixRoundRemoveTests(OrchestrationBase):
         self.local.cua, self.local.spaces = True, ['direct:100.64.0.2:3211', 'direct:100.64.0.9:3211']
 
     def test_a_failed_preview_or_shell_removal_stops_before_anything_irreversible_and_a_rerun_completes(self):
-        for part, fix in [('preview', 'claude-pool device remove vps'), ('shell remove', 'ssh justus@vps claude-pool device shell remove')]:
+        for part, fix in [('preview', 'claude-pool device remove vps'), ('shell remove', 'ssh justus@vps .local/bin/claude-pool device shell remove')]:
             with self.subTest(part=part):
                 self.vps.fail = {part}; self.vps.calls.clear()
                 code, out, err = self.cli('remove', 'vps')

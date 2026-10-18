@@ -28,7 +28,7 @@ import device_sync
 import managed_block
 from private_files import read_private, write_private
 import registry
-from remote import Local, Remote
+from remote import Local, Remote, remote_command
 import service
 import settings
 from device_report import Step
@@ -292,11 +292,11 @@ def adoptable(ps_output, pids):
     return None
 
 
-def adopt_fix(session_id, prefix=''):
-    """How Justus hands a hand-started Conductor to the service; `prefix` is `ssh <target> ` when shown from another device."""
+def adopt_fix(session_id, target=None):
+    """How Justus hands a hand-started Conductor to the service; `target` is its ssh target when shown from another device."""
     if not session_id: return HERDR_FIX
-    return ('stop the hand-started Conductor (herdr session conductor), then run: ' + prefix +
-            'claude-pool device conductor install --session-id ' + session_id)
+    command = 'claude-pool device conductor install --session-id ' + session_id
+    return 'stop the hand-started Conductor (herdr session conductor), then run: ' + (remote_command(target, command) if target else command)
 
 
 def _alive(pid):
@@ -445,24 +445,25 @@ def check(statuses, value):
         first = sorted(extra)[0]
         session = parts[first].get('adoptSessionId')
         session = session if isinstance(session, str) and SESSION_ID.fullmatch(session) else None
-        prefix = '' if first == registry.self_name() else 'ssh ' + str(_target(value, first) or first) + ' '
-        return Step(STEP, 'failed', 'another Conductor runs on ' + ', '.join(sorted(extra)), adopt_fix(session, prefix))
+        where = None if first == registry.self_name() else str(_target(value, first) or first)
+        return Step(STEP, 'failed', 'another Conductor runs on ' + ', '.join(sorted(extra)), adopt_fix(session, where))
     if len(running) > 1:
         others = [name for name in running if name != device] or running[1:]
-        return Step(STEP, 'failed', 'the Conductor runs on ' + ', '.join(running), 'ssh ' + str(_target(value, others[0]) or others[0]) +
-                    ' claude-pool device conductor uninstall')
+        return Step(STEP, 'failed', 'the Conductor runs on ' + ', '.join(running),
+                    remote_command(str(_target(value, others[0]) or others[0]), 'claude-pool device conductor uninstall'))
     if running and running[0] != device:
         return Step(STEP, 'failed', 'the Conductor runs on ' + running[0] + ', the registry names ' + device,
                     'claude-pool device conductor move ' + device)
     if device not in statuses: return Step(STEP, 'unreachable', device + ' did not report its status', None)
     if not running:
-        return Step(STEP, 'failed', 'not running on ' + device, 'ssh ' + str(_target(value, device) or device) + ' claude-pool device conductor install')
+        return Step(STEP, 'failed', 'not running on ' + device,
+                    remote_command(str(_target(value, device) or device), 'claude-pool device conductor install'))
     here = statuses[device]
     if not parts[device].get('ready'):
         return Step(STEP, 'failed', 'running on ' + device + ' but not connected to Remote Control',
                     'turn Remote Control on in the Claude app, wait two minutes, then run claude-pool device check ' + device +
-                    '; if it still says not connected: ssh ' + str(_target(value, device) or device) +
-                    ' claude-pool device conductor install --restart')
+                    '; if it still says not connected: ' +
+                    remote_command(str(_target(value, device) or device), 'claude-pool device conductor install --restart'))
     if here.get('platform') == 'linux' and here.get('linger') is False:
         return Step(STEP, 'failed', 'stops when ' + device + ' logs out (linger is off)', 'claude-pool device add ' + str(_target(value, device) or device))
     if parts[device].get('fresh'):

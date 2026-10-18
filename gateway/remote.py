@@ -39,6 +39,18 @@ def redact(text, secrets: Iterable[str]):
     return text
 
 
+LAUNCHERS = ('claude-pool', 'preview')
+
+
+def remote_command(target, command):
+    """A command for Justus or an agent to run on `target` over ssh. Non-interactive ssh skips ~/.profile (and Debian's
+    ~/.bashrc returns early), so ~/.local/bin is not on PATH there; ssh starts in the home folder, so the claude-pool and
+    preview launchers are named by their home-relative path."""
+    first = command.split(' ', 1)[0]
+    if first in LAUNCHERS: command = '.local/bin/' + command
+    return 'ssh ' + target + ' ' + command
+
+
 def require_pipe(stream):
     if stream.isatty(): raise RuntimeError('Refusing to write a credential to a terminal')
 

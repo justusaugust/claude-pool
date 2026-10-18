@@ -11,7 +11,7 @@ import sys
 import device_sync
 import managed_block
 from device_report import Step
-from remote import Local
+from remote import Local, remote_command
 
 HERE = Path(__file__).resolve().parent
 TOOL = HERE / 'preview'
@@ -105,7 +105,7 @@ def check(remote, user):
     if done.returncode == 0 and backend == 'https': return Step('preview', 'ok', 'HTTPS links through Tailscale Serve')
     if done.returncode == 0 and backend == 'http':
         return Step('preview', 'manual', 'http-only', f'sudo tailscale set --operator={user}')
-    return Step('preview', 'failed', 'preview doctor gave no usable answer', f'ssh {remote.name} preview doctor')
+    return Step('preview', 'failed', 'preview doctor gave no usable answer', remote_command(remote.name, 'preview doctor'))
 
 
 def rules_block():

@@ -29,7 +29,7 @@ import native_login  # noqa: F401  (registers nativeLogin)
 import readings
 import registry
 from private_files import atomic_write, private_directory
-from remote import Local, Remote, redact
+from remote import Local, Remote, redact, remote_command
 import routing
 import service
 import settings
@@ -45,13 +45,13 @@ CHECK_HELP = {
     'linger': ('Linux services survive logout (macOS: skipped)', 'claude-pool device add <ssh-target> tries it without root; if it stays failed, a root user runs sudo loginctl enable-linger <user> on the device'),
     'shell': ('the claude shell function sends claude through the pool', 'claude-pool device add <ssh-target>'),
     'accounts': ('registry, token fingerprints, reserve settings and account health match', 'claude-pool device sync; claude-pool device sync --force-registry on the device whose list is right; claude-pool account add <email> --long-lived --replace --name <name> on the device that first enrolled it, then device sync; claude-pool account reserve <name> --at <pct>; claude-pool device switch'),
-    'service': ('the pool service is running', 'claude-pool device add <ssh-target>; or ssh <ssh-target> claude-pool --start'),
-    'doctor': ('claude-pool doctor on the device reports nothing', 'run ssh <device> claude-pool doctor and apply the fix it prints'),
+    'service': ('the pool service is running', 'claude-pool device add <ssh-target>; or ssh <ssh-target> .local/bin/claude-pool --start'),
+    'doctor': ('claude-pool doctor on the device reports nothing', 'run ssh <device> .local/bin/claude-pool doctor and apply the fix it prints'),
     'native-login': ('Native Claude is logged in to an account the pool serves', 'claude-pool device add <ssh-target> and click Authorize; claude-native auth status if it cannot be read'),
     'herdr': ('this machine has a herdr profile for the device', 'herdr machine add <ssh-target> --label <name>'),
     'app': ('the Mac that runs the Claude app lists and trusts the SSH environment', 'the Claude app clicks printed under Needs you'),
     'cua': ('the device shares its desktop through Cua and the machines can reach each other', 'see docs/DEVICES.md, Cua; macOS: switch on cua-spacesd in Accessibility, then claude-pool device add <ssh-target> --cua'),
-    'conductor': ('exactly one Conductor runs, on the registry device, connected to Remote Control', 'not connected: turn Remote Control on in the Claude app, wait two minutes, run claude-pool device check <device>, then ssh <device> claude-pool device conductor install --restart; not running: ssh <device> claude-pool device conductor install; claude-pool device conductor move <device>; stop the hand-started Conductor (herdr session conductor)'),
+    'conductor': ('exactly one Conductor runs, on the registry device, connected to Remote Control', 'not connected: turn Remote Control on in the Claude app, wait two minutes, run claude-pool device check <device>, then ssh <device> .local/bin/claude-pool device conductor install --restart; not running: ssh <device> .local/bin/claude-pool device conductor install; claude-pool device conductor move <device>; stop the hand-started Conductor (herdr session conductor)'),
     'readings': ('usage readings from the usage owner are fresh', 'ssh -o BatchMode=yes <owner> true must work from the device'),
     'preview': ('the preview tool is installed and links are HTTPS (Linux devices only)', 'claude-pool device add <ssh-target>; a root user runs sudo tailscale set --operator=<user> for HTTPS'),
 }
@@ -540,7 +540,7 @@ class Target:
 
     def forget(self): self.s.forget(self.row['name'])
 
-    def on(self, command): return command if self.mine else 'ssh ' + self.where + ' ' + command
+    def on(self, command): return command if self.mine else remote_command(self.where, command)
 
     def needs_install(self, name):
         return Step(name, 'missing', 'needs a claude-pool with device support on ' + self.row['name'] + ' first', self.retry)
@@ -1103,7 +1103,8 @@ def remove(argv, out, remotes, local, **_):
         print('Claude tasks are running on ' + args.name + '; run claude-pool device remove ' + args.name +
               ' --wait or rerun later. Nothing was changed.')
         return 3
-    title, again, on = args.name + ' (' + row['ssh'] + ')', 'claude-pool device remove ' + args.name, 'ssh ' + row['ssh'] + ' '
+    title, again = args.name + ' (' + row['ssh'] + ')', 'claude-pool device remove ' + args.name
+    def on(command): return remote_command(row['ssh'], command)
     def stop_here(steps):
         print(render(title, steps))
         print(args.name + ' stays registered; once the fix is done, run: ' + again)
@@ -1112,11 +1113,11 @@ def remove(argv, out, remotes, local, **_):
     steps = [preview._replace(fix=again) if preview.status == 'failed' else preview]
     if preview.status == 'failed': return stop_here(steps)
     if not device_install.remove_shell(remote):
-        return stop_here(steps + [Step('shell', 'failed', 'could not remove the claude function', on + 'claude-pool device shell remove')])
+        return stop_here(steps + [Step('shell', 'failed', 'could not remove the claude function', on('claude-pool device shell remove'))])
     steps.append(Step('shell', 'ok', 'claude function removed'))
     stopped = remote.pool('--stop', timeout=POOL_TIMEOUT)
     if stopped.returncode:
-        return stop_here(steps + [Step('service', 'failed', 'the pool on ' + args.name + ' did not stop', on + 'claude-pool --stop')])
+        return stop_here(steps + [Step('service', 'failed', 'the pool on ' + args.name + ' did not stop', on('claude-pool --stop'))])
     label = _service_label(theirs)
     unit = remote.call(['sh', '-c', _unit_command(label, row.get('platform'))])
     if unit.returncode == 0: steps.append(Step('service', 'ok', 'pool stopped and its service disabled'))
@@ -1124,10 +1125,10 @@ def remove(argv, out, remotes, local, **_):
         steps.append(Step('service', 'ok', 'pool stopped; its service was not loaded'))
     else:
         return stop_here(steps + [Step('service', 'failed', 'pool stopped, but its service is still loaded',
-                                       on + shlex.quote(_unit_command(label, row.get('platform'))))])
+                                       on(shlex.quote(_unit_command(label, row.get('platform')))))])
     forgot = remote.device('forget-accounts', timeout=POOL_TIMEOUT)
     if forgot.returncode:
-        return stop_here(steps + [Step('accounts', 'failed', 'could not remove the synced accounts', on + 'claude-pool device forget-accounts')])
+        return stop_here(steps + [Step('accounts', 'failed', 'could not remove the synced accounts', on('claude-pool device forget-accounts'))])
     steps.append(Step('accounts', 'ok', 'synced long-lived accounts removed; its own logins stay'))
     if row.get('cua'):
         try: steps += device_cua.remove(remote, [local])
