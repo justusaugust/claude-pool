@@ -224,7 +224,8 @@ def export_readings(argv, out, **_):
     if not device_sync.is_owner(registry.load()):
         print('This device is not the usage owner; only the usage owner shares readings.', file=sys.stderr)
         return 1
-    print(json.dumps(readings.export(device_sync.pool_overview(), registry.self_name(), int(time.time() * 1000))))
+    ids = {row['name']: registry.ids(row) for row in device_sync.account_rows() if row['active'] and registry.ids(row)}
+    print(json.dumps(readings.export(device_sync.pool_overview(), registry.self_name(), int(time.time() * 1000), ids=ids)))
     return 0
 
 
@@ -617,8 +618,12 @@ def _reserve_issues(value):
     """This device's config rows whose reserve differs from the registry; runs the reserve hook once when any does."""
     def differing():
         rows = {row['name']: row.get('reserveAt', 0) for row in load_config(settings.CONFIG).get('accounts', [])}
-        return [(row['name'], rows[row['name']], row['reserveAt']) for row in value['accounts']
-                if 'reserveAt' in row and row['name'] in rows and rows[row['name']] != row['reserveAt']]
+        members = [accounts_cli.member_identity(settings.STORES, name) for name in rows]
+        found = []
+        for row in value['accounts']:
+            name = registry.local_name(row, members)
+            if 'reserveAt' in row and name in rows and rows[name] != row['reserveAt']: found.append((name, rows[name], row['reserveAt']))
+        return found
     if not differing(): return []
     try: accounts_cli.reserve_hook(value)
     except Exception: pass
@@ -644,28 +649,40 @@ def check_accounts(t):
         issues.append(('missing', 'registry generation ' + str(generation) + ' there is ahead of ' + str(value['generation']) + ' here',
                        'claude-pool device sync'))
     theirs = st.get('accounts') or {}
+    here = device_sync.account_rows()
     for row in value['accounts']:
-        want = row.get('fingerprint') or _local_fingerprint(row['name'])
+        # Each device holds the subscription under its own name: matched by UUIDs, by name only without them.
+        want = row.get('fingerprint') or _local_fingerprint(device_sync.local_name(row, here) or row['name'])
         if want is None: continue
-        have = (theirs.get(row['name']) or {}).get('fingerprint')
+        there = registry.local_name(row, theirs)
+        have = (theirs.get(there) or {}).get('fingerprint')
         if have is None: issues.append(('missing', row['name'] + ' is not on ' + name, 'claude-pool device sync'))
         elif have != want:
-            issues.append(('failed', 'fingerprint drift on ' + row['name'] + ': ' + want + ' expected, ' + have + ' there',
+            issues.append(('failed', 'fingerprint drift on ' + registry.describe(row, there) + ': ' + want + ' expected, ' + have + ' there',
                            'claude-pool device sync'))
+    for account, row in sorted(theirs.items()):
+        if row.get('duplicateOf'):
+            issues.append(('manual', account + ' on ' + name + ' is a second copy of ' + str(row['duplicateOf']) +
+                           ' (the same subscription); nothing serves it',
+                           'on ' + name + ': once ' + str(row['duplicateOf']) + ' works, move ' + account +
+                           '.json out of the claude-long-lived and credential folders (for example into the credential folder\'s .retired)'))
     overview = st.get('overview') if isinstance(st.get('overview'), dict) else {}
     for row in overview.get('accounts') or []:
         if isinstance(row, dict) and row.get('status') == 'reauthenticate':
-            entry = registry.account(value, row.get('name')) or {}
-            issues.append(('failed', str(row.get('name')) + ' needs reauthenticate (token revoked or expired)',
-                           replace_fix(entry.get('email'), row.get('name'))))
+            entry = registry.entry_for(value, theirs.get(row.get('name')) or {'name': row.get('name')}) or {}
+            who = registry.describe(entry, row.get('name')) if entry else str(row.get('name'))
+            issues.append(('failed', who + ' needs reauthenticate (token revoked or expired)',
+                           replace_fix(entry.get('email'), entry.get('name') or row.get('name'))))
     if t.s.probe:
         for account, row in sorted(theirs.items()):
             if row.get('kind') != 'long-lived' or not row.get('active', True): continue
-            alias = (registry.account(value, account) or {}).get('alias') or account
+            entry = registry.entry_for(value, row) or {}
+            # The alias is the target's own: its config row carries the name the status reports.
+            alias = (entry.get('alias') if entry.get('name') == account else None) or account
             done = t.remote.pool(alias, *PROBE, timeout=300)
             if done.returncode or b'OK' not in (done.stdout or b''):
-                entry = registry.account(value, account) or {}
-                issues.append(('failed', 'probe failed for ' + account, replace_fix(entry.get('email'), account)))
+                issues.append(('failed', 'probe failed for ' + (registry.describe(entry, account) if entry else account),
+                               replace_fix(entry.get('email'), entry.get('name') or account)))
     if t.mine: issues += _reserve_issues(value)
     pending = st.get('switchPending') or []
     if pending:
@@ -820,9 +837,10 @@ def ensure_conductor(t):
     return check_conductor(t)  # the device's own report after the install, never a generic one
 
 
-def owner_login_fix(owner, row):
-    """Connect a refreshable login for `row` on the usage owner: only a refreshable grant can read usage."""
-    command = 'claude-pool account add ' + (row.get('email') or '<email>') + ' --name ' + row['name']
+def owner_login_fix(owner, row, local=None):
+    """Connect a refreshable login for `row` on the usage owner (under `local`, its name there, when it has one): only a
+    refreshable grant can read usage."""
+    command = 'claude-pool account add ' + (row.get('email') or '<email>') + ' --name ' + (local or row['name'])
     return remote_command(owner['ssh'], command) if owner.get('ssh') else command + ' on ' + owner['name']
 
 
@@ -832,11 +850,14 @@ def take_usage_role(t):
     value = registry.load()
     if registry.is_owner(value, t.row): return None
     rows = t.status(fresh=True).get('accounts') or {}
-    missing = [row for row in value['accounts']
-               if (rows.get(row['name']) or {}).get('servingKind') != 'refreshable' or not (rows.get(row['name']) or {}).get('active', True)]
+    missing = []
+    for row in value['accounts']:
+        there = registry.local_name(row, rows)  # its name on that device: matched by UUIDs, by name only without them
+        held = rows.get(there) or {}
+        if held.get('servingKind') != 'refreshable' or not held.get('active', True): missing.append((row, there))
     if missing:
-        fix = owner_login_fix(t.row, missing[0]) + ', then claude-pool device add ' + t.where + ' --usage-owner'
-        return Step('usage-owner', 'failed', t.row['name'] + ' serves no refreshable login for ' + ', '.join(row['name'] for row in missing) +
+        fix = owner_login_fix(t.row, *missing[0]) + ', then claude-pool device add ' + t.where + ' --usage-owner'
+        return Step('usage-owner', 'failed', t.row['name'] + ' serves no refreshable login for ' + ', '.join(registry.describe(*item) for item in missing) +
                     ', so it could not read their usage; the usage owner stays ' + ((registry.owner(value) or {}).get('name') or 'unset'), fix)
     def move(current):
         for row in current['devices']: row['roles'] = ['usage'] if row['name'] == t.row['name'] else [r for r in row.get('roles', []) if r != 'usage']
@@ -858,11 +879,15 @@ def check_readings(t):
                     'first readings arrive within 5 min; needs ssh from ' + t.where + ' to ' + reach + ' without a password prompt')
     covered = t.status().get('sharedReadingsAccounts')
     if now - at <= READINGS_MAX_AGE_MS and isinstance(covered, list):
-        missing = [row for row in value['accounts'] if row['name'] not in covered]
+        # The readings carry the target's own names (readings.localize); each registry row is looked up under its name there.
+        rows = t.status().get('accounts') or {}
+        missing = [(row, registry.local_name(row, rows)) for row in value['accounts']]
+        missing = [(row, there) for row, there in missing if (there or row['name']) not in covered]
         if missing:
+            owners = (t.s.status_of(owner['name']) or {}).get('accounts') or {}
             return Step('readings', 'failed', 'the usage readings from ' + owner['name'] + ' have no row for ' +
-                        ', '.join(row['name'] for row in missing) + ' (the owner serves no refreshable login for it)',
-                        owner_login_fix(owner, missing[0]))
+                        ', '.join(registry.describe(*item) for item in missing) + ' (the owner serves no refreshable login for it)',
+                        owner_login_fix(owner, missing[0][0], registry.local_name(missing[0][0], owners)))
     if now - at <= READINGS_MAX_AGE_MS:
         return Step('readings', 'ok', 'from ' + owner['name'] + ', ' + str(max(0, now - at) // 60000) + ' min old')
     return Step('readings', 'missing', 'no usage readings from ' + owner['name'] + ' in the last 15 minutes',
@@ -1100,6 +1125,17 @@ def forget(row, local, remotes):
     return 0 if all(step.status in ('ok', 'skipped') for step in steps) else 1
 
 
+def unique_long_lived(theirs):
+    """The long-lived accounts another device holds (status rows by name) whose token this device holds under no name:
+    compared by fingerprint, so a copy kept here under another local name counts."""
+    try: rows = device_sync.account_rows()
+    except Exception: rows = []
+    held = {row.get(key) for row in rows for key, kind in (('fingerprint', 'kind'), ('servingFingerprint', 'servingKind'))
+            if row.get(kind) == 'long-lived' and row.get(key)}
+    return [account for account, entry in sorted(theirs.items())
+            if entry.get('kind') == 'long-lived' and entry.get('fingerprint') not in held]
+
+
 def remove(argv, out, remotes, local, **_):
     args = parse('remove', argv, (['name'], {}), (['--wait'], {'action': 'store_true'}), (['--uninstall'], {'action': 'store_true'}),
                  (['--forget'], {'action': 'store_true'}))
@@ -1127,12 +1163,7 @@ def remove(argv, out, remotes, local, **_):
               ' first. Nothing was changed.'); return 2
     except (device_sync.Missing, device_sync.Unreachable, device_sync.Failed, ValueError, RuntimeError, OSError) as error:
         print('Could not read the status of ' + args.name + ' (' + _redacted(error) + '). Nothing was changed.'); return 2
-    unique = []
-    for account, entry in sorted(theirs['accounts'].items()):
-        if entry.get('kind') != 'long-lived': continue
-        try: here = _local_fingerprint(account)
-        except Exception: here = None
-        if here is None or here != entry.get('fingerprint'): unique.append(account)
+    unique = unique_long_lived(theirs['accounts'])
     if unique:
         print(args.name + ' holds long-lived ' + ', '.join(unique) + ' that this device has no matching copy of; copy it here first: '
               'claude-pool device sync. Nothing was changed.')

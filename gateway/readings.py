@@ -1,4 +1,6 @@
-"""Usage readings move from the usage owner to the other devices. Only quota numbers travel, never identities or tokens.
+"""Usage readings move from the usage owner to the other devices. Only quota numbers travel, keyed by the owner's account
+names with each account's non-secret UUIDs (userId, organizationId, as in the registry), so a device that names the same
+subscription differently files them under its own name (localize). Never emails, profiles or tokens.
 device_sync is imported inside Puller.run_once: bridge -> readings -> device_sync -> accounts_cli -> bridge must not cycle."""
 import json
 import math
@@ -12,6 +14,7 @@ from remote import OUTDATED, Remote
 LIMIT = 65536
 KEYS = ('fiveHour', 'sevenDay', 'fableWeekly')
 ENTRY = {*KEYS, 'seenAt'}
+IDS = {'userId', 'organizationId'}  # optional: both or neither
 
 
 def number(value): return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
@@ -33,13 +36,17 @@ def check(value):
         if not isinstance(value['accounts'], dict): return None
         accounts = {}
         for name, entry in value['accounts'].items():
-            if not isinstance(name, str) or not isinstance(entry, dict) or set(entry) != ENTRY or not integer(entry['seenAt']): return None
+            if not isinstance(name, str) or not isinstance(entry, dict) or set(entry) not in (ENTRY, ENTRY | IDS) or not integer(entry['seenAt']): return None
             accounts[name] = {**{key: clean_window(entry[key]) for key in KEYS}, 'seenAt': min(entry['seenAt'], value['at'])}
+            if IDS <= set(entry):
+                if registry.ids(entry) is None: return None
+                accounts[name].update(userId=entry['userId'], organizationId=entry['organizationId'])
         return {'version': 1, 'device': value['device'], 'at': value['at'], 'accounts': accounts}
     except (TypeError, KeyError): return None
 
 
-def export(overview, device, now_ms):
+def export(overview, device, now_ms, ids=None):
+    """`ids`: account name -> (userId, organizationId) of this device's accounts, attached so others can match them."""
     accounts = {}
     for row in overview.get('accounts', []):
         if not isinstance(row, dict) or not isinstance(row.get('name'), str) or row.get('readingSource'): continue
@@ -52,8 +59,22 @@ def export(overview, device, now_ms):
                 entry[key] = {'pct': min(100, max(0, window['pct'])), 'resetsAt': int(reset) if number(reset) and reset >= 0 else None}
             else: entry[key] = None
         entry['seenAt'] = int(seen) if number(seen) and seen >= 0 else 0
+        pair = (ids or {}).get(row['name'])
+        if pair and registry.ids({'userId': pair[0], 'organizationId': pair[1]}): entry.update(userId=pair[0], organizationId=pair[1])
         accounts[row['name']] = entry
     return {'version': 1, 'device': device, 'at': now_ms, 'accounts': accounts}
+
+
+def localize(shared, rows):
+    """`shared` with each account filed under the name this device holds its subscription under (`rows`: status account
+    rows). An entry without UUIDs, or of a subscription this device does not hold, keeps its name; a matched entry wins
+    over one that only shares the name."""
+    matched, kept = {}, {}
+    for name, entry in shared['accounts'].items():
+        mine = registry.local_name({'name': name, **{key: entry[key] for key in IDS if key in entry}}, rows) if registry.ids(entry) else None
+        if mine: matched.setdefault(mine, entry)
+        else: kept[name] = entry
+    return {**shared, 'accounts': {**{name: entry for name, entry in kept.items() if name not in matched}, **matched}}
 
 
 def merge(rows, shared, now_ms, max_age_ms=900_000):
@@ -164,9 +185,15 @@ class AuthProbe:
         return state
 
 
+def default_local_accounts():
+    import device_sync
+    return device_sync.account_rows()
+
+
 class Puller:
-    def __init__(self, path, journal, remotes=Remote, interval=300, registry_every=3):
+    def __init__(self, path, journal, remotes=Remote, interval=300, registry_every=3, local_accounts=None):
         self.path, self.journal, self.remotes = path, journal, remotes
+        self.local_accounts = local_accounts or default_local_accounts
         self.interval, self.registry_every = interval, registry_every
         self.successes, self.failing = 0, False
 
@@ -192,6 +219,9 @@ class Puller:
         try: shared = check(json.loads(done.stdout))
         except ValueError: shared = None
         if not shared: return self.fail('bad reading')
+        if any(registry.ids(entry) for entry in shared['accounts'].values()):
+            try: shared = localize(shared, self.local_accounts())
+            except Exception: pass  # unreadable local accounts: the names stay as the owner sent them
         write_private(self.path, json.dumps(shared))
         self.failing = False
         self.successes += 1

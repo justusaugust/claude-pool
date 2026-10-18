@@ -51,8 +51,13 @@ def _json(done):
     return value if isinstance(value, dict) else None
 
 
+# The Mac App Store and standalone Tailscale apps put no `tailscale` on PATH; the CLI ships inside the app.
+MAC_TAILSCALE = '/Applications/Tailscale.app/Contents/MacOS/Tailscale'
+
+
 def tailscale_ip(remote):
     done = _run(remote, ['tailscale', 'ip', '-4'])
+    if done.returncode == 127: done = _run(remote, [MAC_TAILSCALE, 'ip', '-4'])  # not on PATH: the macOS app's CLI
     if done.returncode: return None
     for line in (done.stdout or b'').decode('utf-8', 'replace').splitlines():
         try: address = ipaddress.IPv4Address(line.strip())

@@ -629,8 +629,9 @@ class Machine:
                  linger='yes', shell=True, self_name=None, registry_value=None, accounts=None, service='running',
                  doctor=True, login=TEAM_LOGIN, cua=False, ip=None, preview='ours', rules=True, https=True,
                  overview=None, shared_at='fresh', conductor_part=None, switch_pending=(), herdr=None, label='io.github.claude-pool',
-                 refreshable=('team',), shared_accounts=('team',)):
+                 refreshable=('team',), shared_accounts=('team',), uuids=None):
         self.ssh, self.log = ssh, log
+        self.uuids = dict(uuids or {})  # name -> (userId, organizationId) the status reports, like a real device
         self.refreshable = set(refreshable)  # accounts this machine serves from its own refreshable login
         self.shared_accounts = list(shared_accounts)  # accounts in the usage readings it last received
         self.platform, self.reachable, self.launcher, self.native, self.version = platform, reachable, launcher, native, version
@@ -665,6 +666,7 @@ class Machine:
             rows.append({'name': n, 'kind': r.get('kind', 'long-lived'), 'fingerprint': r['fingerprint'], 'expiresAt': None,
                          'active': r.get('active', True), 'servingFingerprint': r['fingerprint'],
                          'servingKind': 'refreshable' if n in self.refreshable else r.get('kind', 'long-lived')})
+            if n in self.uuids: rows[-1].update(userId=self.uuids[n][0], organizationId=self.uuids[n][1])
         known = self.registry or registry.EMPTY()
         return {'name': self.self_name, 'version': self.version, 'platform': self.platform, 'service': self.service,
                 'accounts': rows, 'switchPending': self.switch_pending, 'registryGeneration': known['generation'],
@@ -771,7 +773,11 @@ class Machine:
             return ok(json.dumps({'result': 'replaced'}))
         if args[:1] == ['receive-account']:
             value = json.loads(data)
-            self.accounts[args[1]] = {'kind': 'long-lived', 'fingerprint': long_lived.fingerprint(value)}
+            ids = (value['shuntAccountUuid'], value['shuntOrganizationUuid'])
+            # Like device_sync.receive_account: the subscription this machine already has keeps its local name.
+            name = next((n for n, held in sorted(self.uuids.items()) if held == ids), args[1])
+            self.uuids[name] = ids
+            self.accounts[name] = {'kind': 'long-lived', 'fingerprint': long_lived.fingerprint(value)}
             return ok('installed')
         if args[:1] == ['self']: self.self_name = args[1]; return ok()
         if args[:1] == ['shell']:

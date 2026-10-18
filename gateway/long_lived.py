@@ -155,22 +155,26 @@ def health(stores, directory, value, now_ms, self_name, rejected=()):
                     mine.append(_finding('warn', name, 'not a long-lived token', 'move ' + str(path) + ' out of ' + str(directory))); continue
             values[label] = loaded
         served = values.get('store') or values.get('replica')
-        row = registry.account(value, name) or {}
-        fix = replace_fix(row.get('email'), name)
+        held = values.get('replica') or served or {}
+        # The registry row of this subscription, which may carry another name on the device that enrolled it.
+        row = registry.entry_for(value, {'name': name, 'userId': held.get('shuntAccountUuid'),
+                                         'organizationId': held.get('shuntOrganizationUuid')}) or {}
+        who = registry.describe(row, name) if row else name
+        fix = replace_fix(row.get('email'), row.get('name') or name)
         if served is not None:
             left = days_left(served, now_ms)
             if left is not None and left <= FAIL_DAYS:
-                mine.append(_finding('fail', name, 'expired' if left <= 0 else 'expires in %d days' % left, fix))
+                mine.append(_finding('fail', who, 'expired' if left <= 0 else 'expires in %d days' % left, fix))
             elif left is not None and left <= WARN_DAYS:
-                mine.append(_finding('warn', name, 'expires in %d days' % left, fix))
+                mine.append(_finding('warn', who, 'expires in %d days' % left, fix))
         replica = values.get('replica')
         if replica is not None and row.get('fingerprint'):
             try:
                 if fingerprint(replica) != row['fingerprint']:
-                    mine.append(_finding('fail', name, 'local token %s differs from the registry %s' % (fingerprint(replica), row['fingerprint']), 'claude-pool device sync'))
+                    mine.append(_finding('fail', who, 'local token %s differs from the registry %s' % (fingerprint(replica), row['fingerprint']), 'claude-pool device sync'))
             except RuntimeError: pass
         if name in rejected:
-            mine.append(_finding('fail', name, 'needs reauthenticate (the token was rejected while the account was cooling)', fix))
-        if name in pending: mine.append(_finding('warn', name, 'switch pending', 'claude-pool device switch'))
-        findings.extend(mine or [_finding('ok', name, 'ok')])
+            mine.append(_finding('fail', who, 'needs reauthenticate (the token was rejected while the account was cooling)', fix))
+        if name in pending: mine.append(_finding('warn', who, 'switch pending', 'claude-pool device switch'))
+        findings.extend(mine or [_finding('ok', who, 'ok')])
     return findings

@@ -281,10 +281,24 @@ def reserve(config, binary, paths, env, name, pct, *, registry_path=None):
                  rejected='Backend rejected the reserve; live routing is unchanged')
     if registry_path is not False:
         try:
-            if registry.account(registry.load(registry_path), name) is not None:
-                def note(value): registry.account(value, name)['reserveAt'] = pct or 0
+            # The registry row of this subscription, which may carry another name (the one of the device that enrolled it).
+            mine = member_identity(env.get('SHUNT_CLAUDE_ACCOUNTS_DIR'), name)
+            entry = registry.entry_for(registry.load(registry_path), mine)
+            if entry is not None:
+                def note(value): registry.account(value, entry['name'])['reserveAt'] = pct or 0
                 registry.update(note, registry_path)
         except ValueError: pass  # an unreadable registry never undoes a reserve that is already applied
+
+
+def member_identity(stores, name):
+    """A config member as a status-style row: name and the UUIDs of its pool store file (none when it is unreadable)."""
+    row = {'name': name, 'active': True}
+    if not stores or not re.fullmatch('[a-z0-9-]{1,80}', name): return row
+    try: value = credential(Path(stores) / (name + '.json'))
+    except (OSError, ValueError, RuntimeError): return row
+    user, org = ids(value)
+    if isinstance(user, str) and user and isinstance(org, str) and org: row.update(userId=user, organizationId=org)
+    return row
 
 
 def local_context():
@@ -299,10 +313,12 @@ def reserve_hook(value, context=None):
     try:
         config, binary, paths, env = context or local_context()
         local = {r['name']: r.get('reserveAt', 0) for r in load(config).get('accounts', [])}
+        members = [member_identity(env.get('SHUNT_CLAUDE_ACCOUNTS_DIR'), name) for name in local]
     except (OSError, ValueError, RuntimeError, ImportError): return
     failed = []
     for row in value.get('accounts', []):
-        name, want = row.get('name'), row.get('reserveAt')
+        # Each device holds the subscription under its own name; the registry row reaches it by UUIDs.
+        name, want = registry.local_name(row, members), row.get('reserveAt')
         if name not in local or want is None or want == local[name]: continue
         try: reserve(config, binary, paths, env, name, want or None, registry_path=False)
         except Exception: failed.append(name)

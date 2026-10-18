@@ -333,3 +333,40 @@ def conductor(value):
     return entry if entry is not None and device(value, entry['device']) is not None else None
 def device(value, name): return next((row for row in value['devices'] if row['name'] == name), None)
 def account(value, name): return next((row for row in value['accounts'] if row['name'] == name), None)
+
+
+# One subscription, one identity: (userId, organizationId). Each device may hold it under its own local name (machines
+# enrolled by hand named the same subscription differently), so whenever one side reasons about another side's accounts it
+# matches by UUIDs and falls back to the name only when a side has no UUIDs.
+
+def ids(row):
+    """(userId, organizationId) of a registry row or a `device status` account row, or None when either is missing."""
+    user, org = (row or {}).get('userId'), (row or {}).get('organizationId')
+    return (user, org) if isinstance(user, str) and user and isinstance(org, str) and org else None
+
+
+def same_subscription(a, b):
+    first, second = ids(a), ids(b)
+    if first and second: return first == second
+    return a.get('name') == b.get('name')
+
+
+def local_name(entry, rows):
+    """The local name `rows` (status account rows: name, userId, organizationId, active) hold the subscription of `entry` (a
+    registry row) under, or None. A served member wins over a copy that is not a member, then the registry's own name."""
+    rows = list(rows.values()) if isinstance(rows, dict) else list(rows or [])
+    found = [row for row in rows if isinstance(row, dict) and isinstance(row.get('name'), str) and same_subscription(entry, row)]
+    if not found: return None
+    return min(found, key=lambda row: (not row.get('active', True), row['name'] != entry.get('name'), row['name']))['name']
+
+
+def entry_for(value, row):
+    """The registry row of the subscription a local account `row` holds, or None (UUIDs first, the name only without them)."""
+    matches = [entry for entry in value['accounts'] if same_subscription(entry, row)]
+    return min(matches, key=lambda entry: (entry['name'] != row.get('name'), entry['name']), default=None)
+
+
+def describe(entry, local):
+    """`team (AI Værk Team, registry: ai-vaerk-team-premium)` when the local name differs from the registry name."""
+    if not local or local == entry['name']: return entry['name']
+    return local + ' (' + (entry.get('label') or entry['name']) + ', registry: ' + entry['name'] + ')'

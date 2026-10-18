@@ -121,7 +121,8 @@ def account_rows():
         try:
             row = {'name': name, 'kind': 'long-lived' if have else kind(value), 'fingerprint': fingerprint(value),
                    'expiresAt': long_lived.expires_at_ms(value), 'active': name in members, 'servingFingerprint': None,
-                   'servingKind': None}
+                   'servingKind': None, 'userId': _text(value.get('shuntAccountUuid')),
+                   'organizationId': _text(value.get('shuntOrganizationUuid'))}
             if name in strays: row['stray'] = True
             if name in members and store.exists() and not store.is_symlink():
                 try:
@@ -130,7 +131,20 @@ def account_rows():
                 except (OSError, ValueError, RuntimeError): pass
         except RuntimeError: continue
         rows.append(row)
+    # A copy that is not a member, of a subscription this device holds under another name, is reported, never served.
+    for row in rows:
+        if row['active']: continue
+        other = registry.local_name(row, rows)
+        if other and other != row['name']: row['duplicateOf'] = other
     return rows
+
+
+def _text(value): return value if isinstance(value, str) and value else None
+
+
+def local_name(entry, rows=None):
+    """The name this device holds the subscription of registry row `entry` under (UUIDs first), or None."""
+    return registry.local_name(entry, account_rows() if rows is None else rows)
 
 
 def status():
@@ -151,16 +165,45 @@ def send_account(name, out=None):
     out.write(path.read_bytes()); out.flush()
 
 
+def _long_lived_at(path):
+    """The fingerprint of the long-lived token at `path`, or None (absent, a symlink, refreshable or unreadable)."""
+    if path.is_symlink() or accounts_cli.stored_kind(path) != 'long-lived': return None
+    return fingerprint(read_private(path))
+
+
+def reconcile(name, local):
+    """A copy of `local`'s subscription kept under the registry name `name` (received before devices matched accounts by
+    UUIDs) joins the local name: the replica moves to `local` only while `local` holds no long-lived token; a pool-store
+    copy that is not a member is moved aside once the same token is held under `local`. Never deletes; a copy that stays
+    shows as `duplicateOf` in status (device check reports it)."""
+    if name == local or name in config_names(): return
+    stray, target = replica(name), replica(local)
+    if _long_lived_at(stray) is not None and long_lived_fingerprint(local) is None and not (target.exists() or target.is_symlink()):
+        os.replace(stray, target)
+    store = settings.STORES / (name + '.json')
+    held = _long_lived_at(target)
+    if held is not None and _long_lived_at(store) == held: retire_store(store, settings.STORES / '.retired')
+
+
 def receive_account(name, data, journal=None):
-    path = replica(name)
+    """Hold the long-lived token of registry account `name`. When this device already has that subscription (same UUIDs)
+    under another local name, the token is kept for the LOCAL name, never as a second account: a later switch replaces the
+    local refreshable grant in place, with its alias and sessions."""
+    check_name(name)
     if not isinstance(data, bytes) or len(data) > LIMIT: raise ValueError('Account file is larger than 128 KiB')
     try: value = json.loads(data)
     except ValueError: raise RuntimeError('Unsupported credential format') from None
     if kind(value) != 'long-lived': raise RuntimeError('Only a long-lived token can be received')
     fp = fingerprint(value)
+    info = {'userId': value['shuntAccountUuid'], 'organizationId': value['shuntOrganizationUuid']}
+    local = local_name({'name': name, **info}) or name
+    if not NAME.fullmatch(local): local = name
+    reconcile(name, local)
+    path = replica(local)
     known = registry.load()
+    entry = registry.account(known, name)
     have = fingerprint(read_private(path)) if accounts_cli.stored_kind(path) == 'long-lived' else None
-    want = (registry.account(known, name) or {}).get('fingerprint')
+    want = (entry or {}).get('fingerprint')
     # A replica that already is the token the registry names is never overwritten by an older one.
     if want and have == want and fp != want: return 'unchanged'
     same = have == fp
@@ -170,26 +213,28 @@ def receive_account(name, data, journal=None):
         if path.exists() or path.is_symlink(): retire_store(path, settings.STORES / '.retired')
         write_private(path, data)
     held = 'unchanged' if same else 'staged'
-    if is_owner(known) or registry.account(known, name) is None: return held
+    if is_owner(known) or entry is None: return held
     store = settings.STORES / path.name
     if store.is_symlink(): raise RuntimeError('Credential file must not be a symlink: ' + store.name)
     if store.exists():
         if accounts_cli.stored_kind(store) != 'long-lived' or fingerprint(read_private(store)) != fp: return held
-        if name in config_names(): return held
-    else: write_private(store, data)
-    row = registry.account(known, name) or {}
-    entry = {'name': name, 'label': row.get('label') or name.replace('-', ' ').title(), 'alias': row.get('alias') or name}
-    if row.get('plan'): entry['plan'] = row['plan']
-    info = {'userId': value['shuntAccountUuid'], 'organizationId': value['shuntOrganizationUuid']}
-    accounts_cli.register_local(entry, info)
-    if (row.get('reserveAt') or 0) > 0:
+        if local in config_names(): return held
+    else:
+        # Refused before anything is written: a second config row for a subscription this device serves adds no quota.
+        from account_metadata import load
+        accounts_cli.refuse_duplicate(load(settings.CONFIG).get('accounts', []), settings.STORES, local, info)
+        write_private(store, data)
+    member = {'name': local, 'label': entry.get('label') or local.replace('-', ' ').title(), 'alias': entry.get('alias') or local}
+    if entry.get('plan'): member['plan'] = entry['plan']
+    accounts_cli.register_local(member, info)
+    if (entry.get('reserveAt') or 0) > 0:
         try:
             config, binary, paths, env = accounts_cli.local_context()
-            accounts_cli.reserve(config, binary, paths, env, name, row['reserveAt'], registry_path=False)
+            accounts_cli.reserve(config, binary, paths, env, local, entry['reserveAt'], registry_path=False)
         except Exception:
             # The install stands; the failure is recorded for diagnostics, never in the return value.
             if journal is not None:
-                try: journal.record('reserve_not_applied', account=name)
+                try: journal.record('reserve_not_applied', account=local)
                 except Exception: pass
     return 'installed'
 
@@ -233,7 +278,7 @@ def receive_registry(data, overview=None, native_identity=None, elsewhere=()):
     try: incoming = registry.validate(json.loads(data))
     except ValueError as error: raise ValueError('Invalid registry: ' + str(error)) from None
     previous, now = registry.receive(incoming)
-    report = {'result': 'unchanged', 'removed': [], 'kept': [], 'kept_busy': [], 'kept_native': [], 'failed': {}, 'hooks': {}}
+    report = {'result': 'unchanged', 'removed': [], 'kept': [], 'kept_busy': [], 'kept_native': [], 'retired': [], 'failed': {}, 'hooks': {}}
     if now != previous: report['result'] = 'replaced' if now == registry.canonical(incoming) else 'merged'
     listed = {row['name'] for row in now['accounts']}
     tombs = {row['name']: row for row in now.get('removed', []) if row['kind'] == 'account' and row['name'] not in listed}
@@ -241,7 +286,9 @@ def receive_registry(data, overview=None, native_identity=None, elsewhere=()):
     for name, tomb in sorted(tombs.items()):
         if not NAME.fullmatch(name): continue
         try:
-            if name not in config_names() and not any((folder / (name + '.json')).exists() for folder in (settings.STORES, settings.LONG_LIVED)): continue
+            if name not in config_names() and not any((folder / (name + '.json')).exists() for folder in (settings.STORES, settings.LONG_LIVED)):
+                report['retired'] += retire_renamed(name, tomb.get('fingerprint'), now)
+                continue
             held = long_lived_fingerprint(name)
             if held is not None and held != tomb.get('fingerprint') and held not in set(elsewhere):
                 report['kept'].append(name)  # another token than the one removed, and maybe its only copy
@@ -270,6 +317,21 @@ def receive_registry(data, overview=None, native_identity=None, elsewhere=()):
             try: hook(now); report['hooks'][label] = 'ok'
             except Exception as error: report['hooks'][label] = 'failed: ' + type(error).__name__
     return report
+
+
+def retire_renamed(name, fp, value):
+    """A removed registry account this device holds under another local name: only the long-lived replica of exactly the
+    removed token is moved aside (never unlinked), so a later switch cannot serve it; the local login and its membership
+    stay. A replica the pool store already serves stays too (the account is in use; device check shows the drift), and so
+    does a token a registry row still names (enrolled again under another name)."""
+    if not fp or any(row.get('fingerprint') == fp for row in value['accounts']): return []
+    retired = []
+    for path in sorted(settings.LONG_LIVED.glob('*.json')):
+        local = path.stem
+        if local == name or local.startswith('.') or not NAME.fullmatch(local) or _long_lived_at(path) != fp: continue
+        if _long_lived_at(settings.STORES / path.name) == fp: continue
+        retire_store(path, settings.STORES / '.retired'); retired.append(local)
+    return retired
 
 
 def secrets():
@@ -326,15 +388,18 @@ def push(remote):
             known = registry.load()
             if theirs.get('registryHash') != registry.digest(known):
                 peer(remote, 'receive-registry', stdin=json.dumps(known).encode())
-        known = registry.load()
+        known, mine = registry.load(), account_rows()
         for row in known['accounts']:
-            path = settings.LONG_LIVED / (row['name'] + '.json')
+            here = local_name(row, mine) or row['name']
+            if not NAME.fullmatch(here): continue
+            path = settings.LONG_LIVED / (here + '.json')
             if accounts_cli.stored_kind(path) != 'long-lived': continue
             data = path.read_bytes()
-            mine = fingerprint(json.loads(data))
-            if row.get('fingerprint') and mine != row['fingerprint']: continue  # not the token the registry names; never push an older one
-            if theirs['accounts'].get(row['name'], {}).get('fingerprint') == mine: continue
-            peer(remote, 'receive-account', row['name'], stdin=data)
+            mine_fp = fingerprint(json.loads(data))
+            if row.get('fingerprint') and mine_fp != row['fingerprint']: continue  # not the token the registry names; never push an older one
+            there = registry.local_name(row, theirs['accounts'])
+            if there is not None and theirs['accounts'][there].get('fingerprint') == mine_fp: continue
+            peer(remote, 'receive-account', row['name'], stdin=data)  # the receiver keeps it under its own name
     return guarded(work, remote.name)
 
 
@@ -342,13 +407,18 @@ def pull(remote):
     def work():
         theirs = peer_status(remote)
         merge_from(remote, theirs)
-        known = {row['name']: row for row in registry.load()['accounts']}
-        for name, row in sorted(theirs['accounts'].items()):
-            path = settings.LONG_LIVED / (name + '.json')
-            if row.get('kind') != 'long-lived' or row.get('stray') or name not in known or not NAME.fullmatch(name): continue
-            if known[name].get('fingerprint') and row.get('fingerprint') != known[name]['fingerprint']: continue
-            if accounts_cli.stored_kind(path) == 'long-lived' and fingerprint(read_private(path)) == row.get('fingerprint'): continue
-            receive_account(name, peer(remote, 'send-account', name))
+        mine = account_rows()
+        offered = {name: row for name, row in theirs['accounts'].items()
+                   if row.get('kind') == 'long-lived' and not row.get('stray') and NAME.fullmatch(name)}
+        for entry in registry.load()['accounts']:
+            there = registry.local_name(entry, offered)
+            if there is None: continue
+            row = offered[there]
+            if entry.get('fingerprint') and row.get('fingerprint') != entry['fingerprint']: continue
+            probe = entry if registry.ids(entry) else {**entry, 'userId': row.get('userId'), 'organizationId': row.get('organizationId')}
+            here = local_name(probe, mine) or entry['name']
+            if NAME.fullmatch(here) and _long_lived_at(replica(here)) == row.get('fingerprint'): continue
+            receive_account(entry['name'], peer(remote, 'send-account', there))
     return guarded(work, remote.name)
 
 

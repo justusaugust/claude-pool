@@ -251,9 +251,9 @@ class ReserveTests(unittest.TestCase):
         value['accounts'] = [{'name': 'team', 'email': 'a@b.de', 'reserveAt': 85}, {'name': 'ops', 'reserveAt': 0}, {'name': 'gone', 'reserveAt': 50}, {'name': 'new'}]
         paths, env = setup.local_paths_env(self.runtime, self.stores)
         context = (self.config, self.binary, paths, env)
-        with patch.object(setup, 'registry') as fake:
+        with patch.object(setup.registry, 'update') as update:  # the hook applies, it never writes the registry
             setup.reserve_hook(value, context)
-            fake.update.assert_not_called()
+            update.assert_not_called()
         self.assertEqual(self.row('team')['reserveAt'], 85)
         self.assertEqual(self.block('team')['max_utilization'], 0.85)
         self.assertNotIn('reserveAt', self.row('ops'))

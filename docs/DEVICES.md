@@ -97,6 +97,8 @@ There is no sudo and no root step anywhere in `add`.
 
 Refreshable accounts stay on the one machine that logged in; they are never copied. The only credentials copied between machines are long-lived tokens, only by `device` commands, through an SSH pipe into 0600 files. A token is identified by its fingerprint (the first 12 hex digits of the SHA-256 of the access token), which is what `check` compares.
 
+An account is identified by its subscription (account and organization UUIDs), not by its name. Each machine may hold the same subscription under its own name, for example `team` on the VPS and `ai-vaerk-team-premium` on the Mac. Every device command matches accounts across machines by subscription and falls back to the name only when one side has no UUIDs; messages name both, as in `team (AI Værk Team, registry: ai-vaerk-team-premium)`. A synced long-lived token is kept under the local name of the subscription, so `device switch` replaces that machine's own login in place (alias and sessions stay) and never adds a second account. A copy that arrived under the registry name before this matching existed moves to the local name on the next sync, unless that name already holds a long-lived token; then `check` lists it and it stays (it is never deleted).
+
 ```sh
 claude-pool account add <email> --long-lived --name <name>
 claude-pool account add <email> --long-lived --replace --name <name>
