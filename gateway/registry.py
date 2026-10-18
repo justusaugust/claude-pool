@@ -17,9 +17,10 @@ import settings
 
 LIMIT = 256 * 1024
 NAME = re.compile(r'[a-z0-9-]{1,40}')
+HERDR_SESSION = re.compile(r'(?!\.{1,2}$)[A-Za-z0-9._-]{1,64}')
 TOKEN_PREFIX = 'sk-' + 'ant-'
 TOP = {'version', 'generation', 'updatedAt', 'devices', 'accounts', 'conductor', 'conductorGeneration', 'removed'}
-DEVICE_KEYS = {'name', 'ssh', 'platform', 'roles', 'tailscaleIp', 'cua', 'cuaTunnels', 'herdrSession', 'addedAt', 'generation'}
+DEVICE_KEYS = {'name', 'ssh', 'platform', 'roles', 'tailscaleIp', 'cua', 'cuaTunnels', 'herdrSession', 'herdrSessions', 'addedAt', 'generation'}
 ACCOUNT_TEXT = ['label', 'alias', 'plan', 'email', 'organization', 'userId', 'organizationId', 'fingerprint']
 ACCOUNT_KEYS = {'name', 'expiresAt', 'reserveAt', 'generation', *ACCOUNT_TEXT}
 TOMBSTONE_KEYS = {'kind', 'name', 'generation', 'fingerprint'}
@@ -60,6 +61,9 @@ def check_device(row):
     roles = row.get('roles', [])
     if not isinstance(roles, list) or any(role != 'usage' for role in roles) or len(set(roles)) != len(roles): raise ValueError("Device roles may only be ['usage']")
     if not isinstance(row.get('cua', False), bool): raise ValueError('cua must be true or false')
+    sessions = row.get('herdrSessions', [])  # herdr sessions on this device that come back after a reboot (device_herdr)
+    if (not isinstance(sessions, list) or any(not isinstance(s, str) or not HERDR_SESSION.fullmatch(s) for s in sessions)
+            or len(set(sessions)) != len(sessions)): raise ValueError('herdrSessions must be a list of distinct herdr session names')
     tunnels = row.get('cuaTunnels', {})  # peer device name -> loopback port of the SSH tunnel this device reaches its Cua host through
     if not isinstance(tunnels, dict) or any(not isinstance(peer, str) or not NAME.fullmatch(peer) or not is_int(port) or not 1024 <= port <= 65535
                                             for peer, port in tunnels.items()):

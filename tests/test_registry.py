@@ -163,6 +163,12 @@ class RegistryTests(unittest.TestCase):
         for bad in ['Mac', 'a b', '', 'x' * 41, '../x']:
             with self.assertRaises(ValueError): registry.update(lambda v: v['devices'].append({**MAC, 'name': bad}), self.path)
 
+    def test_herdr_sessions_are_a_list_of_unique_session_names(self):
+        for bad in ['main', [1], ['a b'], ['../x'], ['x' * 65], ['main', 'main']]:
+            with self.assertRaises(ValueError): registry.update(lambda v: v['devices'].append({**VPS, 'herdrSessions': bad}), self.path)
+        value = registry.update(lambda v: v['devices'].append({**VPS, 'herdrSessions': ['main', 'pr-coord', 'a.b_c']}), self.path)
+        self.assertEqual(value['devices'][0]['herdrSessions'], ['main', 'pr-coord', 'a.b_c'])
+
     def test_reserve_at_must_be_0_to_99(self):
         for bad in [100, -1, 'x', True, 1.5]:
             with self.assertRaises(ValueError): registry.update(lambda v: v['accounts'].append({**ENTRY, 'reserveAt': bad}), self.path)

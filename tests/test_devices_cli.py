@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'gateway'))
 import accounts_cli
 import conductor
 import device_cua
+import device_herdr
 import device_install
 import device_integrations
 import device_preview
@@ -125,7 +126,7 @@ class RoutingTests(DeviceCliBase):
         self.assertEqual(devices_cli.INTERNAL_VERBS, ['status', 'registry', 'receive-registry', 'receive-account', 'send-account',
                                                       'identity', 'readings', 'shell', 'cua-token', 'cua-tunnel', 'conductor serve',
                                                       'conductor install', 'conductor uninstall', 'forget-accounts', 'self',
-                                                      'preview-rules'])
+                                                      'preview-rules', 'herdr-units'])
 
     def test_cua_tunnel_verb_runs_on_this_device_and_prints_json(self):
         with patch.object(device_cua, 'tunnel_add', return_value={'port': 32342, 'running': True}) as add, \
@@ -158,10 +159,10 @@ class RoutingTests(DeviceCliBase):
 class RegistrationTests(DeviceCliBase):
     def test_every_status_part_is_registered(self):
         quiet = lambda *a, **k: FakeRemote('local', lambda argv, data: answer(127))
-        for module in (device_cua, device_integrations, device_preview):
+        for module in (device_cua, device_herdr, device_integrations, device_preview):
             item = patch.object(module, 'Local', quiet); item.start(); self.addCleanup(item.stop)
         status = device_sync.status()
-        self.assertTrue({'linger', 'shell', 'nativeLogin', 'herdrProfiles', 'conductor', 'cua', 'preview'} <= set(status))
+        self.assertTrue({'linger', 'shell', 'nativeLogin', 'herdrProfiles', 'herdrUnits', 'conductor', 'cua', 'preview'} <= set(status))
         self.assertIn(conductor.apply_hook, device_sync.INTEGRATION_HOOKS)
         self.assertIn(device_integrations.apply_hook, device_sync.INTEGRATION_HOOKS)
         self.assertFalse(self.marker.exists())
@@ -644,8 +645,10 @@ class Machine:
                  linger='yes', shell=True, self_name=None, registry_value=None, accounts=None, service='running',
                  doctor=True, login=TEAM_LOGIN, cua=False, ip=None, preview='ours', rules=True, https=True,
                  overview=None, shared_at='fresh', conductor_part=None, switch_pending=(), herdr=None, label='io.github.claude-pool',
-                 refreshable=('team',), shared_accounts=('team',), uuids=None):
+                 refreshable=('team',), shared_accounts=('team',), uuids=None, herdr_units=None):
         self.ssh, self.log = ssh, log
+        # what device_herdr.report() says there: the saved herdr sessions, whether they run and what serves them
+        self.herdr_units = herdr_units or {'available': False, 'reason': 'herdr is not installed'}
         self.uuids = dict(uuids or {})  # name -> (userId, organizationId) the status reports, like a real device
         self.refreshable = set(refreshable)  # accounts this machine serves from its own refreshable login
         self.shared_accounts = list(shared_accounts)  # accounts in the usage readings it last received
@@ -693,7 +696,8 @@ class Machine:
                 'cua': {'host': self.host, 'spaces': list(self.spaces), 'mcp': self.mcp,
                         'tunnels': json.loads(json.dumps(self.tunnels))} if self.cua else None,
                 'preview': {'installed': self.preview == 'ours', 'https': self.https}, 'overview': self.overview,
-                'sharedReadingsAt': self.shared_at, 'sharedReadingsAccounts': list(self.shared_accounts), 'serviceLabel': self.label}
+                'sharedReadingsAt': self.shared_at, 'sharedReadingsAccounts': list(self.shared_accounts), 'serviceLabel': self.label,
+                'herdrUnits': json.loads(json.dumps(self.herdr_units))}
 
     def event(self, label): self.log.append((self.ssh, label))
 
@@ -820,6 +824,14 @@ class Machine:
                 self.conductor = dict(self.conductor, **getattr(self, 'after_failed_install', {}))
                 return answer(1, b'vps\n  failed      conductor     another Conductor is running\n')
             self.conductor = {'installed': True, 'running': True, 'ready': True, 'fresh': False, 'duplicates': []}; return ok()
+        if args[:1] == ['herdr-units']:
+            self.event('herdr-units ' + ' '.join(args[1:]) if args[1:] else 'herdr-units')
+            if 'herdr-units' in self.fail: return answer(1)
+            if args[1:] == ['--remove']: self.herdr_units = {'available': True, 'template': 'absent', 'sessions': []}; return ok()
+            for row in self.herdr_units.get('sessions') or []:
+                if not row.get('unit'): row['enabled'] = True
+            self.herdr_units['template'] = 'current'
+            return ok()
         if args == ['cua-token']: return ok(CUA_FIXTURE_TOKEN) if self.host else answer(1)
         if args[:2] == ['cua-tunnel', 'add']:
             port = (self.tunnels.get(args[2]) or {}).get('port', 32342)
@@ -1106,6 +1118,7 @@ class CheckTests(OrchestrationBase):
         self.vps.accounts, self.vps.service, self.vps.doctor = {}, 'stopped', False
         self.vps.cua, self.vps.ip, self.vps.preview, self.vps.rules = False, '100.64.0.2', 'absent', False
         self.vps.shared_at = None; self.local.herdr = []
+        self.vps.herdr_units = {'available': True, 'template': 'absent', 'sessions': [{'name': 'dashboard', 'running': True, 'enabled': False}]}
         registry.update(lambda value: registry.device(value, 'vps')['roles'].clear() or registry.device(value, 'mac')['roles'].append('usage'), self.reg)
         (self.app / 'ssh_configs.json').unlink()
         code, out, err = self.cli('check', 'vps')
@@ -1191,6 +1204,92 @@ class CheckTests(OrchestrationBase):
         self.assertEqual(code, 2); self.assertIn('device list', out + err)
 
 
+class HerdrUnitsTests(OrchestrationBase):
+    MISSING = 'ssh justus@vps .local/bin/claude-pool device herdr-units'
+
+    def setUp(self):
+        super().setUp()
+        self.local.herdr = [{'id': 'p1', 'label': 'vps', 'target': 'justus@vps'}]
+        registry.update(lambda value: value['devices'].extend([dict(SELF_ROW, roles=['usage']), dict(VPS, ssh='justus@vps', roles=[])]), self.reg)
+        self.vps.registry, self.vps.self_name = registry.load(self.reg), 'vps'
+        self.vps.accounts = {'team': {'kind': 'long-lived', 'fingerprint': self.team_fp}}
+
+    def sessions(self, *rows, template='absent'):
+        self.vps.herdr_units = {'available': True, 'template': template, 'sessions': [dict(row) for row in rows]}
+
+    def test_add_enables_the_units_of_running_sessions_without_adopting_them(self):
+        self.sessions({'name': 'dashboard', 'running': True, 'enabled': False, 'active': False},
+                      {'name': 'trial', 'running': True, 'unit': 'herdr-trial.service'})
+        code, out, err = self.cli('add', 'justus@vps', '--name', 'vps')
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual([label for _, label in self.log if label.startswith('herdr-units')], ['herdr-units'])
+        found = step_of(out, 'herdr-sessions')
+        self.assertEqual(found.group(1), 'ok'); self.assertIn('herdr-trial.service', found.group(2))
+
+    def test_add_records_the_herdr_session_in_the_registry_row(self):
+        self.sessions({'name': 'objekt', 'running': False, 'enabled': False})
+        code, out, err = self.cli('add', 'justus@vps', '--name', 'vps', '--herdr-session', 'objekt')
+        self.assertEqual(code, 0, out + err)
+        row = registry.device(registry.load(self.reg), 'vps')
+        self.assertEqual((row['herdrSession'], row['herdrSessions']), ('objekt', ['objekt']))
+        self.assertEqual([label for _, label in self.log if label.startswith('herdr-units')], ['herdr-units'])
+        self.cli('add', 'justus@vps', '--name', 'vps', '--herdr-session', 'dashboard')
+        self.assertEqual(registry.device(registry.load(self.reg), 'vps')['herdrSessions'], ['objekt', 'dashboard'])
+
+    def test_check_names_missing_sessions_and_the_internal_verb(self):
+        self.sessions({'name': 'dashboard', 'running': True, 'enabled': False}, {'name': 'leitstand', 'running': False, 'enabled': False},
+                      template='current')
+        code, out, _ = self.cli('check', 'vps')
+        self.assertEqual(code, 2)
+        self.assertRegex(out, r'missing +herdr-sessions +nothing brings dashboard back after a reboot\n      fix: ' + re.escape(self.MISSING) + '\n')
+        self.assertFalse([label for _, label in self.log if label.startswith('herdr-units')])
+
+    def test_check_skips_macos_and_machines_without_herdr(self):
+        self.assertEqual(step_of(self.cli('check', 'vps')[1], 'herdr-sessions').group(1), 'skipped')
+        registry.update(lambda value: registry.device(value, 'vps').update(platform='darwin'), self.reg)
+        self.sessions({'name': 'dashboard', 'running': True, 'enabled': False})
+        found = step_of(self.cli('check', 'vps')[1], 'herdr-sessions')
+        self.assertEqual((found.group(1), found.group(2).strip()), ('skipped', device_herdr.LINUX_ONLY))
+
+    def test_remove_stops_when_the_units_cannot_be_removed(self):
+        self.vps.fail = {'herdr-units'}
+        code, out, err = self.cli('remove', 'vps')
+        self.assertEqual(code, 1)
+        self.assertRegex(out, r'failed +herdr-sessions .*\n      fix: ssh justus@vps \.local/bin/claude-pool device herdr-units --remove')
+        self.assertIsNotNone(registry.device(registry.load(self.reg), 'vps'))
+        self.assertNotIn('--stop', [label for _, label in self.log])
+
+    def test_remove_of_a_mac_never_asks_for_herdr_units(self):
+        registry.update(lambda value: registry.device(value, 'vps').update(platform='darwin'), self.reg)
+        self.assertEqual(self.cli('remove', 'vps')[0], 0)
+        self.assertFalse([label for _, label in self.log if label.startswith('herdr-units')])
+
+
+class HerdrUnitsVerbTests(DeviceCliBase):
+    def setUp(self):
+        super().setUp(); self.parts_off()
+        self.devices(MAC, dict(VPS, herdrSessions=['objekt']))
+        registry.set_self('vps', self.self_path)
+
+    def test_the_verb_passes_the_registry_sessions_and_its_flags(self):
+        steps = [Step('objekt', 'ok', 'started by claude-pool-herdr@objekt.service')]
+        with patch.object(device_herdr, 'apply', return_value=steps) as apply, patch.object(device_herdr, 'Host') as host:
+            code, out, _ = self.run_cli(['herdr-units', '--adopt', '--session', 'dashboard'])
+        self.assertEqual(code, 0); self.assertIn('started by claude-pool-herdr@objekt.service', out)
+        apply.assert_called_once_with(host.return_value, ['objekt'], adopt=True, only=['dashboard'])
+
+    def test_refused_or_failed_sessions_exit_1_and_remove_calls_remove(self):
+        with patch.object(device_herdr, 'apply', return_value=[Step('d', 'manual', 'x', 'y')]), patch.object(device_herdr, 'Host'):
+            self.assertEqual(self.run_cli(['herdr-units', '--adopt'])[0], 1)
+        with patch.object(device_herdr, 'remove', return_value=Step('herdr-sessions', 'ok', 'removed')) as remove, \
+                patch.object(device_herdr, 'Host') as host:
+            self.assertEqual(self.run_cli(['herdr-units', '--remove'])[0], 0)
+        remove.assert_called_once_with(host.return_value)
+        self.assertEqual(self.run_cli(['herdr-units', '--session', '../x'])[0], 2)
+        self.assertEqual(self.run_cli(['herdr-units', '--remove', '--adopt'])[0], 2)
+        self.assertFalse(self.marker.exists())
+
+
 class RemoveTests(OrchestrationBase):
     def setUp(self):
         super().setUp()
@@ -1237,7 +1336,7 @@ class RemoveTests(OrchestrationBase):
     def test_remove_undoes_preview_shell_service_accounts_cua_herdr_and_registry(self):
         code, out, err = self.cli('remove', 'vps')
         self.assertEqual(code, 0, out + err)
-        self.assertEqual(self.order(), ['preview', 'shell', '--stop', 'unit', 'forget-accounts', 'cua', 'herdr', 'registry'])
+        self.assertEqual(self.order(), ['preview', 'herdr-units --remove', 'shell', '--stop', 'unit', 'forget-accounts', 'cua', 'herdr', 'registry'])
         self.assertEqual(self.vps.accounts, {'personal': {'kind': 'refreshable', 'fingerprint': '1' * 12}})
         self.assertIsNone(registry.device(registry.load(self.reg), 'vps'))
         self.assertEqual(self.local.herdr, []); self.assertEqual(self.local.spaces, [])

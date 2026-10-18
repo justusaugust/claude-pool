@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'gateway'))
 import conductor
 import device_cua
+import device_herdr
 import device_install
 import device_preview
 import device_report
@@ -42,7 +43,8 @@ class DeviceDocs(unittest.TestCase):
         for name in device_report.CHECK_NAMES: self.assertIn('| `' + name + '`', text)
         self.assertIn('docs/DEVICES.md', (ROOT / 'README.md').read_text())
         for word in ['conductor snapshot', 'preview file', 'account reserve', 'forget-accounts', '--forget',
-                     'one Native Authorize click', 'cua-spacesd', 'tailscale set --operator']:
+                     'one Native Authorize click', 'cua-spacesd', 'tailscale set --operator', 'claude-pool-herdr@', 'herdr-trial.service',
+                     'device herdr-units --adopt']:
             self.assertIn(word.lower(), text.lower())
 
     def test_other_docs_carry_their_device_parts(self):
@@ -60,7 +62,8 @@ class DeviceDocs(unittest.TestCase):
                   'linger': ['sudo loginctl enable-linger'], 'readings': ['BatchMode'], 'service': ['claude-pool --start'],
                   'install': ['Python 3.11'], 'doctor': ['ssh <device>'],
                   'preview': [remote.remote_command('<ssh-target>', device_preview.RESTORE), 'reboot'],
-                  'conductor': ['ssh <device> .local/bin/claude-pool device conductor install', conductor.adopt_fix('abc').split(',')[0]]}
+                  'conductor': ['ssh <device> .local/bin/claude-pool device conductor install', conductor.adopt_fix('abc').split(',')[0]],
+                  'herdr-sessions': [remote.remote_command('<ssh-target>', device_herdr.VERB), device_herdr.VERB + ' --adopt']}
         for name, words in pieces.items():
             row = next(line for line in table.splitlines() if line.startswith('| `' + name + '`'))
             for word in words:

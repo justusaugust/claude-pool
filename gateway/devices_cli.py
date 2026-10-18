@@ -19,6 +19,7 @@ import accounts_cli
 # Every module that contributes a STATUS_PARTS or INTEGRATION_HOOKS entry, imported here so registration never depends on call order.
 import conductor
 import device_cua
+import device_herdr  # noqa: F401  (registers herdrUnits)
 import device_install
 import device_integrations  # noqa: F401  (registers herdrProfiles and its hook)
 import device_preview
@@ -36,7 +37,8 @@ import settings
 
 USER_VERBS = ['add', 'check', 'remove', 'list', 'sync', 'switch', 'conductor move', 'conductor status']
 INTERNAL_VERBS = ['status', 'registry', 'receive-registry', 'receive-account', 'send-account', 'identity', 'readings', 'shell',
-                  'cua-token', 'cua-tunnel', 'conductor serve', 'conductor install', 'conductor uninstall', 'forget-accounts', 'self', 'preview-rules']
+                  'cua-token', 'cua-tunnel', 'conductor serve', 'conductor install', 'conductor uninstall', 'forget-accounts', 'self', 'preview-rules',
+                  'herdr-units']
 CHECK_HELP = {
     'reachable': ('ssh to the device works without a password prompt', 'ssh <ssh-target> true must work without a password prompt (BatchMode)'),
     'native-claude': ('Native Claude Code is installed', 'curl -fsSL https://claude.ai/install.sh | bash on the device'),
@@ -49,6 +51,9 @@ CHECK_HELP = {
     'doctor': ('claude-pool doctor on the device reports nothing', 'run ssh <device> .local/bin/claude-pool doctor and apply the fix it prints'),
     'native-login': ('Native Claude is logged in to an account the pool serves', 'claude-pool device add <ssh-target> and click Authorize; claude-native auth status if it cannot be read'),
     'herdr': ('this machine has a herdr profile for the device', 'herdr machine add <ssh-target> --label <name>'),
+    'herdr-sessions': ('every saved herdr session that runs or that add registered comes back after a reboot (Linux devices only)',
+                       remote_command('<ssh-target>', device_herdr.VERB) + '; to hand a running session to its unit now, while its agents are idle: '
+                       + remote_command('<ssh-target>', device_herdr.VERB + ' --adopt')),
     'app': ('the Mac that runs the Claude app lists and trusts the SSH environment', 'the Claude app clicks printed under Needs you'),
     'cua': ('the device shares its desktop through Cua and the machines can reach each other', 'see docs/DEVICES.md, Cua; macOS: switch on cua-spacesd in Accessibility, then claude-pool device add <ssh-target> --cua'),
     'conductor': ('exactly one Conductor runs, on the registry device, connected to Remote Control', 'not connected: turn Remote Control on in the Claude app, wait two minutes, run claude-pool device check <device>, then ssh <device> .local/bin/claude-pool device conductor install --restart; not running: ssh <device> .local/bin/claude-pool device conductor install; claude-pool device conductor move <device>; stop the hand-started Conductor (herdr session conductor)'),
@@ -69,7 +74,8 @@ DEVICE_HELP = '\n'.join([
     '      Adds or repairs a machine; rerun to finish what is missing. N matches [a-z0-9-]{1,40}, default from the host name.',
     '      --cua also shares desktops through Cua. --usage-owner makes it the usage poller (and creates the Conductor if none exists);',
     '      it needs its own refreshable login for every account (claude-pool account add <email> --name <name> on it), else it is refused.',
-    '      --herdr-session S: the herdr profile on this machine opens session S on the target (herdr machine add --remote-session S).',
+    '      --herdr-session S: the herdr profile on this machine opens session S on the target (herdr machine add --remote-session S),',
+    '      and S comes back after a reboot there like every running session (a claude-pool-herdr@S unit, Linux).',
     '  device check [name] [--probe] [--json]   Reads every check below, changes nothing. --probe sends one tiny Claude request per long-lived account.',
     '  device remove <name> [--wait] [--uninstall] [--forget]',
     '      Stops the pool there, removes its token copies and herdr profile; never destroys the only copy of a token (run device sync first).',
@@ -107,6 +113,9 @@ DEVICE_HELP = '\n'.join([
     'RELATED TOOLS',
     '  claude-pool conductor snapshot|events|tell|journal   what Conductor Claude uses to watch and prompt herdr agents',
     '  preview <port> | preview file <path>                 share a dev server or one file or folder over Tailscale (Linux devices)',
+    '  device herdr-units [--adopt] [--session S]          on a Linux device: a unit per herdr session, so it comes back after a reboot.',
+    '                                                       A running session stays as it is until the next boot; --adopt hands it to its',
+    '                                                       unit now, only while none of its agents is working or waiting.',
     '  Removal runs forget-accounts on the device, only after its pool is stopped. A lost machine: device remove <name> --forget.',
     '', 'Internal verbs (called over SSH): ' + ', '.join(INTERNAL_VERBS)])
 from long_lived import REPLACE_GONE, REPLACE_WHERE, replace_fix
@@ -236,6 +245,21 @@ def shell(argv, out, **_):
     changed = (device_install.shell_add if action == 'add' else device_install.shell_remove)(rc)
     print(('Changed ' if changed else 'Unchanged ') + str(rc))
     return 0
+
+
+def herdr_units(argv, out, **_):
+    """This device's herdr session units (device_herdr): enable them, --adopt running sessions, or --remove ours."""
+    args = parse('herdr-units', argv, (['--adopt'], {'action': 'store_true'}), (['--remove'], {'action': 'store_true'}),
+                 (['--session'], {'action': 'append'}))
+    if args.remove and (args.adopt or args.session): raise Usage('herdr-units --remove takes no other option')
+    for name in args.session or []:
+        if not registry.HERDR_SESSION.fullmatch(name): raise Usage('--session takes letters, digits, dot, dash and underscore')
+    host = device_herdr.Host()
+    if args.remove: steps = [device_herdr.remove(host)]
+    else: steps = device_herdr.apply(host, device_herdr.listed(), adopt=args.adopt, only=args.session) or [
+        Step(device_herdr.STEP, 'ok', 'no saved herdr session runs or is registered')]
+    print(render('herdr sessions on ' + (registry.self_name() or 'this device'), steps))
+    return 0 if all(step.status in ('ok', 'skipped') for step in steps) else 1
 
 
 def cua_token(argv, out, **_):
@@ -759,6 +783,21 @@ def ensure_herdr(t):
     return device_integrations.ensure_herdr(t.row, t.s.local, lambda ssh: t.s.remotes(ssh).reachable())
 
 
+def check_herdr_sessions(t):
+    if t.row.get('platform') == 'darwin': return Step('herdr-sessions', 'skipped', device_herdr.LINUX_ONLY)
+    if not t.supported: return t.needs_install('herdr-sessions')
+    return device_herdr.check(t.status().get('herdrUnits'), t.row.get('herdrSessions') or [], t.on(device_herdr.VERB))
+
+
+def ensure_herdr_sessions(t):
+    """Enables a unit for every session that misses one; never adopts (that stops a running server)."""
+    step = check_herdr_sessions(t)
+    if step.status != 'missing': return step
+    t.remote.device('herdr-units', timeout=POOL_TIMEOUT)
+    t.forget()
+    return check_herdr_sessions(t)
+
+
 def check_app(t): return device_integrations.check_app(t.row, device_integrations.APP_DIR, local_platform())
 
 
@@ -1020,11 +1059,11 @@ def ensure_preview(t):
 
 CHECKS = {'reachable': check_reachable, 'native-claude': check_native_claude, 'install': check_install, 'version': check_version,
           'linger': check_linger, 'shell': check_shell, 'accounts': check_accounts, 'service': check_service, 'doctor': check_doctor,
-          'native-login': check_native_login, 'herdr': check_herdr, 'app': check_app, 'cua': check_cua,
+          'native-login': check_native_login, 'herdr': check_herdr, 'herdr-sessions': check_herdr_sessions, 'app': check_app, 'cua': check_cua,
           'conductor': check_conductor, 'readings': check_readings, 'preview': check_preview}
 ENSURES = {'install': ensure_install, 'version': ensure_version, 'linger': ensure_linger, 'shell': ensure_shell,
            'accounts': ensure_accounts, 'service': ensure_service, 'native-login': ensure_native_login, 'herdr': ensure_herdr,
-           'cua': ensure_cua, 'conductor': ensure_conductor, 'readings': ensure_readings, 'preview': ensure_preview}
+           'herdr-sessions': ensure_herdr_sessions,           'cua': ensure_cua, 'conductor': ensure_conductor, 'readings': ensure_readings, 'preview': ensure_preview}
 assert set(CHECKS) == set(CHECK_NAMES) and set(ENSURES) <= set(CHECKS)
 
 
@@ -1049,7 +1088,9 @@ def _desired(value, me, name, target, platform, args):
         row = {'name': name, 'ssh': target, 'platform': platform, 'roles': [], 'addedAt': int(time.time())}
         value['devices'].append(row)
     row['ssh'], row['platform'] = target, platform
-    if args.herdr_session: row['herdrSession'] = args.herdr_session
+    if args.herdr_session:
+        row['herdrSession'] = args.herdr_session
+        row['herdrSessions'] = list(dict.fromkeys([*(row.get('herdrSessions') or []), args.herdr_session]))
     if args.cua: row['cua'] = True
     if args.usage_owner and 'usage' not in row.get('roles', []):
         for other in value['devices']: other['roles'] = [role for role in other.get('roles', []) if role != 'usage']
@@ -1071,7 +1112,7 @@ def add(argv, out, remotes, local, **_):
     args = parse('add', argv, (['target'], {}), (['--name'], {}), (['--cua'], {'action': 'store_true'}),
                  (['--usage-owner'], {'action': 'store_true'}), (['--herdr-session'], {}))
     target, value, me = args.target, registry.load(), registry.self_name()
-    if args.herdr_session is not None and not re.fullmatch(r'[A-Za-z0-9._-]{1,64}', args.herdr_session):
+    if args.herdr_session is not None and not registry.HERDR_SESSION.fullmatch(args.herdr_session):
         raise Usage('--herdr-session takes letters, digits, dot, dash and underscore')
     known = next((row for row in value['devices'] if row.get('ssh') == target), None)
     name = args.name or (known['name'] if known else name_for(target))
@@ -1282,6 +1323,11 @@ def remove(argv, out, remotes, local, **_):
     preview = run_step(lambda t: device_preview.remove(remote), 'preview', _Plain(row))
     steps = [preview._replace(fix=again) if preview.status == 'failed' else preview]
     if preview.status == 'failed': return stop_here(steps)
+    if row.get('platform') == 'linux':  # its units, never another unit; running herdr sessions keep running until the next boot
+        if remote.device('herdr-units', '--remove', timeout=POOL_TIMEOUT).returncode:
+            return stop_here(steps + [Step('herdr-sessions', 'failed', 'could not remove the herdr session units',
+                                           on(device_herdr.VERB + ' --remove'))])
+        steps.append(Step('herdr-sessions', 'ok', 'no claude-pool herdr session unit left; running sessions keep running until the next reboot'))
     if not device_install.remove_shell(remote):
         return stop_here(steps + [Step('shell', 'failed', 'could not remove the claude function', on('claude-pool device shell remove'))])
     if device_install.shell_left(remote):
@@ -1340,7 +1386,7 @@ VERBS = {'add': add, 'check': check, 'remove': remove, 'list': list_devices, 'sy
          'switch': switch, 'conductor': conductor_verb, 'status': status, 'registry': show_registry,
          'receive-registry': receive_registry, 'receive-account': receive_account, 'send-account': send_account,
          'identity': identity, 'readings': export_readings, 'shell': shell, 'cua-token': cua_token, 'cua-tunnel': cua_tunnel,
-         'forget-accounts': forget_accounts, 'self': name_self, 'preview-rules': preview_rules}
+         'forget-accounts': forget_accounts, 'self': name_self, 'preview-rules': preview_rules, 'herdr-units': herdr_units}
 
 
 def cli(argv, *, remotes=Remote, local=Local(), out=sys.stdout):
