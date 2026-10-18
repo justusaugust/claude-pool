@@ -168,6 +168,7 @@ def write(path, data):
         raise
 
 
-def unload_hint(label):
-    if platform() == 'darwin': return 'launchctl bootout gui/$(id -u)/' + label
+def unload_hint(label, system=None):
+    """The command that unloads the service; `system` ('darwin' or 'linux') names another machine's platform."""
+    if (system or platform()) == 'darwin': return 'launchctl bootout gui/$(id -u)/' + label
     return 'systemctl --user disable --now ' + label + '.service'

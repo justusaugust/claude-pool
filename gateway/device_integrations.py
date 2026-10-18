@@ -53,6 +53,16 @@ def ensure_herdr(device, local, reachable):
     return Step('herdr', 'ok', 'profile added')
 
 
+def check_herdr(device, local):
+    """Like ensure_herdr, but only reads: whether a profile for the device's ssh target exists here."""
+    rows = _list(local)
+    if rows is None: return Step('herdr', 'skipped', 'herdr is not available on this machine')
+    ssh = device.get('ssh')
+    if _is_self(device) or not ssh: return Step('herdr', 'skipped', 'this machine' if _is_self(device) else 'no ssh target')
+    if any(row.get('target') == ssh for row in rows): return Step('herdr', 'ok', 'profile present')
+    return Step('herdr', 'missing', 'no herdr profile for ' + ssh, 'herdr machine add ' + ssh + ' --label ' + device['name'])
+
+
 def remove_herdr(device, local):
     rows = _list(local)
     if rows is None: return Step('herdr', 'skipped', 'herdr is not available on this machine')
