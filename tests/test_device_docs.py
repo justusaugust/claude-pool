@@ -11,8 +11,10 @@ sys.path.insert(0, str(ROOT / 'gateway'))
 import conductor
 import device_cua
 import device_install
+import device_preview
 import device_report
 import devices_cli
+import remote
 
 DEVICES = ROOT / 'docs' / 'DEVICES.md'
 DOCS = [ROOT / 'README.md', *sorted((ROOT / 'docs').glob('*.md'))]
@@ -57,6 +59,7 @@ class DeviceDocs(unittest.TestCase):
         pieces = {'native-claude': [device_install.NATIVE_FIX], 'cua': [device_cua.DOCS_FIX, 'device add <ssh-target> --cua'],
                   'linger': ['sudo loginctl enable-linger'], 'readings': ['BatchMode'], 'service': ['claude-pool --start'],
                   'install': ['Python 3.11'], 'doctor': ['ssh <device>'],
+                  'preview': [remote.remote_command('<ssh-target>', device_preview.RESTORE), 'reboot'],
                   'conductor': ['ssh <device> .local/bin/claude-pool device conductor install', conductor.adopt_fix('abc').split(',')[0]]}
         for name, words in pieces.items():
             row = next(line for line in table.splitlines() if line.startswith('| `' + name + '`'))

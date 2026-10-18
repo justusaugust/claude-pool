@@ -53,7 +53,7 @@ CHECK_HELP = {
     'cua': ('the device shares its desktop through Cua and the machines can reach each other', 'see docs/DEVICES.md, Cua; macOS: switch on cua-spacesd in Accessibility, then claude-pool device add <ssh-target> --cua'),
     'conductor': ('exactly one Conductor runs, on the registry device, connected to Remote Control', 'not connected: turn Remote Control on in the Claude app, wait two minutes, run claude-pool device check <device>, then ssh <device> .local/bin/claude-pool device conductor install --restart; not running: ssh <device> .local/bin/claude-pool device conductor install; claude-pool device conductor move <device>; stop the hand-started Conductor (herdr session conductor)'),
     'readings': ('usage readings from the usage owner are fresh', 'ssh -o BatchMode=yes <owner> true must work from the device'),
-    'preview': ('the preview tool is installed and links are HTTPS (Linux devices only)', 'claude-pool device add <ssh-target>; a root user runs sudo tailscale set --operator=<user> for HTTPS'),
+    'preview': ('the preview tool is installed, links are HTTPS and every preview comes back after a reboot (Linux devices only)', 'claude-pool device add <ssh-target>; a root user runs sudo tailscale set --operator=<user> for HTTPS; previews that would not survive a reboot: ' + remote_command('<ssh-target>', device_preview.RESTORE)),
 }
 assert tuple(CHECK_HELP) == CHECK_NAMES
 DEVICE_HELP = '\n'.join([

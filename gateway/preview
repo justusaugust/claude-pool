@@ -9,6 +9,7 @@ import argparse
 import asyncio
 import bisect
 import codecs
+import errno
 import html
 import io
 import ipaddress
@@ -90,7 +91,11 @@ COMMANDS
                                   Cua desktops list and every desktop share. A folder named only with digits,
                                   or named cua: write ./2026 or ./cua
   preview stop --all              stop every preview, file share and Cua share this tool created (nothing else)
-  preview doctor                  which backend is available and how to enable HTTPS
+  preview doctor                  which backend is available, how to enable HTTPS, and whether every
+                                  preview comes back after a reboot
+  preview restore                 make every preview this tool knows come back after a reboot (for previews
+                                  an older version started; preview doctor says when). Same ports, same links.
+                                  Safe to run again.
 
 BACKENDS (chosen automatically)
   https  Tailscale Serve: https://<vps>.<tailnet>.ts.net:<port>, needs the operator setting.
@@ -105,6 +110,8 @@ BACKENDS (chosen automatically)
   reloads itself every few seconds. Ports 22, 80 and 443 are refused (system services).
   A file share adds one more unit, preview-file-<port>.service: a read-only file server bound
   to 127.0.0.1 only, which the proxy above exposes like any other port.
+  Previews survive a reboot: every unit is a file in ~/.config/systemd/user, enabled and started, and
+  the Tailscale Serve entry is kept by tailscaled; preview stop disables and deletes exactly those files.
   Tests: python3 -m unittest preview_test (in ~/.local/bin).
 """
 
@@ -522,6 +529,16 @@ class Proxy:
             return
 
 
+def address_missing(host):
+    """True when no interface carries this address yet (EADDRNOTAVAIL), e.g. tailscale0 just after a reboot."""
+    with socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET, socket.SOCK_STREAM) as probe:
+        try:
+            probe.bind((host.strip("[]"), 0))
+        except OSError as e:
+            return e.errno == errno.EADDRNOTAVAIL
+    return False
+
+
 async def start_proxy_server(listen_host, listen_port, proxy):
     listen_host = check_listen_host(listen_host)  # the bind-address guarantee, enforced at the socket
     return await asyncio.start_server(proxy.handle, listen_host, listen_port, limit=1 << 20, reuse_address=True)
@@ -555,7 +572,8 @@ def cmd_serve(args):
             server = await start_proxy_server(host, port, proxy)
         except OSError as e:
             print(f"preview: cannot listen on {host}:{port}: {e.strerror or e}", file=sys.stderr)
-            return EXIT_CONFIG
+            # After a reboot the unit can start before tailscale0 has its address: exit so systemd tries again.
+            return 1 if address_missing(host) else EXIT_CONFIG
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
@@ -1406,6 +1424,34 @@ def cmd_cua_index(args):
 
 
 # ---------------------------------------------------------------------------
+# Unit files (~/.config/systemd/user): every preview is an enabled unit, so it comes back after a reboot
+# ---------------------------------------------------------------------------
+
+UNIT_MARKER = "# Written by preview; `preview stop` disables and deletes this file."
+UNIT_NAME = re.compile(r"preview-(?:\d{1,5}|file-\d{1,5}|cua-index)(?:\.service)?")
+_SYSTEMD_PLAIN = re.compile(r"[A-Za-z0-9_./:@,+=-]+")
+
+
+def systemd_word(arg):
+    """One ExecStart= argument, quoted so systemd passes it through unchanged ($$ and %% are a literal $ and %)."""
+    if CONTROL_CHARS.search(arg):
+        raise ValueError("refusing a unit command that contains control characters")
+    if _SYSTEMD_PLAIN.fullmatch(arg):
+        return arg
+    return '"' + arg.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%").replace("$", "$$") + '"'
+
+
+def unit_file_text(description, argv):
+    """The unit file of one preview unit: the same command and restart rules the transient units had, plus [Install]."""
+    description = printable(description).strip().rstrip("\\").strip().replace("%", "%%") or "preview"
+    return "\n".join([
+        UNIT_MARKER, "[Unit]", f"Description={description}", "StartLimitIntervalSec=0", "",
+        "[Service]", "ExecStart=" + " ".join(systemd_word(arg) for arg in argv), "Restart=on-failure", "RestartSec=2",
+        f"RestartPreventExitStatus={EXIT_CONFIG}", "Environment=PYTHONUNBUFFERED=1", "",
+        "[Install]", "WantedBy=default.target", ""])
+
+
+# ---------------------------------------------------------------------------
 # System access (tailscale, systemd --user, ss). Tests replace this class.
 # ---------------------------------------------------------------------------
 
@@ -1493,20 +1539,78 @@ class System:
         r = self.run(["systemctl", "--user", "is-active", unit], timeout=10)
         return (r.stdout or "").strip() or "unknown"
 
+    def unit_dir(self):
+        """Where the systemd user manager reads unit files (it does not see this shell's XDG_CONFIG_HOME)."""
+        return Path.home() / ".config" / "systemd" / "user"
+
+    def unit_path(self, unit):
+        return self.unit_dir() / (unit if unit.endswith(".service") else unit + ".service")
+
+    def has_unit_file(self, unit):
+        """True when the unit is a regular file this tool wrote (its first line is UNIT_MARKER)."""
+        if not isinstance(unit, str) or not UNIT_NAME.fullmatch(unit):
+            return False
+        path = self.unit_path(unit)
+        try:
+            if path.is_symlink() or not path.is_file():
+                return False
+            with open(path, encoding="utf-8", errors="replace") as f:
+                return f.readline().rstrip("\n") == UNIT_MARKER
+        except OSError:
+            return False
+
     def unit_start(self, unit, description, argv):
+        """Write the unit file, enable and start it, so the preview comes back after a reboot. A unit an older version
+        started with systemd-run (transient) is stopped first; the file then takes its place with the same command."""
+        try:
+            text = unit_file_text(description, argv)
+        except ValueError as e:
+            return False, str(e)
+        if not UNIT_NAME.fullmatch(unit):
+            return False, f"refusing to manage {printable(unit)!r}: not a preview unit"
+        path = self.unit_path(unit)
+        if (path.exists() or path.is_symlink()) and not self.has_unit_file(unit):
+            return False, f"{path} exists and was not written by preview; remove or rename it"
         self.run(["systemctl", "--user", "stop", unit], timeout=20)
         self.run(["systemctl", "--user", "reset-failed", unit], timeout=10)
-        r = self.run([
-            "systemd-run", "--user", "--quiet", f"--unit={unit}", f"--description={description}",
-            "-p", "Restart=on-failure", "-p", "RestartSec=2", "-p", f"RestartPreventExitStatus={EXIT_CONFIG}",
-            "-p", "StartLimitIntervalSec=0", "--setenv=PYTHONUNBUFFERED=1",
-            *(arg.replace("$", "$$") for arg in argv),  # systemd expands $VAR and ${VAR} in the command; $$ is a literal $
-        ], timeout=30)
-        return r.returncode == 0, (r.stderr or r.stdout).strip()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(f".{path.name}.tmp")
+            tmp.write_text(text)
+            tmp.chmod(0o644)
+            tmp.replace(path)
+        except OSError as e:
+            return False, f"cannot write {path}: {e.strerror or e}"
+        self.run(["systemctl", "--user", "daemon-reload"], timeout=30)
+        why = ""
+        for verb in ("enable", "start"):
+            r = self.run(["systemctl", "--user", verb, unit], timeout=30)
+            if r.returncode != 0:
+                why = (r.stderr or r.stdout).strip() or f"systemctl --user {verb} {unit} failed"
+                break
+        else:
+            r = self.run(["systemctl", "--user", "show", "-p", "FragmentPath", "--value", unit], timeout=10)
+            loaded = (r.stdout or "").strip()
+            if not loaded or os.path.realpath(loaded) != os.path.realpath(path):
+                why = f"systemd runs {unit} from {printable(loaded) or 'no file'}, not from {path}"
+        if why:
+            self.unit_stop(unit)  # no half-made unit stays enabled
+            return False, why
+        return True, ""
 
     def unit_stop(self, unit):
+        """Stop a preview unit; when it is a unit file this tool wrote, also disable and delete that file (nothing else)."""
+        ours = self.has_unit_file(unit)
+        if ours:
+            self.run(["systemctl", "--user", "disable", unit], timeout=20)
         self.run(["systemctl", "--user", "stop", unit], timeout=20)
         self.run(["systemctl", "--user", "reset-failed", unit], timeout=10)
+        if ours:
+            try:
+                self.unit_path(unit).unlink()
+            except FileNotFoundError:
+                pass
+            self.run(["systemctl", "--user", "daemon-reload"], timeout=30)
 
     def unit_log(self, unit, lines=5):
         r = self.run(["journalctl", "--user", "-u", unit, "-n", str(lines), "--no-pager", "-o", "cat"], timeout=10)
@@ -1648,9 +1752,8 @@ def wait_listening(sysm, host, port, seconds=4.0):
     return False
 
 
-def start_unit(sysm, entry):
-    unit = entry["unit"]
-    host, lport = parse_hostport(entry["listen"])
+def proxy_argv(sysm, entry):
+    """The proxy command for a recorded preview; a Cua share always keeps its owner gate (ValueError when it cannot)."""
     argv = ["/usr/bin/python3", "-I", self_path(), "_serve", "--listen", entry["listen"],
             "--target", str(entry["port"]), "--public-url", entry["link"], "--tailnet-ip", sysm.tailnet()[0]]
     if cua_unit_of(entry):
@@ -1658,6 +1761,19 @@ def start_unit(sysm, entry):
     elif cua_space_of(entry):
         space_host, space_port = space_address(entry["space_id"])
         argv += ["--upstream-host", space_host, "--upstream-port", str(space_port), "--owner-login", entry["owner_login"]]
+    elif entry.get("kind") in ("cua", "cua-space"):
+        raise ValueError("its Cua share record is incomplete, so it would start without the owner gate; "
+                         "run preview cua again")
+    return argv
+
+
+def start_unit(sysm, entry):
+    unit = entry["unit"]
+    host, lport = parse_hostport(entry["listen"])
+    try:
+        argv = proxy_argv(sysm, entry)
+    except ValueError as e:
+        return False, str(e)
     ok, err = sysm.unit_start(unit, f"preview {entry['port']}: {entry['label']}", argv)
     if not ok:
         return False, err or "systemd-run failed"
@@ -1730,8 +1846,15 @@ def cmd_start(sysm, port, label=None, out=None, err=None, cua=None):
     if existing and same_share and entry_healthy(sysm, existing):
         upgrade = existing["backend"] == "http" and operator is True and forced != "http"
         if not upgrade:
-            if label != existing.get("label"):
-                existing["label"] = label
+            changed = label != existing.get("label")
+            existing["label"] = label
+            if not existing.get("persistent"):  # an older version's transient unit: same port, listen and link, as a file
+                started, msg = start_unit(sysm, existing)
+                if not started:
+                    print(f"preview: could not keep port {port} across a reboot: {msg}", file=err)
+                    return 1
+                existing["persistent"] = changed = True
+            if changed:
                 save_state(existing)
             print(existing["link"], file=out)
             print(note_for(existing, target_listening(sysm, port), sysm), file=err)
@@ -1753,6 +1876,7 @@ def cmd_start(sysm, port, label=None, out=None, err=None, cua=None):
                 sysm.serve_remove(port)
                 print(f"preview: could not start the proxy for port {port}: {msg}", file=err)
                 return 1
+            entry["persistent"] = True
     if entry is None:
         if cua is not None:  # the login gate only holds behind Tailscale Serve; never fall back to HTTP for this share
             print(f"preview: the Cua desktops link needs HTTPS through Tailscale Serve, which is not available here "
@@ -1767,6 +1891,7 @@ def cmd_start(sysm, port, label=None, out=None, err=None, cua=None):
         if not started:
             print(f"preview: could not start the proxy for port {port}: {msg}", file=err)
             return 1
+        entry["persistent"] = True
     save_state(entry)
     print(entry["link"], file=out)
     print(note_for(entry, target_listening(sysm, port), sysm), file=err)
@@ -1818,7 +1943,7 @@ def cmd_stop(sysm, port=None, all_=False, out=None, err=None, path=None, cua=Fal
         index = load_state(CUA_PORT)
         entries = ([index] if index and cua_unit_of(index) else []) + [e for e in all_states() if cua_space_of(e)]
         if not entries:
-            if sysm.unit_state(CUA_UNIT) == "active":  # an index left behind without its link
+            if sysm.unit_state(CUA_UNIT) == "active" or sysm.has_unit_file(CUA_UNIT):  # an index left without its link
                 sysm.unit_stop(CUA_UNIT)
             print("preview: no Cua desktops share running (see preview list)", file=err)
             return 1
@@ -1879,8 +2004,12 @@ def plan_file_share(sysm, path, label=None):
     label = label or (existing or {}).get("label") or (root.name + ("/" if root.is_dir() else ""))
     return {"path": str(root), "kind": "folder" if root.is_dir() else "file", "port": port, "label": label,
             "serve": ("127.0.0.1", port), "unit": f"{FILE_UNIT_PREFIX}{port}.service", "proxy_unit": f"{UNIT_PREFIX}{port}",
-            "backend": backend, "reuse": existing is not None,
-            "argv": ["/usr/bin/python3", "-I", self_path(), "_serve-file", "--root", str(root), "--port", str(port)]}
+            "backend": backend, "reuse": existing is not None, "persistent": bool(existing and existing.get("persistent")),
+            "argv": file_server_argv(root, port)}
+
+
+def file_server_argv(root, port):
+    return ["/usr/bin/python3", "-I", self_path(), "_serve-file", "--root", str(root), "--port", str(port)]
 
 
 def file_plan(argv, sysm):
@@ -1900,7 +2029,7 @@ def cmd_file(sysm, path, label=None, out=None, err=None):
         return 1
     port, unit = plan["port"], plan["unit"]
     host, lport = plan["serve"]
-    if not (sysm.unit_state(unit) == "active" and sysm.can_connect(host, lport)):
+    if not (plan["persistent"] and sysm.unit_state(unit) == "active" and sysm.can_connect(host, lport)):
         ok, msg = sysm.unit_start(unit, f"preview file {port}: {plan['label']}", plan["argv"])
         if ok and not wait_listening(sysm, host, lport):
             ok, msg = False, sysm.unit_log(unit) or f"file server did not start listening on {host}:{lport}"
@@ -1975,6 +2104,7 @@ def cmd_doctor(sysm, out=None):
     linger = sysm.run(["loginctl", "show-user", user, "-p", "Linger", "--value"], timeout=10).stdout.strip()
     print(f"linger         {linger or 'unknown'} (yes = previews keep running after logout)", file=out)
     print(f"previews       {len(all_states())} open (preview list)", file=out)
+    persistence_line(sysm, out)
     login, share = sysm.owner_login(), load_state(CUA_PORT)
     if not sysm.cua_path():
         print("cua desktops   cua is not installed, so preview cua cannot run (install Cua, check cua --version)", file=out)
@@ -1987,6 +2117,87 @@ def cmd_doctor(sysm, out=None):
         running = "running" if share and cua_unit_of(share) else "not running"
         print(f"cua desktops   preview cua gives {printable(login)} one link to every Cua desktop ({running})", file=out)
     return 0
+
+
+def entry_units(entry):
+    """Every unit a recorded preview runs: its proxy, plus the file server or the Cua desktops index."""
+    return [entry.get("unit")] + [u for u in (file_unit_of(entry), cua_unit_of(entry)) if u]
+
+
+def transient_previews(sysm):
+    """Recorded previews with a unit that is not a unit file (an older version started it with systemd-run)."""
+    return [e for e in all_states() if not all(sysm.has_unit_file(u) for u in entry_units(e))]
+
+
+def persistence_line(sysm, out):
+    transient = transient_previews(sysm)
+    if transient:
+        ports = ", ".join(printable(e.get("port")) for e in transient)
+        print(f"persistent     no ({ports} would not come back after a reboot); fix: preview restore", file=out)
+    else:
+        print("persistent     yes (every preview comes back after a reboot)", file=out)
+
+
+def unit_specs(sysm, entry):
+    """[(unit, description, argv, (host, port), seconds)] to rebuild a recorded preview's units, file server or index
+    first. ValueError (or KeyError, TypeError) when the record cannot be trusted to rebuild them."""
+    port = entry["port"]
+    if not isinstance(port, int) or entry["unit"] != f"{UNIT_PREFIX}{port}":
+        raise ValueError("its record does not name its own unit")
+    host, lport = parse_hostport(entry["listen"])
+    check_listen_host(host)
+    label = entry.get("label") or f"port {port}"
+    specs = []
+    if file_unit_of(entry):
+        root = check_share_root(entry["path"])
+        if str(root) != entry["path"]:
+            raise ValueError(f"{entry['path']} now resolves to {root}; run preview file again")
+        specs.append((file_unit_of(entry), f"preview file {port}: {label}", file_server_argv(root, port),
+                      ("127.0.0.1", port), 4.0))
+    if cua_unit_of(entry):
+        cua = sysm.cua_path()
+        if not cua:
+            raise ValueError("cua is not installed (install it from github.com/trycua/cua, then check cua --version)")
+        specs.append((CUA_UNIT, "preview cua: Cua desktops index", cua_index_argv(sysm, cua), ("127.0.0.1", CUA_PORT), 20.0))
+    specs.append((entry["unit"], f"preview {port}: {label}", proxy_argv(sysm, entry), (host, lport), 4.0))
+    return specs
+
+
+def cmd_restore(sysm, out=None, err=None):
+    """Give every recorded preview without a unit file one (stop the transient unit, write, enable, start). Ports and
+    links stay as recorded; the Tailscale Serve entries are kept by tailscaled and not touched."""
+    out, err = out or sys.stdout, err or sys.stderr
+    restored, failed = 0, 0
+    for entry in all_states():
+        missing = [u for u in entry_units(entry) if not sysm.has_unit_file(u)]
+        if not missing:
+            continue
+        what = printable(f"{entry.get('port')} ({entry.get('label')})")
+        try:
+            specs = unit_specs(sysm, entry)
+        except (KeyError, TypeError, ValueError) as e:
+            print(f"preview: could not restore {what}: {printable(e)}", file=err)
+            failed += 1
+            continue
+        for unit, description, argv, (host, lport), seconds in specs:
+            if unit not in missing:
+                continue
+            ok, msg = sysm.unit_start(unit, description, argv)
+            if ok and not (wait_up(sysm, host, lport, seconds) if unit == CUA_UNIT else wait_listening(sysm, host, lport, seconds)):
+                ok, msg = False, sysm.unit_log(unit) or f"it did not come up on {host}:{lport}"
+            if not ok:
+                sysm.unit_stop(unit)
+                print(f"preview: could not restore {what}: {unit}: {printable(msg) or 'systemctl failed'}", file=err)
+                failed += 1
+                break
+        else:
+            entry["persistent"] = True
+            save_state(entry)
+            restored += 1
+            print(f"restored {what}: comes back after a reboot, link {entry['link']}", file=out)
+    if not restored and not failed:
+        print("nothing to restore: every preview already comes back after a reboot", file=out)
+    return 1 if failed else 0
 
 
 def wait_up(sysm, host, port, seconds=20.0):
@@ -2035,13 +2246,16 @@ def cua_plan(sysm, label=None):
             continue
         taken.add(port)
         spaces.append({**space, "port": port})
-    _, public_host = sysm.tailnet()
     return {"port": CUA_PORT, "label": label or (existing or {}).get("label") or CUA_LABEL,
             "serve": ("127.0.0.1", CUA_PORT), "unit": CUA_UNIT, "proxy_unit": f"{UNIT_PREFIX}{CUA_PORT}",
             "backend": "https", "owner_login": login, "cua": cua, "spaces": spaces, "stale": stale,
-            "skipped": skipped, "unplaced": unplaced,
-            "argv": ["/usr/bin/python3", "-I", self_path(), "_cua-index", "--port", str(CUA_PORT), "--cua", cua,
-                     "--public-host", public_host, "--state-dir", str(state_dir())]}
+            "skipped": skipped, "unplaced": unplaced, "persistent": bool(existing and existing.get("persistent")),
+            "argv": cua_index_argv(sysm, cua)}
+
+
+def cua_index_argv(sysm, cua):
+    return ["/usr/bin/python3", "-I", self_path(), "_cua-index", "--port", str(CUA_PORT), "--cua", cua,
+            "--public-host", sysm.tailnet()[1], "--state-dir", str(state_dir())]
 
 
 def cmd_cua(sysm, label=None, out=None, err=None):
@@ -2053,7 +2267,7 @@ def cmd_cua(sysm, label=None, out=None, err=None):
         return 1
     host, lport = plan["serve"]
     active = sysm.unit_state(CUA_UNIT) == "active"
-    if not (active and sysm.can_connect(host, lport)):
+    if not (plan["persistent"] and active and sysm.can_connect(host, lport)):
         if not active and (sysm.listeners(lport) or target_listening(sysm, lport)):
             print(f"preview: something else already listens on port {lport}; stop it, then run preview cua again", file=err)
             return 1
@@ -2098,7 +2312,7 @@ def cmd_cua(sysm, label=None, out=None, err=None):
 def build_parser():
     p = argparse.ArgumentParser(prog="preview", description=HELP, formatter_class=argparse.RawDescriptionHelpFormatter,
                                 usage="preview <port> [--name LABEL] | file <path> [--name LABEL] | cua [--name LABEL] | list [--json] | "
-                                      "stop <port>|<path>|cua|--all | doctor")
+                                      "stop <port>|<path>|cua|--all | doctor | restore")
     p.add_argument("--version", action="version", version=f"preview {VERSION}")
     return p
 
@@ -2161,6 +2375,9 @@ def parse(argv):
     if cmd == "doctor":
         argparse.ArgumentParser(prog="preview doctor").parse_args(argv[1:])
         return "doctor", None
+    if cmd == "restore":
+        argparse.ArgumentParser(prog="preview restore").parse_args(argv[1:])
+        return "restore", None
     if cmd == "_serve":
         sp = argparse.ArgumentParser(prog="preview _serve")
         sp.add_argument("--listen", required=True)
@@ -2198,6 +2415,8 @@ def main(argv=None, sysm=None):
         return cmd_cua(sysm, a.name)
     if cmd == "doctor":
         return cmd_doctor(sysm)
+    if cmd == "restore":
+        return cmd_restore(sysm)
     return cmd_start(sysm, a.port, a.name)
 
 

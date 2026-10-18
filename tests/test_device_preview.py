@@ -20,16 +20,19 @@ import device_sync
 from fakes import FakeRemote
 from remote import Completed
 
-TOOL_SHA = 'c4aaac57cf0bb23e4a64d91e2435d638d87bab1dfb66f14e2102a51a079198f5'
+TOOL_SHA = '8cba203c1f2566ec033d47dc39189c7dbf0643fc68fd619720f8a19c1bc4c0d0'
 PREVIOUS_SHA = 'b3e645e7ba9750057b68c12f7dd518d19ff792a98062eeea857115b194358d94'  # the copy live on personal-vps
 FIRST_FILE_SHARE_SHA = '89c880b1411939c7996239273e28aa51399a1dca1cd56e387754e82e235faabe'  # Task 16's first release
 BEFORE_HOST_CHECK_SHA = '7894d83a893ab63cc07ec07244b910ae8fce1949b080ba355a3b08f6e3903efd'  # the release before the Host check
 BEFORE_CUA_SHA = 'fc7f0f3162eadf48ca4f1b942aef8b25f6446fba8fdc1e64bafc959c718a5a11'  # the release before `preview cua`
 FIRST_CUA_SHA = 'ce9f107b5620bea133df4972781e0630bc880b2b2d933f6761e3d84f855bd90b'  # first `preview cua`, on the VPS
 VIEWER_COOKIE_SHA = '27adcbcf4e189571c911730040e606e5a961a81debe3080d62bf9d8551b489aa'  # `cua viewer` with its cookie
+BEFORE_REBOOT_SHA = 'c4aaac57cf0bb23e4a64d91e2435d638d87bab1dfb66f14e2102a51a079198f5'  # one Cua link; transient units
 OTHER_SHA = '0' * 64
 RUN = 'cd "$HOME" && exec .local/bin/preview "$@"'
 DOCTOR_HTTPS = 'tailnet name   box.ts.net\nbackend        https (Tailscale Serve is allowed for this user)\n'
+PERSISTENT_YES = 'persistent     yes (every preview comes back after a reboot)\n'
+PERSISTENT_NO = 'persistent     no (8820, 18500 would not come back after a reboot); fix: preview restore\n'
 DOCTOR_HTTP = 'tailnet name   box.ts.net\nbackend        http (Tailscale Serve not allowed for this user; links look like http://x:<port>)\n'
 
 
@@ -124,7 +127,8 @@ class InstallTests(unittest.TestCase):
         self.assertNotIn(TOOL_SHA, ' '.join(argv))
 
     def test_known_previous_copy_is_updated_in_place(self):
-        self.assertEqual(device_preview.KNOWN_PREVIOUS, {PREVIOUS_SHA, FIRST_FILE_SHARE_SHA, BEFORE_HOST_CHECK_SHA, BEFORE_CUA_SHA, FIRST_CUA_SHA, VIEWER_COOKIE_SHA})
+        self.assertEqual(device_preview.KNOWN_PREVIOUS, {PREVIOUS_SHA, FIRST_FILE_SHARE_SHA, BEFORE_HOST_CHECK_SHA, BEFORE_CUA_SHA, FIRST_CUA_SHA,
+                                                         VIEWER_COOKIE_SHA, BEFORE_REBOOT_SHA})
         remote = device(target_sha=PREVIOUS_SHA)
         step = device_preview.install(remote)
         self.assertEqual((step.status, step.detail), ('ok', 'updated'))
@@ -138,6 +142,10 @@ class InstallTests(unittest.TestCase):
 
     def test_first_file_share_release_is_updated_too(self):
         self.assertEqual(device_preview.install(device(target_sha=FIRST_FILE_SHARE_SHA)).detail, 'updated')
+
+    def test_the_release_with_transient_units_is_updated_too(self):
+        self.assertNotEqual(TOOL_SHA, BEFORE_REBOOT_SHA)
+        self.assertEqual(device_preview.install(device(target_sha=BEFORE_REBOOT_SHA)).detail, 'updated')
 
     @needs_gnu
     def test_update_script_replaces_only_a_known_file(self):
@@ -256,6 +264,25 @@ class CheckTests(unittest.TestCase):
 
     def test_check_failed_when_doctor_is_unreadable(self):
         self.assertEqual(device_preview.check(device(doctor='nonsense\n'), 'justus').status, 'failed')
+
+    def test_check_reports_previews_that_would_not_survive_a_reboot(self):
+        for backend in (DOCTOR_HTTPS, DOCTOR_HTTP):
+            doctor = backend + PERSISTENT_NO
+            step = device_preview.check(device(doctor=doctor), 'justus')
+            self.assertEqual((step.status, step.fix), ('missing', 'ssh box .local/bin/preview restore'))
+            self.assertIn('reboot', step.detail)
+
+    def test_check_ok_when_every_preview_is_persistent_or_the_tool_is_older(self):
+        self.assertEqual(device_preview.check(device(doctor=DOCTOR_HTTPS + PERSISTENT_YES), 'justus').status, 'ok')
+        self.assertEqual(device_preview.check(device(doctor=DOCTOR_HTTPS), 'justus').status, 'ok')
+
+    def test_check_reads_the_real_doctor_wording(self):
+        tool = load_tool()
+        for transient, word in ((False, 'yes'), (True, 'no')):
+            out = io.StringIO()
+            with mock.patch.object(tool, 'transient_previews', return_value=[{'port': 8820}] if transient else []):
+                tool.persistence_line(tool.System(), out)
+            self.assertEqual(device_preview._persistent(out.getvalue()), word)
 
     def test_check_runs_the_tool_from_home(self):
         remote = device()

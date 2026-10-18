@@ -33,7 +33,8 @@ PDF = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\n%%EOF
 # ---------------------------------------------------------------------------
 
 class FakeSystem(pv.System):
-    """Simulates systemd-run/systemctl/tailscale at the command level, so the real System methods build the argv."""
+    """Simulates systemctl --user (unit files in a temp folder) and tailscale at the command level, so the real System
+    methods write the unit files and build every command line. Nothing is ever run."""
 
     def __init__(self, operator=False, serve_allowed=False):
         super().__init__()
@@ -41,33 +42,67 @@ class FakeSystem(pv.System):
         self.active = {}  # unit -> (host, port) it listens on
         self.serve = {}
         self.commands = []
+        self.started = []  # (unit, the command its ExecStart runs) for every start
+        self.enabled = set()
+        self.transient = {}  # unit -> fragment path of a unit made by an older version with systemd-run
         self.busy = set()  # ports something else already listens on (127.0.0.1)
         self.next_free = 41000
+        self._units = tempfile.TemporaryDirectory()
+
+    def unit_dir(self):
+        return Path(self._units.name) / "systemd" / "user"
 
     def argvs(self):
         return [list(argv) for argv in self.commands]
+
+    def runs(self, word):
+        return [cmd for _, cmd in self.started if word in cmd]
+
+    def unit_path(self, unit):
+        return self.unit_dir() / (unit if unit.endswith(".service") else unit + ".service")
+
+    def listen_for(self, unit, cmd):
+        """Where a started unit listens, or None when it never comes up."""
+        if "_serve-file" in cmd:
+            return "127.0.0.1", int(cmd[cmd.index("--port") + 1])
+        if "_cua-index" in cmd:
+            return "127.0.0.1", int(cmd[cmd.index("--port") + 1])
+        host, port = pv.parse_hostport(cmd[cmd.index("--listen") + 1])
+        pv.check_listen_host(host)
+        return host, port
 
     def run(self, argv, timeout=30):
         argv = list(argv)
         self.commands.append(argv)
         done = lambda out="", code=0: pv.subprocess.CompletedProcess(argv, code, out, "")
+        if argv[0] == "systemd-run":
+            raise AssertionError("previews must be unit files, never systemd-run: " + " ".join(argv))
         if argv[:2] == ["systemctl", "--user"]:
-            verb, unit = argv[2], argv[3] if len(argv) > 3 else ""
+            verb, unit = argv[2], argv[-1] if len(argv) > 3 else ""
             if verb == "stop":
                 self.active.pop(unit, None)
+                self.transient.pop(unit, None)
             if verb == "is-active":
                 return done("active\n" if unit in self.active else "inactive\n", 0 if unit in self.active else 3)
-            return done()
-        if argv[0] == "systemd-run":
-            unit = next(a.split("=", 1)[1] for a in argv if a.startswith("--unit="))
-            cmd = argv[argv.index("/usr/bin/python3"):]
-            if "_serve-file" in cmd:
-                listen = ("127.0.0.1", int(cmd[cmd.index("--port") + 1]))
-            else:
-                host, port = pv.parse_hostport(cmd[cmd.index("--listen") + 1])
-                pv.check_listen_host(host)
-                listen = (host, port)
-            self.active[unit] = listen
+            if verb == "enable":
+                if not self.unit_path(unit).exists():
+                    return done("", 1)
+                self.enabled.add(unit)
+            if verb == "disable":
+                self.enabled.discard(unit)
+            if verb == "show":
+                if unit in self.transient:
+                    return done(self.transient[unit] + "\n")
+                return done((str(self.unit_path(unit)) if self.unit_path(unit).exists() else "") + "\n")
+            if verb == "start":
+                path = self.unit_path(unit)
+                if unit in self.active or not path.exists():
+                    return done("", 0 if unit in self.active else 5)
+                cmd = exec_start(path.read_text())
+                self.started.append((unit, cmd))
+                listen = self.listen_for(unit, cmd)
+                if listen:
+                    self.active[unit] = listen
             return done()
         if argv[:3] == ["tailscale", "serve", "status"]:
             return done(json.dumps({"TCP": {str(p): {} for p in self.serve}}))
@@ -106,6 +141,36 @@ class FakeSystem(pv.System):
 
     def firewall_tailnet_ports(self, path=None):
         return None
+
+
+def exec_start(unit_text):
+    """The command of a unit file's ExecStart= line, split and unescaped the way systemd does it: specifiers (%%) first,
+    then words (double quotes with \\ and \\" escapes), then $$ in each word."""
+    [line] = [l for l in unit_text.splitlines() if l.startswith("ExecStart=")]
+    value, words, word, quoted, i = line[len("ExecStart="):].replace("%%", "%"), [], None, False, 0
+    while i < len(value):
+        c = value[i]
+        if quoted:
+            if c == "\\":
+                word += value[i + 1]
+                i += 1
+            elif c == '"':
+                quoted = False
+            else:
+                word += c
+        elif c == '"':
+            quoted, word = True, word or ""
+        elif c == " ":
+            if word is not None:
+                words.append(word)
+            word = None
+        else:
+            word = (word or "") + c
+        i += 1
+    assert not quoted, line
+    if word is not None:
+        words.append(word)
+    return [w.replace("$$", "$") for w in words]
 
 
 def quiet(fn, *args, **kwargs):
@@ -414,7 +479,7 @@ class FileCommandTests(unittest.TestCase):
             self.assertEqual(len(err.strip().splitlines()), 1, (path, err))
             self.assertTrue(err.startswith('preview: '), err)
         self.assertEqual(fake_system.active, {})
-        self.assertFalse([a for a in fake_system.argvs() if a[0] == 'systemd-run'])
+        self.assertEqual(fake_system.started, [])
 
     def test_file_share_serves_on_loopback_and_reuses_the_backend(self):
         for operator, serve_allowed in [(False, False), (True, True)]:
@@ -425,7 +490,8 @@ class FileCommandTests(unittest.TestCase):
                 self.assertIn(plan['port'], pv.FILE_PORTS)
                 self.assertEqual(plan['unit'], f"preview-file-{plan['port']}.service")
                 self.assertEqual(plan['path'], str(self.folder))
-                self.assertEqual(fake.argvs(), [a for a in fake.argvs() if a[0] != 'systemd-run'])  # pure: nothing started
+                self.assertEqual(fake.started, [])  # pure: nothing started
+                self.assertFalse(fake.unit_dir().exists())
                 self.assertEqual(fake.active, {})
                 same_backend_as_port_preview = 'https' if operator else 'http'
                 self.assertEqual(plan['backend'], same_backend_as_port_preview)
@@ -436,7 +502,7 @@ class FileCommandTests(unittest.TestCase):
                 self.assertEqual(state['path'], str(self.folder))
                 self.assertEqual(out.strip(), state['link'])
                 self.assertEqual(fake.active[plan['unit']], ('127.0.0.1', plan['port']))
-                file_run = [a for a in fake.argvs() if a[0] == 'systemd-run' and '_serve-file' in a][0]
+                file_run = fake.runs('_serve-file')[0]
                 self.assertIn(str(self.folder), file_run)
                 quiet(pv.main, ['stop', '--all'], sysm=fake)
 
@@ -451,10 +517,10 @@ class FileCommandTests(unittest.TestCase):
     def test_same_path_reuses_its_port(self):
         fake = FakeSystem(operator=False)
         first = self.main(['file', str(self.folder)], fake)
-        starts = len([a for a in fake.argvs() if a[0] == 'systemd-run'])
+        starts = len(fake.started)
         second = self.main(['file', str(self.folder) + '/'], fake)
         self.assertEqual(first[1], second[1])
-        self.assertEqual(len([a for a in fake.argvs() if a[0] == 'systemd-run']), starts)
+        self.assertEqual(len(fake.started), starts)
         other = self.main(['file', str(self.folder / 'notes.md')], fake)
         self.assertNotEqual(other[1], first[1])
         self.assertEqual(pv.file_plan(['file', str(self.folder)], fake)['port'], int(first[1].strip().rsplit(':', 1)[1]))
@@ -532,18 +598,19 @@ class FileCommandTests(unittest.TestCase):
                     pv.check_share_root(root)
 
     def test_dollar_signs_reach_systemd_escaped(self):
-        folder = self.home / '${HOME}x$USER'
+        folder = self.home / '${HOME}x$USER%n'
         folder.mkdir()
         fake = FakeSystem(operator=False)
         code, _, err = self.main(['file', str(folder)], fake)
         self.assertEqual(code, 0, err)
-        [run] = [a for a in fake.argvs() if a[0] == 'systemd-run' and '_serve-file' in a]
-        self.assertIn(str(self.home) + '/$${HOME}x$$USER', run)
-        self.assertNotIn(str(folder), run)
-        for argv in fake.argvs():
-            if argv[0] == 'systemd-run':
-                command = argv[argv.index('/usr/bin/python3'):]
-                self.assertFalse([a for a in command if '$' in a.replace('$$', '')], command)
+        [run] = fake.runs('_serve-file')
+        self.assertIn(str(folder), run)  # what systemd runs after unescaping: the folder exactly
+        for path in fake.unit_dir().glob('*.service'):
+            [line] = [l for l in path.read_text().splitlines() if l.startswith('ExecStart=')]
+            self.assertNotRegex(line.replace('$$', ''), r'\$', path.name)  # no $VAR expansion left
+            self.assertNotRegex(line.replace('%%', ''), r'%', path.name)  # no %n specifier left
+            if path.name.startswith('preview-file-'):
+                self.assertIn(str(self.home) + '/$${HOME}x$$USER%%n', line)
 
     def test_list_strips_control_characters_from_labels(self):
         fake = FakeSystem(operator=False)

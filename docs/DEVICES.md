@@ -60,7 +60,7 @@ claude-pool device switch [--wait]
 | `cua` | the device shares its desktop through Cua and the machines can reach each other | see docs/DEVICES.md, Cua; macOS: switch on cua-spacesd in Accessibility, then claude-pool device add <ssh-target> --cua |
 | `conductor` | exactly one Conductor runs, on the registry device, connected to Remote Control | ssh <device> .local/bin/claude-pool device conductor install; claude-pool device conductor move <device>; stop the hand-started Conductor (herdr session conductor) |
 | `readings` | usage readings from the usage owner are fresh | ssh -o BatchMode=yes <owner> true must work from the device |
-| `preview` | the preview tool is installed and links are HTTPS (Linux devices only) | claude-pool device add <ssh-target>; a root user runs sudo tailscale set --operator=<user> for HTTPS |
+| `preview` | the preview tool is installed, links are HTTPS and every preview comes back after a reboot (Linux devices only) | claude-pool device add <ssh-target>; a root user runs sudo tailscale set --operator=<user> for HTTPS; previews that would not survive a reboot: ssh <ssh-target> .local/bin/preview restore |
 
 `<device>` and `<ssh-target>` are the device name and its ssh target. Several fixes in a row mean the code uses different ones for different problems: the `fix:` line under the step says which applies.
 
@@ -167,11 +167,14 @@ preview list
 preview stop <port>|<path>|cua
 preview stop --all
 preview doctor
+preview restore
 ```
 
 `preview file <path>` shares one file or one folder, read-only. Markdown opens as a page (add `?raw=1` for the source), images and PDFs open inline, other text is plain, anything else downloads. Dotfiles and dot folders (`.env`, `.git`, `~/.ssh`), anything a symlink points to outside the shared folder, the home folder itself and its ancestors, `/proc`, `/sys`, `/dev` and `/run` are refused. File shares listen on 127.0.0.1 and are exposed on the tailnet only, on ports 18400 to 18499. `preview doctor` says which backend is available. A preview answers only requests addressed to the device's tailnet name, its short name, its tailnet address or localhost with the preview's port; any other host gets `421`, so a web page cannot read a preview through a name it points at the tailnet address.
 
 `preview cua` on a device with Cua gives one HTTPS link to every Cua desktop it knows (`cua spaces ls`), to see and operate them from the iPhone. The link opens a short list of the desktops (served on 127.0.0.1:18500 by `preview-cua-index.service`); each `direct:<host>:<port>` desktop gets its own share on port 18501 and up, which reaches only loopback or tailnet addresses. Tapping a desktop makes a fresh one-hour viewer link with `cua sandbox view` and opens it with audio off; the viewer ticket lives only in that redirect and is never printed, logged or stored. Only the Tailscale login that owns the device may open these links; anyone else, other tailnet members included, gets `403`. It needs HTTPS through Tailscale Serve and refuses the HTTP backend. Run it again after adding or removing a Space (each desktop keeps its port); stop everything with `preview stop cua`.
+
+Previews survive a reboot: every preview, file share and Cua share is an enabled unit file in `~/.config/systemd/user` (Tailscale keeps the Serve entries), and `preview stop` disables and deletes exactly those files; previews an older release started come back only after `preview restore` has run once, which `preview doctor` and `device check` point out.
 
 Without the Tailscale operator setting, links are HTTP and may be blocked by the server's firewall on some ports; `preview doctor` shows which ports pass. HTTPS works on any port.
 

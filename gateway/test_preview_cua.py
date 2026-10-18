@@ -57,20 +57,15 @@ class CuaSystem(tpf.FakeSystem):
             if argv[1:] == ["spaces", "ls", "--json"]:
                 return done(self.spaces_out or "", 0 if self.spaces_out is not None else 1)
             return done("", 2)
-        if argv and argv[0] == "systemd-run" and "_cua-index" in argv:
-            self.commands.append(argv)
-            unit = next(a.split("=", 1)[1] for a in argv if a.startswith("--unit="))
-            cmd = argv[argv.index("/usr/bin/python3"):]
-            if self.index_listens:
-                self.active[unit] = ("127.0.0.1", int(cmd[cmd.index("--port") + 1]))
-            return done()
         return super().run(argv, timeout)
+
+    def listen_for(self, unit, cmd):
+        if "_cua-index" in cmd and not self.index_listens:
+            return None
+        return super().listen_for(unit, cmd)
 
     def cua_path(self):
         return self.cua
-
-    def runs(self, word):
-        return [a[a.index("/usr/bin/python3"):] for a in self.argvs() if a[0] == "systemd-run" and word in a]
 
 
 def opt(cmd, name):
@@ -112,7 +107,8 @@ class CuaCommandTests(unittest.TestCase):
                          [(VPS_DESKTOP["id"], "Personal VPS Desktop", "127.0.0.1", 32191, 18501),
                           (MAC["id"], "Justus Mac", "100.116.84.79", 3211, 18502)])
         self.assertEqual(plan["skipped"], ["direct:8.8.8.8:3211"])
-        self.assertFalse([a for a in fake.argvs() if a[0] in ("systemd-run", "systemctl")])
+        self.assertFalse([a for a in fake.argvs() if a[0] == "systemctl"])
+        self.assertEqual(fake.started, [])
         self.assertEqual(fake.active, {})
 
     def test_cua_starts_the_index_and_one_gated_https_proxy_per_space(self):
@@ -143,10 +139,10 @@ class CuaCommandTests(unittest.TestCase):
     def test_rerun_keeps_ports_adds_new_spaces_and_drops_gone_ones(self):
         fake = self.https()
         self.main(["cua"], fake)
-        runs = len([a for a in fake.argvs() if a[0] == "systemd-run"])
+        runs = len(fake.started)
         code, out, _ = self.main(["cua"], fake)
         self.assertEqual((code, out.strip()), (0, f"https://{TS_NAME}:18500"))
-        self.assertEqual(len([a for a in fake.argvs() if a[0] == "systemd-run"]), runs)
+        self.assertEqual(len(fake.started), runs)
         other = {"id": "direct:127.0.0.1:32300", "name": "Tunnel box"}
         fake.spaces_out = spaces_json(MAC, other)
         self.assertEqual(self.main(["cua"], fake)[0], 0)
@@ -162,7 +158,7 @@ class CuaCommandTests(unittest.TestCase):
                     code, out, err = self.main(["cua"], fake)
                 self.assertEqual((code, out), (1, ""))
                 self.assertIn("preview doctor", err)
-                self.assertFalse([a for a in fake.argvs() if a[0] == "systemd-run"])
+                self.assertEqual(fake.started, [])
                 self.assertEqual(pv.all_states(), [])
 
     def test_serve_refusal_never_falls_back_to_http(self):
@@ -181,7 +177,7 @@ class CuaCommandTests(unittest.TestCase):
                 code, out, err = self.main(["cua"], fake)
                 self.assertEqual((code, out), (1, ""))
                 self.assertTrue(err.startswith("preview: "), err)
-                self.assertFalse([a for a in fake.argvs() if a[0] == "systemd-run"])
+                self.assertEqual(fake.started, [])
         self.assertIn("cua --version", self.main(["cua"], self.https(cua=None))[2])
         fake = self.https()
         fake.status_raw = "not json"
