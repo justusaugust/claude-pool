@@ -258,6 +258,15 @@ class CheckTests(unittest.TestCase):
         self.assertEqual(step.status, 'failed'); self.assertIn('claude-native auth login', step.fix)
         self.assertEqual(step.fix, 'log in on vps with an account the pool serves: claude-native auth login')
 
+    def test_unserved_login_on_the_conductor_device_fails(self):
+        step = native_login.check(fake_status('other@x.de', 'Other'), '/opt/claude', ACCOUNTS, conductor_here=True)
+        self.assertEqual(step.status, 'failed')
+
+    def test_unserved_login_elsewhere_or_without_conductor_is_manual(self):
+        step = native_login.check(fake_status('other@x.de', 'Other'), '/opt/claude', ACCOUNTS, conductor_here=False)
+        self.assertEqual(step, Step('native-login', 'manual', 'other@x.de (Other) is not a pool account; only needed where a Conductor runs',
+                                    'claude-native auth login (choose a pool account) only if a Conductor should run here'))
+
     def test_matching_native_login_is_ok_regardless_of_case_and_spacing(self):
         self.assertEqual(native_login.check(fake_status('Ops@X.de', ' Team  A '), '/opt/claude', ACCOUNTS).status, 'ok')
 

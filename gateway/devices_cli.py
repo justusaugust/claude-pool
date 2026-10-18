@@ -783,7 +783,8 @@ def check_doctor(t):
 
 def check_native_login(t):
     if not t.native: return t.needs_native('native-login')
-    return native_login.check(t.remote, t.native, registry.load()['accounts'])
+    value = registry.load(); entry = registry.conductor(value)
+    return native_login.check(t.remote, t.native, value['accounts'], conductor_here=entry is not None and entry['device'] == t.row['name'])
 
 
 def ensure_native_login(t):

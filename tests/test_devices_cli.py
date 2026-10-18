@@ -157,6 +157,22 @@ class RoutingTests(DeviceCliBase):
 
 
 class RegistrationTests(DeviceCliBase):
+    def check_native_login_here(self, conductor_entry):
+        self.devices(MAC, VPS, conductor_entry=conductor_entry)
+        target = Mock(native='/opt/claude', row={'name': 'vps'})
+        with patch.object(native_login, 'check', Mock(return_value=Step('native-login', 'ok', 'x'))) as check:
+            devices_cli.check_native_login(target)
+        return check.call_args.kwargs['conductor_here']
+
+    def test_native_login_is_strict_only_on_the_conductor_device(self):
+        self.assertTrue(self.check_native_login_here({'device': 'vps', 'email': 'team@x.de', 'organization': 'Team A', 'cwd': '/srv/c'}))
+
+    def test_native_login_is_lenient_on_another_device(self):
+        self.assertFalse(self.check_native_login_here({'device': 'mac', 'email': 'team@x.de', 'organization': 'Team A', 'cwd': '/srv/c'}))
+
+    def test_native_login_is_lenient_without_a_conductor(self):
+        self.assertFalse(self.check_native_login_here(None))
+
     def test_every_status_part_is_registered(self):
         quiet = lambda *a, **k: FakeRemote('local', lambda argv, data: answer(127))
         for module in (device_cua, device_herdr, device_integrations, device_preview):

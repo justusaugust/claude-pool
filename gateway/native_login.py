@@ -96,8 +96,9 @@ def _served(identity, accounts, stores):
     return False
 
 
-def check(remote, native: str, accounts: list, stores=None) -> Step:
-    """Whether `remote` has a Native login, and whether the pool serves that account."""
+def check(remote, native: str, accounts: list, stores=None, conductor_here=True) -> Step:
+    """Whether `remote` has a Native login, and whether the pool serves that account. A login the pool does not serve only
+    fails where the Conductor runs (Remote Control needs it there); elsewhere it is a manual note."""
     device = remote.name
     done = remote.call([native, 'auth', 'status', '--json'], timeout=30)
     if done.returncode == 255 and not done.stdout.strip():
@@ -109,6 +110,9 @@ def check(remote, native: str, accounts: list, stores=None) -> Step:
     if done.returncode: return unreadable
     shown = identity['email'] + (' (' + identity['organization'] + ')' if identity['organization'] else '')
     if _served(identity, accounts, settings.STORES if stores is None else stores): return Step(STEP, 'ok', shown)
+    if not conductor_here:
+        return Step(STEP, 'manual', shown + ' is not a pool account; only needed where a Conductor runs',
+                    'claude-native auth login (choose a pool account) only if a Conductor should run here')
     return Step(STEP, 'failed', shown + ' is not an account the pool serves',
                 'log in on ' + device + ' with an account the pool serves: claude-native auth login')
 
