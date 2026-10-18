@@ -295,6 +295,11 @@ class PeerTests(FileDevice):
         self.assertEqual(report['removed'], []); self.assertIn(NEW, report['kept'])
         self.assertEqual(self.config_names(), ['operations', NEW])
         self.assertTrue((settings.STORES / (NEW + '.json')).exists()); self.assertTrue((settings.LONG_LIVED / (NEW + '.json')).exists())
+        # The rename's tombstone stays (a peer that missed the rename must not bring the old row back), but once this
+        # device has it, every later sync is quiet about it.
+        again = device_sync.receive_registry(mac.read_bytes(), overview=lambda: {})
+        self.assertEqual((again['result'], again['removed'], again['kept']), ('unchanged', [], []))
+        self.assertEqual(self.config_names(), ['operations', NEW])
 
 
 class EnrollAfterRenameTests(RenameBase):

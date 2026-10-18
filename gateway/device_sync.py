@@ -320,7 +320,9 @@ def receive_registry(data, overview=None, native_identity=None, elsewhere=()):
                 report['kept'].append(name)  # another token than the one removed, and maybe its only copy
                 continue
             if renamed_elsewhere(name, tomb, now):
-                report['kept'].append(name)  # renamed on the device that enrolled it; this device keeps its own name
+                # Renamed on the device that enrolled it; this device keeps its own name. The tombstone has to stay (a peer
+                # that missed the rename would bring the old row back), so it is reported only by the receive that brings it.
+                if previous_tomb(previous, name) != tomb: report['kept'].append(name)
                 continue
             if not routing.wait_idle(local_overview(overview), name, False):
                 report['kept_busy'].append(name); continue
@@ -356,6 +358,11 @@ def _uuids_of(name):
         except (OSError, ValueError, RuntimeError): continue
         if found: return found
     return None
+
+
+def previous_tomb(value, name):
+    """The account tombstone for `name` this device already had before a receive, or None."""
+    return next((row for row in value.get('removed', []) if row['kind'] == 'account' and row['name'] == name), None)
 
 
 def renamed_elsewhere(name, tomb, value):
