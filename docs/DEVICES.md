@@ -162,13 +162,16 @@ Preview runs on Linux devices (macOS devices are `skipped`); `add` installs the 
 ```sh
 preview 5173 --name "landing page"
 preview file docs/report.md
+preview cua
 preview list
-preview stop <port>|<path>
+preview stop <port>|<path>|cua
 preview stop --all
 preview doctor
 ```
 
 `preview file <path>` shares one file or one folder, read-only. Markdown opens as a page (add `?raw=1` for the source), images and PDFs open inline, other text is plain, anything else downloads. Dotfiles and dot folders (`.env`, `.git`, `~/.ssh`), anything a symlink points to outside the shared folder, the home folder itself and its ancestors, `/proc`, `/sys`, `/dev` and `/run` are refused. File shares listen on 127.0.0.1 and are exposed on the tailnet only, on ports 18400 to 18499. `preview doctor` says which backend is available. A preview answers only requests addressed to the device's tailnet name, its short name, its tailnet address or localhost with the preview's port; any other host gets `421`, so a web page cannot read a preview through a name it points at the tailnet address.
+
+`preview cua` on a device with Cua gives one HTTPS link to every desktop it knows (`cua spaces ls`), to see and operate them from the iPhone. It runs `cua viewer` on 127.0.0.1:18500 as `preview-cua-viewer.service` behind the preview proxy, which adds the viewer's key to every request itself, so the link carries no key and the key is never printed or logged. Only the Tailscale login that owns the device may open it; anyone else, other tailnet members included, gets `403`. It needs HTTPS through Tailscale Serve and refuses the HTTP backend. Stop it with `preview stop cua`.
 
 Without the Tailscale operator setting, links are HTTP and may be blocked by the server's firewall on some ports; `preview doctor` shows which ports pass. HTTPS works on any port.
 

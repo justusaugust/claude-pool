@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import socket
 import stat
@@ -33,6 +34,9 @@ UNIT_PREFIX = "preview-"
 RESERVED_PORTS = {22, 80, 443}
 TAILNET_NETS = (ipaddress.ip_network("100.64.0.0/10"), ipaddress.ip_network("fd7a:115c:a1e0::/48"))
 EXIT_CONFIG = 78  # systemd does not restart on this exit status (RestartPreventExitStatus)
+CUA_PORT = 18500  # `preview cua`: the Cua viewer on 127.0.0.1:18500, shared as https://<vps>:18500
+CUA_UNIT = "preview-cua-viewer.service"
+CUA_LABEL = "Cua desktops"
 
 HELP = """\
 Open a web server that runs on this VPS (localhost) on Justus' Mac and iPhone with one link.
@@ -67,11 +71,20 @@ COMMANDS
                                   symlink points to outside the shared folder; / and the home
                                   folder itself are refused. Safe to run again (same path, same
                                   link). File shares use ports 18400-18499.
+  preview cua [--name LABEL]      one link to every Cua desktop this VPS knows (cua spaces ls), to see
+                                  and operate them from the iPhone. Runs `cua viewer` on
+                                  127.0.0.1:18500 (unit preview-cua-viewer.service) behind the proxy,
+                                  which adds the viewer's key to every request itself: the link carries
+                                  no key and the key is never printed or logged. Only the Tailscale
+                                  login that owns this VPS may open it; anyone else, other tailnet
+                                  members included, gets 403. HTTPS only (Tailscale Serve); with the
+                                  http backend it refuses (preview doctor). Safe to run again.
   preview list [--json]           open previews: port, label, link, backend, target listening?
-                                  File shares also show their path.
-  preview stop <port>|<path>      stop one preview or file share (a dev server keeps running).
-                                  A folder named only with digits: write ./2026
-  preview stop --all              stop every preview and file share created by this tool (nothing else)
+                                  File shares also show their path, the Cua share its viewer.
+  preview stop <port>|<path>|cua  stop one preview or file share (a dev server keeps running), or the
+                                  Cua desktops share and its viewer. A folder named only with digits,
+                                  or named cua: write ./2026 or ./cua
+  preview stop --all              stop every preview, file share and Cua share this tool created (nothing else)
   preview doctor                  which backend is available and how to enable HTTPS
 
 BACKENDS (chosen automatically)
@@ -307,6 +320,79 @@ MISDIRECTED = (b"HTTP/1.1 421 Misdirected Request\r\nContent-Type: text/plain; c
                b"Connection: close\r\nContent-Length: 46\r\n\r\nThis preview answers only its own tailnet name.")
 
 
+def plain_answer(status, text, extra=b""):
+    """A complete short plain-text response that ends the connection."""
+    body = text.encode()
+    return (b"HTTP/1.1 " + status + b"\r\nContent-Type: text/plain; charset=utf-8\r\nCache-Control: no-store\r\n" + extra +
+            b"Connection: close\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+
+
+# The Cua desktops share (`preview cua`): the proxy lets through only the Tailscale login that owns this machine
+# (Tailscale Serve sets Tailscale-User-Login itself and drops any a client sends) and adds the viewer's key, which it
+# reads from the viewer wrapper's 0600 file, to every request. The browser never needs the key; a page load without it
+# is redirected to the same address with the key, after the login check, for a viewer page that reads it from location.
+FORBIDDEN = plain_answer(b"403 Forbidden", "This link is only for the owner of this machine.\n")
+BAD_TARGET = plain_answer(b"400 Bad Request", "Bad request.\n")
+VIEWER_KEY = re.compile(rb"[A-Za-z0-9._~%-]{8,512}")
+
+
+def viewer_starting_page():
+    body = (b"<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>"
+            b"<meta http-equiv=refresh content=3><title>Cua desktops</title>"
+            b"<body style='font:16px/1.5 system-ui;margin:3rem auto;max-width:34rem;padding:0 1rem'>"
+            b"<h1 style='font-size:1.3rem'>The Cua viewer is starting</h1>"
+            b"<p>This page reloads every 3 seconds. If it stays, run <code>preview cua</code> again on the machine.</p>")
+    return (b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\n"
+            b"Connection: close\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+
+
+def read_viewer_key(path):
+    """The viewer's key as bytes, or None unless the file is a regular file of this user, not a symlink, mode 0600."""
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    except (OSError, TypeError, ValueError):
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o077:
+            return None
+        data = os.read(fd, 1025)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    key = data.strip()
+    return key if VIEWER_KEY.fullmatch(key) else None
+
+
+def _is_key_param(pair):
+    try:
+        return urllib.parse.unquote_plus(pair.split(b"=", 1)[0].decode("ascii"), errors="strict") == "key"
+    except UnicodeError:
+        return False
+
+
+def target_has_key(target):
+    _, sep, query = target.partition(b"?")
+    return bool(sep) and any(_is_key_param(pair) for pair in query.split(b"&"))
+
+
+def target_with_key(target, key):
+    """The request target with every `key` parameter the client sent replaced by the viewer's own key."""
+    path, sep, query = target.partition(b"?")
+    kept = [pair for pair in query.split(b"&") if pair and not _is_key_param(pair)] if sep else []
+    return path + b"?" + b"&".join(kept + [b"key=" + key])
+
+
+def is_navigation(method, headers):
+    if method != b"GET":
+        return False
+    mode = header(headers, "sec-fetch-mode")
+    if mode is not None:
+        return mode.strip().lower() == b"navigate"
+    return b"text/html" in (header(headers, "accept") or b"").lower()
+
+
 def split_host(value):
     """(host, port or None) of a Host header value, lower case, without a trailing dot; None when it is not one."""
     try:
@@ -320,11 +406,15 @@ def split_host(value):
 
 
 class Proxy:
-    def __init__(self, target_port, public_base=None, target_hosts=("127.0.0.1", "::1"), tailnet_ip=None, listen_port=None):
+    def __init__(self, target_port, public_base=None, target_hosts=("127.0.0.1", "::1"), tailnet_ip=None, listen_port=None,
+                 upstream_host=None, key_file=None, owner_login=None):
         self.target_port = target_port
-        self.target_host_header = f"localhost:{target_port}".encode()
+        self.target_host_header = f"{upstream_host or 'localhost'}:{target_port}".encode()
         self.public_base = public_base.rstrip("/").encode() if public_base else None
-        self.target_hosts = target_hosts
+        self.target_hosts = (upstream_host,) if upstream_host else target_hosts
+        # Cua desktops share only: the one Tailscale login let through, and the file with the viewer's key.
+        self.owner_login = owner_login.encode() if owner_login is not None else None
+        self.key_file = key_file
         # DNS rebinding guard: a request is served only when its Host names this machine on the tailnet (MagicDNS name,
         # its short form, the tailnet IPv4) or localhost, with the share's port. Rewriting Host would otherwise defeat a
         # dev server's own rebinding check, and any web page could read the share through a rebound name.
@@ -350,6 +440,30 @@ class Proxy:
         name, port = found
         return name in self.allowed_names and (port is None or port in self.allowed_ports)
 
+    def login_ok(self, headers):
+        """True when the request carries exactly one Tailscale-User-Login and it is the owner's (Cua share only)."""
+        if self.owner_login is None:
+            return True
+        logins = [v for n, v in headers if n.lower() == b"tailscale-user-login"]
+        return len(logins) == 1 and logins[0] == self.owner_login
+
+    def cua_route(self, start, headers):
+        """(start line with the viewer's key, None) to forward, or (None, a complete local answer)."""
+        if not self.login_ok(headers):
+            return None, FORBIDDEN
+        key = read_viewer_key(self.key_file)
+        if key is None:
+            return None, viewer_starting_page()
+        parts = start.split(b" ", 2)
+        if len(parts) != 3 or not parts[1].startswith(b"/"):
+            return None, BAD_TARGET
+        method, target, version = parts
+        upgrade = b"upgrade" in header_tokens(headers, "connection") and header(headers, "upgrade") is not None
+        if not upgrade and not target_has_key(target) and is_navigation(method.upper(), headers):
+            return None, plain_answer(b"302 Found", "", b"Location: " + target_with_key(target, key) + b"\r\n"
+                                      b"Referrer-Policy: no-referrer\r\n")
+        return b" ".join((method, target_with_key(target, key), version)), None
+
     async def connect_upstream(self):
         last = None
         for host in self.target_hosts:
@@ -371,6 +485,12 @@ class Proxy:
                 cwriter.write(MISDIRECTED)
                 await cwriter.drain()
                 return
+            if self.owner_login is not None:
+                _, answer = self.cua_route(*split_head(head))
+                if answer is not None:  # refused, starting or redirected: nothing reaches the viewer
+                    cwriter.write(answer)
+                    await cwriter.drain()
+                    return
             try:
                 ureader, uwriter = await self.connect_upstream()
             except OSError:
@@ -378,8 +498,9 @@ class Proxy:
                 await cwriter.drain()
                 return
             pending = asyncio.Queue()
-            up = asyncio.ensure_future(self.client_to_upstream(head, creader, uwriter, pending, peer_ip))
-            down = asyncio.ensure_future(self.upstream_to_client(ureader, cwriter, pending))
+            open_ = [0]  # requests forwarded whose response has not been written in full yet
+            up = asyncio.ensure_future(self.client_to_upstream(head, creader, uwriter, pending, peer_ip, cwriter, open_))
+            down = asyncio.ensure_future(self.upstream_to_client(ureader, cwriter, pending, open_))
             done, _ = await asyncio.wait({up, down}, return_when=asyncio.FIRST_COMPLETED)
             if down in done:
                 up.cancel()
@@ -395,16 +516,26 @@ class Proxy:
                 if w is not None:
                     w.close()
 
-    async def client_to_upstream(self, head, creader, uwriter, pending, peer_ip):
+    async def client_to_upstream(self, head, creader, uwriter, pending, peer_ip, cwriter=None, open_=None):
+        open_ = open_ if open_ is not None else [0]
         try:
             while head is not None:
                 start, headers = split_head(head)
                 if not self.host_allowed(headers):
                     break  # a foreign Host later on the connection: earlier answers finish, nothing more reaches the server
+                if self.owner_login is not None:
+                    start, answer = self.cua_route(start, headers)
+                    if answer is not None:
+                        if open_[0] == 0 and cwriter is not None:  # answer only in order; a pipelined one just ends it
+                            cwriter.write(answer)
+                            await cwriter.drain()
+                        break
                 method = start.split(b" ", 1)[0].upper()
                 headers = rewrite_request(headers, self.target_host_header, peer_ip)
                 upgrade = b"upgrade" in header_tokens(headers, "connection") and header(headers, "upgrade") is not None
                 pending.put_nowait(method)
+                if not upgrade and method != b"CONNECT":
+                    open_[0] += 1
                 uwriter.write(join_head(start, headers))
                 await uwriter.drain()
                 if upgrade or method == b"CONNECT":
@@ -424,7 +555,8 @@ class Proxy:
             except Exception:
                 pass
 
-    async def upstream_to_client(self, ureader, cwriter, pending):
+    async def upstream_to_client(self, ureader, cwriter, pending, open_=None):
+        open_ = open_ if open_ is not None else [0]
         try:
             while True:
                 head = await read_head(ureader)
@@ -445,6 +577,7 @@ class Proxy:
                     await copy_all(ureader, cwriter)
                     return
                 if method == b"HEAD" or code in (204, 304):
+                    open_[0] -= 1
                     continue
                 kind, n = body_length(headers)
                 if kind == "chunked":
@@ -454,6 +587,7 @@ class Proxy:
                 else:  # body ends when the server closes the connection
                     await copy_all(ureader, cwriter)
                     return
+                open_[0] -= 1
         except (ProtocolError, OSError, asyncio.IncompleteReadError, asyncio.LimitOverrunError):
             return
 
@@ -470,7 +604,17 @@ def cmd_serve(args):
     except UnsafeListenAddress as e:
         print(f"preview: {e}", file=sys.stderr)
         return EXIT_CONFIG
-    proxy = Proxy(args.target, args.public_url, tailnet_ip=args.tailnet_ip, listen_port=port)
+    gate = (args.owner_login, args.key_file, args.upstream_host)
+    if any(x is not None for x in gate):
+        # The Cua share: a login gate is only a gate behind Tailscale Serve, which sets the login header; a proxy on the
+        # tailnet IP would accept a forged one. So all three parts, loopback only, both ways.
+        if None in gate or not args.owner_login or not ipaddress.ip_address(host.strip("[]")).is_loopback \
+                or args.upstream_host != "127.0.0.1":
+            print("preview: the Cua share needs --owner-login, --key-file and --upstream-host 127.0.0.1, and listens on "
+                  "127.0.0.1 only", file=sys.stderr)
+            return EXIT_CONFIG
+    proxy = Proxy(args.target, args.public_url, tailnet_ip=args.tailnet_ip, listen_port=port,
+                  upstream_host=args.upstream_host, key_file=args.key_file, owner_login=args.owner_login)
 
     async def main():
         try:
@@ -1137,6 +1281,106 @@ def cmd_serve_file(args):
 
 
 # ---------------------------------------------------------------------------
+# Cua desktops (`preview cua`): `cua viewer` runs inside preview-cua-viewer.service via `preview _cua-viewer`, bound to
+# 127.0.0.1:18500. The wrapper keeps the key it prints in a 0600 file for the proxy and never lets it into the journal.
+# ---------------------------------------------------------------------------
+
+class CuaRefused(ValueError):
+    pass
+
+
+_KEY_IN_URL = re.compile(r"([?&]key=)[^&\s\"'<>]+")
+_KEY_IN_JSON = re.compile(r'("key"\s*:\s*")[^"]*(")')
+
+
+def cua_key_file():
+    return state_dir() / "cua" / "viewer.key"
+
+
+def viewer_argv(cua, port):
+    return [cua, "viewer", "--listen", f"127.0.0.1:{port}", "--no-open"]
+
+
+def redact(text, key=None):
+    """Text with every viewer key in it (as a URL parameter, a JSON field or the bare value) replaced by <hidden>."""
+    text = _KEY_IN_JSON.sub(r"\1<hidden>\2", _KEY_IN_URL.sub(r"\1<hidden>", text))
+    return text.replace(key, "<hidden>") if key else text
+
+
+def write_viewer_key(path, key):
+    """Writes the key into a 0600 file in a 0700 folder of this user, atomically (a reader never sees half a key)."""
+    path = Path(path)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    st = os.lstat(path.parent)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid():
+        raise OSError(f"{path.parent} is not a folder of this user")
+    os.chmod(path.parent, 0o700)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        os.write(fd, key + b"\n")
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
+
+
+def drop_viewer_key(path):
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
+def cmd_cua_viewer(args):
+    if not os.path.isabs(args.cua) or not os.access(args.cua, os.X_OK):
+        print(f"preview: --cua must be the absolute path of the cua program, not {printable(args.cua)!r}", file=sys.stderr)
+        return EXIT_CONFIG
+    if args.port != CUA_PORT:
+        print(f"preview: the Cua viewer uses port {CUA_PORT}, not {args.port}", file=sys.stderr)
+        return EXIT_CONFIG
+    host = check_listen_host("127.0.0.1")  # the viewer is never reachable except through the preview proxy
+    key_file = Path(args.key_file)
+    drop_viewer_key(key_file)  # a key from an earlier run is dead; the proxy waits for the new one
+    try:
+        child = subprocess.Popen(viewer_argv(args.cua, args.port), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT)
+    except OSError as e:
+        print(f"preview: cannot start {printable(args.cua)}: {e.strerror or e}", file=sys.stderr)
+        return 1
+    stopping = []
+
+    def stop(*_):
+        stopping.append(True)
+        try:
+            child.terminate()
+        except OSError:
+            pass
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, stop)
+    key = None
+    try:
+        for raw in iter(child.stdout.readline, b""):
+            if key is None:
+                found = re.search(rb"[?&]key=([A-Za-z0-9._~%-]+)", raw)
+                if found and VIEWER_KEY.fullmatch(found.group(1)):
+                    key = found.group(1)
+                    write_viewer_key(key_file, key)
+                    print(f"preview: Cua viewer ready on {host}:{args.port}; its key is in {key_file} (0600)", flush=True)
+            line = raw.decode("utf-8", "replace").rstrip("\r\n")
+            print("cua: " + printable(redact(line, key.decode() if key else None)), flush=True)
+    except OSError as e:
+        print(f"preview: cannot keep the viewer's key in {key_file}: {e.strerror or e}", file=sys.stderr)
+        stop()
+    finally:
+        code = child.wait()
+        drop_viewer_key(key_file)
+    if stopping:
+        return 0
+    return code if code > 0 else 1  # the viewer ending on its own is a failure: systemd starts it again
+
+
+# ---------------------------------------------------------------------------
 # System access (tailscale, systemd --user, ss). Tests replace this class.
 # ---------------------------------------------------------------------------
 
@@ -1165,6 +1409,24 @@ class System:
                     pass
             self._ts = (ip, name)
         return self._ts
+
+    def owner_login(self):
+        """The Tailscale login that owns this machine (Self.UserID -> User[id].LoginName), or None."""
+        r = self.run(["tailscale", "status", "--json"], timeout=10)
+        if r.returncode != 0:
+            return None
+        try:
+            data = json.loads(r.stdout)
+            login = data["User"][str(data["Self"]["UserID"])]["LoginName"]
+        except (ValueError, KeyError, TypeError):
+            return None
+        return login if isinstance(login, str) and login.strip() == login and login and not CONTROL_CHARS.search(login) else None
+
+    def cua_path(self):
+        """The cua program (also in ~/.local/bin, where Cua's installer puts it), as an absolute path, or None."""
+        path = os.pathsep.join(p for p in (os.environ.get("PATH", ""), str(Path.home() / ".local/bin")) if p)
+        found = shutil.which("cua", path=path)
+        return os.path.abspath(found) if found else None
 
     def operator_ok(self):
         """True/False if we can tell whether this user may change Tailscale Serve, None if unknown."""
@@ -1361,6 +1623,8 @@ def start_unit(sysm, entry):
     host, lport = parse_hostport(entry["listen"])
     argv = ["/usr/bin/python3", "-I", self_path(), "_serve", "--listen", entry["listen"],
             "--target", str(entry["port"]), "--public-url", entry["link"], "--tailnet-ip", sysm.tailnet()[0]]
+    if cua_unit_of(entry):
+        argv += ["--upstream-host", "127.0.0.1", "--key-file", str(cua_key_file()), "--owner-login", entry["owner_login"]]
     ok, err = sysm.unit_start(unit, f"preview {entry['port']}: {entry['label']}", argv)
     if not ok:
         return False, err or "systemd-run failed"
@@ -1404,11 +1668,15 @@ def backend_choice(operator, forced):
     return "https" if forced != "http" and (operator is not False or forced == "https") else "http"
 
 
-def cmd_start(sysm, port, label=None, out=None, err=None):
+def cmd_start(sysm, port, label=None, out=None, err=None, cua=None):
+    """`cua` is set only by cmd_cua: the Cua share's fields (owner login, viewer unit); it is HTTPS or nothing."""
     out, err = out or sys.stdout, err or sys.stderr
     ts_ip, _ = sysm.tailnet()
     https_link, http_link = links(sysm, port)
     existing = load_state(port)
+    if cua is None and existing and existing.get("kind") == "cua":
+        print(f"preview: port {port} is the Cua desktops share; run preview cua again, or preview stop cua first", file=err)
+        return 1
 
     exposed = [a for a, _ in sysm.listeners(port) if wildcard_or_public(a, ts_ip)]
     if exposed:
@@ -1425,7 +1693,8 @@ def cmd_start(sysm, port, label=None, out=None, err=None):
     operator = sysm.operator_ok()
     forced = os.environ.get("PREVIEW_BACKEND", "")
 
-    if existing and entry_healthy(sysm, existing):
+    same_share = cua is None or all(existing and existing.get(k) == v for k, v in cua.items())
+    if existing and same_share and entry_healthy(sysm, existing):
         upgrade = existing["backend"] == "http" and operator is True and forced != "http"
         if not upgrade:
             if label != existing.get("label"):
@@ -1444,13 +1713,18 @@ def cmd_start(sysm, port, label=None, out=None, err=None):
         ok, serve_error = sysm.serve_add(port, internal)
         if ok:
             entry = {"port": port, "label": label, "backend": "https", "link": https_link,
-                     "listen": f"127.0.0.1:{internal}", "unit": f"{UNIT_PREFIX}{port}", "created": int(time.time())}
+                     "listen": f"127.0.0.1:{internal}", "unit": f"{UNIT_PREFIX}{port}", "created": int(time.time()),
+                     **(cua or {})}
             started, msg = start_unit(sysm, entry)
             if not started:
                 sysm.serve_remove(port)
                 print(f"preview: could not start the proxy for port {port}: {msg}", file=err)
                 return 1
     if entry is None:
+        if cua is not None:  # the login gate only holds behind Tailscale Serve; never fall back to HTTP for this share
+            print(f"preview: the Cua desktops link needs HTTPS through Tailscale Serve, which is not available here "
+                  f"({serve_error or 'not permitted'}); see preview doctor", file=err)
+            return 1
         if forced == "https":
             print(f"preview: Tailscale Serve is not available: {serve_error or 'not permitted'}", file=err)
             return 1
@@ -1479,19 +1753,39 @@ def file_unit_of(entry):
     return unit if entry.get("file_unit") == unit else None
 
 
+def cua_unit_of(entry):
+    """The viewer unit of the Cua desktops share (only the name this tool gives it, whatever the state file says)."""
+    ok = entry.get("kind") == "cua" and entry.get("cua_unit") == CUA_UNIT and entry.get("port") == CUA_PORT
+    return CUA_UNIT if ok else None
+
+
 def stop_share(sysm, entry):
-    """Stop a preview, and for a file share also its file server."""
+    """Stop a preview, and for a file share also its file server, for the Cua share also its viewer and key."""
     stop_entry(sysm, entry)
     if file_unit_of(entry):
         sysm.unit_stop(file_unit_of(entry))
+    if cua_unit_of(entry):
+        sysm.unit_stop(CUA_UNIT)
+        drop_viewer_key(cua_key_file())
 
 
 def stopped_line(entry):
     return printable(f"stopped {entry['port']} ({entry['label']}" + (f", {entry['path']})" if entry.get("path") else ")"))
 
 
-def cmd_stop(sysm, port=None, all_=False, out=None, err=None, path=None):
+def cmd_stop(sysm, port=None, all_=False, out=None, err=None, path=None, cua=False):
     out, err = out or sys.stdout, err or sys.stderr
+    if cua:
+        entry = load_state(CUA_PORT)
+        if not (entry and cua_unit_of(entry)):
+            if sysm.unit_state(CUA_UNIT) == "active":  # a viewer left behind without its link
+                sysm.unit_stop(CUA_UNIT)
+                drop_viewer_key(cua_key_file())
+            print("preview: no Cua desktops share running (see preview list)", file=err)
+            return 1
+        stop_share(sysm, entry)
+        print(stopped_line(entry), file=out)
+        return 0
     if all_:
         entries = all_states()
         for e in entries:
@@ -1592,6 +1886,8 @@ def cmd_list(sysm, as_json=False, out=None):
         row = {**e, "target_listening": target_listening(sysm, e["port"]), "proxy": sysm.unit_state(e["unit"])}
         if file_unit_of(e):
             row["file_server"] = sysm.unit_state(file_unit_of(e))
+        if cua_unit_of(e):
+            row["viewer"] = sysm.unit_state(CUA_UNIT)
         rows.append(row)
     if as_json:
         print(json.dumps(rows, indent=2), file=out)
@@ -1603,7 +1899,7 @@ def cmd_list(sysm, as_json=False, out=None):
     for r in rows:
         table.append((str(r["port"]), printable(r["label"]), r["backend"],
                       "listening" if r["target_listening"] else "not listening", r["proxy"], r["link"],
-                      printable(r.get("path", ""))))
+                      printable(r.get("path", "") or (f"viewer {r['viewer']}" if "viewer" in r else ""))))
     widths = [max(len(row[i]) for row in table) for i in range(len(table[0]))]
     for row in table:
         print("  ".join(c.ljust(w) for c, w in zip(row, widths)).rstrip(), file=out)
@@ -1638,6 +1934,86 @@ def cmd_doctor(sysm, out=None):
     linger = sysm.run(["loginctl", "show-user", user, "-p", "Linger", "--value"], timeout=10).stdout.strip()
     print(f"linger         {linger or 'unknown'} (yes = previews keep running after logout)", file=out)
     print(f"previews       {len(all_states())} open (preview list)", file=out)
+    login, share = sysm.owner_login(), load_state(CUA_PORT)
+    if not sysm.cua_path():
+        print("cua desktops   cua is not installed, so preview cua cannot run (install Cua, check cua --version)", file=out)
+    elif not login or login == "tagged-devices":
+        print("cua desktops   preview cua cannot tell which Tailscale login owns this machine (tailscale status --json)",
+              file=out)
+    elif operator is False:
+        print("cua desktops   preview cua needs the https backend (enable HTTPS above)", file=out)
+    else:
+        running = "running" if share and cua_unit_of(share) else "not running"
+        print(f"cua desktops   preview cua gives {printable(login)} one link to every Cua desktop ({running})", file=out)
+    return 0
+
+
+def wait_viewer(sysm, host, port, key_file, seconds=20.0):
+    """True once the viewer listens and its key file is there."""
+    for _ in range(int(seconds / 0.25)):
+        if sysm.can_connect(host, port, timeout=0.3) and read_viewer_key(key_file) is not None:
+            return True
+        sysm.sleep(0.25)
+    return False
+
+
+def cua_plan(sysm, label=None):
+    """What `preview cua` will do, without starting anything; CuaRefused when it must not run."""
+    login = sysm.owner_login()
+    if not login:
+        raise CuaRefused("cannot tell which Tailscale login owns this machine (tailscale status --json); "
+                         "is Tailscale up?")
+    if login == "tagged-devices":
+        raise CuaRefused("this machine is a tagged Tailscale device, so no single login owns it; "
+                         "the Cua desktops link is only for an owner")
+    if backend_choice(sysm.operator_ok(), os.environ.get("PREVIEW_BACKEND", "")) != "https":
+        raise CuaRefused("the Cua desktops link needs HTTPS through Tailscale Serve (over the http backend any "
+                         "tailnet member could pass for the owner); see preview doctor")
+    cua = sysm.cua_path()
+    if not cua:
+        raise CuaRefused("cua is not installed (install it from github.com/trycua/cua, then check cua --version)")
+    existing = load_state(CUA_PORT)
+    if existing and not cua_unit_of(existing):
+        raise CuaRefused(f"port {CUA_PORT} already has another preview; run preview stop {CUA_PORT} first")
+    label = label or (existing or {}).get("label") or CUA_LABEL
+    key_file = str(cua_key_file())
+    return {"port": CUA_PORT, "label": label, "serve": ("127.0.0.1", CUA_PORT), "unit": CUA_UNIT,
+            "proxy_unit": f"{UNIT_PREFIX}{CUA_PORT}", "backend": "https", "owner_login": login, "key_file": key_file,
+            "cua": cua, "viewer_argv": viewer_argv(cua, CUA_PORT),
+            "argv": ["/usr/bin/python3", "-I", self_path(), "_cua-viewer", "--cua", cua, "--port", str(CUA_PORT),
+                     "--key-file", key_file]}
+
+
+def cmd_cua(sysm, label=None, out=None, err=None):
+    out, err = out or sys.stdout, err or sys.stderr
+    try:
+        plan = cua_plan(sysm, label)
+    except CuaRefused as e:
+        print(f"preview: {e}", file=err)
+        return 1
+    host, lport = plan["serve"]
+    key_file = Path(plan["key_file"])
+    active = sysm.unit_state(CUA_UNIT) == "active"
+    if not (active and sysm.can_connect(host, lport) and read_viewer_key(key_file) is not None):
+        if not active and (sysm.listeners(lport) or target_listening(sysm, lport)):
+            print(f"preview: something else already listens on port {lport}; stop it, then run preview cua again", file=err)
+            return 1
+        ok, msg = sysm.unit_start(CUA_UNIT, "preview cua: Cua desktops viewer", plan["argv"])
+        if ok and not wait_viewer(sysm, host, lport, key_file):
+            ok, msg = False, f"it did not come up on {host}:{lport} (journalctl --user -u {CUA_UNIT})"
+        if not ok:
+            sysm.unit_stop(CUA_UNIT)
+            drop_viewer_key(key_file)
+            print(f"preview: could not start the Cua viewer: {printable(redact(msg or 'systemd-run failed'))}", file=err)
+            return 1
+    code = cmd_start(sysm, CUA_PORT, plan["label"], out=out, err=err,
+                     cua={"kind": "cua", "cua_unit": CUA_UNIT, "owner_login": plan["owner_login"]})
+    if code != 0:
+        sysm.unit_stop(CUA_UNIT)
+        drop_viewer_key(key_file)
+        return code
+    print(f"  Shows every Cua desktop this machine knows (cua spaces ls). Only {printable(plan['owner_login'])} can "
+          f"open it; anyone else gets 403. Stop: preview stop cua", file=err)
     return 0
 
 
@@ -1647,7 +2023,8 @@ def cmd_doctor(sysm, out=None):
 
 def build_parser():
     p = argparse.ArgumentParser(prog="preview", description=HELP, formatter_class=argparse.RawDescriptionHelpFormatter,
-                                usage="preview <port> [--name LABEL] | file <path> [--name LABEL] | list [--json] | stop <port>|<path>|--all | doctor")
+                                usage="preview <port> [--name LABEL] | file <path> [--name LABEL] | cua [--name LABEL] | list [--json] | "
+                                      "stop <port>|<path>|cua|--all | doctor")
     p.add_argument("--version", action="version", version=f"preview {VERSION}")
     return p
 
@@ -1667,14 +2044,18 @@ def parse(argv):
         a = sp.parse_args(argv[1:])
         return "list", a
     if cmd == "stop":
-        sp = argparse.ArgumentParser(prog="preview stop", usage="preview stop <port> | preview stop <path> | preview stop --all")
+        sp = argparse.ArgumentParser(prog="preview stop",
+                                     usage="preview stop <port> | preview stop <path> | preview stop cua | preview stop --all")
         sp.add_argument("target", nargs="?", metavar="port|path")
         sp.add_argument("--all", action="store_true", help="stop every preview created by this tool")
         a = sp.parse_args(argv[1:])
         if (a.target is not None) == bool(a.all):
             sp.error("give exactly one of <port>, <path> or --all")
         a.port = a.path = None
-        if a.target is not None and a.target.isdigit():
+        a.cua = a.target == "cua"
+        if a.cua:
+            pass
+        elif a.target is not None and a.target.isdigit():
             try:
                 a.port = check_port(a.target)
             except argparse.ArgumentTypeError as e:
@@ -1687,6 +2068,16 @@ def parse(argv):
         sp.add_argument("path")
         sp.add_argument("--name", "--label", dest="name", help="short label shown in preview list")
         return "file", sp.parse_args(argv[1:])
+    if cmd == "cua":
+        sp = argparse.ArgumentParser(prog="preview cua", usage="preview cua [--name LABEL]")
+        sp.add_argument("--name", "--label", dest="name", help="short label shown in preview list")
+        return "cua", sp.parse_args(argv[1:])
+    if cmd == "_cua-viewer":
+        sp = argparse.ArgumentParser(prog="preview _cua-viewer")
+        sp.add_argument("--cua", required=True)
+        sp.add_argument("--port", required=True, type=int)
+        sp.add_argument("--key-file", required=True)
+        return "_cua-viewer", sp.parse_args(argv[1:])
     if cmd == "_serve-file":
         sp = argparse.ArgumentParser(prog="preview _serve-file")
         sp.add_argument("--root", required=True)
@@ -1701,6 +2092,9 @@ def parse(argv):
         sp.add_argument("--target", required=True, type=int)
         sp.add_argument("--public-url")
         sp.add_argument("--tailnet-ip")
+        sp.add_argument("--upstream-host")
+        sp.add_argument("--key-file")
+        sp.add_argument("--owner-login")
         return "_serve", sp.parse_args(argv[1:])
     if cmd == "start":
         argv = argv[1:]
@@ -1716,13 +2110,17 @@ def main(argv=None, sysm=None):
         return cmd_serve(a)
     if cmd == "_serve-file":
         return cmd_serve_file(a)
+    if cmd == "_cua-viewer":
+        return cmd_cua_viewer(a)
     sysm = sysm or System()
     if cmd == "list":
         return cmd_list(sysm, a.json)
     if cmd == "stop":
-        return cmd_stop(sysm, a.port, a.all, path=a.path)
+        return cmd_stop(sysm, a.port, a.all, path=a.path, cua=a.cua)
     if cmd == "file":
         return cmd_file(sysm, a.path, a.name)
+    if cmd == "cua":
+        return cmd_cua(sysm, a.name)
     if cmd == "doctor":
         return cmd_doctor(sysm)
     return cmd_start(sysm, a.port, a.name)

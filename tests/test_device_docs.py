@@ -68,7 +68,7 @@ class DeviceDocs(unittest.TestCase):
         text = DEVICES.read_text() + devices_cli.DEVICE_HELP
         for word in ['Python 3.11', 'same tailnet', '[a-z0-9-]{1,40}', '--from-file', '--herdr-session', '--remote-session',
                      '--replace', 'first enrolled', 'conductor install', '--fresh', 'Conductor Claude', 'outdated launcher (no device support)',
-                     'preview stop --all', 'preview doctor', 'github.com/trycua/cua', 'cua --version', 'exit code 3', 'enable-linger',
+                     'preview stop --all', 'preview doctor', 'preview cua', 'github.com/trycua/cua', 'cua --version', 'exit code 3', 'enable-linger',
                      'ssh-keygen', 'ssh-copy-id']:
             self.assertIn(word, text)
         self.assertNotIn('exit 86', text)

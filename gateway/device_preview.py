@@ -20,10 +20,11 @@ RULES_START = '<!-- claude-pool:previews start -->'
 RULES_END = '<!-- claude-pool:previews end -->'
 LINUX_ONLY = 'preview runs its proxy as a systemd user unit; Linux only for now'
 # Earlier releases of gateway/preview that install() may replace: the copy live on personal-vps, the first release with
-# file shares, then the release before the Host header check.
+# file shares, the release before the Host header check, then the release before `preview cua`.
 KNOWN_PREVIOUS = {'b3e645e7ba9750057b68c12f7dd518d19ff792a98062eeea857115b194358d94',
                   '89c880b1411939c7996239273e28aa51399a1dca1cd56e387754e82e235faabe',
-                  '7894d83a893ab63cc07ec07244b910ae8fce1949b080ba355a3b08f6e3903efd'}
+                  '7894d83a893ab63cc07ec07244b910ae8fce1949b080ba355a3b08f6e3903efd',
+                  'fc7f0f3162eadf48ca4f1b942aef8b25f6446fba8fdc1e64bafc959c718a5a11'}
 
 _HASH = ('if command -v sha256sum >/dev/null 2>&1; then h=$(sha256sum "$f" | cut -d" " -f1); '
          'else h=$(shasum -a 256 "$f" | cut -d" " -f1); fi; ')
