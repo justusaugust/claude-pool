@@ -295,7 +295,9 @@ class ServiceBase(unittest.TestCase):
                    mock.patch.object(settings, 'CONDUCTOR_STATE', self.runtime / 'conductor.json'),
                    mock.patch.object(accounts_cli, 'local_context',
                                      return_value=(self.config, self.bin / 'shunt', [self.toml], dict(os.environ))),
-                   mock.patch.object(registry, 'self_name', return_value='personal-vps')]
+                   mock.patch.object(registry, 'self_name', return_value='personal-vps'),
+                   mock.patch.object(settings, 'NATIVE_CLAUDE', '/opt/native/claude'),
+                   mock.patch.object(conductor, 'PROC', self.root / 'no-proc')]
         for item in patches: item.start(); self.addCleanup(item.stop)
         accounts = [{'name': 'team', 'email': 'Justus@AI-Vaerk.de', 'organization': 'AI-Vaerk Team'},
                     {'name': 'ops', 'email': 'ops@ai-vaerk.de', 'organization': 'AI-Vaerk Team'}]
@@ -314,6 +316,14 @@ class ServiceBase(unittest.TestCase):
 
 
 class InstallTests(ServiceBase):
+    def test_a_reattach_form_conductor_with_no_recorded_session_blocks_install_with_the_adopt_fix(self):
+        self.foreign('remote-control --session-id cse_' + SESSION + ' --permission-mode auto')
+        self.assertFalse(settings.CONDUCTOR_STATE.exists())
+        step = conductor.install()
+        self.assertEqual(step.status, 'failed')
+        self.assertIn('--session-id cse_' + SESSION, step.fix)
+        self.assertEqual(self.calls(), []); self.assertFalse(self.unit().exists())
+
     def test_second_conductor_process_blocks_install(self):
         self.foreign('remote-control --name Conductor Claude --spawn same-dir --permission-mode auto')
         step = conductor.install()
@@ -329,19 +339,44 @@ class InstallTests(ServiceBase):
         self.assertEqual(json.loads(settings.CONDUCTOR_STATE.read_text())['sessionId'], 'cse_' + SESSION)
         self.assertEqual(conductor.install().status, 'failed')  # the recorded session still marks the hand-started one
         self.foreign('remote-control --session-id cse_other --permission-mode auto')
-        self.assertEqual(conductor.install().status, 'ok')
+        self.assertEqual(conductor.install().status, 'failed')  # any other Native Remote Control is a second Conductor
+        self.foreign('app-server --remote-control', pid=4300)
+        self.assertEqual(conductor.install().status, 'ok')  # a --remote-control flag is not the remote-control command
         with self.assertRaises(ValueError): conductor.install(session_id='cse_x; rm -rf ~')
 
-    def test_duplicates_exclude_our_own_child_its_descendants_and_other_remote_controls(self):
-        ps = (' 10  9 claude remote-control --name Conductor Claude --spawn same-dir\n'
-              ' 11  1 claude remote-control --session-id cse_' + SESSION + ' --permission-mode auto\n'
-              ' 12  1 claude remote-control --name Other --spawn same-dir\n 13  1 vim notes-about-remote-control --name Conductor Claude\n'
+    def test_duplicates_are_every_native_remote_control_except_our_own_child_and_its_descendants(self):
+        native = '/opt/native/claude'
+        ps = (' 10  9 /opt/native/claude remote-control --name Conductor Claude --spawn same-dir\n'
+              ' 11  1 /opt/native/claude remote-control --session-id cse_' + SESSION + ' --permission-mode auto\n'
+              ' 12  1 /opt/native/claude remote-control --name Other --spawn same-dir\n'
+              ' 13  1 vim notes-about-remote-control --name Conductor Claude\n'
+              ' 14  1 /usr/local/bin/codex app-server --remote-control --listen stdio\n'
               '  9  1 python3 run.py device conductor serve\n'
-              ' 15 10 claude remote-control --name Conductor Claude --spawn same-dir\n'
-              ' 16 15 claude remote-control --name Conductor Claude --spawn same-dir\n')
-        self.assertEqual(conductor.duplicates(ps, None), [10, 15, 16])
-        self.assertEqual(conductor.duplicates(ps, 10), [])
-        self.assertEqual(conductor.duplicates(ps, None, session_id='cse_' + SESSION), [10, 11, 15, 16])
+              ' 15 10 /opt/native/claude remote-control --name Conductor Claude --spawn same-dir\n'
+              ' 16 15 /opt/native/claude remote-control --name Conductor Claude --spawn same-dir\n')
+        self.assertEqual(conductor.duplicates(ps, None, native=native), [10, 11, 12, 15, 16])
+        self.assertEqual(conductor.duplicates(ps, 10, native=native), [11, 12])
+
+    def test_the_live_vps_conductor_is_found_through_proc_and_codex_is_not(self):
+        # Facts from personal-vps (2026-10-18): the hand-started Conductor is `~/.local/bin/claude remote-control --session-id
+        # cse_<id> --permission-mode auto` (no --name); codex app-server --remote-control runs on the same machine.
+        root = Path(self.tmp.name)
+        versions = root / 'home/.local/share/claude/versions'; versions.mkdir(parents=True)
+        current, older = versions / '2.1.500', versions / '2.1.400'
+        for path in (current, older): path.write_text('')
+        link = root / 'home/.local/bin/claude'; link.parent.mkdir(parents=True); link.symlink_to(current)
+        proc = root / 'proc'
+        for pid, exe in [(4242, older), (4300, root / 'codex'), (4400, current)]:
+            (proc / str(pid)).mkdir(parents=True); (proc / str(pid) / 'exe').symlink_to(exe)
+        ps = (' 4242     1 ' + str(link) + ' remote-control --session-id cse_01AbCdEf --permission-mode auto\n'
+              ' 4300     1 ' + str(root / 'codex') + ' app-server --remote-control --listen stdio\n'
+              ' 4400  4399 claude remote-control --name Leitstand --spawn same-dir --permission-mode auto\n'
+              ' 4500     1 ' + str(link) + ' --resume\n')
+        with mock.patch.object(conductor, 'PROC', proc):
+            found = conductor.duplicates(ps, None, native=str(link))
+            self.assertEqual(found, [4242, 4400])
+            self.assertEqual(conductor.adoptable(ps, found), 'cse_01AbCdEf')
+            self.assertEqual(conductor.duplicates(ps, 4399, native=str(link)), [4242])
 
     def test_install_refuses_on_a_device_the_registry_does_not_name_unless_moving(self):
         with mock.patch.object(registry, 'self_name', return_value='mac'):

@@ -56,6 +56,7 @@ START, END = '<!-- claude-pool:devices start -->', '<!-- claude-pool:devices end
 LABEL = service.installed_label(service.receipt(settings.HERE.parent)) + '.conductor'
 WINDOW = (50, 300)  # rows, columns of the child's terminal: wide enough that no line of interest wraps
 REATTACH_TRIES = 3
+PROC = Path('/proc')  # Linux: /proc/<pid>/exe names the real executable of a process
 DELETE = object()
 
 
@@ -229,9 +230,39 @@ def processes():
     return _run(['ps', '-axww', '-o', 'pid=,ppid=,args=']).stdout or ''
 
 
-def duplicates(ps_output, own_pid, session_id=None):
-    """Conductor processes other than our own child and its descendants (`pid ppid args` lines): Remote Control named
-    Conductor Claude, or attached to our recorded session."""
+def _resolved(path):
+    try: return os.path.realpath(path)
+    except (OSError, ValueError): return None
+
+
+def executable(pid, argv0):
+    """The real executable of process `pid`: /proc/<pid>/exe on Linux, else its argv[0] (absolute, or found on the
+    Conductor's PATH). None when it cannot be told."""
+    try:
+        target = os.readlink(PROC / str(pid) / 'exe')
+        return target[:-len(' (deleted)')] if target.endswith(' (deleted)') else target
+    except OSError: pass
+    if os.path.isabs(argv0): return argv0
+    import shutil
+    return shutil.which(argv0, path=unit_path())
+
+
+def is_native(path, native):
+    """`path` is the Native Claude binary claude-pool uses, or another version of the same installation (Native keeps its
+    versions side by side in one `versions` folder; a running process may still be an older one after an update)."""
+    found, wanted = _resolved(path) if path else None, _resolved(native) if native else None
+    if not found or not wanted: return False
+    if found == wanted: return True
+    parent = os.path.dirname(wanted)
+    return os.path.basename(parent) == 'versions' and os.path.dirname(found) == parent
+
+
+def duplicates(ps_output, own_pid, native=None):
+    """Every Native Claude `remote-control` process except our own child and its descendants (`pid ppid args` lines),
+    whatever its --name or --session-id: one pool has exactly one Conductor, and a hand-started one (for example
+    `claude remote-control --session-id cse_<id> --permission-mode auto`) can only be adopted, never run twice.
+    Other programs with a --remote-control flag (codex app-server) never count."""
+    native = native or settings.NATIVE_CLAUDE
     rows = []
     for line in ps_output.splitlines():
         parts = line.split()
@@ -245,11 +276,8 @@ def duplicates(ps_output, own_pid, session_id=None):
             if parent in ours and pid not in ours: ours.add(pid); grew = True
     found = []
     for pid, _, words in rows:
-        if 'remote-control' not in words or pid in ours: continue
-        named = any(words[i:i + 3] == ['--name', 'Conductor', 'Claude'] and (i + 3 == len(words) or words[i + 3].startswith('-'))
-                    for i in range(len(words)))
-        attached = bool(session_id) and any(words[i:i + 2] == ['--session-id', session_id] for i in range(len(words)))
-        if named or attached: found.append(pid)
+        if 'remote-control' not in words[1:] or pid in ours: continue
+        if is_native(executable(pid, words[0]), native): found.append(pid)
     return found
 
 
@@ -333,7 +361,7 @@ def install(session_id=None, fresh=False, moving=False, restart=False):
         if record.get('sessionId'): changes['previousSessionId'] = record['sessionId']
     if changes: record = _update(state, **changes)
     listing = processes()
-    found = duplicates(listing, _own_child(record), record.get('sessionId'))
+    found = duplicates(listing, _own_child(record))
     if found: return Step(STEP, 'failed', 'another Conductor is running (pid ' + ', '.join(map(str, found)) + ')',
                           adopt_fix(adoptable(listing, found)))
     cwd = Path(entry['cwd']).expanduser()
@@ -388,7 +416,7 @@ def status():
         installed = service.service_file(LABEL).exists()
         own = _own_child(record) if installed else None
         listing = processes()
-        found = duplicates(listing, own, record.get('sessionId'))
+        found = duplicates(listing, own)
         return {'installed': installed, 'running': own is not None, 'ready': own is not None and bool(record.get('ready')),
                 'fresh': bool(record.get('fresh')), 'duplicates': found, 'adoptSessionId': adoptable(listing, found)}
     except Exception as error:
