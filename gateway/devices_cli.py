@@ -67,7 +67,8 @@ DEVICE_HELP = '\n'.join([
     'VERBS',
     '  device add <ssh-target> [--name N] [--cua] [--usage-owner] [--herdr-session S]',
     '      Adds or repairs a machine; rerun to finish what is missing. N matches [a-z0-9-]{1,40}, default from the host name.',
-    '      --cua also shares desktops through Cua. --usage-owner makes it the usage poller (and creates the Conductor if none exists).',
+    '      --cua also shares desktops through Cua. --usage-owner makes it the usage poller (and creates the Conductor if none exists);',
+    '      it needs its own refreshable login for every account (claude-pool account add <email> --name <name> on it), else it is refused.',
     '      --herdr-session S: the herdr profile on this machine opens session S on the target (herdr machine add --remote-session S).',
     '  device check [name] [--probe] [--json]   Reads every check below, changes nothing. --probe sends one tiny Claude request per long-lived account.',
     '  device remove <name> [--wait] [--uninstall] [--forget]',
@@ -159,10 +160,12 @@ def overview_part():
 
 
 def readings_part():
-    """When this device last received usage readings from the usage owner (ms), or None."""
+    """When this device last received usage readings from the usage owner (ms), or None, and which accounts they cover
+    (an account the owner reads no usage for has no row, or one that was never seen)."""
     try: shared = readings.load_shared(settings.SHARED_READINGS)
     except Exception: shared = None
-    return {'sharedReadingsAt': shared['at'] if shared else None}
+    covered = sorted(name for name, entry in shared['accounts'].items() if entry.get('seenAt')) if shared else None
+    return {'sharedReadingsAt': shared['at'] if shared else None, 'sharedReadingsAccounts': covered}
 
 
 device_sync.STATUS_PARTS.extend([overview_part, readings_part])
@@ -814,6 +817,31 @@ def ensure_conductor(t):
     return check_conductor(t)  # the device's own report after the install, never a generic one
 
 
+def owner_login_fix(owner, row):
+    """Connect a refreshable login for `row` on the usage owner: only a refreshable grant can read usage."""
+    command = 'claude-pool account add ' + (row.get('email') or '<email>') + ' --name ' + row['name']
+    return remote_command(owner['ssh'], command) if owner.get('ssh') else command + ' on ' + owner['name']
+
+
+def take_usage_role(t):
+    """`add --usage-owner`: the role moves only to a device that serves every registry account from its own refreshable
+    login (status servingKind); a device that only holds long-lived tokens could read no usage. None when it moved."""
+    value = registry.load()
+    if 'usage' in t.row.get('roles', []): return None
+    rows = t.status(fresh=True).get('accounts') or {}
+    missing = [row for row in value['accounts']
+               if (rows.get(row['name']) or {}).get('servingKind') != 'refreshable' or not (rows.get(row['name']) or {}).get('active', True)]
+    if missing:
+        fix = owner_login_fix(t.row, missing[0]) + ', then claude-pool device add ' + t.where + ' --usage-owner'
+        return Step('usage-owner', 'failed', t.row['name'] + ' serves no refreshable login for ' + ', '.join(row['name'] for row in missing) +
+                    ', so it could not read their usage; the usage owner stays ' + ((registry.owner(value) or {}).get('name') or 'unset'), fix)
+    def move(current):
+        for row in current['devices']: row['roles'] = ['usage'] if row['name'] == t.row['name'] else [r for r in row.get('roles', []) if r != 'usage']
+    registry.update(move)
+    t.row = registry.device(registry.load(), t.row['name'])
+    return None
+
+
 def check_readings(t):
     value = registry.load()
     owner = registry.owner(value)
@@ -825,6 +853,13 @@ def check_readings(t):
     if not isinstance(at, int):
         return Step('readings', 'manual', 'no usage readings from ' + owner['name'] + ' yet',
                     'first readings arrive within 5 min; needs ssh from ' + t.where + ' to ' + reach + ' without a password prompt')
+    covered = t.status().get('sharedReadingsAccounts')
+    if now - at <= READINGS_MAX_AGE_MS and isinstance(covered, list):
+        missing = [row for row in value['accounts'] if row['name'] not in covered]
+        if missing:
+            return Step('readings', 'failed', 'the usage readings from ' + owner['name'] + ' have no row for ' +
+                        ', '.join(row['name'] for row in missing) + ' (the owner serves no refreshable login for it)',
+                        owner_login_fix(owner, missing[0]))
     if now - at <= READINGS_MAX_AGE_MS:
         return Step('readings', 'ok', 'from ' + owner['name'] + ', ' + str(max(0, now - at) // 60000) + ' min old')
     return Step('readings', 'missing', 'no usage readings from ' + owner['name'] + ' in the last 15 minutes',
@@ -945,17 +980,22 @@ def add(argv, out, remotes, local, **_):
         return 2
     if me is None: registry.set_self(local_name()); me = registry.self_name()
     start = value['generation']
-    wanted = copy.deepcopy(value); _desired(wanted, me, name, target, platform, args)
-    if wanted != value: registry.update(lambda current: _desired(current, me, name, target, platform, args))
+    # The usage role moves only after the accounts step, once the target's own logins can be read (take_usage_role).
+    placed = argparse.Namespace(**{**vars(args), 'usage_owner': False})
+    wanted = copy.deepcopy(value); _desired(wanted, me, name, target, platform, placed)
+    if wanted != value: registry.update(lambda current: _desired(current, me, name, target, platform, placed))
     session = Session(remotes, local)
     t = Target(session, registry.device(registry.load(), name), remote, False, args)
-    ensured = {'reachable': None}
+    ensured, refused = {'reachable': None}, None
     for step_name in ADD_ORDER[1:]:
         t.row = registry.device(registry.load(), name)
         step = run_step(CHECKS[step_name], step_name, t)
         ensured[step_name] = None
         if step.status != 'ok' and step_name in ENSURES:
             ensured[step_name] = run_step(ENSURES[step_name], step_name, t)
+        if step_name == 'accounts' and args.usage_owner:
+            refused = run_step(take_usage_role, 'usage-owner', t)
+            if refused is not None: t.args = argparse.Namespace(**{**vars(args), 'usage_owner': False})  # no Conductor either
     synced = {}
     if registry.load()['generation'] != start:  # every other device learns about this one (and runs its herdr hook)
         try: synced = device_sync.sync_all(remotes)
@@ -966,6 +1006,7 @@ def add(argv, out, remotes, local, **_):
     for step in check_all(t):
         done = ensured.get(step.name)
         final.append(done if prefer_ensured(done, step, t.retry) else step)
+    if refused is not None: final.append(refused)
     print(render(name + ' (' + target + ')', final))
     print_sync(synced)
     return 0 if ready(final) else 2

@@ -23,7 +23,7 @@ Run the same command again to repair a half-finished machine: every step finishe
 Options:
 
 - `--cua` also shares desktops through Cua (see Cua below).
-- `--usage-owner` makes the device the one that polls usage. It also creates the Conductor on that device, only when none exists yet.
+- `--usage-owner` makes the device the one that polls usage. Only a refreshable login can read usage, so the device must serve every account from its own refreshable login first (`claude-pool account add <email> --name <name>` on it); otherwise `add` refuses the role, names the missing accounts and changes no owner. It also creates the Conductor on that device, only when none exists yet.
 - `--herdr-session <session>` adds a herdr profile on this machine that opens that herdr session on the target (`herdr machine add <ssh-target> --label <name> --remote-session <session>`). The Conductor's instructions name the session.
 
 Exit codes: 0 when no step is `missing`, `failed` or `unreachable`; manual steps never block. 2 when a step needs work: read its `fix:` line, run it, and run `add` again. A Linux device whose linger needs root is `failed` (so exit 2) until the root command in "What only a human does" has run: `add` first tries `loginctl enable-linger` without root.
@@ -111,7 +111,7 @@ A long-lived token lasts one year and is inference only. `doctor` warns 30 days 
 
 ## The usage owner and readings
 
-One device is the usage owner (`add <ssh-target> --usage-owner`). It polls the provider. Every other device pulls the readings from it over SSH every 5 minutes, using the pool service, which cannot answer a password prompt. So every non-owner device needs passwordless ssh to the owner: on the device run `ssh-keygen` if it has no key, `ssh-copy-id <owner-ssh-target>`, and check `ssh -o BatchMode=yes <owner-ssh-target> true`. The `readings` check is `manual` until the first readings arrive (within 5 minutes).
+One device is the usage owner (`add <ssh-target> --usage-owner`). It polls the provider. Every other device pulls the readings from it over SSH every 5 minutes, using the pool service, which cannot answer a password prompt. So every non-owner device needs passwordless ssh to the owner: on the device run `ssh-keygen` if it has no key, `ssh-copy-id <owner-ssh-target>`, and check `ssh -o BatchMode=yes <owner-ssh-target> true`. The `readings` check is `manual` until the first readings arrive (within 5 minutes). It fails when the readings have no row for an account, because the owner then serves no refreshable login for it.
 
 ## Conductor
 

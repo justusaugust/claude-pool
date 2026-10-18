@@ -120,10 +120,13 @@ def account_rows():
         except (OSError, ValueError, RuntimeError): continue
         try:
             row = {'name': name, 'kind': 'long-lived' if have else kind(value), 'fingerprint': fingerprint(value),
-                   'expiresAt': long_lived.expires_at_ms(value), 'active': name in members, 'servingFingerprint': None}
+                   'expiresAt': long_lived.expires_at_ms(value), 'active': name in members, 'servingFingerprint': None,
+                   'servingKind': None}
             if name in strays: row['stray'] = True
             if name in members and store.exists() and not store.is_symlink():
-                try: row['servingFingerprint'] = fingerprint(read_private(store))
+                try:
+                    served = read_private(store)
+                    row['servingFingerprint'], row['servingKind'] = fingerprint(served), kind(served)
                 except (OSError, ValueError, RuntimeError): pass
         except RuntimeError: continue
         rows.append(row)

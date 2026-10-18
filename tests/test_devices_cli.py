@@ -618,8 +618,11 @@ class Machine:
     def __init__(self, ssh, log, *, platform='linux', reachable=True, launcher='current', native=NATIVE_PATH, version=WANTED,
                  linger='yes', shell=True, self_name=None, registry_value=None, accounts=None, service='running',
                  doctor=True, login=TEAM_LOGIN, cua=False, ip=None, preview='ours', rules=True, https=True,
-                 overview=None, shared_at='fresh', conductor_part=None, switch_pending=(), herdr=None, label='io.github.claude-pool'):
+                 overview=None, shared_at='fresh', conductor_part=None, switch_pending=(), herdr=None, label='io.github.claude-pool',
+                 refreshable=('team',), shared_accounts=('team',)):
         self.ssh, self.log = ssh, log
+        self.refreshable = set(refreshable)  # accounts this machine serves from its own refreshable login
+        self.shared_accounts = list(shared_accounts)  # accounts in the usage readings it last received
         self.platform, self.reachable, self.launcher, self.native, self.version = platform, reachable, launcher, native, version
         self.linger, self.shell, self.self_name, self.registry = linger, shell, self_name, registry_value
         self.accounts = dict(accounts or {})
@@ -646,8 +649,12 @@ class Machine:
         self.remote = Remote_(ssh, self.handle)
 
     def status(self):
-        rows = [{'name': n, 'kind': r.get('kind', 'long-lived'), 'fingerprint': r['fingerprint'], 'expiresAt': None,
-                 'active': r.get('active', True), 'servingFingerprint': r['fingerprint']} for n, r in sorted(self.accounts.items())]
+        rows = []
+        for n in sorted(set(self.accounts) | self.refreshable):
+            r = self.accounts.get(n) or {'kind': 'refreshable', 'fingerprint': '2' * 12}
+            rows.append({'name': n, 'kind': r.get('kind', 'long-lived'), 'fingerprint': r['fingerprint'], 'expiresAt': None,
+                         'active': r.get('active', True), 'servingFingerprint': r['fingerprint'],
+                         'servingKind': 'refreshable' if n in self.refreshable else r.get('kind', 'long-lived')})
         known = self.registry or registry.EMPTY()
         return {'name': self.self_name, 'version': self.version, 'platform': self.platform, 'service': self.service,
                 'accounts': rows, 'switchPending': self.switch_pending, 'registryGeneration': known['generation'],
@@ -656,7 +663,7 @@ class Machine:
                 'herdrProfiles': [], 'conductor': self.conductor,
                 'cua': {'host': self.host, 'spaces': list(self.spaces), 'mcp': self.mcp} if self.cua else None,
                 'preview': {'installed': self.preview == 'ours', 'https': self.https}, 'overview': self.overview,
-                'sharedReadingsAt': self.shared_at, 'serviceLabel': self.label}
+                'sharedReadingsAt': self.shared_at, 'sharedReadingsAccounts': list(self.shared_accounts), 'serviceLabel': self.label}
 
     def event(self, label): self.log.append((self.ssh, label))
 
@@ -850,6 +857,20 @@ class AddTests(OrchestrationBase):
         self.assertTrue(self.vps.shell); self.assertEqual(self.vps.linger, 'yes'); self.assertEqual(self.vps.service, 'running')
         self.assertTrue(self.vps.rules); self.assertEqual(self.vps.preview, 'ours')
         self.assertEqual([r['target'] for r in self.local.herdr], ['justus@vps'])
+
+    def test_usage_owner_is_refused_on_a_device_that_serves_no_refreshable_login_for_the_accounts(self):
+        # A fresh machine only stages long-lived tokens; as usage owner it could poll no usage and readings would stop.
+        registry.update(lambda value: value['devices'].append(dict(SELF_ROW, roles=['usage'])), self.reg)
+        self.fresh_vps(refreshable=())
+        code, out, err = self.cli('add', 'justus@vps', '--name', 'vps', '--usage-owner')
+        self.assertEqual(code, 2, out + err)
+        self.assertEqual(registry.owner(registry.load(self.reg))['name'], 'mac')
+        self.assertIsNone(registry.load(self.reg)['conductor'])
+        self.assertRegex(out, r'failed +usage-owner +vps serves no refreshable login for team.*\n      fix: '
+                              r'ssh justus@vps \.local/bin/claude-pool account add team@x\.de --name team, then claude-pool device add justus@vps --usage-owner')
+        self.fresh_vps()
+        code, out, err = self.cli('add', 'justus@vps', '--name', 'vps', '--usage-owner')
+        self.assertEqual(code, 0, out + err); self.assertEqual(registry.owner(registry.load(self.reg))['name'], 'vps')
 
     def test_add_checks_the_launcher_before_any_device_verb(self):
         self.fresh_vps()
@@ -1247,6 +1268,12 @@ class FixRoundCheckTests(OrchestrationBase):
         self.vps.shared_at = int(time.time() * 1000) - 20 * 60_000
         code, out, _ = self.cli('check', 'vps')
         self.assertEqual(code, 2); self.assertRegex(out, r'\n  missing +readings ')
+
+    def test_readings_fail_when_the_shared_reading_has_no_row_for_an_account(self):
+        self.vps.shared_accounts = []
+        code, out, _ = self.cli('check', 'vps')
+        self.assertEqual(code, 2)
+        self.assertRegex(out, r'\n  failed +readings +the usage readings from mac have no row for team.*\n      fix: .*account add team@x\.de --name team')
 
     def test_doctor_fixes_are_run_on_the_device(self):
         self.vps.doctor = False
