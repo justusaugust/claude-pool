@@ -156,8 +156,8 @@ class Base(unittest.TestCase):
         return device_herdr.Host(home=self.m.home, local=FakeLocal(self.m), proc=self.m.proc, kill=self.m.kill, sleep=sleep,
                                  clock=lambda: self.clock[0])
 
-    def apply(self, listed=(), adopt=False):
-        return device_herdr.apply(self.host(), list(listed), adopt=adopt)
+    def apply(self, listed=(), adopt=False, everything=False):
+        return device_herdr.apply(self.host(), list(listed), adopt=adopt, everything=everything)
 
     def by_name(self, steps): return {step.name: step for step in steps}
 
@@ -173,7 +173,10 @@ class UnitFileTests(Base):
         lines = text.splitlines()
         self.assertTrue(lines[0].startswith(device_herdr.MARK))
         self.assertIn('ExecStart=' + str(self.m.herdr_path) + ' --session %i server', lines)
-        self.assertIn('Environment=PATH=' + str(self.m.home) + '/.local/bin:/usr/local/bin:/usr/bin:/bin', lines)
+        # A resumed agent gets what a login shell has (~/.profile adds ~/.local/bin and ~/bin): the `claude` function finds
+        # claude-pool, and claude-pool finds python3 and Native Claude.
+        home = str(self.m.home)
+        self.assertIn('Environment=PATH=' + home + '/.local/bin:' + home + '/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', lines)
         for line in ['Restart=on-failure', 'RestartSec=3', '[Install]', 'WantedBy=default.target']: self.assertIn(line, lines)
         self.assertNotIn('$HOME', text)
 
@@ -191,7 +194,7 @@ class UnitFileTests(Base):
     def test_a_template_claude_pool_did_not_write_is_never_overwritten(self):
         self.m.add('dashboard')
         path = self.m.units / device_herdr.TEMPLATE; path.write_text('[Service]\nExecStart=/bin/true\n')
-        steps = self.apply()
+        steps = self.apply(['dashboard'])
         self.assertEqual(steps[0].status, 'failed'); self.assertIn('did not write', steps[0].detail)
         self.assertEqual(path.read_text(), '[Service]\nExecStart=/bin/true\n')
         self.assertFalse([c for c in self.m.calls if c[2:3] == ['enable']])
@@ -201,11 +204,19 @@ class ApplyTests(Base):
     def test_a_running_session_is_enabled_but_never_started_or_stopped(self):
         self.m.add('dashboard', agents=CLAUDE)
         pid = self.m.sessions['dashboard']['pid']
-        steps = self.by_name(self.apply())
+        steps = self.by_name(self.apply(['dashboard']))
         self.assertEqual(steps['dashboard'].status, 'ok'); self.assertIn('next boot', steps['dashboard'].detail)
         self.assertIn('claude-pool-herdr@dashboard.service', self.m.enabled)
         self.assertEqual(self.starts(), []); self.assertEqual(self.m.killed, [])
         self.assertTrue((self.m.proc / str(pid)).exists())
+
+    def test_a_running_session_nobody_listed_gets_a_unit_only_with_everything(self):
+        # A throwaway session must not come back at every boot just because it ran while device add looked.
+        self.m.add('dashboard', agents=CLAUDE); self.m.add('scratch', agents=())
+        self.assertEqual(list(self.by_name(self.apply(['dashboard']))), ['dashboard'])
+        self.assertEqual(self.m.enabled, {'claude-pool-herdr@dashboard.service'})
+        self.assertEqual(sorted(self.by_name(self.apply(everything=True))), ['dashboard', 'scratch'])
+        self.assertIn('claude-pool-herdr@scratch.service', self.m.enabled)
 
     def test_a_registered_session_that_is_not_running_is_enabled_and_started(self):
         self.m.add('objekt', running=False)
@@ -233,7 +244,7 @@ class ApplyTests(Base):
         wants = self.m.units / 'default.target.wants'; wants.mkdir()
         os.symlink(self.m.units / 'herdr@.service', wants / 'herdr@conductor.service')
         (self.m.units / 'pr.service').write_text('[Service]\nEnvironment=HERDR_SESSION=pr-coord\nExecStart=-herdr server\n')
-        steps = self.by_name(self.apply())
+        steps = self.by_name(self.apply(everything=True))
         self.assertEqual(steps['conductor'].detail, 'served by herdr@conductor.service')
         self.assertEqual(steps['pr-coord'].detail, 'served by pr.service')
 
@@ -254,7 +265,7 @@ class AdoptTests(Base):
                 self.setUp()
                 self.m.add('dashboard', agents=CLAUDE, statuses={'helper': status})
                 pid = self.m.sessions['dashboard']['pid']
-                step = self.by_name(self.apply(adopt=True))['dashboard']
+                step = self.by_name(self.apply(['dashboard'], adopt=True))['dashboard']
                 self.assertEqual(step.status, 'manual'); self.assertIn('helper', step.detail); self.assertIn(status, step.detail)
                 self.assertIn('--adopt', step.fix)
                 self.assertEqual(self.m.killed, []); self.assertEqual(self.starts(), [])
@@ -279,7 +290,7 @@ class AdoptTests(Base):
     def test_adopt_refuses_when_no_single_process_owns_the_socket(self):
         self.m.add('dashboard', agents=CLAUDE)
         (self.m.proc / 'net/unix').write_text('Num       RefCount Protocol Flags    Type St Inode Path\n')
-        step = self.by_name(self.apply(adopt=True))['dashboard']
+        step = self.by_name(self.apply(['dashboard'], adopt=True))['dashboard']
         self.assertEqual(step.status, 'manual'); self.assertIn('socket', step.detail)
         self.assertEqual(self.m.killed, [])
 
@@ -287,7 +298,7 @@ class AdoptTests(Base):
         self.m.add('dashboard', agents=CLAUDE)
         pid = self.m.sessions['dashboard']['pid']
         (self.m.proc / str(pid) / 'cmdline').write_bytes(b'/usr/bin/python3\0x.py\0')
-        step = self.by_name(self.apply(adopt=True))['dashboard']
+        step = self.by_name(self.apply(['dashboard'], adopt=True))['dashboard']
         self.assertEqual(step.status, 'manual'); self.assertEqual(self.m.killed, [])
 
     def test_adopt_verifies_workspaces_and_each_conversation_id(self):
@@ -297,7 +308,7 @@ class AdoptTests(Base):
                 self.setUp()
                 self.m.add('dashboard', agents=CLAUDE, workspaces=[{'workspace_id': 'w1', 'label': 'werkbank'}])
                 self.m.restore = restore
-                step = self.by_name(self.apply(adopt=True))['dashboard']
+                step = self.by_name(self.apply(['dashboard'], adopt=True))['dashboard']
                 self.assertEqual(step.status, wanted, step)
                 if wanted == 'failed':
                     self.assertIn('herdr --session dashboard', step.fix)
@@ -308,7 +319,7 @@ class AdoptTests(Base):
     def test_adopt_reports_a_server_that_does_not_stop(self):
         self.m.add('dashboard', agents=CLAUDE)
         host = self.host(); host.kill = lambda pid, sig: self.m.killed.append((pid, sig))
-        step = self.by_name(device_herdr.apply(host, [], adopt=True))['dashboard']
+        step = self.by_name(device_herdr.apply(host, ['dashboard'], adopt=True))['dashboard']
         self.assertEqual(step.status, 'failed'); self.assertIn('did not stop', step.detail)
         self.assertEqual(self.starts(), [])
 
@@ -328,21 +339,30 @@ class CheckTests(Base):
 
     def test_missing_names_the_sessions_and_the_internal_verb(self):
         self.m.add('dashboard'); self.m.add('objekt', running=False); self.m.add('leitstand', running=False)
-        step = self.check(['objekt'])
-        self.assertEqual((step.status, step.fix), ('missing', self.FIX))
+        step = self.check(['dashboard', 'objekt'])
+        self.assertEqual((step.status, step.fix), ('missing', self.FIX + ' --session dashboard --session objekt'))
         self.assertIn('dashboard', step.detail); self.assertIn('objekt', step.detail); self.assertNotIn('leitstand', step.detail)
+
+    def test_a_running_session_nobody_listed_is_only_mentioned(self):
+        self.m.add('dashboard'); self.m.add('scratch')
+        self.apply(['dashboard'])
+        step = self.check(['dashboard'])
+        self.assertEqual(step.status, 'ok', step)
+        self.assertIn('scratch runs without a unit', step.detail)
+        self.assertIn('--herdr-session scratch', step.detail)
+        self.assertEqual(self.check().status, 'ok')
 
     def test_ok_once_every_session_is_enabled_or_served_by_another_unit(self):
         self.m.add('dashboard'); self.m.add('trial')
         (self.m.units / 'herdr-trial.service').write_text('[Service]\nExecStart=/x/herdr --session trial server\n')
-        self.apply()
-        step = self.check()
+        self.apply(everything=True)
+        step = self.check(['dashboard', 'trial'])
         self.assertEqual(step.status, 'ok', step); self.assertIn('herdr-trial.service', step.detail)
 
     def test_an_outdated_template_is_missing_again(self):
-        self.m.add('dashboard'); self.apply()
+        self.m.add('dashboard'); self.apply(['dashboard'])
         (self.m.units / device_herdr.TEMPLATE).write_text(device_herdr.MARK + '\n[Service]\nExecStart=/old/herdr --session %i server\n')
-        self.assertEqual(self.check().status, 'missing')
+        self.assertEqual(self.check(['dashboard']).status, 'missing')
 
     def test_status_part_is_registered_and_reports_nothing_off_linux(self):
         self.assertIn(device_herdr.status_part, device_sync.STATUS_PARTS)

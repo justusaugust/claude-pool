@@ -13,7 +13,7 @@ Tailscale is the only network path between machines. Nothing listens on a public
 ## Add a machine
 
 ```sh
-claude-pool device add <ssh-target> [--name <name>] [--cua] [--usage-owner] [--herdr-session <session>]
+claude-pool device add <ssh-target> [--name <name>] [--cua] [--usage-owner] [--herdr-session <session>] [--herdr-units listed|all]
 ```
 
 `<ssh-target>` is anything `ssh` accepts, for example `user@host` or an alias. The device name must match `[a-z0-9-]{1,40}`; by default it is the host part of the target, lowercased (`alex@example-vps.example` becomes `example-vps`). Pass `--name` to choose another.
@@ -25,6 +25,7 @@ Options:
 - `--cua` also shares desktops through Cua (see Cua below).
 - `--usage-owner` makes the device the one that polls usage. Only a refreshable login can read usage, so the device must serve every account from its own refreshable login first (`claude-pool account add <email> --name <name>` on it); otherwise `add` refuses the role, names the missing accounts and changes no owner. It also creates the Conductor on that device, only when none exists yet.
 - `--herdr-session <session>` adds a herdr profile on this machine that opens that herdr session on the target (`herdr machine add <ssh-target> --label <name> --remote-session <session>`). The Conductor's instructions name the session. The session is also recorded for the target, so it comes back after a reboot there even while it is not running (see herdr sessions after a reboot).
+- `--herdr-units all` also gives every herdr session that runs on the target right now a unit, so it comes back after a reboot. Without it (`listed`, the default) only sessions given with `--herdr-session`, now or earlier, get one; `check` names the other running sessions without counting them as missing.
 
 Exit codes: 0 when no step is `missing`, `failed` or `unreachable`; manual steps never block. 2 when a step needs work: read its `fix:` line, run it, and run `add` again. A Linux device whose linger needs root is `failed` (so exit 2) until the root command in "What only a human does" has run: `add` first tries `loginctl enable-linger` without root.
 
@@ -56,7 +57,7 @@ claude-pool device switch [--wait]
 | `doctor` | claude-pool doctor on the device reports nothing | run ssh <device> .local/bin/claude-pool doctor and apply the fix it prints |
 | `native-login` | Native Claude is logged in; on the device that runs the Conductor it must be an account the pool serves (`failed` otherwise), elsewhere another login is only a `manual` note, as it is when no Conductor is configured | claude-pool device add <ssh-target> and click Authorize; claude-native auth status if it cannot be read |
 | `herdr` | this machine has a herdr profile for the device | herdr machine add <ssh-target> --label <name> |
-| `herdr-sessions` | every saved herdr session that runs or that add registered comes back after a reboot (Linux devices only) | ssh <ssh-target> .local/bin/claude-pool device herdr-units; to hand a running session to its unit now, while its agents are idle: ssh <ssh-target> .local/bin/claude-pool device herdr-units --adopt |
+| `herdr-sessions` | every herdr session registered for the device (add --herdr-session) comes back after a reboot (Linux devices only); other running sessions are only named | ssh <ssh-target> .local/bin/claude-pool device herdr-units --session <session>; to hand a running session to its unit now, while its agents are idle: ssh <ssh-target> .local/bin/claude-pool device herdr-units --adopt |
 | `app` | the Mac that runs the Claude app lists and trusts the SSH environment | the Claude app clicks printed under Needs you |
 | `cua` | the device shares its desktop through Cua and the machines can reach each other | see docs/DEVICES.md, Cua; macOS: switch on cua-spacesd in Accessibility, then claude-pool device add <ssh-target> --cua |
 | `conductor` | exactly one Conductor runs, on the registry device, connected to Remote Control | ssh <device> .local/bin/claude-pool device conductor install; claude-pool device conductor move <device>; stop the hand-started Conductor (herdr session conductor) |
@@ -164,7 +165,9 @@ claude-pool conductor journal add|show|prune  # append-only journal
 
 ## herdr sessions after a reboot
 
-herdr saves each session's workspaces, folders and the conversation of every Claude pane in `~/.config/herdr/sessions/<session>/session.json`, and resumes those Claude agents (`claude --resume <id>`) when its server starts again. Something has to start the server at boot. On a Linux device, `add` writes one systemd user template unit, `~/.config/systemd/user/claude-pool-herdr@.service` (`herdr --session %i server`, restarted on failure), and enables an instance `claude-pool-herdr@<session>` for every session that has a `session.json` and either runs or was given with `--herdr-session`. The `herdr-sessions` check is `ok` when each of them is enabled.
+herdr saves each session's workspaces, folders and the conversation of every Claude pane in `~/.config/herdr/sessions/<session>/session.json`, and resumes those Claude agents (`claude --resume <id>`) when its server starts again. Something has to start the server at boot. On a Linux device, `add` writes one systemd user template unit, `~/.config/systemd/user/claude-pool-herdr@.service` (`herdr --session %i server`, restarted on failure), and enables an instance `claude-pool-herdr@<session>` for every session that has a `session.json` and was given with `--herdr-session` (with `--herdr-units all`, also for every session running at that moment). A throwaway session therefore never comes back at boot unless you asked for it. The `herdr-sessions` check is `ok` when each registered session is enabled; a running session nobody registered is named in its detail (`runs without a unit`) and never makes the check fail.
+
+The unit sets `PATH` to what a login shell has (`~/.local/bin`, `~/bin`, `/usr/local/sbin`, `/usr/local/bin`, `/usr/sbin`, `/usr/bin`, `/sbin`, `/bin`), so an agent herdr resumes finds `claude-pool` behind the `claude` function and `python3` behind `claude-pool`, as it did in the ssh session that first started the server.
 
 Enabling never starts a unit next to a running server, so nothing that runs is interrupted: a session started by hand (for example from another machine's herdr profile) keeps running, and its unit takes over at the next boot. A session that is registered but not running is started by its unit right away. A session that a unit claude-pool did not write already serves, for example `herdr-trial.service`, counts as served and is never touched; neither is that unit.
 
@@ -177,6 +180,16 @@ ssh <ssh-target> .local/bin/claude-pool device herdr-units --adopt [--session <s
 It refuses, changing nothing, while any agent of the session is working or waiting for an answer. Otherwise it stops that session's server by the process id that owns the session's socket (never by name, never another session), starts the unit and checks that the session lists the same workspaces and that each Claude agent came back with the same conversation. Every process running in that session's panes ends; conversations survive. herdr may resume the agents only once a client attaches: if the check says an agent did not come back, attach once with `herdr --session <session>` and run `claude-pool device check <name>`.
 
 `device remove` disables and deletes only the units claude-pool wrote; the sessions keep running until that machine reboots.
+
+To verify after a reboot, on the device:
+
+```sh
+systemctl --user status claude-pool-herdr@<session>      # active (running)
+systemctl --user show -p Environment claude-pool-herdr@<session>   # the PATH above
+herdr --session <session>                                # attach: the workspaces and Claude agents are back
+```
+
+Then, in one of its panes: `type claude` names the function that runs `claude-pool exec`, `command -v claude-pool` prints `~/.local/bin/claude-pool`, and `claude-pool usage --once` answers. If an agent is missing, attach once (herdr resumes agents when a client attaches) and run `claude-pool device check <name>` from the other machine.
 
 ## Cua
 

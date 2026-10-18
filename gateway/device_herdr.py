@@ -37,9 +37,16 @@ LISTENING = 0x10000  # __SO_ACCEPTCON in /proc/net/unix
 def unit(name): return PREFIX + name + '.service'
 
 
+def login_path(home):
+    """The PATH a login shell has (Debian's /etc/profile plus the ~/.local/bin and ~/bin that ~/.profile adds): the agents
+    herdr resumes run the `claude` shell function, which needs claude-pool (~/.local/bin), and claude-pool needs python3."""
+    return ':'.join([str(home) + '/.local/bin', str(home) + '/bin', '/usr/local/sbin', '/usr/local/bin', '/usr/sbin', '/usr/bin',
+                     '/sbin', '/bin'])
+
+
 def template(herdr, home):
     """The template unit; `%i` is the session name. systemd never expands $HOME in Environment=, so the path is written out."""
-    path = 'PATH=' + str(home) + '/.local/bin:/usr/local/bin:/usr/bin:/bin'
+    path = 'PATH=' + login_path(home)
     return '\n'.join([MARK, '[Unit]', 'Description=herdr session %i (claude-pool)', 'After=' + service.DEFAULT_LABEL + '.service', '',
                       '[Service]', 'ExecStart=' + service.exec_quote(herdr) + ' --session %i server', 'Environment=' + service.quote(path),
                       'Restart=on-failure', 'RestartSec=3', '', '[Install]', 'WantedBy=default.target']) + '\n'
@@ -272,9 +279,10 @@ def adopt_one(host, name, info):
     return Step(name, 'ok', 'adopted by ' + unit(name) + '; ' + str(len(workspaces)) + ' workspaces and ' + str(len(wanted)) + ' Claude agents came back')
 
 
-def apply(host, registered, adopt=False, only=None):
+def apply(host, registered, adopt=False, only=None, everything=False):
     """`device herdr-units`: one Step per session it looks after (or one Step when it can do nothing here): every saved session
-    that runs or that the registry lists for this device. `only` limits it to those sessions (they need not run or be listed)."""
+    the registry lists for this device. `only` limits it to those sessions (they need not run or be listed); `everything`
+    (`--all`) adds every session that runs now, so a throwaway session never comes back at boot unless someone asked."""
     if service.platform() != 'linux': return [Step(STEP, 'skipped', LINUX_ONLY)]
     herdr = host.herdr()
     if herdr is None: return [Step(STEP, 'skipped', 'herdr is not installed on this machine')]
@@ -282,7 +290,9 @@ def apply(host, registered, adopt=False, only=None):
     found = host.sessions()
     if found is None: return [Step(STEP, 'failed', 'herdr could not list its sessions', herdr + ' session list --json')]
     foreign = host.foreign()
-    scope = [n for n in sorted(found) if (found[n]['running'] or n in registered or n in (only or ())) and (only is None or n in only)]
+    if everything: wanted = set(registered) | set(only or ()) | {n for n in found if found[n]['running']}
+    else: wanted = set(registered if only is None else only)
+    scope = [n for n in sorted(found) if n in wanted]
     ours = [n for n in scope if n not in foreign]
     steps = {n: Step(n, 'ok', 'served by ' + foreign[n]) for n in scope if n in foreign}
     state = host.template_state(herdr) if ours else 'current'
@@ -337,25 +347,34 @@ def report(host=None):
     return {'available': True, 'sessions': rows, 'template': host.template_state(herdr)}
 
 
-def check(part, registered, fix):
-    """ok when every saved session that runs or the registry lists has its unit enabled (or a foreign unit serves it)."""
+def check(part, registered, fix, everything=False):
+    """ok when every saved session the registry lists has its unit enabled (or a foreign unit serves it). A running session
+    nobody listed is only mentioned: it comes back after a reboot only if someone asks for it (`everything`: add
+    --herdr-units all, which makes it count like a registered one)."""
     if not isinstance(part, dict): return Step(STEP, 'failed', 'could not read the herdr sessions on the device', fix)
     if not part.get('available'): return Step(STEP, 'skipped', str(part.get('reason') or 'herdr is not installed'))
     rows = part.get('sessions')
     if not isinstance(rows, list): return Step(STEP, 'failed', 'herdr could not list its sessions there', fix)
     rows = [row for row in rows if isinstance(row, dict) and isinstance(row.get('name'), str)]
-    scope = [row for row in rows if row.get('running') or row['name'] in registered]
-    if not scope: return Step(STEP, 'ok', 'no saved herdr session runs or is registered')
+    scope = [row for row in rows if row['name'] in registered or (everything and row.get('running'))]
+    current = part.get('template') == 'current'
+    served = lambda row: row.get('unit') or (row.get('enabled') and current)
+    loose = [row['name'] for row in rows if row not in scope and row.get('running') and not served(row)]
+    aside = ('; ' + ', '.join(loose) + (' runs' if len(loose) == 1 else ' run') + ' without a unit and will not come back after a '
+             'reboot (to keep ' + ('it' if len(loose) == 1 else 'them') + ': claude-pool device add <ssh-target> '
+             + ' '.join('--herdr-session ' + name for name in loose) + ', or --herdr-units all)') if loose else ''
+    if not scope: return Step(STEP, 'ok', 'no herdr session is registered for this device' + aside)
     if part.get('template') == 'foreign' and any(not row.get('unit') for row in scope):
         return Step(STEP, 'failed', TEMPLATE + ' there is a unit claude-pool did not write', 'move it aside, then: ' + fix)
-    current = part.get('template') == 'current'
-    missing = [row['name'] for row in scope if not row.get('unit') and not (row.get('enabled') and current)]
-    if missing: return Step(STEP, 'missing', 'nothing brings ' + ', '.join(missing) + ' back after a reboot', fix)
+    missing = [row['name'] for row in scope if not served(row)]
+    if missing:
+        return Step(STEP, 'missing', 'nothing brings ' + ', '.join(missing) + ' back after a reboot',
+                    fix + (' --all' if everything else '') + ''.join(' --session ' + name for name in missing if name in registered))
     notes = [row['name'] + ' through ' + row['unit'] for row in scope if row.get('unit')]
     later = [row['name'] for row in scope if not row.get('unit') and row.get('running') and not row.get('active')]
     if later: notes.append('its unit takes over ' + ', '.join(later) + ' at the next boot')
     return Step(STEP, 'ok', str(len(scope)) + ' session' + ('' if len(scope) == 1 else 's') + ' come back after a reboot' +
-                (' (' + '; '.join(notes) + ')' if notes else ''))
+                (' (' + '; '.join(notes) + ')' if notes else '') + aside)
 
 
 def status_part():

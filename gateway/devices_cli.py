@@ -52,8 +52,9 @@ CHECK_HELP = {
     'doctor': ('claude-pool doctor on the device reports nothing', 'run ssh <device> .local/bin/claude-pool doctor and apply the fix it prints'),
     'native-login': ('Native Claude is logged in to an account the pool serves', 'claude-pool device add <ssh-target> and click Authorize; claude-native auth status if it cannot be read'),
     'herdr': ('this machine has a herdr profile for the device', 'herdr machine add <ssh-target> --label <name>'),
-    'herdr-sessions': ('every saved herdr session that runs or that add registered comes back after a reboot (Linux devices only)',
-                       remote_command('<ssh-target>', device_herdr.VERB) + '; to hand a running session to its unit now, while its agents are idle: '
+    'herdr-sessions': ('every herdr session registered for the device (add --herdr-session) comes back after a reboot (Linux devices only); '
+                       'other running sessions are only named',
+                       remote_command('<ssh-target>', device_herdr.VERB + ' --session <session>') + '; to hand a running session to its unit now, while its agents are idle: '
                        + remote_command('<ssh-target>', device_herdr.VERB + ' --adopt')),
     'app': ('the Mac that runs the Claude app lists and trusts the SSH environment', 'the Claude app clicks printed under Needs you'),
     'cua': ('the device shares its desktop through Cua and the machines can reach each other', 'see docs/DEVICES.md, Cua; macOS: switch on cua-spacesd in Accessibility, then claude-pool device add <ssh-target> --cua'),
@@ -71,12 +72,13 @@ DEVICE_HELP = '\n'.join([
     '  - This machine has at least one long-lived account: claude-pool account add <email> --long-lived (opens a browser; or --from-file).',
     '  - Another device to use as usage owner needs ssh from the new machine to the owner without a prompt (readings).', '',
     'VERBS',
-    '  device add <ssh-target> [--name N] [--cua] [--usage-owner] [--herdr-session S]',
+    '  device add <ssh-target> [--name N] [--cua] [--usage-owner] [--herdr-session S] [--herdr-units listed|all]',
     '      Adds or repairs a machine; rerun to finish what is missing. N matches [a-z0-9-]{1,40}, default from the host name.',
     '      --cua also shares desktops through Cua. --usage-owner makes it the usage poller (and creates the Conductor if none exists);',
     '      it needs its own refreshable login for every account (claude-pool account add <email> --name <name> on it), else it is refused.',
     '      --herdr-session S: the herdr profile on this machine opens session S on the target (herdr machine add --remote-session S),',
-    '      and S comes back after a reboot there like every running session (a claude-pool-herdr@S unit, Linux).',
+    '      and S comes back after a reboot there (a claude-pool-herdr@S unit, Linux). Only registered sessions get a unit;',
+    '      --herdr-units all also gives one to every session running there now.',
     '  device check [name] [--probe] [--json]   Reads every check below, changes nothing. --probe sends one tiny Claude request per long-lived account.',
     '  device remove <name> [--wait] [--uninstall] [--forget]',
     '      Stops the pool there, removes its token copies and herdr profile; never destroys the only copy of a token (run device sync first).',
@@ -115,7 +117,8 @@ DEVICE_HELP = '\n'.join([
     '  claude-pool conductor snapshot|events|tell|journal   what Conductor Claude uses to watch and prompt herdr agents;',
     '                                                      tell --list shows the queued tasks, tell --cancel <id> removes one',
     '  preview <port> | preview file <path>                 share a dev server or one file or folder over Tailscale (Linux devices)',
-    '  device herdr-units [--adopt] [--session S]          on a Linux device: a unit per herdr session, so it comes back after a reboot.',
+    '  device herdr-units [--adopt] [--session S] [--all]  on a Linux device: a unit per registered herdr session (or S; --all: every',
+    '                                                       running one too), so it comes back after a reboot.',
     '                                                       A running session stays as it is until the next boot; --adopt hands it to its',
     '                                                       unit now, only while none of its agents is working or waiting.',
     '  Removal runs forget-accounts on the device, only after its pool is stopped. A lost machine: device remove <name> --forget.',
@@ -266,14 +269,14 @@ def shell(argv, out, **_):
 def herdr_units(argv, out, **_):
     """This device's herdr session units (device_herdr): enable them, --adopt running sessions, or --remove ours."""
     args = parse('herdr-units', argv, (['--adopt'], {'action': 'store_true'}), (['--remove'], {'action': 'store_true'}),
-                 (['--session'], {'action': 'append'}))
-    if args.remove and (args.adopt or args.session): raise Usage('herdr-units --remove takes no other option')
+                 (['--session'], {'action': 'append'}), (['--all'], {'action': 'store_true'}))
+    if args.remove and (args.adopt or args.session or args.all): raise Usage('herdr-units --remove takes no other option')
     for name in args.session or []:
         if not registry.HERDR_SESSION.fullmatch(name): raise Usage('--session takes letters, digits, dot, dash and underscore')
     host = device_herdr.Host()
     if args.remove: steps = [device_herdr.remove(host)]
-    else: steps = device_herdr.apply(host, device_herdr.listed(), adopt=args.adopt, only=args.session) or [
-        Step(device_herdr.STEP, 'ok', 'no saved herdr session runs or is registered')]
+    else: steps = device_herdr.apply(host, device_herdr.listed(), adopt=args.adopt, only=args.session, everything=args.all) or [
+        Step(device_herdr.STEP, 'ok', 'no saved herdr session is registered' + (' or runs' if args.all else ''))]
     print(render('herdr sessions on ' + (registry.self_name() or 'this device'), steps))
     return 0 if all(step.status in ('ok', 'skipped') for step in steps) else 1
 
@@ -805,14 +808,20 @@ def ensure_herdr(t):
 def check_herdr_sessions(t):
     if t.row.get('platform') == 'darwin': return Step('herdr-sessions', 'skipped', device_herdr.LINUX_ONLY)
     if not t.supported: return t.needs_install('herdr-sessions')
-    return device_herdr.check(t.status().get('herdrUnits'), t.row.get('herdrSessions') or [], t.on(device_herdr.VERB))
+    return device_herdr.check(t.status().get('herdrUnits'), t.row.get('herdrSessions') or [], t.on(device_herdr.VERB),
+                              everything=getattr(t.args, 'herdr_units', None) == 'all')
 
 
 def ensure_herdr_sessions(t):
-    """Enables a unit for every session that misses one; never adopts (that stops a running server)."""
+    """Enables a unit for every registered session that misses one, and with `--herdr-units all` for every running session
+    too; never adopts (that stops a running server). The sessions are named on the command line: the device's own
+    registry may not list them yet (add syncs it at the end)."""
+    everything = getattr(t.args, 'herdr_units', None) == 'all'
     step = check_herdr_sessions(t)
     if step.status != 'missing': return step
-    t.remote.device('herdr-units', timeout=POOL_TIMEOUT)
+    names = t.row.get('herdrSessions') or []
+    t.remote.device('herdr-units', *[word for name in names for word in ('--session', name)], *(['--all'] if everything else []),
+                    timeout=POOL_TIMEOUT)
     t.forget()
     return check_herdr_sessions(t)
 
@@ -1129,7 +1138,8 @@ def print_sync(results):
 
 def add(argv, out, remotes, local, **_):
     args = parse('add', argv, (['target'], {}), (['--name'], {}), (['--cua'], {'action': 'store_true'}),
-                 (['--usage-owner'], {'action': 'store_true'}), (['--herdr-session'], {}))
+                 (['--usage-owner'], {'action': 'store_true'}), (['--herdr-session'], {}),
+                 (['--herdr-units'], {'choices': ['listed', 'all'], 'default': 'listed'}))
     target, value, me = args.target, registry.load(), registry.self_name()
     if args.herdr_session is not None and not registry.HERDR_SESSION.fullmatch(args.herdr_session):
         raise Usage('--herdr-session takes letters, digits, dot, dash and underscore')

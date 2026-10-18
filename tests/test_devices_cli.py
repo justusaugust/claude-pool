@@ -879,8 +879,11 @@ class Machine:
             self.event('herdr-units ' + ' '.join(args[1:]) if args[1:] else 'herdr-units')
             if 'herdr-units' in self.fail: return answer(1)
             if args[1:] == ['--remove']: self.herdr_units = {'available': True, 'template': 'absent', 'sessions': []}; return ok()
+            named = [args[i + 1] for i, word in enumerate(args) if word == '--session']
+            mine = registry.device(self.registry or registry.EMPTY(), self.self_name) or {}
+            wanted = set(named or mine.get('herdrSessions') or [])
             for row in self.herdr_units.get('sessions') or []:
-                if not row.get('unit'): row['enabled'] = True
+                if not row.get('unit') and (row['name'] in wanted or ('--all' in args and row.get('running'))): row['enabled'] = True
             self.herdr_units['template'] = 'current'
             return ok()
         if args == ['cua-token']: return ok(CUA_FIXTURE_TOKEN) if self.host else answer(1)
@@ -1187,7 +1190,7 @@ class CheckTests(OrchestrationBase):
         self.assertEqual(self.count(self.local, 'machine add'), 0)
 
     def test_check_lists_each_missing_item_with_its_exact_fix(self):
-        registry.update(lambda value: (registry.device(value, 'vps').update(cua=True), value.update(
+        registry.update(lambda value: (registry.device(value, 'vps').update(cua=True, herdrSessions=['dashboard']), value.update(
             conductor={'device': 'vps', 'email': 'team@x.de', 'organization': 'Team A', 'cwd': '/srv/c'})), self.reg)
         self.vps.native, self.vps.version, self.vps.linger, self.vps.shell = None, '0.9', 'no', False
         self.vps.accounts, self.vps.service, self.vps.doctor = {}, 'stopped', False
@@ -1292,14 +1295,27 @@ class HerdrUnitsTests(OrchestrationBase):
     def sessions(self, *rows, template='absent'):
         self.vps.herdr_units = {'available': True, 'template': template, 'sessions': [dict(row) for row in rows]}
 
-    def test_add_enables_the_units_of_running_sessions_without_adopting_them(self):
+    def test_add_enables_the_units_of_listed_sessions_without_adopting_them(self):
         self.sessions({'name': 'dashboard', 'running': True, 'enabled': False, 'active': False},
                       {'name': 'trial', 'running': True, 'unit': 'herdr-trial.service'})
+        code, out, err = self.cli('add', 'alex@vps', '--name', 'vps', '--herdr-session', 'dashboard')
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual([label for _, label in self.log if label.startswith('herdr-units')], ['herdr-units --session dashboard'])
+        found = step_of(out, 'herdr-sessions')
+        self.assertEqual(found.group(1), 'ok'); self.assertIn('takes over dashboard at the next boot', found.group(2))
+
+    def test_add_leaves_running_sessions_nobody_listed_alone_unless_asked(self):
+        self.sessions({'name': 'scratch', 'running': True, 'enabled': False, 'active': False})
         code, out, err = self.cli('add', 'alex@vps', '--name', 'vps')
         self.assertEqual(code, 0, out + err)
-        self.assertEqual([label for _, label in self.log if label.startswith('herdr-units')], ['herdr-units'])
+        self.assertFalse([label for _, label in self.log if label.startswith('herdr-units')])
         found = step_of(out, 'herdr-sessions')
-        self.assertEqual(found.group(1), 'ok'); self.assertIn('herdr-trial.service', found.group(2))
+        self.assertEqual(found.group(1), 'ok'); self.assertIn('scratch runs without a unit', found.group(2))
+        self.assertFalse(self.vps.herdr_units['sessions'][0]['enabled'])
+        code, out, err = self.cli('add', 'alex@vps', '--name', 'vps', '--herdr-units', 'all')
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual([label for _, label in self.log if label.startswith('herdr-units')], ['herdr-units --all'])
+        self.assertTrue(self.vps.herdr_units['sessions'][0]['enabled'])
 
     def test_add_records_the_herdr_session_in_the_registry_row(self):
         self.sessions({'name': 'objekt', 'running': False, 'enabled': False})
@@ -1307,16 +1323,18 @@ class HerdrUnitsTests(OrchestrationBase):
         self.assertEqual(code, 0, out + err)
         row = registry.device(registry.load(self.reg), 'vps')
         self.assertEqual((row['herdrSession'], row['herdrSessions']), ('objekt', ['objekt']))
-        self.assertEqual([label for _, label in self.log if label.startswith('herdr-units')], ['herdr-units'])
+        self.assertEqual([label for _, label in self.log if label.startswith('herdr-units')], ['herdr-units --session objekt'])
         self.cli('add', 'alex@vps', '--name', 'vps', '--herdr-session', 'dashboard')
         self.assertEqual(registry.device(registry.load(self.reg), 'vps')['herdrSessions'], ['objekt', 'dashboard'])
 
     def test_check_names_missing_sessions_and_the_internal_verb(self):
+        registry.update(lambda value: registry.device(value, 'vps').update(herdrSessions=['dashboard']), self.reg)
         self.sessions({'name': 'dashboard', 'running': True, 'enabled': False}, {'name': 'leitstand', 'running': False, 'enabled': False},
                       template='current')
         code, out, _ = self.cli('check', 'vps')
         self.assertEqual(code, 2)
-        self.assertRegex(out, r'missing +herdr-sessions +nothing brings dashboard back after a reboot\n      fix: ' + re.escape(self.MISSING) + '\n')
+        self.assertRegex(out, r'missing +herdr-sessions +nothing brings dashboard back after a reboot\n      fix: '
+                         + re.escape(self.MISSING + ' --session dashboard') + '\n')
         self.assertFalse([label for _, label in self.log if label.startswith('herdr-units')])
 
     def test_check_skips_macos_and_machines_without_herdr(self):
@@ -1351,7 +1369,10 @@ class HerdrUnitsVerbTests(DeviceCliBase):
         with patch.object(device_herdr, 'apply', return_value=steps) as apply, patch.object(device_herdr, 'Host') as host:
             code, out, _ = self.run_cli(['herdr-units', '--adopt', '--session', 'dashboard'])
         self.assertEqual(code, 0); self.assertIn('started by claude-pool-herdr@objekt.service', out)
-        apply.assert_called_once_with(host.return_value, ['objekt'], adopt=True, only=['dashboard'])
+        apply.assert_called_once_with(host.return_value, ['objekt'], adopt=True, only=['dashboard'], everything=False)
+        with patch.object(device_herdr, 'apply', return_value=steps) as apply, patch.object(device_herdr, 'Host') as host:
+            self.assertEqual(self.run_cli(['herdr-units', '--all'])[0], 0)
+        apply.assert_called_once_with(host.return_value, ['objekt'], adopt=False, only=None, everything=True)
 
     def test_refused_or_failed_sessions_exit_1_and_remove_calls_remove(self):
         with patch.object(device_herdr, 'apply', return_value=[Step('d', 'manual', 'x', 'y')]), patch.object(device_herdr, 'Host'):
