@@ -64,7 +64,8 @@ def usage(data, *, width=80, color=False):
     for account in data['accounts']:
         status = account['status']
         code = '32' if status == 'ready' else '31' if status == 'limited' else '33'
-        add(account['label'] + ' · ' + status, '1;' + code)
+        source = str(account.get('readingSource') or '').partition(':')[2]
+        add(account['label'] + ' · ' + status + (' · reserved from ' + str(account['reserveAt']) + '%' if account.get('reserveAt') else '') + (' · reading from ' + source if source else ''), '1;' + code)
         age = duration((now - account['seenAt']) / 1000) + ' ago' if account['seenAt'] else 'unknown'
         add((account.get('plan') or '') + ' · checked ' + age, '90')
         quota('5h', account.get('fiveHour'))

@@ -39,13 +39,36 @@ def copy_release(target):
         shutil.copytree(src, target / name, ignore=ignore) if src.is_dir() else shutil.copyfile(src, target / name)
 
 
+SOURCE_SUFFIXES = {'.py', '.ts', '.tsx', '.js', '.css', '.html', '.json', '.md', '.patch'}
+
+
+def release_source(name):
+    """A release file that the source archive `device add` sends would also carry (scripts/package.py source_files):
+    the same files on every device, whatever the checkout held besides and whichever backend the platform built."""
+    parts = name.split('/')
+    if name in {'README.md', 'LICENSE', 'install.py', 'run.py'}: return True
+    if parts[0] not in {'gateway', 'backend', 'docs', 'scripts'} or name.startswith('gateway/bin/'): return False
+    if '__pycache__' in parts or '/.claude-plugin/types/' in name: return False
+    return name == 'gateway/preview' or Path(name).suffix in SOURCE_SUFFIXES or parts[-1].startswith('LICENSE-')
+
+
+def source_version(target):
+    """Digest of the release's sources only. Devices compare this one: the backend binary is built per platform."""
+    digest = hashlib.sha256()
+    for path in sorted(target.rglob('*')):
+        name = path.relative_to(target).as_posix()
+        if path.is_file() and not path.is_symlink() and release_source(name):
+            digest.update(name.encode() + b'\0' + path.read_bytes())
+    return digest.hexdigest()[:20]
+
+
 def build_info(target):
     digest = hashlib.sha256()
     for path in sorted(target.rglob('*')):
         if path.is_file() and not path.is_symlink() and '__pycache__' not in path.parts and path.name not in {'build-info.json', 'installation.json'} and path.relative_to(target).parts[0] != 'versions':
             digest.update(path.relative_to(target).as_posix().encode() + b'\0' + path.read_bytes())
     binary = target / 'gateway/bin/shunt'
-    return {'version': digest.hexdigest()[:20], 'backendPin': json.loads((target / 'backend/upstream.json').read_text()),
+    return {'version': digest.hexdigest()[:20], 'sourceVersion': source_version(target), 'backendPin': json.loads((target / 'backend/upstream.json').read_text()),
             'backendSha256': hashlib.sha256(binary.read_bytes()).hexdigest() if binary.is_file() else None}
 
 
@@ -168,6 +191,8 @@ def update_install(prefix, *, skip_backend=False):
         # Check the copied files before changing the pointer or any launcher.
         check_release(target, receipt['config'])
         if (current / 'build-info.json').is_file() and json.loads((current / 'build-info.json').read_text())['version'] == info['version'] and build_info(current)['version'] == info['version'] and (skip_backend or os.access(current / 'gateway/bin/shunt', os.X_OK)):
+            if json.loads((current / 'build-info.json').read_text()).get('sourceVersion') != info['sourceVersion']:
+                atomic_write(current / 'build-info.json', json.dumps(info) + '\n', 0o644)  # a release from before sourceVersion
             if future_service:
                 atomic_write(service_file, future_service)
                 print('Future service entry prepared; the loaded service was left unchanged.')
@@ -175,6 +200,7 @@ def update_install(prefix, *, skip_backend=False):
         destination = versions / info['version']
         if destination.exists():
             if build_info(destination)['version'] != info['version'] or (not skip_backend and not os.access(destination / 'gateway/bin/shunt', os.X_OK)): raise RuntimeError('Retained release changed; refusing to reuse it')
+            atomic_write(destination / 'build-info.json', json.dumps(info) + '\n', 0o644)
         else: target.rename(destination)
         if not (prefix / 'run.py').exists():
             # Legacy source installs retain every old module while adopting the stable launcher.

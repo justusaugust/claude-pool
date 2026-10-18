@@ -45,6 +45,18 @@ claude-native                      # original Native Claude
 
 `work` is an example alias you configure, not a built-in account. No paid API-key fallback is configured.
 
+## Several machines
+
+One pool can serve a Mac and a Linux server. From a machine that already runs the pool:
+
+```sh
+claude-pool device add <ssh-target>   # install, sync accounts, repair; safe to rerun
+claude-pool device check              # one report per machine, with the fix for anything wrong
+claude-pool help device               # every command, check and human step
+```
+
+Only long-lived tokens are copied, and only by these commands. Read [docs/DEVICES.md](docs/DEVICES.md) for the full guide, including the Conductor, Cua and preview links.
+
 ## Identity is separate from inference
 
 Artifacts, connectors and their permissions belong to the Native login. Switching the inference subscription does not move an artifact or grant access to another account's mail or Drive. Intentionally changing the Native login can make the previous login's artifacts unavailable. Keep the Native owner's user/organization identity among your configured accounts so the gateway can validate it.

@@ -25,8 +25,12 @@ process.stdin.on('end', () => {
 '''
 
 
-@unittest.skipUnless(sys.platform.startswith('linux') and NODE, 'Linux host commands run only on Linux with Node')
+@unittest.skipUnless(sys.platform.startswith('linux') and (NODE or os.environ.get('CI')), 'Linux host commands run only on Linux with Node')
 class LinuxMachineCommands(unittest.TestCase):
+    def setUp(self):
+        # In CI a missing Node is a broken runner, not a reason to skip.
+        if not NODE: self.fail('node is not on PATH; the Linux host-command test needs Node in CI')
+
     def test_proc_commands_print_the_macos_shapes_and_parse(self):
         with tempfile.TemporaryDirectory() as folder:
             probe = Path(folder) / 'probe.mjs'

@@ -1,12 +1,14 @@
 """Guided subscription enrollment. Shunt owns OAuth, token refresh and routing."""
 import argparse
+import copy
 import fcntl
 import json
 import os
 from pathlib import Path
 import re
-import stat
+import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import tomllib
@@ -16,7 +18,12 @@ import urllib.request
 
 from account_login import login
 from account_metadata import load
-from bridge import atomic_write
+import long_lived
+from long_lived import fingerprint, kind
+from private_files import atomic_write, private_directory, read_private, write_private
+import registry
+from remote import Remote
+import routing
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -24,22 +31,19 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def credential(path):
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    with os.fdopen(fd) as file:
-        info = os.fstat(file.fileno())
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077 or info.st_size > 131072:
-            raise RuntimeError('Credential must be your private 0600 file')
-        value = json.load(file)
-    if not isinstance(value, dict): raise RuntimeError('Invalid credential format')
-    oauth = value.get('claudeAiOauth', {})
-    if not isinstance(oauth, dict): raise RuntimeError('Invalid OAuth credential format')
-    if not all(isinstance(oauth.get(k), str) and oauth[k] for k in ('accessToken', 'refreshToken')):
-        raise RuntimeError('A refreshable OAuth login is required')
+    value = read_private(path)
+    kind(value)
+    return value
+
+
+def refreshable(path):
+    value = credential(path)
+    if kind(value) != 'refreshable': raise RuntimeError('A refreshable OAuth login is required')
     return value
 
 
 def profile(path):
-    stored = credential(path)
+    stored = refreshable(path)
     request = urllib.request.Request('https://api.anthropic.com/api/oauth/profile', headers={
         'Authorization': 'Bearer ' + stored['claudeAiOauth']['accessToken'],
         'User-Agent': 'claude-cli/2.1.300 (external, cli)', 'anthropic-beta': 'oauth-2025-04-20'})
@@ -76,6 +80,41 @@ def identity(data, stored):
             'userId': user_id, 'organizationId': org_id}
 
 
+IDENTITY_KEYS = ('email', 'organization', 'plan', 'userId', 'organizationId')
+OWNER_NEEDED = 'Identity needs the usage owner: run this on the usage owner or make it reachable. The token is saved; rerun to resume.'
+
+
+def long_lived_identity(value, stores, lookup):
+    """A long-lived token has no profile scope: borrow the identity of a refreshable grant with the same UUIDs."""
+    ids = (value.get('shuntAccountUuid'), value.get('shuntOrganizationUuid'))
+    for path in sorted(Path(stores).glob('*.json')):
+        if path.is_symlink() or not path.is_file(): continue
+        try: other = credential(path)
+        except (OSError, ValueError, RuntimeError): continue
+        if kind(other) == 'refreshable' and (other.get('shuntAccountUuid'), other.get('shuntOrganizationUuid')) == ids:
+            return profile(path)
+    info = lookup(*ids)
+    if info is None: raise RuntimeError(OWNER_NEEDED)
+    if not isinstance(info, dict) or any(not isinstance(info.get(key), str) or not info[key] for key in IDENTITY_KEYS):
+        raise RuntimeError('The usage owner returned an incomplete identity; nothing was enrolled')
+    if (info['userId'], info['organizationId']) != ids:
+        raise RuntimeError('Credential and verified organization differ; nothing was enrolled')
+    return {key: info[key] for key in IDENTITY_KEYS}
+
+
+def owner_lookup(user_id, org_id, remotes=Remote):
+    """Ask the usage owner (over SSH) for the identity of its refreshable grant with these UUIDs."""
+    value = registry.load()
+    owner = registry.owner(value)
+    if owner is None or owner['name'] == registry.self_name() or not owner.get('ssh'): return None
+    try: done = remotes(owner['ssh']).device('identity', user_id, org_id)  # never reaches a launcher without device support
+    except ValueError: return None  # an ssh target the transport refuses
+    if done.returncode: return None
+    try: info = json.loads(done.stdout)
+    except ValueError: return None
+    return info if isinstance(info, dict) else None
+
+
 def normalized(value):
     return re.sub('[^a-z0-9]', '', unicodedata.normalize('NFKD', value.lower().replace('æ', 'ae')))
 
@@ -97,6 +136,41 @@ def add_membership(text, name):
     return candidate
 
 
+def remove_membership(text, name):
+    """Inverse of add_membership: drop the [[providers.anthropic.accounts]] block named `name` (with its sub-tables)."""
+    before = tomllib.loads(text)
+    rows = before['providers']['anthropic'].get('accounts', [])
+    if not any(row.get('name') == name for row in rows): return text
+    lines = text.splitlines(keepends=True)
+    header = '[[providers.anthropic.accounts]]'
+    start = None
+    for index, line in enumerate(lines):
+        if line.strip() != header: continue
+        end = index + 1
+        while end < len(lines):
+            stripped = lines[end].strip()
+            if stripped.startswith('[') and not stripped.startswith(('[providers.anthropic.accounts.', '[[providers.anthropic.accounts.')): break
+            end += 1
+        block = tomllib.loads(''.join(lines[index:end]))['providers']['anthropic']['accounts']
+        if block and block[0].get('name') == name:
+            start = index; break
+    if start is None: raise RuntimeError('The runtime configuration lists ' + name + ' in a form this command cannot edit')
+    prefix, suffix = ''.join(lines[:start]), ''.join(lines[end:])
+    candidate = prefix + suffix if suffix else prefix.rstrip() + '\n'
+    if 'accounts' not in tomllib.loads(candidate).get('providers', {}).get('anthropic', {}):
+        # Keep an empty member list so the file stays valid and add_membership can extend it again.
+        out, done = [], False
+        for line in candidate.splitlines(keepends=True):
+            out.append(line)
+            if not done and line.strip() == '[providers.anthropic]': out.append('accounts = []\n'); done = True
+        candidate = ''.join(out) if done else candidate.rstrip() + '\n\n[providers.anthropic]\naccounts = []\n'
+    after = tomllib.loads(candidate)
+    expected = copy.deepcopy(before)
+    expected['providers']['anthropic']['accounts'] = [row for row in rows if row.get('name') != name]
+    if after != expected: raise RuntimeError('Removing ' + name + ' would change other runtime settings; nothing was changed')
+    return candidate
+
+
 def verify_expected(info, email, organization):
     if info['email'].casefold() != email.casefold():
         raise RuntimeError('Signed in as ' + info['email'] + ', expected ' + email + '. Nothing was enrolled.')
@@ -104,23 +178,56 @@ def verify_expected(info, email, organization):
         raise RuntimeError('Selected organization is ' + info['organization'] + ', expected ' + organization + '. Nothing was enrolled.')
 
 
-def register(config, stores, binary, paths, entry, info, env):
+def refuse_duplicate(rows, stores, name, info):
+    """A second name for the same subscription adds no quota."""
+    for row in rows:
+        if row['name'] == name: continue
+        other_path = stores / (row['name'] + '.json')
+        if not other_path.exists(): continue
+        other = credential(other_path)
+        if (other.get('shuntAccountUuid'), other.get('shuntOrganizationUuid')) == (info['userId'], info['organizationId']):
+            raise RuntimeError('This subscription is already connected as ' + row.get('label', row['name']) + '; a second alias adds no quota.')
+
+
+def refuse_other_name(rows, stores, name, info, known):
+    """A long-lived enrollment under a name that differs from the registry's name for the subscription, or from this
+    machine's own name for it, is refused with the one command that makes the names agree: account rename."""
+    mine = (info['userId'], info['organizationId'])
+    entry = next((row for row in known['accounts'] if (row.get('userId'), row.get('organizationId')) == mine), None)
+    here = None
+    for row in rows:
+        path = stores / (row['name'] + '.json')
+        if path.exists() and not path.is_symlink():
+            try:
+                if ids(credential(path)) == mine: here = row; break
+            except (OSError, ValueError, RuntimeError): continue
+    if entry is not None and entry['name'] != name:
+        what = entry.get('label') or entry['name']
+        lead = 'This subscription is already connected as ' + what + ' (registry name ' + entry['name']
+        if here is not None and here['name'] != entry['name']:
+            raise RuntimeError(lead + ', on this machine ' + here['name'] + '). Give it the registry name here first: claude-pool account rename '
+                               + here['name'] + ' ' + entry['name'] + ', then rerun with --name ' + entry['name'] + '. Nothing was enrolled.')
+        raise RuntimeError(lead + '); a second alias adds no quota. Rerun with --name ' + entry['name'] + '. Nothing was enrolled.')
+    if here is not None and here['name'] != name:
+        raise RuntimeError('This subscription is already connected as ' + (here.get('label') or here['name']) + ' (name ' + here['name']
+                           + ' on this machine); a second alias adds no quota. To use the name ' + name + ' instead, run: claude-pool account rename '
+                           + here['name'] + ' ' + name + ', then rerun this command. Nothing was enrolled.')
+    clash = registry.account(known, name)
+    if clash is not None and not registry.same_subscription(clash, {'name': name, 'userId': mine[0], 'organizationId': mine[1]}):
+        # The upsert would replace that subscription's row on every device; account rename refuses the same name.
+        raise RuntimeError('The registry uses ' + name + ' for another subscription (' + (clash.get('label') or name)
+                           + '); choose another --name. Nothing was enrolled.')
+
+
+def apply_change(config, binary, paths, env, change_value, change_toml,
+                 rejected='Backend rejected the change; live membership is unchanged'):
+    """The one validated write path for membership: candidates are checked before anything is written."""
     config.parent.mkdir(parents=True, exist_ok=True)
     with (config.parent / ('.' + config.name + '.lock')).open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         value = load(config)
-        rows = value.setdefault('accounts', [])
-        for row in rows:
-            if row['name'] == entry['name']: continue
-            other_path = stores / (row['name'] + '.json')
-            if not other_path.exists(): continue
-            other = credential(other_path)
-            if (other.get('shuntAccountUuid'), other.get('shuntOrganizationUuid')) == (info['userId'], info['organizationId']):
-                raise RuntimeError('This subscription is already connected as ' + row.get('label', row['name']) + '; a second alias adds no quota.')
-        old = next((r for r in rows if r['name'] == entry['name']), None)
-        if old: rows[rows.index(old)] = entry
-        else: rows.append(entry)
-        candidates = [(p, add_membership(p.read_text(), entry['name'])) for p in paths if p.exists()]
+        change_value(value)
+        candidates = [(p, change_toml(p.read_text())) for p in paths if p.exists()]
         with tempfile.NamedTemporaryFile(mode='w', dir=config.parent) as candidate:
             candidate.write(json.dumps(value)); candidate.flush(); load(Path(candidate.name))
         for _, content in candidates:
@@ -128,26 +235,740 @@ def register(config, stores, binary, paths, entry, info, env):
                 candidate.write(content); candidate.flush()
                 result = subprocess.run([str(binary), '--config', candidate.name, 'check'], env=env,
                                         capture_output=True, timeout=20)
-                if result.returncode: raise RuntimeError('Backend rejected enrollment; live membership is unchanged')
+                if result.returncode: raise RuntimeError(rejected)
         # Persist recovery metadata before the watched runtime file activates membership.
         atomic_write(config, json.dumps(value, indent=2) + '\n')
         for path, content in candidates:
             if path.read_text() != content: atomic_write(path, content)
 
 
-def cli(argv, *, config, stores, binary, runtime, backend_source=None, backend_env=None, overview=None):
+def register(config, stores, binary, paths, entry, info, env):
+    def change(value):
+        rows = value.setdefault('accounts', [])
+        refuse_duplicate(rows, stores, entry['name'], info)
+        old = next((r for r in rows if r['name'] == entry['name']), None)
+        if old: rows[rows.index(old)] = entry
+        else: rows.append(entry)
+    apply_change(config, binary, paths, env, change, lambda text: add_membership(text, entry['name']),
+                 rejected='Backend rejected enrollment; live membership is unchanged')
+
+
+def unregister(config, stores, binary, paths, name, env):
+    """Drop `name` from the config and every runtime member list. Idempotent: an absent member changes nothing."""
+    def change(value):
+        value['accounts'] = [row for row in value.get('accounts', []) if row['name'] != name]
+    apply_change(config, binary, paths, env, change, lambda text: remove_membership(text, name),
+                 rejected='Backend rejected the removal; live membership is unchanged')
+
+
+def set_account_option(text, name, key, value):
+    """Set (float) or remove (None) `key` inside the [[providers.anthropic.accounts]] table named `name`.
+    Every other table stays byte-identical; the result must parse to the old document with only that key changed."""
+    before = tomllib.loads(text)
+    rows = before.get('providers', {}).get('anthropic', {}).get('accounts', [])
+    if not any(row.get('name') == name for row in rows): return text
+    lines = text.splitlines(keepends=True)
+    header = '[[providers.anthropic.accounts]]'
+    start = end = None
+    for index, line in enumerate(lines):
+        if line.strip() != header: continue
+        stop = index + 1
+        while stop < len(lines) and not lines[stop].strip().startswith('['): stop += 1  # the member's own keys end at the next table
+        block = tomllib.loads(''.join(lines[index:stop]))['providers']['anthropic']['accounts']
+        if block and block[0].get('name') == name: start, end = index, stop; break
+    if start is None: raise RuntimeError('The runtime configuration lists ' + name + ' in a form this command cannot edit')
+    own = re.compile(r'\s*(?:' + re.escape(key) + '|"' + re.escape(key) + '"|\'' + re.escape(key) + r'\')\s*=')
+    at = next((i for i in range(start + 1, end) if own.match(lines[i])), None)
+    if value is None:
+        if at is not None: del lines[at]  # no matching line: the verification below refuses a key it could not find
+    else:
+        line = key + ' = ' + repr(float(value)) + '\n'
+        if at is not None: lines[at] = line
+        else:
+            last = max(i for i in range(start, end) if lines[i].strip())
+            if not lines[last].endswith('\n'): lines[last] += '\n'
+            lines.insert(last + 1, line)
+    candidate = ''.join(lines)
+    expected = copy.deepcopy(before)
+    row = next(r for r in expected['providers']['anthropic']['accounts'] if r.get('name') == name)
+    if value is None: row.pop(key, None)
+    else: row[key] = float(value)
+    if tomllib.loads(candidate) != expected: raise RuntimeError('Editing ' + name + ' would change other runtime settings; nothing was changed')
+    return candidate
+
+
+def reserve(config, binary, paths, env, name, pct, *, registry_path=None):
+    """Make `name` the pool's last choice from `pct` percent (None = off). Same validated write path as membership.
+    Shunt (pinned e147f9b9, src/accounts.rs resolved_max_utilization): an account-level `max_utilization` caps every
+    quota window (5h, weekly and Fable 7d_oi) and excludes the account from selection at or above it, with or without
+    [server.pool]; no per-window key is needed. The pool layer (routing.choose) enforces the same limit on merged readings.
+    The registry entry (when there is one) follows so other devices apply it; the hook passes no registry_path."""
+    if not any(r['name'] == name for r in load(config).get('accounts', [])):
+        raise RuntimeError('No account named ' + name + ' is connected (see claude-pool account list)')
+    def change(value):
+        next(r for r in value['accounts'] if r['name'] == name)['reserveAt'] = pct or 0
+    apply_change(config, binary, paths, env, change,
+                 lambda text: set_account_option(text, name, 'max_utilization', pct / 100 if pct else None),
+                 rejected='Backend rejected the reserve; live routing is unchanged')
+    if registry_path is not False:
+        try:
+            # The registry row of this subscription, which may carry another name (the one of the device that enrolled it).
+            mine = member_identity(env.get('SHUNT_CLAUDE_ACCOUNTS_DIR'), name)
+            entry = registry.entry_for(registry.load(registry_path), mine)
+            if entry is not None:
+                def note(value): registry.account(value, entry['name'])['reserveAt'] = pct or 0
+                registry.update(note, registry_path)
+        except ValueError: pass  # an unreadable registry never undoes a reserve that is already applied
+
+
+def member_identity(stores, name):
+    """A config member as a status-style row: name and the UUIDs of its pool store file (none when it is unreadable)."""
+    row = {'name': name, 'active': True}
+    if not stores or not re.fullmatch('[a-z0-9-]{1,80}', name): return row
+    try: value = credential(Path(stores) / (name + '.json'))
+    except (OSError, ValueError, RuntimeError): return row
+    user, org = ids(value)
+    if isinstance(user, str) and user and isinstance(org, str) and org: row.update(userId=user, organizationId=org)
+    return row
+
+
+def local_context():
+    import settings
+    paths, env = local_paths_env(settings.RUNTIME, settings.STORES)
+    return settings.CONFIG, settings.HERE / 'bin/shunt', paths, env
+
+
+def reserve_hook(value, context=None):
+    """Device sync: apply each registry `reserveAt` that differs from this device (never syncs onward). Tries every account,
+    then raises one error naming the failed ones (names only) so device sync records the hook as failed."""
+    try:
+        config, binary, paths, env = context or local_context()
+        local = {r['name']: r.get('reserveAt', 0) for r in load(config).get('accounts', [])}
+        members = [member_identity(env.get('SHUNT_CLAUDE_ACCOUNTS_DIR'), name) for name in local]
+    except (OSError, ValueError, RuntimeError, ImportError): return
+    failed = []
+    for row in value.get('accounts', []):
+        # Each device holds the subscription under its own name; the registry row reaches it by UUIDs.
+        name, want = registry.local_name(row, members), row.get('reserveAt')
+        if name not in local or want is None or want == local[name]: continue
+        try: reserve(config, binary, paths, env, name, want or None, registry_path=False)
+        except Exception: failed.append(name)
+    if failed: raise RuntimeError('Reserve not applied for: ' + ', '.join(failed))
+
+
+def local_paths_env(runtime, stores, backend_source=None, backend_env=None):
+    """The runtime TOML files that list members, and the environment `shunt check` validates them with."""
+    paths = ([Path(backend_source)] if backend_source else []) + [Path(runtime) / 'shunt.toml']
+    env = {**os.environ, 'POOL_CLIENT_TOKENS':'setup:local-config-validation-token',
+           'POOL_ADMIN_TOKENS':'setup:local-config-validation-token', **(backend_env or {}),
+           'SHUNT_CLAUDE_ACCOUNTS_DIR': str(stores)}
+    return paths, env
+
+
+def register_local(entry, info):
+    import settings
+    paths, env = local_paths_env(settings.RUNTIME, settings.STORES)
+    register(settings.CONFIG, settings.STORES, settings.HERE / 'bin/shunt', paths, entry, info, env)
+
+
+def readiness(overview, entry, name, email, long):
+    print('4/4 · Checking the running pool', flush=True)
+    if not overview:
+        print('Connected ' + entry['label'] + '. Start the pool with claude; shortcut: claude ' + entry['alias'])
+        return 0
+    deadline = time.monotonic() + 330
+    announced = False
+    while time.monotonic() < deadline:
+        try:
+            data = overview()
+            row = next((a for a in data.get('accounts', []) if a.get('name') == name), None)
+        except (OSError, ValueError, RuntimeError): row = None
+        if long and row and row.get('status') == 'reauthenticate':
+            print(entry['label'] + ' rejected its long-lived token. Fix: claude-pool account add ' + email + ' --long-lived --replace --name ' + name + ', then claude-pool device sync')
+            return 2
+        if long and row and row.get('status') == 'unknown':
+            print('Connected ' + entry['label'] + ' · no reading yet (first request fills it)')
+            print('Start a session: claude ' + entry['alias'] + '  |  All accounts: claude')
+            return 0
+        if row and row.get('status') not in ('unknown', None):
+            print(f"Connected {entry['label']} · {row['status']} · {len(data['accounts'])} accounts")
+            print('Start a session: claude ' + entry['alias'] + '  |  All accounts: claude')
+            return 0
+        if not announced:
+            print('Waiting for the backend’s first quota reading…', flush=True)
+            announced = True
+        time.sleep(5)
+    print('Login and membership are saved. Readiness is not confirmed yet; rerun this command to resume without another login.')
+    return 2
+
+
+def ids(value): return (value.get('shuntAccountUuid'), value.get('shuntOrganizationUuid'))
+
+
+def swap_in(path, value, stamp):
+    """Install `value` at `path` atomically; the old file stays beside it as <file>.replaced-<stamp> (0600, never deleted)."""
+    aside, n = path.with_name(path.name + '.replaced-' + stamp), 1
+    while aside.exists() or aside.is_symlink():
+        aside, n = path.with_name(path.name + '.replaced-' + stamp + '-' + str(n)), n + 1
+    os.link(path, aside)  # same inode: the old token survives the atomic replace below
+    write_private(path, json.dumps(value))
+    if fingerprint(credential(path)) != fingerprint(value): raise RuntimeError('The new token did not verify after install; the old one is kept as ' + aside.name)
+
+
+def replacement(args, binary, directory, name, label, registry_path, staging):
+    """Mint or read a new token for an enrolled account without touching any saved file; verify it replaces like for like."""
+    token = directory / (name + '.json')
+    if not (token.exists() or token.is_symlink()):
+        raise RuntimeError('No long-lived token is saved for ' + name + '; run this without --replace')
+    old = credential(token)
+    if kind(old) != 'long-lived': raise RuntimeError('The saved file is not a long-lived token; nothing was replaced')
+    if args.from_file:
+        print('1/4 · Reading the replacement token', flush=True)
+        new = read_private(Path(args.from_file).expanduser())
+    else:
+        print('1/4 · Opening browser authorization for a replacement token', flush=True)
+        private_directory(directory)
+        staging.append(Path(tempfile.mkdtemp(prefix='.replace-', dir=directory)))
+        login(binary, staging[0], name, label, mode='setup-token')
+        new = credential(staging[0] / (name + '.json'))
+    if kind(new) != 'long-lived': raise RuntimeError('Only a long-lived token can replace a long-lived token; nothing was replaced')
+    if fingerprint(new) == fingerprint(old): raise RuntimeError('The new token is the same as the saved one; nothing was replaced')
+    saved = registry.account(registry.load(registry_path), name) or {}
+    if ids(new) != ids(old) or (saved.get('userId') is not None and (saved.get('userId'), saved.get('organizationId')) != ids(new)):
+        raise RuntimeError('The new token belongs to another account or organization; nothing was replaced')
+    return new
+
+
+def enroll_long_lived(args, email, name, entry, *, config, stores, binary, runtime, backend_source, backend_env,
+                      overview, directory, registry_path, self_path, lookup):
+    staging = []
+    try:
+        return enroll_steps(args, email, name, entry, config=config, stores=stores, binary=binary, runtime=runtime,
+                            backend_source=backend_source, backend_env=backend_env, overview=overview, directory=directory,
+                            registry_path=registry_path, self_path=self_path, lookup=lookup, staging=staging)
+    finally:
+        # A minted replacement that was not installed is discarded; the saved token stays as it was.
+        for folder in staging: shutil.rmtree(folder, ignore_errors=True)
+
+
+def enroll_steps(args, email, name, entry, *, config, stores, binary, runtime, backend_source, backend_env,
+                 overview, directory, registry_path, self_path, lookup, staging):
+    token = directory / (name + '.json')
+    if args.replace:
+        value = replacement(args, binary, directory, name, entry['label'] + ' — ' + email, registry_path, staging)
+    else:
+        if args.from_file:
+            print('1/4 · Saving the staged long-lived token', flush=True)
+            long_lived.adopt(Path(args.from_file).expanduser(), directory, name)
+        elif token.exists() or token.is_symlink():
+            print('1/4 · Using saved long-lived token', flush=True)
+        else:
+            print('1/4 · Opening browser authorization for a long-lived token', flush=True)
+            private_directory(directory)
+            login(binary, directory, name, entry['label'] + ' — ' + email, mode='setup-token')
+        value = credential(token)
+        if kind(value) != 'long-lived': raise RuntimeError('The saved file is not a long-lived token; nothing was enrolled')
+    print('2/4 · Verifying account and organization', flush=True)
+    info = long_lived_identity(value, stores, lookup or owner_lookup)
+    verify_expected(info, email, args.organization)
+    print(info['email'] + ' · ' + info['organization'] + ' · ' + info['plan'], flush=True)
+    entry['plan'] = info['plan']
+    print('3/4 · Registering account and shortcut', flush=True)
+    shared = {**{key: info[key] for key in IDENTITY_KEYS}, **entry, 'fingerprint': fingerprint(value),
+              'expiresAt': long_lived.expires_at_ms(value)}
+    def wanted(current):
+        old = registry.account(current, name) or {}
+        return {**shared, **({'reserveAt': old['reserveAt']} if 'reserveAt' in old else {})}
+    def upsert(current):
+        current['accounts'] = [r for r in current['accounts'] if r['name'] != name] + [wanted(current)]
+    known = registry.load(registry_path)
+    refuse_other_name(load(config).get('accounts', []), stores, name, info, known)
+    # Refuse a second name for this subscription before anything is written (register() checks again under its lock).
+    refuse_duplicate(load(config).get('accounts', []), stores, name, info)
+    for row in known['accounts']:
+        if row['name'] != name and (row.get('userId'), row.get('organizationId')) == (info['userId'], info['organizationId']):
+            raise RuntimeError('This subscription is already connected as ' + (row.get('label') or row['name']) + '; a second alias adds no quota.')
+    stamp = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
+    if args.replace:
+        swap_in(token, value, stamp)
+        if args.from_file: Path(args.from_file).expanduser().unlink()
+    if registry.account(known, name) != wanted(known): known = registry.update(upsert, registry_path)
+    owner = registry.owner(known)
+    is_owner = owner is not None and owner['name'] == registry.self_name(self_path)
+    store = stores / (name + '.json')
+    if store.is_symlink(): raise RuntimeError('Credential file must not be a symlink: ' + store.name)
+    current = credential(store) if store.exists() else None
+    if current is not None and kind(current) == 'refreshable':
+        # A refreshable grant is unique; replacing it would lose it. Switching is a separate, deliberate step.
+        if not is_owner: print('This machine keeps its own login for ' + entry['label'] + '; run claude-pool device switch when no task is running.', flush=True)
+    elif current is None and is_owner:
+        print('This machine is the usage owner and serves ' + entry['label'] + ' from a refreshable login. Connect one with claude-pool account add ' + email + ' --name ' + name + '.')
+        return 0
+    elif current is not None and args.replace and fingerprint(current) != fingerprint(value):
+        swap_in(store, value, stamp)
+    elif current is None or fingerprint(current) != fingerprint(value):
+        write_private(store, json.dumps(value))
+        if fingerprint(credential(store)) != fingerprint(value): raise RuntimeError('The pool copy of the token did not verify; rerun this command')
+    paths, env = local_paths_env(runtime, stores, backend_source, backend_env)
+    register(config, stores, binary, paths, entry, info, env)
+    return readiness(overview, entry, name, email, kind(credential(store)) == 'long-lived')
+
+
+def stored_kind(path):
+    """'refreshable', 'long-lived', or None for a file that is unreadable or not a credential."""
+    try: return kind(credential(path))
+    except (OSError, ValueError, RuntimeError): return None
+
+
+def same_file(a, b):
+    return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+
+
+def retire(stores, long_lived_dir, name, *, after_link=None, tries=3, keep_long_lived=False):
+    """A refreshable grant is unique: it moves to stores/.retired/<name>-<unix>.json and is never deleted.
+    Long-lived replicas are unlinked, unless `keep_long_lived` (a removal received from another device): then they are
+    moved aside like everything else. Anything unrecognised is moved aside too, never deleted.
+    A file replaced while it is being moved is never unlinked: the step retries, then stops with an error."""
+    for path in (Path(stores) / (name + '.json'), Path(long_lived_dir) / (name + '.json')):
+        for _ in range(tries):
+            try: before = os.lstat(path)
+            except FileNotFoundError: break
+            if not keep_long_lived and not path.is_symlink() and stored_kind(path) == 'long-lived':
+                if same_file(os.lstat(path), before):
+                    path.unlink(); break
+                continue
+            folder = Path(stores) / '.retired'
+            private_directory(folder)
+            stamp, n = str(int(time.time())), 0
+            while True:
+                target = folder / (name + '-' + stamp + ('-' + str(n) if n else '') + '.json')
+                try: os.link(path, target, follow_symlinks=False); break
+                except FileExistsError: n += 1
+            if after_link: after_link(path, target)
+            try: current = os.lstat(path)
+            except FileNotFoundError:
+                break  # moved away by someone else; the retired link keeps its bytes
+            if same_file(current, os.lstat(target)):
+                path.unlink(); break
+            target.unlink()  # the link points at the old file, not the one now at `path`
+        else:
+            raise RuntimeError(path.name + ' changed while it was being retired; nothing more was removed. Rerun this command.')
+
+
+def matches_native(native, name, value, stores):
+    """Whether account `name` is the Native login (`native` from native_login.parse_auth_status).
+    Email must match; organizations are compared only when both sides name one."""
+    if not native: return False
+    entry = registry.account(value, name) or {}
+    if entry.get('email'):
+        email, organization = entry['email'], entry.get('organization') or ''
+    else:
+        path = Path(stores) / (name + '.json')
+        if not (path.exists() or path.is_symlink()): return False
+        try: stored = credential(path)
+        except (OSError, ValueError, RuntimeError):
+            raise RuntimeError('Could not read the login of ' + name + ' to check whether it is the Native login; nothing was removed. Fix the file (private 0600 JSON) and rerun.') from None
+        if kind(stored) != 'refreshable': return False  # a long-lived token has no profile to compare
+        try: info = profile(path)
+        except RuntimeError:
+            raise RuntimeError('Could not check whether ' + name + ' is the Native login (identity check unavailable); nothing was removed. Rerun when online.') from None
+        email, organization = info['email'], info['organization']
+    if normalized(native['email']) != normalized(email): return False
+    theirs, ours = normalized(native.get('organization') or ''), normalized(organization or '')
+    return not theirs or not ours or theirs == ours
+
+
+def remove_account(name, wait, *, config, stores, binary, runtime, backend_source, backend_env, overview,
+                   directory, registry_path, native_identity):
+    if not re.fullmatch('[a-z0-9-]{1,80}', name): raise RuntimeError('Usage: claude-pool account remove <name> [--wait]')
+    rows = load(config).get('accounts', [])
+    row = next((r for r in rows if r['name'] == name), None)
+    known = registry.load(registry_path)
+    entry = registry.account(known, name)
+    if entry is None:
+        # This machine may hold the subscription under its own name; its registry row (enrolled elsewhere) is found by
+        # UUIDs, so the removal reaches every device instead of coming back with the next sync.
+        try: mine = _account_ids(stores, directory, name)
+        except (OSError, ValueError, RuntimeError): mine = {}
+        if mine: entry = registry.entry_for(known, {'name': name, **mine})
+    files = [stores / (name + '.json'), directory / (name + '.json')]
+    if row is None and entry is None and not any(p.exists() or p.is_symlink() for p in files):
+        raise RuntimeError('No account named ' + name + ' is connected (see claude-pool account list)')
+    for path in files:
+        if path.is_symlink(): raise RuntimeError('Credential file must not be a symlink: ' + path.name)
+    label = (row or entry or {}).get('label') or name
+    private_directory(stores)
+    if row is not None and len(rows) == 1:
+        raise RuntimeError(label + ' is the only connected account; the pool needs at least one. Nothing was removed.')
+    with (stores / ('.' + name + '.add.lock')).open('a') as lock:
+        try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError: raise RuntimeError('This account has a connection in progress; nothing was removed') from None
+        if matches_native(native_identity() if native_identity else None, name, {'accounts': [{**entry, 'name': name}] if entry else []}, stores):
+            raise RuntimeError(label + ' is the Native login of this machine and must stay connected. '
+                               'Sign Native in with another connected account first (claude-native auth login). Nothing was removed.')
+        if overview:
+            if wait: print('Waiting for ' + label + ' to finish its running requests…', flush=True)
+            if not routing.wait_idle(overview, name, wait):
+                raise RuntimeError(label + ' is still serving a request' + (' after 30 minutes' if wait else '')
+                                   + ' (or the pool did not answer); nothing was removed. '
+                                   + ('Rerun when it is idle.' if wait else 'Rerun with --wait to remove it once idle.'))
+        kept = any(p.exists() and stored_kind(p) != 'long-lived' for p in files)
+        paths, env = local_paths_env(runtime, stores, backend_source, backend_env)
+        unregister(config, stores, binary, paths, name, env)
+        retire(stores, directory, name)
+        if entry is not None:
+            registry.update(lambda value: value.update(accounts=[r for r in value['accounts'] if r['name'] != entry['name']]), registry_path)
+    print('Removed ' + label + ' from the pool.')
+    if kept:
+        print('Its login is kept in ' + str(stores / '.retired') + ' (a refreshable login cannot be recreated without a browser).')
+    aside = sorted({p.name for folder in (stores, directory) for p in folder.glob(name + '.json.replaced-*')})
+    if aside:
+        print('Earlier replaced tokens are kept, never deleted automatically: ' + ', '.join(aside))
+    if entry is not None:
+        print('Other devices drop it after claude-pool device sync' + (' (registry: ' + entry['name'] + ').' if entry['name'] != name else '.'))
+    return 0
+
+
+ACCOUNT_HELP = '\n'.join([
+    'claude-pool account <verb>: the subscriptions this machine serves.', '',
+    '  claude-pool account list                               names, labels and shortcuts',
+    '  claude-pool account add <email> [--name N] [--label L] [--alias A]   browser login, verified identity, joins the pool',
+    '  claude-pool account add <email> --long-lived [--replace] [--from-file F] [--name N]   a one-year token every device can use',
+    '  claude-pool account remove <name> [--wait]             disconnect without interrupting running requests',
+    '  claude-pool account rename <old> <new> [--wait]        rename the account on this machine; label and shortcut stay',
+    '  claude-pool account reserve <name> --at <pct> | --off  last choice from a percent of its 5-hour or weekly limit', '',
+    'rename moves the login, the long-lived token, the config row, the runtime config, the reserve and the local state',
+    '(probe results, pulled readings, session pins) to the new name. It refuses a name that is already connected, that is not',
+    'lowercase a-z, 0-9 and -, or under which a token of another subscription is saved. A second copy of the same token under',
+    'the new name is removed only when another copy of it stays; anything else is moved into the credential folder\'s .retired.',
+    'A running pool is restarted to take the new name, once the account (and then the pool) serves no request; --wait waits up',
+    'to 30 minutes. When this machine enrolled the subscription, the registry row is renamed too; other devices keep their own',
+    'names. Use it so a subscription carries the same name on every machine: device check prints the exact command.',
+])
+NAME = re.compile('[a-z0-9-]{1,80}')
+RENAME_USAGE = 'Usage: claude-pool account rename <old> <new> [--wait]'
+STATE_LIMIT = 4 * 1024 * 1024
+
+
+def rename_membership(text, old, new):
+    """Rename the [[providers.anthropic.accounts]] table `old` to `new`; every other line stays byte-identical and the
+    result must parse to the old document with only that name changed."""
+    before = tomllib.loads(text)
+    rows = before.get('providers', {}).get('anthropic', {}).get('accounts', [])
+    if not any(row.get('name') == old for row in rows): return text
+    if any(row.get('name') == new for row in rows): raise RuntimeError('The runtime configuration already lists ' + new + '; nothing was renamed')
+    lines = text.splitlines(keepends=True)
+    header = '[[providers.anthropic.accounts]]'
+    start = end = None
+    for index, line in enumerate(lines):
+        if line.strip() != header: continue
+        stop = index + 1
+        while stop < len(lines) and not lines[stop].strip().startswith('['): stop += 1
+        block = tomllib.loads(''.join(lines[index:stop]))['providers']['anthropic']['accounts']
+        if block and block[0].get('name') == old: start, end = index, stop; break
+    if start is None: raise RuntimeError('The runtime configuration lists ' + old + ' in a form this command cannot edit')
+    own = re.compile(r'(\s*)(?:name|"name"|\'name\')\s*=')
+    at = next((i for i in range(start + 1, end) if own.match(lines[i])), None)
+    if at is None: raise RuntimeError('The runtime configuration lists ' + old + ' in a form this command cannot edit')
+    lines[at] = own.match(lines[at]).group(1) + 'name = ' + json.dumps(new) + '\n'
+    candidate = ''.join(lines)
+    expected = copy.deepcopy(before)
+    next(r for r in expected['providers']['anthropic']['accounts'] if r.get('name') == old)['name'] = new
+    if tomllib.loads(candidate) != expected: raise RuntimeError('Renaming ' + old + ' would change other runtime settings; nothing was renamed')
+    return candidate
+
+
+def rename_in_sessions(value, old, new):
+    """The pool bridge's saved state (sessions.json) with every reference to account `old` renamed: pins, the serving
+    account, routing, switch history, paused accounts, observations and traffic. Returns (value, changed)."""
+    changed = []
+    def swap(holder, key):
+        if isinstance(holder, dict) and holder.get(key) == old: holder[key] = new; changed.append(key)
+    if not isinstance(value, dict): return value, False
+    versioned = value.get('version') == 1
+    sessions = value.get('sessions') if versioned else value
+    for state in (sessions.values() if isinstance(sessions, dict) else []):
+        if not isinstance(state, dict): continue
+        for key in ('active', 'pin', 'reserved'): swap(state, key)
+        swap(state.get('routing'), 'account')
+        for item in (state.get('history') if isinstance(state.get('history'), list) else []) + [state.get('switch')]:
+            swap(item, 'from'); swap(item, 'to')
+    if versioned:
+        observations = value.get('observations')
+        if isinstance(observations, dict) and old in observations:
+            observations[new] = observations.pop(old); changed.append('observations')
+        if isinstance(value.get('paused'), list) and old in value['paused']:
+            value['paused'] = sorted({new if name == old else name for name in value['paused']}); changed.append('paused')
+        for row in value.get('traffic') if isinstance(value.get('traffic'), list) else []: swap(row, 'account')
+    return value, bool(changed)
+
+
+class _Undo:
+    """Every step of a rename registers how to put it back; rollback runs them in reverse and names what it could not."""
+    def __init__(self): self.steps = []
+    def add(self, what, undo): self.steps.append((what, undo))
+    def rollback(self):
+        failed = []
+        for what, undo in reversed(self.steps):
+            try: undo()
+            except Exception: failed.append(what)
+        return failed
+
+
+def _move(source, target, undo):
+    if target.exists() or target.is_symlink(): raise RuntimeError(target.name + ' appeared in ' + str(target.parent) + ' during the rename')
+    os.rename(source, target)
+    undo.add(str(source) + ' (now ' + str(target) + ')', lambda: os.rename(target, source))
+
+
+def _aside(path, folder, undo):
+    """Move `path` into `folder` under a unique name (the folder is private, the file is never unlinked here)."""
+    private_directory(folder)
+    stamp, n = str(int(time.time())), 0
+    while True:
+        target = folder / (path.stem + '-' + stamp + ('-' + str(n) if n else '') + path.suffix)
+        if not (target.exists() or target.is_symlink()): break
+        n += 1
+    _move(path, target, undo)
+    return target
+
+
+def _rewrite(path, data, undo):
+    original = path.read_bytes()
+    atomic_write(path, data)
+    undo.add(str(path), lambda: atomic_write(path, original))
+
+
+def _rename_state(runtime, old, new, undo):
+    """Local state keyed by the account name: the long-lived probe results, the readings pulled from the usage owner and
+    the bridge's sessions (pins, paused accounts, observations). Files that are absent or unreadable stay as they are."""
+    renamed = []
+    for name in ('long-lived-probes.json', 'shared-readings.json', 'sessions.json', 'sessions.bak'):
+        path = Path(runtime) / name
+        try:
+            if path.is_symlink() or not path.is_file() or path.stat().st_size > STATE_LIMIT: continue
+            value = json.loads(path.read_bytes())
+        except (OSError, ValueError): continue
+        if name.startswith('sessions'): value, changed = rename_in_sessions(value, old, new)
+        else:
+            table = value.get('accounts') if name == 'shared-readings.json' and isinstance(value, dict) else value
+            changed = isinstance(table, dict) and old in table
+            if changed: table[new] = table.pop(old)
+        if changed:
+            _rewrite(path, json.dumps(value, sort_keys=name == 'long-lived-probes.json'), undo); renamed.append(name)
+    return renamed
+
+
+def _rename_files(old, new, stores, directory, undo):
+    """Move the account's files to `new`. The account's own store file stays its store file; one long-lived token ends up
+    in the long-lived folder under `new`; any other copy found under either name is removed only when a kept file holds
+    the identical token, otherwise moved into stores/.retired (never the only copy of a token). Returns report lines."""
+    s_old, l_old, s_new, l_new = (stores / (old + '.json'), directory / (old + '.json'), stores / (new + '.json'), directory / (new + '.json'))
+    present = {path: credential(path) for path in (s_old, l_old, s_new, l_new) if path.exists()}
+    store = s_old if s_old in present else s_new if s_new in present else None
+    replica = next((path for path in (l_old, l_new, s_new) if path in present and path != store and kind(present[path]) == 'long-lived'), None)
+    kept = {fingerprint(present[path]) for path in (store, replica) if path is not None}
+    lines, staged = [], []
+    for path in [p for p in present if p not in (store, replica)]:
+        if fingerprint(present[path]) in kept:
+            staging = path.parent / ('.rename-' + new)
+            private_directory(staging)
+            undo.add(str(staging), lambda folder=staging: folder.rmdir() if folder.exists() and not any(folder.iterdir()) else None)
+            target = staging / path.name
+            _move(path, target, undo); staged.append(target)
+            lines.append('Removed a second copy of the same token: ' + str(path))
+        else:
+            target = _aside(path, stores / '.retired', undo)
+            lines.append('Moved ' + str(path) + ' aside to ' + str(target) + ' (the only copy of that token; never deleted)')
+    if replica is not None and replica != l_new: _move(replica, l_new, undo)
+    if store is not None and store != s_new: _move(store, s_new, undo)
+    for path in (s_old, l_old):
+        if path.exists() or path.is_symlink(): raise RuntimeError(str(path) + ' is still there after the move')
+    return lines, staged
+
+
+def _account_ids(stores, directory, name):
+    for path in (stores / (name + '.json'), directory / (name + '.json')):
+        if path.exists():
+            user, org = ids(credential(path))
+            if user and org: return {'userId': user, 'organizationId': org}
+    return {}
+
+
+def rename_account(old, new, wait, *, config, stores, binary, runtime, backend_source, backend_env, overview,
+                   directory, registry_path, pool):
+    if not NAME.fullmatch(old or ''): raise RuntimeError(RENAME_USAGE)
+    rows = load(config).get('accounts', [])
+    row = next((r for r in rows if r['name'] == old), None)
+    if row is None: raise RuntimeError('No account named ' + old + ' is connected (see claude-pool account list)')
+    label = row.get('label') or old
+    if not NAME.fullmatch(new or ''): raise RuntimeError('Choose a lowercase account name (a-z, 0-9 and -, up to 80 characters)')
+    if new == old: raise RuntimeError(label + ' is already named ' + old + '; nothing was renamed')
+    if any(r['name'] == new for r in rows): raise RuntimeError(new + ' is already a connected account; nothing was renamed')
+    for path in (stores / (old + '.json'), directory / (old + '.json'), stores / (new + '.json'), directory / (new + '.json')):
+        if path.is_symlink(): raise RuntimeError('Credential file must not be a symlink: ' + str(path))
+        if path.exists():
+            try: credential(path)
+            except (OSError, ValueError, RuntimeError):
+                raise RuntimeError(str(path) + ' cannot be read (it must be a private 0600 credential file); nothing was renamed') from None
+    mine = _account_ids(stores, directory, old)
+    for path in (stores / (new + '.json'), directory / (new + '.json')):
+        if path.exists() and (not mine or ids(credential(path)) != (mine['userId'], mine['organizationId'])):
+            raise RuntimeError(str(path) + ' holds a token of another subscription; nothing was renamed')
+    known = registry.load(registry_path)
+    member = {'name': old, **mine}
+    entry = registry.entry_for(known, member)
+    marker = next((t for t in known.get('removed', []) if t['kind'] == 'account' and t['name'] == new), None)
+    if marker is not None:
+        # A removal marker carries no UUIDs: every later sync would apply it to whatever this machine calls `new`.
+        raise RuntimeError('The registry has a removal marker for ' + new + ' (removed at generation ' + str(marker['generation'])
+                           + (', token ' + marker['fingerprint'] if marker.get('fingerprint') else '') + '); a later sync would '
+                           'remove the renamed account. Choose another name. Nothing was renamed.')
+    clash = registry.account(known, new)
+    if clash is not None and not registry.same_subscription(clash, member):
+        raise RuntimeError('The registry uses ' + new + ' for another subscription; nothing was renamed')
+    follow = entry is not None and entry['name'] == old and clash is None
+    if follow and not registry.NAME.fullmatch(new):
+        raise RuntimeError('The registry names this account too, and registry names have at most 40 characters; nothing was renamed')
+    private_directory(stores)
+    with (stores / ('.' + old + '.add.lock')).open('a') as lock_old, (stores / ('.' + new + '.add.lock')).open('a') as lock_new:
+        for lock in (lock_old, lock_new):
+            try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError: raise RuntimeError('This account has a connection in progress; nothing was renamed') from None
+        stopped = False
+        if overview is not None:
+            if wait: print('Waiting for ' + label + ' to finish its running requests…', flush=True)
+            if not routing.wait_idle(overview, old, wait):
+                raise RuntimeError(label + ' is still serving a request' + (' after 30 minutes' if wait else '')
+                                   + ' (or the pool did not answer); nothing was renamed. '
+                                   + ('Rerun when it is idle.' if wait else 'Rerun with --wait to rename it once idle.'))
+            # The running pool takes the new name only through a restart, which would cut every other running request.
+            if not routing.wait_idle(overview, None, wait):
+                raise RuntimeError('Other Claude tasks are running; renaming restarts the pool and would interrupt them. Nothing was renamed. '
+                                   + ('Rerun when they are done.' if wait else 'Rerun with --wait to rename once the pool is idle.'))
+            if pool is None: raise RuntimeError('The pool is running and cannot be restarted from here; stop it with claude-pool --stop, then rerun.')
+            if pool('--stop'):
+                print('The pool service did not stop; nothing was changed. Rerun claude-pool account rename ' + old + ' ' + new + '.')
+                return 1
+            stopped = True
+        try:
+            lines = _rename(old, new, label, follow, config=config, stores=stores, binary=binary, runtime=runtime,
+                            backend_source=backend_source, backend_env=backend_env, directory=directory, registry_path=registry_path)
+        except BaseException:  # Ctrl-C and SystemExit too: _rename has put everything back, the pool must run again
+            if stopped and pool('--start'): print('The pool service did not restart. Run: claude-pool --start')
+            raise
+    started = stopped and pool('--start')
+    print('Renamed ' + old + ' to ' + new + ' (' + label + '; the shortcut claude ' + (row.get('alias') or old) + ' stays).')
+    for line in lines: print(line)
+    if entry is None: print('The registry does not list this subscription; other devices are unchanged.')
+    elif follow: print('The registry now names it ' + new + '; other devices keep their own names after claude-pool device sync.')
+    elif entry['name'] == new: print('The registry already names it ' + new + '.')
+    else: print('The registry names it ' + entry['name'] + ' (another device enrolled it); the registry is unchanged.')
+    if stopped:
+        if started:
+            print('The pool service did not restart. Run: claude-pool --start')
+            return 1
+        print('Stopped the pool for the rename and started it again with the new name.')
+    else: print('The pool was not running; it uses the new name when it starts.')
+    return 0
+
+
+def _rename(old, new, label, follow, *, config, stores, binary, runtime, backend_source, backend_env, directory, registry_path):
+    """The rename itself, all or nothing: any failure after the first move puts every step back and says what remains."""
+    undo = _Undo()
+    try:
+        lines, staged = _rename_files(old, new, stores, directory, undo)
+        paths, env = local_paths_env(runtime, stores, backend_source, backend_env)
+        for path in [config, *(p for p in paths if p.exists())]:
+            undo.add(str(path), lambda path=path, data=path.read_bytes(): atomic_write(path, data))
+        def change(value):
+            next(r for r in value['accounts'] if r['name'] == old)['name'] = new
+        apply_change(config, binary, paths, env, change, lambda text: rename_membership(text, old, new),
+                     rejected='Backend rejected the new name; nothing was renamed')
+        _rename_state(runtime, old, new, undo)
+        if follow:
+            def note(value): registry.account(value, old)['name'] = new
+            registry.update(note, registry_path)
+    except BaseException as error:
+        failed = undo.rollback()
+        if not isinstance(error, Exception):  # Ctrl-C or SystemExit: put back, say so, keep the interruption
+            print('Interrupted; ' + ('everything was put back, it is still named ' + old + '.' if not failed else
+                                     'could not put back: ' + ', '.join(failed) + '.'), file=sys.stderr)
+            raise
+        reason = type(error).__name__ + ': ' + str(error)
+        if not failed: raise RuntimeError('Renaming ' + label + ' failed (' + reason + '); everything was put back, it is still named ' + old + '.') from None
+        raise RuntimeError('Renaming ' + label + ' failed (' + reason + ') and these could not be put back: ' + ', '.join(failed)
+                           + '. Check them by hand; the config still names it ' + old + ' unless listed.') from None
+    for path in staged:
+        try: path.unlink(); path.parent.rmdir()
+        except OSError: pass
+    return lines
+
+
+def percent(text):
+    if not re.fullmatch('[0-9]{1,3}', text) or not 1 <= int(text) <= 99: raise argparse.ArgumentTypeError('--at must be a whole number from 1 to 99')
+    return int(text)
+
+
+def cli(argv, *, on_change=None, **options):
+    """Run an account command. After a successful add or remove, `on_change()` (a device sync) reports one line per
+    device; a failing sync never changes the exit code of a change that already succeeded."""
+    code = run_cli(argv, **options)
+    if code == 0 and on_change is not None and argv[:1] in (['add'], ['remove'], ['reserve'], ['rename']):
+        try: results = on_change()
+        except Exception as error: print('Device sync failed (' + type(error).__name__ + '); run claude-pool device sync later.')
+        else:
+            for device, result in sorted(results.items()): print('  ' + device + ': ' + result)
+    return code
+
+
+def run_cli(argv, *, config, stores, binary, runtime, backend_source=None, backend_env=None, overview=None,
+            long_lived=None, registry_path=None, self_path=None, lookup=None, native_identity=None, pool=None):
     parser = argparse.ArgumentParser(prog='claude account')
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('list', help='Show connected names and shortcuts')
     add = sub.add_parser('add', help='Authorize, verify and enroll a subscription')
     add.add_argument('email', nargs='?'); add.add_argument('--name'); add.add_argument('--label')
     add.add_argument('--alias'); add.add_argument('--organization')
+    add.add_argument('--long-lived', action='store_true', help='Enroll a long-lived token (shared by every device)')
+    add.add_argument('--from-file', help='With --long-lived: adopt a staged 0600 token file instead of opening a browser')
+    add.add_argument('--replace', action='store_true', help='With --long-lived: install a new token for this account; the old one is kept aside')
+    remove = sub.add_parser('remove', help='Disconnect a subscription without interrupting running requests')
+    remove.add_argument('name'); remove.add_argument('--wait', action='store_true', help='Wait (up to 30 minutes) until the account serves no request')
+    renamed = sub.add_parser('rename', help='Rename an account on this machine (label and shortcut stay)')
+    renamed.add_argument('old'); renamed.add_argument('new')
+    renamed.add_argument('--wait', action='store_true', help='Wait (up to 30 minutes) until the pool is idle, then restart it with the new name')
+    reserved = sub.add_parser('reserve', help='Make an account the pool\'s last choice, with no new pool work near its limits')
+    reserved.add_argument('name')
+    mode = reserved.add_mutually_exclusive_group(required=True)
+    mode.add_argument('--at', type=percent, metavar='PCT', help='Reserve from this percent (1-99) of its 5-hour or weekly limit')
+    mode.add_argument('--off', action='store_true', help='Use the account like any other again')
     args = parser.parse_args(argv)
     config, stores, binary, runtime = map(Path, (config, stores, binary, runtime))
+    directory = Path(long_lived) if long_lived else stores.parent / 'claude-long-lived'
+    if args.command == 'remove':
+        return remove_account(args.name, args.wait, config=config, stores=stores, binary=binary, runtime=runtime,
+                              backend_source=backend_source, backend_env=backend_env, overview=overview, directory=directory,
+                              registry_path=registry_path, native_identity=native_identity)
+    if args.command == 'rename':
+        return rename_account(args.old, args.new, args.wait, config=config, stores=stores, binary=binary, runtime=runtime,
+                              backend_source=backend_source, backend_env=backend_env, overview=overview, directory=directory,
+                              registry_path=registry_path, pool=pool)
+    if args.command == 'reserve':
+        row = next((r for r in load(config).get('accounts', []) if r['name'] == args.name), None)
+        if row is None: raise RuntimeError('No account named ' + args.name + ' is connected (see claude-pool account list)')
+        paths, env = local_paths_env(runtime, stores, backend_source, backend_env)
+        reserve(config, binary, paths, env, args.name, None if args.off else args.at, registry_path=registry_path)
+        label = row.get('label', row['name'])
+        if args.off: print(label + ' is no longer reserved.')
+        else: print('Reserved ' + label + ' from ' + str(args.at) + '%: last choice, and no new pool work at or above ' + str(args.at) + '% of its 5-hour or weekly limit.')
+        return 0
     if args.command == 'list':
         for row in load(config).get('accounts', []):
             print(f"{row.get('label', row['name'])} · claude {row.get('alias', row['name'])}")
         return 0
+    if args.from_file and not args.long_lived: raise RuntimeError('--from-file needs --long-lived')
+    if args.replace and not args.long_lived: raise RuntimeError('--replace needs --long-lived')
     email = args.email
     if not email and os.isatty(0): email = input('Account email: ').strip()
     if not email or not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+', email):
@@ -171,6 +992,10 @@ def cli(argv, *, config, stores, binary, runtime, backend_source=None, backend_e
     with (stores / ('.' + name + '.add.lock')).open('a') as lock:
         try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError: raise RuntimeError('This account already has a connection in progress') from None
+        if args.long_lived:
+            return enroll_long_lived(args, email, name, entry, config=config, stores=stores, binary=binary, runtime=runtime,
+                                     backend_source=backend_source, backend_env=backend_env, overview=overview,
+                                     directory=directory, registry_path=registry_path, self_path=self_path, lookup=lookup)
         path = stores / (name + '.json')
         print('1/4 · ' + ('Using saved login' if path.exists() else 'Opening browser authorization'), flush=True)
         if not path.exists() and not path.is_symlink(): login(binary, stores, name, entry['label'] + ' — ' + email)
@@ -179,29 +1004,6 @@ def cli(argv, *, config, stores, binary, runtime, backend_source=None, backend_e
         print(info['email'] + ' · ' + info['organization'] + ' · ' + info['plan'], flush=True)
         entry['plan'] = info['plan']
         print('3/4 · Registering account and shortcut', flush=True)
-        paths = ([Path(backend_source)] if backend_source else []) + [runtime / 'shunt.toml']
-        env = {**os.environ, 'POOL_CLIENT_TOKENS':'setup:local-config-validation-token',
-               'POOL_ADMIN_TOKENS':'setup:local-config-validation-token', **(backend_env or {}),
-               'SHUNT_CLAUDE_ACCOUNTS_DIR': str(stores)}
+        paths, env = local_paths_env(runtime, stores, backend_source, backend_env)
         register(config, stores, binary, paths, entry, info, env)
-        print('4/4 · Checking the running pool', flush=True)
-        if overview:
-            deadline = time.monotonic() + 330
-            announced = False
-            while time.monotonic() < deadline:
-                try:
-                    data = overview()
-                    row = next((a for a in data.get('accounts', []) if a.get('name') == name), None)
-                except (OSError, ValueError, RuntimeError): row = None
-                if row and row.get('status') not in ('unknown', None):
-                    print(f"Connected {entry['label']} · {row['status']} · {len(data['accounts'])} accounts")
-                    print('Start a session: claude ' + entry['alias'] + '  |  All accounts: claude')
-                    return 0
-                if not announced:
-                    print('Waiting for the backend’s first quota reading…', flush=True)
-                    announced = True
-                time.sleep(5)
-            print('Login and membership are saved. Readiness is not confirmed yet; rerun this command to resume without another login.')
-            return 2
-        print('Connected ' + entry['label'] + '. Start the pool with claude; shortcut: claude ' + entry['alias'])
-        return 0
+        return readiness(overview, entry, name, email, False)

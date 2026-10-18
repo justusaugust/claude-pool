@@ -4,7 +4,6 @@ import http.client
 import json
 import math
 import os
-import tempfile
 import re
 import threading
 import time
@@ -19,8 +18,10 @@ from forecast import estimate, renewal_scenario, workload_estimates
 from routing import choose, profile, session_rows, unavailable, REASONS
 from validation import archive, HistoryIndex
 from diagnostics import Journal
+import readings
 from native_auth import NativeAuthUnavailable
 from telemetry import fable_windows, capacity
+from private_files import atomic_write
 
 from settings import LABELS, CONFIG
 HOP = {"host", "connection", "content-length", "transfer-encoding"}
@@ -45,27 +46,19 @@ def event(value):
         "thinkingDropped": value.get("thinkingDropped") is True}
 
 
-def atomic_write(path, data):
-    tmp = None
-    try:
-        with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, prefix=path.name + ".", delete=False) as file:
-            tmp = Path(file.name)
-            file.write(data); file.flush(); os.fsync(file.fileno())
-        tmp.replace(path)
-    finally:
-        if tmp: tmp.unlink(missing_ok=True)
-
 class PoolBridge(ThreadingHTTPServer):
     daemon_threads = False
     allow_reuse_address = True
 
-    def __init__(self, address, upstream_port, client_token, admin_token, state_path=None, native_auth=None):
+    def __init__(self, address, upstream_port, client_token, admin_token, state_path=None, native_auth=None, shared_readings=None):
         super().__init__(address, Handler)
         self.upstream_port, self.client_token, self.admin_token = upstream_port, client_token, admin_token
         self.native_auth = native_auth
+        self.shared_readings = Path(shared_readings) if shared_readings else None
         self.lock = threading.RLock()
         self.sessions, self.observations, self.paused_names = {}, {}, set()
         self.traffic = []
+        self.outcomes = []  # recent upstream answers: status and answering account (x-shunt-account), in memory only
         self.recovery = {"restarts": 0, "state": "ready"}
         self.persistence_error = False
         self._last_saved = None
@@ -236,6 +229,15 @@ class PoolBridge(ThreadingHTTPServer):
         finally:
             conn.close()
 
+    def note_outcome(self, status, account):
+        """Keep the last 200 upstream answers (time, status, x-shunt-account) for the long-lived probe; no body, no token."""
+        with self.lock:
+            self.outcomes.append({'at': int(time.time() * 1000), 'status': status, 'account': account})
+            del self.outcomes[:-200]
+
+    def outcomes_since(self, at_ms):
+        with self.lock: return [dict(row) for row in self.outcomes if row['at'] >= at_ms]
+
     def accounts(self):
         rows = []
         admin = self.admin()
@@ -260,6 +262,7 @@ class PoolBridge(ThreadingHTTPServer):
                              "fiveHour": window("5h"), "sevenDay": window("7d"), "fableWeekly": fable.get((provider['provider'], source['name'], source['account_ref'])), "status": status,
                              "plan": source.get("plan"), "seenAt": (source.get("observed_at_5h") or 0) * 1000,
                              "paused": source.get("paused", False), "cooldownSeconds": source.get("cooldown_secs_remaining", 0) or 0})
+        if self.shared_readings: readings.merge(rows, readings.load_shared(self.shared_readings), int(time.time() * 1000))
         from account_metadata import decorate
         decorate({'accounts': rows}, CONFIG)
         with self.lock:
@@ -601,6 +604,7 @@ class Handler(BaseHTTPRequestHandler):
             response = conn.getresponse()
             lease['progress'] = time.monotonic()
             account = response.getheader('x-shunt-account')
+            self.server.note_outcome(response.status, account)
             if response.status >= 400: self.server.journal.record('upstream_http_error', status=response.status, account=account)
             while response.status == 429 and path == '/v1/messages' and request.get('stream') is True and isinstance(request.get('model'), str):
                 quota = capacity(self.server.accounts(), request.get('model', ''), int(time.time() * 1000))
@@ -642,6 +646,7 @@ class Handler(BaseHTTPRequestHandler):
                 response = conn.getresponse()
                 lease['progress'] = time.monotonic()
                 account = response.getheader('x-shunt-account')
+                self.server.note_outcome(response.status, account)
             if committed and (response.status != 200 or 'text/event-stream' not in response.getheader('Content-Type', '')):
                 raise ConnectionError()
             if not committed:

@@ -1,0 +1,2488 @@
+#!/usr/bin/env python3
+"""preview: open a web server that runs on this VPS's localhost, or one file or folder, from any device on the tailnet.
+
+Single file, Python 3 standard library only. See `preview --help`.
+Tests: preview_test.py next to this file (python3 -m unittest from that directory).
+"""
+
+import argparse
+import asyncio
+import bisect
+import codecs
+import errno
+import html
+import io
+import ipaddress
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import socket
+import stat
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+VERSION = "1.1"
+UNIT_PREFIX = "preview-"
+RESERVED_PORTS = {22, 80, 443}
+TAILNET_NETS = (ipaddress.ip_network("100.64.0.0/10"), ipaddress.ip_network("fd7a:115c:a1e0::/48"))
+EXIT_CONFIG = 78  # systemd does not restart on this exit status (RestartPreventExitStatus)
+CUA_PORT = 18500  # `preview cua`: the index of Cua desktops on 127.0.0.1:18500, shared as https://<vps>:18500
+CUA_UNIT = "preview-cua-index.service"
+LEGACY_CUA_UNIT = "preview-cua-viewer.service"  # `cua viewer` of two earlier releases: a transient unit plus a key file
+CUA_SPACE_PORTS = range(18501, 18600)  # one share per Cua desktop (Space)
+CUA_LABEL = "Cua desktops"
+
+HELP = """\
+Open a web server that runs on this VPS (localhost) on the user's Mac and iPhone with one link.
+
+WHEN TO USE
+  Every time you start or change a web frontend or any HTTP server a human should look at
+  (Vite, Next.js, Astro, php -S, python -m http.server, Storybook, ...). Give the user the
+  printed link instead of screenshots. The link only works on devices in the Tailscale tailnet.
+
+HOW
+  1. Start the dev server bound to 127.0.0.1 (never 0.0.0.0; that would expose it publicly):
+       npm run dev -- --host 127.0.0.1 --port 5173
+       php -S 127.0.0.1:8000 router.php
+       python3 -m http.server 8080 --bind 127.0.0.1
+  2. preview 5173 --name "landing page"
+     It prints one line with the link, plus a short note. Send that link to the user.
+  3. When the work is done: preview stop 5173
+
+  To share a file or folder instead (a Markdown report, screenshots, a PDF):
+       preview file docs/report.md        or        preview file screenshots/
+
+COMMANDS
+  preview <port> [--name LABEL]   expose 127.0.0.1:<port> to the tailnet and print the link.
+                                  Safe to run again (same link; also upgrades HTTP to HTTPS
+                                  once Tailscale Serve is allowed). Works before the server is up.
+  preview file <path> [--name LABEL]
+                                  share one file or one folder read-only and print the link.
+                                  Markdown opens as a readable page (add ?raw=1 for the source),
+                                  images and PDFs open in the browser, other text shows as plain
+                                  text, everything else downloads. Dotfiles and dot folders
+                                  (.env, .git, ~/.ssh, ...) are never served, nor anything a
+                                  symlink points to outside the shared folder; / and the home
+                                  folder itself are refused. Safe to run again (same path, same
+                                  link). File shares use ports 18400-18499.
+  preview cua [--name LABEL]      one link to every Cua desktop this VPS knows (cua spaces ls), to see
+                                  and operate them from the iPhone. The link opens a list of the desktops
+                                  (served on 127.0.0.1:18500 by preview-cua-index.service); tapping one
+                                  makes a fresh one-hour viewer link (cua sandbox view) and opens that
+                                  desktop through its own share on 18501 and up, with audio off (the
+                                  desktop container has no sound server). The viewer ticket lives only in
+                                  that redirect and is never printed, logged or stored. Only the
+                                  Tailscale login that owns this VPS may open any of these links; anyone
+                                  else, other tailnet members included, gets 403. HTTPS only (Tailscale
+                                  Serve); with the http backend it refuses (preview doctor). Run it again
+                                  after adding or removing a Space; ports stay the same per desktop.
+  preview list [--json]           open previews: port, label, link, backend, target listening?
+                                  File shares also show their path, Cua desktops their Space.
+  preview stop <port>|<path>|cua  stop one preview or file share (a dev server keeps running), or the
+                                  Cua desktops list and every desktop share. A folder named only with digits,
+                                  or named cua: write ./2026 or ./cua
+  preview stop --all              stop every preview, file share and Cua share this tool created (nothing else)
+  preview doctor                  which backend is available, how to enable HTTPS, and whether every
+                                  preview comes back after a reboot
+  preview restore                 make every preview this tool knows come back after a reboot (for previews
+                                  an older version started; preview doctor says when). Same ports, same links.
+                                  Safe to run again.
+
+BACKENDS (chosen automatically)
+  https  Tailscale Serve: https://<vps>.<tailnet>.ts.net:<port>, needs the operator setting.
+  http   Fallback when Serve is not allowed: proxy bound only to the VPS tailnet IP,
+         http://<vps>.<tailnet>.ts.net:<port>. The VPS firewall may block tailnet ports for this
+         backend (preview doctor shows which ports pass); https works on any port.
+  Both run a small proxy (systemd --user unit preview-<port>) that rewrites Host, Origin and
+  Referer to localhost:<port>, so Vite allowedHosts, Next.js dev origin checks and similar
+  host checks pass. WebSockets (hot reload) and streaming responses pass through. Absolute
+  redirects to localhost:<port> are rewritten to the preview link. The proxy never listens
+  on 0.0.0.0 or a public address. If nothing listens on the port yet, the page says so and
+  reloads itself every few seconds. Ports 22, 80 and 443 are refused (system services).
+  A file share adds one more unit, preview-file-<port>.service: a read-only file server bound
+  to 127.0.0.1 only, which the proxy above exposes like any other port.
+  Previews survive a reboot: every unit is a file in ~/.config/systemd/user, enabled and started, and
+  the Tailscale Serve entry is kept by tailscaled; preview stop disables and deletes exactly those files.
+  Tests: python3 -m unittest preview_test (in ~/.local/bin).
+"""
+
+
+# ---------------------------------------------------------------------------
+# Bind-address guarantee
+# ---------------------------------------------------------------------------
+
+class UnsafeListenAddress(ValueError):
+    pass
+
+
+def check_listen_host(host):
+    """Allow only loopback or a Tailscale address. Never 0.0.0.0, ::, a hostname or a public IP."""
+    try:
+        ip = ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        raise UnsafeListenAddress(f"refusing to listen on {host!r}: not a literal IP address")
+    if ip.is_unspecified:
+        raise UnsafeListenAddress(f"refusing to listen on {host}: that is every interface, including the public one")
+    if ip.is_loopback or any(ip in net for net in TAILNET_NETS):
+        return str(ip)
+    raise UnsafeListenAddress(f"refusing to listen on {host}: only 127.0.0.1 or the Tailscale IP are allowed")
+
+
+def parse_hostport(value):
+    m = re.fullmatch(r"\[?([0-9a-fA-F:.]+)\]?:(\d+)", value)
+    if not m:
+        raise ValueError(f"expected HOST:PORT, got {value!r}")
+    return m.group(1), int(m.group(2))
+
+
+def check_port(value):
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"not a port number: {value!r}")
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError(f"port out of range (1-65535): {port}")
+    if port in RESERVED_PORTS:
+        raise argparse.ArgumentTypeError(f"port {port} is used by system services on this VPS; pick another port")
+    return port
+
+
+# ---------------------------------------------------------------------------
+# The proxy (runs inside the systemd --user unit via `preview _serve`)
+# ---------------------------------------------------------------------------
+
+class ProtocolError(Exception):
+    pass
+
+
+async def read_head(reader):
+    """Read one HTTP header block. Returns bytes (without the final CRLFCRLF) or None at clean EOF."""
+    while True:
+        try:
+            data = await reader.readuntil(b"\r\n\r\n")
+        except asyncio.IncompleteReadError as e:
+            if e.partial.strip():
+                raise ProtocolError("connection closed inside a header block")
+            return None
+        except asyncio.LimitOverrunError:
+            raise ProtocolError("header block too large")
+        data = data.lstrip(b"\r\n")
+        if data:
+            return data[:-4] if data.endswith(b"\r\n\r\n") else data
+
+
+def split_head(head):
+    lines = head.split(b"\r\n")
+    headers = []
+    for line in lines[1:]:
+        if not line:
+            continue
+        name, sep, value = line.partition(b":")
+        if not sep:
+            raise ProtocolError("malformed header line")
+        headers.append((name.strip(), value.strip()))
+    return lines[0], headers
+
+
+def join_head(start, headers):
+    return start + b"\r\n" + b"".join(n + b": " + v + b"\r\n" for n, v in headers) + b"\r\n"
+
+
+def _hname(name):
+    return (name.encode("latin-1") if isinstance(name, str) else name).lower()
+
+
+def header(headers, name):
+    name = _hname(name)
+    for n, v in headers:
+        if n.lower() == name:
+            return v
+    return None
+
+
+def header_tokens(headers, name):
+    out = set()
+    name = _hname(name)
+    for n, v in headers:
+        if n.lower() == name:
+            out.update(t.strip().lower() for t in v.split(b","))
+    return out
+
+
+def rewrite_request(headers, target_host, peer_ip=None):
+    """Make the request look like it was made on localhost:<port> itself."""
+    orig_host = header(headers, "host")
+    out = []
+    saw_xff = False
+    for n, v in headers:
+        ln = n.lower()
+        if ln == b"host":
+            v = target_host
+        elif ln in (b"origin", b"referer") and orig_host:
+            for scheme in (b"http://", b"https://"):
+                pref = scheme + orig_host
+                if v == pref or v.startswith(pref + b"/") or v.startswith(pref + b"?"):
+                    v = b"http://" + target_host + v[len(pref):]
+                    break
+        elif ln in (b"x-forwarded-host", b"x-forwarded-proto", b"x-forwarded-port", b"forwarded"):
+            continue
+        elif ln == b"x-forwarded-for":
+            saw_xff = True
+        out.append((n, v))
+    if orig_host is None:
+        out.append((b"Host", target_host))
+    if not saw_xff and peer_ip:
+        out.append((b"X-Forwarded-For", peer_ip.encode()))
+    return out
+
+
+def rewrite_response(headers, target_port, public_base, upstream=None):
+    """Absolute redirects to the local server (or to `upstream`, its host:port) become the preview link."""
+    if not public_base:
+        return headers
+    locals_ = [f"http://{h}:{target_port}".encode() for h in ("localhost", "127.0.0.1", "[::1]")]
+    if upstream:
+        locals_.append(b"http://" + upstream)
+    out = []
+    for n, v in headers:
+        if n.lower() in (b"location", b"content-location"):
+            for local in locals_:
+                if v == local or v[len(local):len(local) + 1] in (b"/", b"?", b"#") and v.startswith(local):
+                    v = public_base + v[len(local):]
+                    break
+        out.append((n, v))
+    return out
+
+
+def body_length(headers):
+    """Returns ('chunked', None), ('length', n) or ('none', None)."""
+    if b"chunked" in header_tokens(headers, "transfer-encoding"):
+        return "chunked", None
+    cl = [v for n, v in headers if n.lower() == b"content-length"]
+    if cl:
+        values = {x.strip() for v in cl for x in v.split(b",")}
+        if len(values) != 1 or not next(iter(values)).isdigit():
+            raise ProtocolError("bad Content-Length")
+        return "length", int(next(iter(values)))
+    return "none", None
+
+
+async def copy_n(reader, writer, n):
+    while n > 0:
+        data = await reader.read(min(n, 65536))
+        if not data:
+            raise ProtocolError("connection closed inside a body")
+        writer.write(data)
+        await writer.drain()
+        n -= len(data)
+
+
+async def copy_chunked(reader, writer):
+    while True:
+        line = await reader.readuntil(b"\r\n")
+        writer.write(line)
+        try:
+            size = int(line.split(b";")[0].strip(), 16)
+        except ValueError:
+            raise ProtocolError("bad chunk size")
+        if size == 0:
+            while True:  # trailers, then the empty line
+                line = await reader.readuntil(b"\r\n")
+                writer.write(line)
+                if line == b"\r\n":
+                    await writer.drain()
+                    return
+        await copy_n(reader, writer, size + 2)
+
+
+async def copy_all(reader, writer):
+    while True:
+        data = await reader.read(65536)
+        if not data:
+            break
+        writer.write(data)
+        await writer.drain()
+    try:
+        if writer.can_write_eof():
+            writer.write_eof()
+    except (OSError, RuntimeError):
+        pass
+
+
+def unavailable_page(port, where=None):
+    where = html.escape(where or f"localhost:{port}")
+    body = (
+        "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>"
+        "<meta http-equiv=refresh content=3><title>Waiting for %s</title>"
+        "<body style='font:16px/1.5 system-ui;margin:3rem auto;max-width:34rem;padding:0 1rem'>"
+        "<h1 style='font-size:1.3rem'>Nothing is answering on %s yet</h1>"
+        "<p>The preview link works, but the server behind it is not running or still starting. "
+        "This page reloads every 3 seconds.</p>" % (where, where)
+    ).encode()
+    return (b"HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\n"
+            b"Connection: close\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+
+
+MISDIRECTED = (b"HTTP/1.1 421 Misdirected Request\r\nContent-Type: text/plain; charset=utf-8\r\nCache-Control: no-store\r\n"
+               b"Connection: close\r\nContent-Length: 46\r\n\r\nThis preview answers only its own tailnet name.")
+
+
+def plain_answer(status, text, extra=b""):
+    """A complete short plain-text response that ends the connection."""
+    body = text.encode()
+    return (b"HTTP/1.1 " + status + b"\r\nContent-Type: text/plain; charset=utf-8\r\nCache-Control: no-store\r\n" + extra +
+            b"Connection: close\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+
+
+# The Cua desktops share (`preview cua`): its proxies let through only the Tailscale login that owns this machine.
+# Tailscale Serve sets Tailscale-User-Login itself and drops any copy a client sends, so these proxies listen on
+# loopback only, behind Serve.
+FORBIDDEN = plain_answer(b"403 Forbidden", "This link is only for the owner of this machine.\n")
+
+
+def split_host(value):
+    """(host, port or None) of a Host header value, lower case, without a trailing dot; None when it is not one."""
+    try:
+        text = value.decode("ascii").strip().lower()
+    except UnicodeDecodeError:
+        return None
+    match = re.fullmatch(r"(\[[0-9a-f:.]+\]|[a-z0-9.-]+)(?::([0-9]{1,5}))?", text)
+    if not match:
+        return None
+    return match.group(1).rstrip("."), int(match.group(2)) if match.group(2) else None
+
+
+class Proxy:
+    def __init__(self, target_port, public_base=None, target_hosts=("127.0.0.1", "::1"), tailnet_ip=None, listen_port=None,
+                 upstream_host=None, upstream_port=None, owner_login=None):
+        self.target_port = target_port  # the share's port (its link); the server behind it is upstream_host:upstream_port
+        self.upstream_port = upstream_port or target_port
+        host = upstream_host or "localhost"
+        self.upstream = (f"[{host}]" if ":" in host else host) + f":{self.upstream_port}"
+        self.target_host_header = self.upstream.encode()
+        self.public_base = public_base.rstrip("/").encode() if public_base else None
+        self.target_hosts = (upstream_host,) if upstream_host else target_hosts
+        # Cua desktops share only: the one Tailscale login let through.
+        self.owner_login = owner_login.encode() if owner_login is not None else None
+        # DNS rebinding guard: a request is served only when its Host names this machine on the tailnet (MagicDNS name,
+        # its short form, the tailnet IPv4) or localhost, with the share's port. Rewriting Host would otherwise defeat a
+        # dev server's own rebinding check, and any web page could read the share through a rebound name.
+        names, ports = {"localhost", "127.0.0.1"}, {target_port}
+        if tailnet_ip:
+            names.add(tailnet_ip)
+        if public_base:
+            public = urllib.parse.urlsplit(public_base)
+            if public.hostname:
+                names.add(public.hostname.rstrip(".").lower())
+                names.add(public.hostname.split(".")[0].lower())
+            if public.port:
+                ports.add(public.port)
+        if listen_port:
+            ports.add(listen_port)
+        self.allowed_names, self.allowed_ports = names, ports
+
+    def host_allowed(self, headers):
+        value = header(headers, "host")
+        found = split_host(value) if value is not None else None
+        if not found:
+            return False
+        name, port = found
+        return name in self.allowed_names and (port is None or port in self.allowed_ports)
+
+    def login_ok(self, headers):
+        """True when the request carries exactly one Tailscale-User-Login and it is the owner's (Cua share only)."""
+        if self.owner_login is None:
+            return True
+        logins = [v for n, v in headers if n.lower() == b"tailscale-user-login"]
+        return len(logins) == 1 and logins[0] == self.owner_login
+
+    async def connect_upstream(self):
+        last = None
+        for host in self.target_hosts:
+            try:
+                return await asyncio.open_connection(host, self.upstream_port, limit=1 << 20)
+            except OSError as e:
+                last = e
+        raise last or OSError("no upstream")
+
+    async def handle(self, creader, cwriter):
+        peer = cwriter.get_extra_info("peername")
+        peer_ip = peer[0] if peer else None
+        uwriter = None
+        try:
+            head = await read_head(creader)
+            if head is None:
+                return
+            if not self.host_allowed(split_head(head)[1]):
+                cwriter.write(MISDIRECTED)
+                await cwriter.drain()
+                return
+            if not self.login_ok(split_head(head)[1]):
+                cwriter.write(FORBIDDEN)  # nothing reaches the server behind this share
+                await cwriter.drain()
+                return
+            try:
+                ureader, uwriter = await self.connect_upstream()
+            except OSError:
+                cwriter.write(unavailable_page(self.target_port, self.upstream if self.owner_login is not None else None))
+                await cwriter.drain()
+                return
+            pending = asyncio.Queue()
+            open_ = [0]  # requests forwarded whose response has not been written in full yet
+            up = asyncio.ensure_future(self.client_to_upstream(head, creader, uwriter, pending, peer_ip, cwriter, open_))
+            down = asyncio.ensure_future(self.upstream_to_client(ureader, cwriter, pending, open_))
+            done, _ = await asyncio.wait({up, down}, return_when=asyncio.FIRST_COMPLETED)
+            if down in done:
+                up.cancel()
+            else:
+                await down
+            for t in (up, down):
+                if t.done() and not t.cancelled() and t.exception():
+                    pass
+        except (ProtocolError, OSError, asyncio.IncompleteReadError, asyncio.LimitOverrunError):
+            pass
+        finally:
+            for w in (cwriter, uwriter):
+                if w is not None:
+                    w.close()
+
+    async def client_to_upstream(self, head, creader, uwriter, pending, peer_ip, cwriter=None, open_=None):
+        open_ = open_ if open_ is not None else [0]
+        try:
+            while head is not None:
+                start, headers = split_head(head)
+                if not self.host_allowed(headers):
+                    break  # a foreign Host later on the connection: earlier answers finish, nothing more reaches the server
+                if not self.login_ok(headers):
+                    if open_[0] == 0 and cwriter is not None:  # answer only in order; a pipelined one just ends it
+                        cwriter.write(FORBIDDEN)
+                        await cwriter.drain()
+                    break
+                method = start.split(b" ", 1)[0].upper()
+                headers = rewrite_request(headers, self.target_host_header, peer_ip)
+                upgrade = b"upgrade" in header_tokens(headers, "connection") and header(headers, "upgrade") is not None
+                pending.put_nowait(method)
+                if not upgrade and method != b"CONNECT":
+                    open_[0] += 1
+                uwriter.write(join_head(start, headers))
+                await uwriter.drain()
+                if upgrade or method == b"CONNECT":
+                    await copy_all(creader, uwriter)  # WebSocket: raw bytes both ways from here
+                    return
+                kind, n = body_length(headers)
+                if kind == "chunked":
+                    await copy_chunked(creader, uwriter)
+                elif kind == "length":
+                    await copy_n(creader, uwriter, n)
+                head = await read_head(creader)
+            if uwriter.can_write_eof():
+                uwriter.write_eof()
+        except (ProtocolError, OSError, asyncio.IncompleteReadError, asyncio.LimitOverrunError):
+            try:
+                uwriter.close()
+            except Exception:
+                pass
+
+    async def upstream_to_client(self, ureader, cwriter, pending, open_=None):
+        open_ = open_ if open_ is not None else [0]
+        try:
+            while True:
+                head = await read_head(ureader)
+                if head is None:
+                    return
+                start, headers = split_head(head)
+                parts = start.split(b" ", 2)
+                code = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+                if 100 <= code < 200 and code != 101:
+                    cwriter.write(join_head(start, headers))
+                    await cwriter.drain()
+                    continue
+                method = pending.get_nowait() if not pending.empty() else b"GET"
+                headers = rewrite_response(headers, self.target_port, self.public_base, self.target_host_header)
+                cwriter.write(join_head(start, headers))
+                await cwriter.drain()
+                if code == 101 or (method == b"CONNECT" and 200 <= code < 300):
+                    await copy_all(ureader, cwriter)
+                    return
+                if method == b"HEAD" or code in (204, 304):
+                    open_[0] -= 1
+                    continue
+                kind, n = body_length(headers)
+                if kind == "chunked":
+                    await copy_chunked(ureader, cwriter)
+                elif kind == "length":
+                    await copy_n(ureader, cwriter, n)
+                else:  # body ends when the server closes the connection
+                    await copy_all(ureader, cwriter)
+                    return
+                open_[0] -= 1
+        except (ProtocolError, OSError, asyncio.IncompleteReadError, asyncio.LimitOverrunError):
+            return
+
+
+def address_missing(host):
+    """True when no interface carries this address yet (EADDRNOTAVAIL), e.g. tailscale0 just after a reboot."""
+    with socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET, socket.SOCK_STREAM) as probe:
+        try:
+            probe.bind((host.strip("[]"), 0))
+        except OSError as e:
+            return e.errno == errno.EADDRNOTAVAIL
+    return False
+
+
+async def start_proxy_server(listen_host, listen_port, proxy):
+    listen_host = check_listen_host(listen_host)  # the bind-address guarantee, enforced at the socket
+    return await asyncio.start_server(proxy.handle, listen_host, listen_port, limit=1 << 20, reuse_address=True)
+
+
+def cmd_serve(args):
+    host, port = parse_hostport(args.listen)
+    try:
+        check_listen_host(host)
+    except UnsafeListenAddress as e:
+        print(f"preview: {e}", file=sys.stderr)
+        return EXIT_CONFIG
+    gate = (args.owner_login, args.upstream_host, args.upstream_port)
+    if any(x is not None for x in gate):
+        # A Cua share: a login gate is only a gate behind Tailscale Serve, which sets the login header (a proxy on the
+        # tailnet IP would accept a forged one), and its upstream is a loopback or tailnet address, nothing else.
+        ok = None not in gate and bool(args.owner_login) and ipaddress.ip_address(host.strip("[]")).is_loopback
+        try:
+            ok = ok and bool(check_listen_host(args.upstream_host)) and 1 <= args.upstream_port <= 65535
+        except UnsafeListenAddress:
+            ok = False
+        if not ok:
+            print("preview: a Cua share needs --owner-login, --upstream-host (loopback or tailnet) and --upstream-port, "
+                  "and listens on 127.0.0.1 only", file=sys.stderr)
+            return EXIT_CONFIG
+    proxy = Proxy(args.target, args.public_url, tailnet_ip=args.tailnet_ip, listen_port=port,
+                  upstream_host=args.upstream_host, upstream_port=args.upstream_port, owner_login=args.owner_login)
+
+    async def main():
+        try:
+            server = await start_proxy_server(host, port, proxy)
+        except OSError as e:
+            print(f"preview: cannot listen on {host}:{port}: {e.strerror or e}", file=sys.stderr)
+            # After a reboot the unit can start before tailscale0 has its address: exit so systemd tries again.
+            return 1 if address_missing(host) else EXIT_CONFIG
+        stop = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, stop.set)
+        print(f"preview: {host}:{port} -> localhost:{args.target}" + (f" ({args.public_url})" if args.public_url else ""), flush=True)
+        await stop.wait()
+        server.close()
+        if hasattr(server, "close_clients"):  # Python 3.13: do not wait for idle keep-alive clients
+            server.close_clients()
+        return 0
+
+    return asyncio.run(main())
+
+
+# ---------------------------------------------------------------------------
+# File shares (the file server runs inside the systemd --user unit preview-file-<port>.service via
+# `preview _serve-file`, bound to 127.0.0.1 only; a normal preview proxy exposes that port)
+# ---------------------------------------------------------------------------
+
+FILE_PORTS = range(18400, 18500)
+FILE_UNIT_PREFIX = "preview-file-"
+HTML_CSP = ("default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; "
+            "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+OTHER_CSP = "sandbox"
+INLINE_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+                ".webp": "image/webp", ".pdf": "application/pdf"}
+MARKDOWN_EXTS = {".md", ".markdown"}
+MARKDOWN_RENDER_LIMIT = 2 * 1024 * 1024  # larger Markdown files are served as plain text
+CHUNK = 64 * 1024
+TEXT_SNIFF = 8192
+SYSTEM_ROOTS = tuple(Path(p) for p in ("/proc", "/sys", "/dev", "/run"))
+CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def printable(text):
+    """Text without control characters (escape sequences, bells, newlines) for terminal output."""
+    return CONTROL_CHARS.sub("", str(text))
+
+
+class FileShareRefused(ValueError):
+    pass
+
+
+def hidden(parts):
+    """True if any path component starts with a dot (dotfiles, dot folders, and . or ..)."""
+    return any(part.startswith(".") for part in parts)
+
+
+def check_share_root(path):
+    """The resolved path to share, or FileShareRefused for anything that must never be shared."""
+    if CONTROL_CHARS.search(str(path)):
+        raise FileShareRefused("refusing to share a path that contains control characters")
+    raw = Path(os.path.expanduser(str(path)))
+    try:
+        resolved = raw.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        raise FileShareRefused(f"{path}: no such file or folder")
+    if CONTROL_CHARS.search(str(resolved)):
+        raise FileShareRefused(f"refusing to share {path}: the real path contains control characters")
+    if any(resolved == system or resolved.is_relative_to(system) for system in SYSTEM_ROOTS):
+        raise FileShareRefused(f"refusing to share {path}: system folders (/proc, /sys, /dev, /run) are never shared")
+    if hidden(Path(os.path.abspath(raw)).parts) or hidden(resolved.parts):
+        raise FileShareRefused(f"refusing to share {path}: dotfiles and dot folders (like ~/.ssh) are never shared")
+    if resolved == Path(resolved.anchor):
+        raise FileShareRefused("refusing to share /: pick one file or folder")
+    home = Path.home().resolve()
+    if resolved == home or home.is_relative_to(resolved):
+        raise FileShareRefused(f"refusing to share {path}: that is the home folder (or contains it); "
+                               f"pick one file or folder inside it")
+    if not (resolved.is_file() or resolved.is_dir()):
+        raise FileShareRefused(f"refusing to share {path}: not a regular file or folder")
+    return resolved
+
+
+def resolve_request(root, single, request_path):
+    """The file or folder a request path names inside the share, or None (404)."""
+    path = request_path.split("#", 1)[0]
+    try:
+        path = urllib.parse.unquote(path, errors="strict")
+    except UnicodeDecodeError:
+        return None
+    if not path.startswith("/") or "\x00" in path:
+        return None
+    parts = [part for part in path.split("/") if part not in ("", ".")]
+    if hidden(parts):  # also catches ".."
+        return None
+    if single:
+        return root if parts in ([], [root.name]) else None
+    try:
+        target = root.joinpath(*parts).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if target != root and not target.is_relative_to(root):
+        return None  # a symlink that points outside the shared folder
+    if hidden(target.relative_to(root).parts):
+        return None  # a symlink that points at a dotfile inside the shared folder
+    return target
+
+
+def looks_like_text(head):
+    if b"\x00" in head:
+        return False
+    try:
+        codecs.getincrementaldecoder("utf-8")().decode(head, final=False)
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
+def content_disposition(kind, name):
+    """`inline` or `attachment` with a safely quoted filename (RFC 6266 / RFC 5987 for anything not plain ASCII)."""
+    fallback = "".join(c if 32 <= ord(c) < 127 and c not in '"\\' else "_" for c in name) or "file"
+    value = f'{kind}; filename="{fallback}"'
+    if fallback != name:
+        value += "; filename*=UTF-8''" + urllib.parse.quote(name, safe="")
+    return value
+
+
+PAGE_CSS = """
+:root { color-scheme: light dark; }
+body { margin: 0; padding: 2rem 1.25rem 4rem; font: 17px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  color: #1d1d1f; background: #fff; -webkit-text-size-adjust: 100%; }
+main { max-width: 70ch; margin: 0 auto; overflow-wrap: anywhere; }
+h1, h2, h3, h4, h5, h6 { line-height: 1.25; margin: 1.6em 0 .6em; text-wrap: balance; }
+h1 { font-size: 1.8rem; margin-top: 0; } h2 { font-size: 1.4rem; } h3 { font-size: 1.15rem; }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+li + li { margin-top: .25em; }
+a { color: #0a58ca; }
+code, pre { font: .88em/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+code { background: rgba(127, 127, 127, .15); padding: .1em .3em; border-radius: 4px; }
+pre { background: rgba(127, 127, 127, .12); padding: .8em 1em; overflow-x: auto; border-radius: 8px; }
+pre code { background: none; padding: 0; overflow-wrap: normal; }
+blockquote { margin-left: 0; padding-left: 1em; border-left: 3px solid rgba(127, 127, 127, .4); opacity: .85; }
+img { max-width: 100%; height: auto; }
+table { border-collapse: collapse; display: block; overflow-x: auto; }
+th, td { border: 1px solid rgba(127, 127, 127, .35); padding: .35em .6em; text-align: left; vertical-align: top; }
+hr { border: 0; border-top: 1px solid rgba(127, 127, 127, .35); margin: 2em 0; }
+ul.index { list-style: none; padding: 0; }
+ul.index li { margin: 0; padding: .45em 0; border-bottom: 1px solid rgba(127, 127, 127, .2); }
+@media (prefers-color-scheme: dark) { body { color: #e8e8ea; background: #161618; } a { color: #6ea8fe; } }
+"""
+
+
+def html_page(title, body):
+    return ('<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n'
+            '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+            '<meta name="referrer" content="no-referrer">\n'
+            f"<title>{html.escape(title)}</title>\n<style>{PAGE_CSS}</style>\n</head>\n<body>\n<main>\n"
+            f"{body}\n</main>\n</body>\n</html>\n")
+
+
+# Markdown: a small, conservative subset. Every text run is HTML-escaped; raw HTML shows as text;
+# link and image URLs must be http(s), mailto (links only) or relative, otherwise only their text is kept.
+
+MD_SPAN = 2000   # an inline construct (emphasis, link) may span at most this many characters
+MD_DEPTH = 8     # nesting limit for block quotes, lists and emphasis
+_MD_FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+_MD_HEADING = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+(.*))?$")
+_MD_HR = re.compile(r"^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$")
+_MD_ITEM = re.compile(r"^( *)(?:([-*+])|(\d{1,9})[.)])(?:[ \t]+(.*))?$")
+_MD_QUOTE = re.compile(r"^ {0,3}> ?(.*)$")
+_MD_SPECIAL = re.compile(r"[\\`*_\[!<]")
+_MD_LABEL = re.compile(r"\[((?:[^\[\]\\]|\\.|\[[^\[\]]*\])*)\]\(", re.S)
+_MD_AUTOLINK = re.compile(r"<((?:https?|mailto):[^\s<>]+)>", re.I)
+_MD_SPACE = " \t\n\r\f\v"
+_ASCII_ALNUM = set("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
+# Every Markdown pattern above is linear: no two adjacent quantifiers can match the same characters. Closing
+# delimiters for emphasis and code spans are found by bisecting precomputed positions, not by lazy regex scans.
+_MD_ESCAPABLE = set("\\`*_{}[]()#+-.!|<>~\"'")
+
+
+def md_url_ok(url, image=False):
+    if not url or "\\" in url or any(ord(c) < 0x21 or ord(c) == 0x7F for c in url):
+        return False
+    m = re.match(r"([A-Za-z][A-Za-z0-9+.-]*):", url)
+    if not m:
+        return True  # relative
+    return m.group(1).lower() in ({"http", "https"} if image else {"http", "https", "mailto"})
+
+
+def _md_heading_text(text):
+    """Heading text without an optional closing run of # (which must follow a space)."""
+    text = (text or "").rstrip(" \t")
+    bare = text.rstrip("#")
+    if bare != text and (not bare or bare[-1] in " \t"):
+        text = bare.rstrip(" \t")
+    return text
+
+
+def _md_table_sep(line):
+    cells = line.strip()
+    if "|" not in cells:
+        return False
+    cells = cells[1:] if cells.startswith("|") else cells
+    cells = cells[:-1] if cells.endswith("|") else cells
+    return all(re.fullmatch(r":?-+:?", cell.strip()) for cell in cells.split("|"))
+
+
+def _md_destination(text, j, end):
+    """Parse `url` or `<url>`, an optional "title" and the closing `)`, starting just after `(`.
+    Returns (url, title, index after the `)`) or None. One pass, no backtracking."""
+    while j < end and text[j] in _MD_SPACE:
+        j += 1
+    if j < end and text[j] == "<":
+        k = text.find(">", j + 1, end)
+        if k < 0 or "<" in text[j + 1:k] or "\n" in text[j + 1:k]:
+            return None
+        url, j = text[j + 1:k], k + 1
+    else:
+        start, nested = j, False
+        while j < end and text[j] not in _MD_SPACE:
+            c = text[j]
+            if c in "<>":
+                return None
+            if c == "(":
+                if nested:
+                    return None
+                nested = True
+            elif c == ")":
+                if not nested:
+                    break
+                nested = False
+            j += 1
+        if nested:
+            return None
+        url = text[start:j]
+    k, title = j, None
+    while k < end and text[k] in _MD_SPACE:
+        k += 1
+    if k > j and k < end and text[k] == '"':
+        q = text.find('"', k + 1, end)
+        if q < 0 or "\n" in text[k + 1:q]:
+            return None
+        title, k = text[k + 1:q], q + 1
+        while k < end and text[k] in _MD_SPACE:
+            k += 1
+    if k < end and text[k] == ")":
+        return url, title, k + 1
+    return None
+
+
+def md_inline(text, links=True, depth=0):
+    if depth > MD_DEPTH:
+        return html.escape(text)
+    out, i, n = [], 0, len(text)
+    marks = {}
+
+    def closer(kind, lo, hi):
+        """First closing delimiter of `kind` at a position in [lo, hi], or None."""
+        if not marks:
+            marks.update({"**": [], "__": [], "*": [], "_": [], "`": {}})
+            for m in re.finditer(r"[*_]", text):
+                j, c = m.start(), text[m.start()]
+                if j == 0 or text[j - 1].isspace():
+                    continue
+                if text.startswith(c * 2, j):
+                    marks[c * 2].append(j)
+                if c == "*" and text[j - 1] != "*":
+                    marks["*"].append(j)
+                if c == "_" and not (j + 1 < n and text[j + 1] in _ASCII_ALNUM):
+                    marks["_"].append(j)
+            for m in re.finditer(r"`+", text):
+                marks["`"].setdefault(m.end() - m.start(), []).append(m.start())
+        found = marks[kind[0]].get(len(kind), []) if kind[0] == "`" else marks[kind]
+        k = bisect.bisect_left(found, lo)
+        return found[k] if k < len(found) and found[k] <= hi else None
+    while i < n:
+        m = _MD_SPECIAL.search(text, i)
+        if not m:
+            out.append(html.escape(text[i:]))
+            break
+        if m.start() > i:
+            out.append(html.escape(text[i:m.start()]))
+        i = m.start()
+        c, end = text[i], min(n, i + MD_SPAN)
+        if c == "\\" and i + 1 < n and text[i + 1] in _MD_ESCAPABLE:
+            out.append(html.escape(text[i + 1]))
+            i += 2
+            continue
+        if c == "`":
+            j = i
+            while j < n and text[j] == "`":
+                j += 1
+            run = j - i
+            close = closer("`" * run, j, min(n, j + MD_SPAN) - run)
+            if close is not None:
+                out.append("<code>" + html.escape(text[j:close].strip(" ") or text[j:close]) + "</code>")
+                i = close + run
+            else:
+                out.append(html.escape(text[i:j]))
+                i = j
+            continue
+        if c == "!" and i + 1 < n and text[i + 1] == "[":
+            lm = _MD_LABEL.match(text, i + 1, end)
+            dest = lm and _md_destination(text, lm.end(), end)
+            if dest:
+                label, (url, title, after) = lm.group(1), dest
+                if md_url_ok(url, image=True):
+                    out.append(f'<img src="{html.escape(url)}" alt="{html.escape(label)}"'
+                               + (f' title="{html.escape(title)}"' if title else "") + ">")
+                else:
+                    out.append(html.escape(label))
+                i = after
+                continue
+        if c == "[":
+            lm = _MD_LABEL.match(text, i, end)
+            dest = lm and _md_destination(text, lm.end(), end)
+            if dest:
+                label, (url, title, after) = lm.group(1), dest
+                inner = md_inline(label, links=False, depth=depth + 1)
+                if links and md_url_ok(url):
+                    out.append(f'<a href="{html.escape(url)}"' + (f' title="{html.escape(title)}"' if title else "")
+                               + f">{inner}</a>")
+                else:
+                    out.append(inner)
+                i = after
+                continue
+        if c == "<":
+            am = _MD_AUTOLINK.match(text, i, end)
+            if am and links and md_url_ok(am.group(1)):
+                out.append(f'<a href="{html.escape(am.group(1))}">{html.escape(am.group(1))}</a>')
+                i = am.end()
+                continue
+        if c in "*_" and not (c == "_" and i > 0 and text[i - 1].isalnum()):
+            if text.startswith(c * 2, i) and i + 2 < n and not text[i + 2].isspace():
+                j = closer(c * 2, i + 3, end - 2)
+                if j is not None:
+                    out.append("<strong>" + md_inline(text[i + 2:j], links, depth + 1) + "</strong>")
+                    i = j + 2
+                    continue
+            if i + 1 < n and not text[i + 1].isspace() and not (c == "*" and text[i + 1] == "*"):
+                j = closer(c, i + 2, end - 1)
+                if j is not None:
+                    out.append("<em>" + md_inline(text[i + 1:j], links, depth + 1) + "</em>")
+                    i = j + 1
+                    continue
+        out.append(html.escape(c))
+        i += 1
+    return "".join(out)
+
+
+def _md_table_cells(line):
+    line = line.strip()
+    if line.startswith("|"):
+        line = line[1:]
+    if line.endswith("|") and not line.endswith("\\|"):
+        line = line[:-1]
+    return [cell.strip() for cell in re.split(r"(?<!\\)\|", line)]
+
+
+def _md_block_start(line):
+    return bool(_MD_FENCE.match(line) or _MD_HEADING.match(line) or _MD_HR.match(line) or _MD_QUOTE.match(line))
+
+
+def _md_list(lines, i, depth):
+    """Parse the list that starts at lines[i]. Returns (html, next index)."""
+    items, n = [], len(lines)
+    while i < n:
+        line = lines[i]
+        if not line.strip():
+            j = i
+            while j < n and not lines[j].strip():
+                j += 1
+            if j < n and (_MD_ITEM.match(lines[j]) or lines[j].startswith("  ")):
+                i = j
+                continue
+            break
+        m = _MD_ITEM.match(line)
+        if m and not _MD_HR.match(line):
+            items.append({"indent": len(m.group(1)), "ordered": m.group(3) is not None,
+                          "start": int(m.group(3) or 1), "text": [m.group(4) or ""]})
+        elif items and (line.startswith("  ") or not _md_block_start(line)):
+            items[-1]["text"].append(line.strip())
+        else:
+            break
+        i += 1
+    return _md_list_html(items, 0, depth)[0], i
+
+
+def _md_list_html(items, k, depth):
+    first = items[k]
+    indent, ordered = first["indent"], first["ordered"]
+    tag = "ol" if ordered else "ul"
+    start = f' start="{first["start"]}"' if ordered and first["start"] != 1 else ""
+    parts, current = [f"<{tag}{start}>"], None
+
+    def close():
+        if current is not None:
+            parts.append("<li>" + md_inline("\n".join(current["text"]).strip(), depth=depth)
+                         + "".join(current["children"]) + "</li>")
+
+    while k < len(items):
+        item = items[k]
+        if item["indent"] < indent:
+            break
+        if item["indent"] >= indent + 2 and current is not None:
+            if depth >= MD_DEPTH:
+                current["text"].append(item["text"][0])
+                current["text"].extend(item["text"][1:])
+                k += 1
+                continue
+            child, k = _md_list_html(items, k, depth + 1)
+            current["children"].append(child)
+            continue
+        if item["ordered"] != ordered:
+            break
+        close()
+        current = {"text": list(item["text"]), "children": []}
+        k += 1
+    close()
+    parts.append(f"</{tag}>")
+    return "".join(parts), k
+
+
+def md_blocks(raw_lines, depth=0):
+    lines = [line.expandtabs(4) for line in raw_lines]
+    out, para, i, n = [], [], 0, len(lines)
+
+    def flush():
+        if para:
+            out.append("<p>" + md_inline("\n".join(p.strip() for p in para), depth=depth) + "</p>")
+            para.clear()
+
+    while i < n:
+        line = lines[i]
+        if not line.strip():
+            flush()
+            i += 1
+            continue
+        m = _MD_FENCE.match(line)
+        if m and not (m.group(1)[0] == "`" and "`" in m.group(2)):
+            flush()
+            fence, info = m.group(1), m.group(2).strip()
+            closing = re.compile(r"^ {0,3}" + re.escape(fence[0]) + "{%d,}[ \t]*$" % len(fence))
+            i += 1
+            code = []
+            while i < n and not closing.match(lines[i]):
+                code.append(raw_lines[i])
+                i += 1
+            i += 1
+            lang = re.sub(r"[^\w+.-]", "", info.split()[0]) if info else ""
+            cls = f' class="language-{lang}"' if lang else ""
+            out.append(f"<pre><code{cls}>" + html.escape("\n".join(code)) + "</code></pre>")
+            continue
+        m = _MD_HEADING.match(line)
+        if m:
+            flush()
+            level = len(m.group(1))
+            out.append(f"<h{level}>" + md_inline(_md_heading_text(m.group(2)), depth=depth) + f"</h{level}>")
+            i += 1
+            continue
+        if _MD_HR.match(line):
+            flush()
+            out.append("<hr>")
+            i += 1
+            continue
+        if _MD_QUOTE.match(line):
+            flush()
+            quoted = []
+            while i < n and _MD_QUOTE.match(lines[i]):
+                quoted.append(_MD_QUOTE.match(lines[i]).group(1))
+                i += 1
+            if depth >= MD_DEPTH:
+                out.append("<blockquote><p>" + md_inline("\n".join(quoted), depth=depth) + "</p></blockquote>")
+            else:
+                out.append("<blockquote>" + md_blocks(quoted, depth + 1) + "</blockquote>")
+            continue
+        if _MD_ITEM.match(line):
+            flush()
+            listed, i = _md_list(lines, i, depth)
+            out.append(listed)
+            continue
+        if "|" in line and i + 1 < n and _md_table_sep(lines[i + 1]):
+            flush()
+            head = _md_table_cells(line)
+            i += 2
+            rows = []
+            while i < n and lines[i].strip() and "|" in lines[i]:
+                rows.append(_md_table_cells(lines[i]))
+                i += 1
+            cell = lambda tag, text: f"<{tag}>" + md_inline(text, depth=depth) + f"</{tag}>"
+            body = "".join("<tr>" + "".join(cell("td", c) for c in row) + "</tr>" for row in rows)
+            out.append("<table><thead><tr>" + "".join(cell("th", c) for c in head) + "</tr></thead>"
+                       + (f"<tbody>{body}</tbody>" if body else "") + "</table>")
+            continue
+        para.append(line)
+        i += 1
+    flush()
+    return "\n".join(out)
+
+
+def render_markdown(text, title):
+    """A complete, self-contained HTML page for a Markdown text (standard library only)."""
+    return html_page(title, md_blocks(text.splitlines()))
+
+
+def index_page(root, folder):
+    rel = folder.relative_to(root).parts
+    title = "/".join((root.name, *rel))
+    rows = []
+    if rel:
+        parent = "/" + "".join(urllib.parse.quote(part, safe="") + "/" for part in rel[:-1])
+        rows.append(f'<li><a href="{html.escape(parent)}">..</a></li>')
+    try:
+        children = sorted(folder.iterdir(), key=lambda child: child.name)
+    except OSError:
+        children = []
+    for child in children:
+        if child.name.startswith("."):
+            continue
+        try:
+            real = child.resolve(strict=True)
+            mode = real.stat().st_mode
+        except (OSError, RuntimeError):
+            continue
+        if (real != root and not real.is_relative_to(root)) or hidden(real.relative_to(root).parts):
+            continue
+        is_dir = stat.S_ISDIR(mode)
+        if not (is_dir or stat.S_ISREG(mode)):
+            continue
+        href = "/" + "/".join(urllib.parse.quote(part, safe="") for part in (*rel, child.name)) + ("/" if is_dir else "")
+        rows.append(f'<li><a href="{html.escape(href)}">{html.escape(child.name)}{"/" if is_dir else ""}</a></li>')
+    body = f"<h1>{html.escape(title)}</h1>\n<ul class=\"index\">\n" + "\n".join(rows) + "\n</ul>"
+    if len(rows) == (1 if rel else 0):
+        body += "\n<p>This folder is empty.</p>"
+    return html_page(title, body)
+
+
+def make_file_handler(root, quiet=False):
+    """A read-only GET/HEAD handler for one file or one folder. Nothing outside `root`, and no dotfile, is served."""
+    root = Path(root).resolve(strict=True)
+    single = root.is_file()
+
+    class FileHandler(BaseHTTPRequestHandler):
+        server_version = "preview"
+        sys_version = ""
+
+        def __getattr__(self, name):
+            if name.startswith("do_"):
+                return self.not_allowed
+            raise AttributeError(name)
+
+        def log_message(self, format, *args):
+            if not quiet:
+                super().log_message(format, *args)
+
+        def send_error(self, code, message=None, explain=None):
+            phrase = self.responses.get(code, ("Error",))[0]
+            self.send_bytes(code, "text/plain; charset=utf-8", f"{code} {phrase}\n".encode(), OTHER_CSP)
+
+        def not_allowed(self):
+            self.send_bytes(405, "text/plain; charset=utf-8", b"Only GET and HEAD are allowed.\n", OTHER_CSP,
+                            [("Allow", "GET, HEAD")])
+
+        def not_found(self):
+            self.send_bytes(404, "text/plain; charset=utf-8", b"Not found.\n", OTHER_CSP)
+
+        def start(self, code, ctype, length, csp, extra=()):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(length))
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Content-Security-Policy", csp)
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Cache-Control", "no-cache")
+            for name, value in extra:
+                self.send_header(name, value)
+            self.end_headers()
+
+        def send_bytes(self, code, ctype, body, csp, extra=()):
+            self.start(code, ctype, len(body), csp, extra)
+            if self.command != "HEAD":
+                self.wfile.write(body)
+
+        def do_GET(self):
+            path, _, query = self.path.partition("?")
+            target = resolve_request(root, single, path)
+            if target is None:
+                return self.not_found()
+            if target.is_dir():
+                return self.send_bytes(200, "text/html; charset=utf-8", index_page(root, target).encode(), HTML_CSP)
+            self.send_file(target, query)
+
+        do_HEAD = do_GET
+
+        def send_file(self, target, query):
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+            try:
+                fd = os.open(target, flags)
+            except OSError:
+                return self.not_found()
+            with os.fdopen(fd, "rb") as f:
+                st = os.fstat(f.fileno())
+                if not stat.S_ISREG(st.st_mode):
+                    return self.not_found()
+                name, ext = target.name, target.suffix.lower()
+                raw = urllib.parse.parse_qs(query).get("raw") == ["1"]
+                if ext in MARKDOWN_EXTS and not raw and st.st_size <= MARKDOWN_RENDER_LIMIT:
+                    text = f.read(MARKDOWN_RENDER_LIMIT + 1).decode("utf-8", "replace")
+                    return self.send_bytes(200, "text/html; charset=utf-8", render_markdown(text, name).encode(), HTML_CSP)
+                extra = []
+                if ext in MARKDOWN_EXTS:
+                    ctype = "text/plain; charset=utf-8"
+                elif ext in INLINE_TYPES:
+                    ctype = INLINE_TYPES[ext]
+                    extra.append(("Content-Disposition", content_disposition("inline", name)))
+                else:
+                    head = f.read(TEXT_SNIFF)
+                    f.seek(0)
+                    if looks_like_text(head):
+                        ctype = "text/plain; charset=utf-8"
+                    else:
+                        ctype = "application/octet-stream"
+                        extra.append(("Content-Disposition", content_disposition("attachment", name)))
+                self.start(200, ctype, st.st_size, OTHER_CSP, extra)
+                if self.command == "HEAD":
+                    return
+                left = st.st_size
+                try:
+                    while left > 0:
+                        data = f.read(min(CHUNK, left))
+                        if not data:  # the file shrank: the promised length cannot be met, so end the connection
+                            self.close_connection = True
+                            break
+                        self.wfile.write(data)
+                        left -= len(data)
+                except (BrokenPipeError, ConnectionResetError):
+                    self.close_connection = True
+
+    return FileHandler
+
+
+def cmd_serve_file(args):
+    try:
+        root = check_share_root(args.root)
+    except FileShareRefused as e:
+        print(f"preview: {e}", file=sys.stderr)
+        return EXIT_CONFIG
+    if args.port not in FILE_PORTS:
+        print(f"preview: file shares use ports {FILE_PORTS.start}-{FILE_PORTS.stop - 1}, not {args.port}", file=sys.stderr)
+        return EXIT_CONFIG
+    host = check_listen_host("127.0.0.1")  # the file server is never reachable except through the preview proxy
+    try:
+        server = ThreadingHTTPServer((host, args.port), make_file_handler(root))
+    except OSError as e:
+        print(f"preview: cannot listen on {host}:{args.port}: {e.strerror or e}", file=sys.stderr)
+        return EXIT_CONFIG
+    server.daemon_threads = True
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda *_: threading.Thread(target=server.shutdown, daemon=True).start())
+    print(f"preview: serving {root} read-only on {host}:{args.port}", flush=True)
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Cua desktops (`preview cua`): an index on 127.0.0.1:18500 (preview-cua-index.service, via `preview _cua-index`) lists
+# the Spaces `cua spaces ls --json` knows, live at each request, and every `direct:<host>:<port>` Space gets its own
+# owner-only proxy on 18501 and up. Tapping a Space mints a one-hour viewer link with `cua sandbox view` and redirects to
+# that Space's share; the ticket travels only in that redirect's URL fragment and is never logged, printed or stored.
+# ---------------------------------------------------------------------------
+
+class CuaRefused(ValueError):
+    pass
+
+
+SPACE_ID = re.compile(r"direct:(\d{1,3}(?:\.\d{1,3}){3}|\[[0-9A-Fa-f:]+\]):(\d{1,5})")
+PUBLIC_HOST = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?")
+CUA_PAGE_CSP = "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+FRAGMENT_OK = re.compile(r"[A-Za-z0-9._~%!$&'()*+,;=:@/?-]+")
+
+
+def space_address(space_id):
+    """(host, port) of a `direct:<host>:<port>` Space a share may reach (loopback or tailnet only), else None."""
+    m = SPACE_ID.fullmatch(space_id) if isinstance(space_id, str) else None
+    if not m or not 1 <= int(m.group(2)) <= 65535:
+        return None
+    try:
+        return check_listen_host(m.group(1)), int(m.group(2))
+    except UnsafeListenAddress:
+        return None
+
+
+def space_upstream(host, port):
+    return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+
+
+def parse_spaces(text):
+    """([{id, name, host, upstream_port}], [skipped ids]) for the direct Spaces in `cua spaces ls --json`, or None."""
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    items = data.get("spaces") if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        return None
+    spaces, skipped, seen = [], [], set()
+    for item in items:
+        sid = item.get("id") if isinstance(item, dict) else None
+        if not isinstance(sid, str) or not sid.startswith("direct:") or sid in seen:
+            continue
+        seen.add(sid)
+        address = space_address(sid)
+        if not address:
+            skipped.append(printable(sid))
+            continue
+        name = next((item[k] for k in ("name", "display_name", "label", "title")
+                     if isinstance(item.get(k), str) and printable(item[k]).strip()), sid)
+        spaces.append({"id": sid, "name": printable(name).strip()[:80], "host": address[0], "upstream_port": address[1]})
+    return spaces, skipped
+
+
+def run_cua(argv, timeout=30):
+    """(exit code, stdout) of one cua command; its output is never printed or logged."""
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired):
+        return 1, ""
+    return done.returncode, done.stdout
+
+
+def _cua_page(status, title, body):
+    headers = [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store"),
+               ("Content-Security-Policy", CUA_PAGE_CSP), ("Referrer-Policy", "no-referrer"),
+               ("X-Content-Type-Options", "nosniff")]
+    return status, headers, html_page(title, body).encode()
+
+
+def with_audio_off(fragment):
+    """The viewer's fragment with audio=none (the desktop container has no working sound server)."""
+    pairs = [pair for pair in fragment.split("&") if pair and pair.split("=", 1)[0] != "audio"]
+    return "&".join(pairs + ["audio=none"])
+
+
+def cua_index_answer(path, run, cua, public_host, shares):
+    """(status, headers, body) for one GET on the index. shares: {Space id: its share port}."""
+    path = path.split("?", 1)[0]
+
+    def listed():
+        code, out = run([cua, "spaces", "ls", "--json"])
+        parsed = parse_spaces(out) if code == 0 else None
+        return parsed[0] if parsed else None
+
+    if path == "/":
+        spaces = listed()
+        if spaces is None:
+            return _cua_page(502, "Cua desktops", "<h1>Cua desktops</h1><p>cua could not list the desktops on this "
+                                                  "machine. Try again, or run <code>cua spaces ls</code> there.</p>")
+        rows = []
+        for space in spaces:
+            name, port = html.escape(space["name"]), shares.get(space["id"])
+            rows.append(f'<li><a href="/open/{port}">{name}</a></li>' if port else
+                        f"<li>{name} <small>(not shared yet: run <code>preview cua</code> on the machine)</small></li>")
+        body = ('<h1>Cua desktops</h1>\n<ul class="index">\n' + "\n".join(rows) + "\n</ul>\n"
+                "<p><small>Tap a desktop to open it. Each tap makes a fresh link for one hour.</small></p>") if rows else \
+            "<h1>Cua desktops</h1><p>No Cua desktops are registered on this machine (cua spaces ls).</p>"
+        return _cua_page(200, "Cua desktops", body)
+    found = re.fullmatch(r"/open/(\d{1,5})", path)
+    sid = next((i for i, p in shares.items() if found and p == int(found.group(1))), None)
+    if sid is None:
+        return _cua_page(404, "Not found", '<p>Not found. <a href="/">All desktops</a></p>')
+    spaces = listed()
+    if spaces is None:
+        return _cua_page(502, "Cua desktops", '<p>cua could not list the desktops. <a href="/">Try again</a></p>')
+    if sid not in {space["id"] for space in spaces}:
+        return _cua_page(404, "Not found", '<p>This desktop is no longer registered. <a href="/">All desktops</a></p>')
+    code, out = run([cua, "sandbox", "view", sid, "--no-open", "--json", "--ttl", "1h"])
+    try:
+        url = json.loads(out).get("url") if code == 0 else None
+        parts = urllib.parse.urlsplit(url) if isinstance(url, str) and not CONTROL_CHARS.search(url) else None
+    except (ValueError, TypeError, AttributeError):
+        parts = None
+    if parts is None or parts.path != "/viewer/" or not FRAGMENT_OK.fullmatch(parts.fragment or ""):
+        return _cua_page(502, "Cua desktops", '<p>cua could not open this desktop. <a href="/">Try again</a></p>')
+    location = f"https://{public_host}:{shares[sid]}/viewer/#{with_audio_off(parts.fragment)}"
+    return 303, [("Location", location), ("Cache-Control", "no-store"), ("Referrer-Policy", "no-referrer")], b""
+
+
+def make_cua_index_handler(run, cua, public_host, shares):
+    """GET/HEAD handler for the index; `shares` returns {Space id: share port} at each request. Logs nothing."""
+
+    class IndexHandler(BaseHTTPRequestHandler):
+        server_version = "preview"
+        sys_version = ""
+
+        def __getattr__(self, name):
+            if name.startswith("do_"):
+                return self.not_allowed
+            raise AttributeError(name)
+
+        def log_message(self, format, *args):
+            pass
+
+        def send_error(self, code, message=None, explain=None):
+            self.reply(*_cua_page(code, "Error", f"<p>{int(code)}</p>"))
+
+        def not_allowed(self):
+            self.reply(405, [("Content-Type", "text/plain; charset=utf-8"), ("Allow", "GET, HEAD")],
+                       b"Only GET and HEAD are allowed.\n")
+
+        def reply(self, status, headers, body):
+            self.send_response(status)
+            for name, value in headers:
+                self.send_header(name, value)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+
+        def do_GET(self):
+            self.reply(*cua_index_answer(self.path, run, cua, public_host, shares()))
+
+        do_HEAD = do_GET
+
+    return IndexHandler
+
+
+def cmd_cua_index(args):
+    if not os.path.isabs(args.cua) or not os.access(args.cua, os.X_OK):
+        print(f"preview: --cua must be the absolute path of the cua program, not {printable(args.cua)!r}", file=sys.stderr)
+        return EXIT_CONFIG
+    if args.port != CUA_PORT:
+        print(f"preview: the Cua desktops index uses port {CUA_PORT}, not {args.port}", file=sys.stderr)
+        return EXIT_CONFIG
+    if not PUBLIC_HOST.fullmatch(args.public_host):
+        print("preview: --public-host must be this machine's tailnet name", file=sys.stderr)
+        return EXIT_CONFIG
+    os.environ["PREVIEW_STATE_DIR"] = args.state_dir
+    host = check_listen_host("127.0.0.1")  # reachable only through the owner-only preview proxy
+    shares = lambda: {e["space_id"]: e["port"] for e in all_states() if cua_space_of(e)}
+    try:
+        server = ThreadingHTTPServer((host, args.port), make_cua_index_handler(run_cua, args.cua, args.public_host, shares))
+    except OSError as e:
+        print(f"preview: cannot listen on {host}:{args.port}: {e.strerror or e}", file=sys.stderr)
+        return EXIT_CONFIG
+    server.daemon_threads = True
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda *_: threading.Thread(target=server.shutdown, daemon=True).start())
+    print(f"preview: Cua desktops index on {host}:{args.port}", flush=True)
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Unit files (~/.config/systemd/user): every preview is an enabled unit, so it comes back after a reboot
+# ---------------------------------------------------------------------------
+
+UNIT_MARKER = "# Written by preview; `preview stop` disables and deletes this file."
+UNIT_NAME = re.compile(r"preview-(?:\d{1,5}|file-\d{1,5}|cua-index)(?:\.service)?")
+_SYSTEMD_PLAIN = re.compile(r"[A-Za-z0-9_./:@,+=-]+")
+
+
+def systemd_word(arg):
+    """One ExecStart= argument, quoted so systemd passes it through unchanged ($$ and %% are a literal $ and %)."""
+    if CONTROL_CHARS.search(arg):
+        raise ValueError("refusing a unit command that contains control characters")
+    if _SYSTEMD_PLAIN.fullmatch(arg):
+        return arg
+    return '"' + arg.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%").replace("$", "$$") + '"'
+
+
+def unit_file_text(description, argv):
+    """The unit file of one preview unit: the same command and restart rules the transient units had, plus [Install]."""
+    description = printable(description).strip().rstrip("\\").strip().replace("%", "%%") or "preview"
+    return "\n".join([
+        UNIT_MARKER, "[Unit]", f"Description={description}", "StartLimitIntervalSec=0", "",
+        "[Service]", "ExecStart=" + " ".join(systemd_word(arg) for arg in argv), "Restart=on-failure", "RestartSec=2",
+        f"RestartPreventExitStatus={EXIT_CONFIG}", "Environment=PYTHONUNBUFFERED=1", "",
+        "[Install]", "WantedBy=default.target", ""])
+
+
+# ---------------------------------------------------------------------------
+# System access (tailscale, systemd --user, ss). Tests replace this class.
+# ---------------------------------------------------------------------------
+
+class TailnetUnknown(RuntimeError):
+    """Tailscale did not report this machine's tailnet name and IP."""
+
+
+class System:
+    def __init__(self):
+        self._ts = None
+
+    def run(self, argv, timeout=30):
+        try:
+            return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        except FileNotFoundError:
+            return subprocess.CompletedProcess(argv, 127, "", f"{argv[0]}: not found")
+        except subprocess.TimeoutExpired:
+            return subprocess.CompletedProcess(argv, 124, "", f"{argv[0]}: timed out")
+
+    def tailnet(self):
+        """(tailnet IPv4, MagicDNS name) of this machine; TailnetUnknown when Tailscale cannot say (never a guess)."""
+        if self._ts is None:
+            r = self.run(["tailscale", "status", "--self", "--peers=false", "--json"], timeout=10)
+            ip = name = None
+            if r.returncode == 0:
+                try:
+                    me = json.loads(r.stdout)["Self"]
+                    name = me.get("DNSName", "").rstrip(".") or None
+                    ip = next((a for a in me.get("TailscaleIPs", []) if "." in a), None)
+                except (ValueError, KeyError, TypeError, AttributeError):
+                    pass
+            if not (ip and name):
+                raise TailnetUnknown("tailscale status gave no tailnet name and IP for this machine "
+                                     "(is Tailscale running and logged in? check: tailscale status)")
+            self._ts = (ip, name)
+        return self._ts
+
+    def owner_login(self):
+        """The Tailscale login that owns this machine (Self.UserID -> User[id].LoginName), or None."""
+        r = self.run(["tailscale", "status", "--json"], timeout=10)
+        if r.returncode != 0:
+            return None
+        try:
+            data = json.loads(r.stdout)
+            login = data["User"][str(data["Self"]["UserID"])]["LoginName"]
+        except (ValueError, KeyError, TypeError):
+            return None
+        return login if isinstance(login, str) and login.strip() == login and login and not CONTROL_CHARS.search(login) else None
+
+    def cua_spaces(self, cua):
+        """parse_spaces of `cua spaces ls --json`, or None when cua could not answer."""
+        r = self.run([cua, "spaces", "ls", "--json"], timeout=30)
+        return parse_spaces(r.stdout) if r.returncode == 0 else None
+
+    def cua_path(self):
+        """The cua program (also in ~/.local/bin, where Cua's installer puts it), as an absolute path, or None."""
+        path = os.pathsep.join(p for p in (os.environ.get("PATH", ""), str(Path.home() / ".local/bin")) if p)
+        found = shutil.which("cua", path=path)
+        return os.path.abspath(found) if found else None
+
+    def operator_ok(self):
+        """True/False if we can tell whether this user may change Tailscale Serve, None if unknown."""
+        if os.geteuid() == 0:
+            return True
+        r = self.run(["tailscale", "debug", "prefs"], timeout=10)
+        if r.returncode != 0:
+            return None
+        try:
+            op = json.loads(r.stdout).get("OperatorUser") or ""
+        except ValueError:
+            return None
+        return op == current_user()
+
+    def serve_ports(self):
+        """Ports that have a Tailscale Serve entry (anyone's)."""
+        r = self.run(["tailscale", "serve", "status", "--json"], timeout=10)
+        if r.returncode != 0:
+            return set()
+        try:
+            return {int(p) for p in (json.loads(r.stdout or "{}").get("TCP") or {})}
+        except (ValueError, AttributeError):
+            return set()
+
+    def serve_add(self, port, internal_port):
+        r = self.run(["tailscale", "serve", "--bg", "--yes", f"--https={port}", f"http://127.0.0.1:{internal_port}"], timeout=30)
+        return r.returncode == 0, (r.stderr or r.stdout).strip()
+
+    def serve_remove(self, port):
+        r = self.run(["tailscale", "serve", f"--https={port}", "off"], timeout=30)
+        return r.returncode == 0, (r.stderr or r.stdout).strip()
+
+    def unit_state(self, unit):
+        r = self.run(["systemctl", "--user", "is-active", unit], timeout=10)
+        return (r.stdout or "").strip() or "unknown"
+
+    def unit_dir(self):
+        """Where the systemd user manager reads unit files (it does not see this shell's XDG_CONFIG_HOME)."""
+        return Path.home() / ".config" / "systemd" / "user"
+
+    def unit_path(self, unit):
+        return self.unit_dir() / (unit if unit.endswith(".service") else unit + ".service")
+
+    def has_unit_file(self, unit):
+        """True when the unit is a regular file this tool wrote (its first line is UNIT_MARKER)."""
+        if not isinstance(unit, str) or not UNIT_NAME.fullmatch(unit):
+            return False
+        path = self.unit_path(unit)
+        try:
+            if path.is_symlink() or not path.is_file():
+                return False
+            with open(path, encoding="utf-8", errors="replace") as f:
+                return f.readline().rstrip("\n") == UNIT_MARKER
+        except OSError:
+            return False
+
+    def own_unit_files(self):
+        """Sorted names of the unit files this tool wrote that are still in the unit folder (recorded or not)."""
+        try:
+            names = [p.name for p in self.unit_dir().iterdir() if UNIT_NAME.fullmatch(p.name)]
+        except OSError:
+            return []
+        return sorted(name for name in names if self.has_unit_file(name))
+
+    def unit_start(self, unit, description, argv):
+        """Write the unit file, enable and start it, so the preview comes back after a reboot. A unit an older version
+        started with systemd-run (transient) is stopped first; the file then takes its place with the same command."""
+        try:
+            text = unit_file_text(description, argv)
+        except ValueError as e:
+            return False, str(e)
+        if not UNIT_NAME.fullmatch(unit):
+            return False, f"refusing to manage {printable(unit)!r}: not a preview unit"
+        path = self.unit_path(unit)
+        if (path.exists() or path.is_symlink()) and not self.has_unit_file(unit):
+            return False, f"{path} exists and was not written by preview; remove or rename it"
+        self.run(["systemctl", "--user", "stop", unit], timeout=20)
+        self.run(["systemctl", "--user", "reset-failed", unit], timeout=10)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(f".{path.name}.tmp")
+            tmp.write_text(text)
+            tmp.chmod(0o644)
+            tmp.replace(path)
+        except OSError as e:
+            return False, f"cannot write {path}: {e.strerror or e}"
+        self.run(["systemctl", "--user", "daemon-reload"], timeout=30)
+        why = ""
+        for verb in ("enable", "start"):
+            r = self.run(["systemctl", "--user", verb, unit], timeout=30)
+            if r.returncode != 0:
+                why = (r.stderr or r.stdout).strip() or f"systemctl --user {verb} {unit} failed"
+                break
+        else:
+            r = self.run(["systemctl", "--user", "show", "-p", "FragmentPath", "--value", unit], timeout=10)
+            loaded = (r.stdout or "").strip()
+            if not loaded or os.path.realpath(loaded) != os.path.realpath(path):
+                why = f"systemd runs {unit} from {printable(loaded) or 'no file'}, not from {path}"
+        if why:
+            self.unit_stop(unit)  # no half-made unit stays enabled
+            return False, why
+        return True, ""
+
+    def unit_stop(self, unit):
+        """Stop a preview unit; when it is a unit file this tool wrote, also disable and delete that file (nothing else)."""
+        ours = self.has_unit_file(unit)
+        if ours:
+            self.run(["systemctl", "--user", "disable", unit], timeout=20)
+        self.run(["systemctl", "--user", "stop", unit], timeout=20)
+        self.run(["systemctl", "--user", "reset-failed", unit], timeout=10)
+        if ours:
+            try:
+                self.unit_path(unit).unlink()
+            except FileNotFoundError:
+                pass
+            self.run(["systemctl", "--user", "daemon-reload"], timeout=30)
+
+    def unit_log(self, unit, lines=5):
+        r = self.run(["journalctl", "--user", "-u", unit, "-n", str(lines), "--no-pager", "-o", "cat"], timeout=10)
+        return (r.stdout or "").strip()
+
+    def listeners(self, port):
+        """[(address, process)] of TCP listeners on a port."""
+        r = self.run(["ss", "-Hltnp", f"sport = :{port}"], timeout=10)
+        out = []
+        for line in (r.stdout or "").splitlines():
+            cols = line.split()
+            if len(cols) < 4:
+                continue
+            addr = cols[3].rsplit(":", 1)[0].strip("[]").split("%")[0]
+            m = re.search(r'users:\(\("([^"]+)"', line)
+            out.append((addr, m.group(1) if m else ""))
+        return out
+
+    def can_connect(self, host, port, timeout=0.5):
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except OSError:
+            return False
+
+    def free_local_port(self):
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+
+    def sleep(self, seconds):
+        time.sleep(seconds)
+
+    def firewall_tailnet_ports(self, path="/etc/nftables.conf"):
+        """Ports the host firewall lets in from the tailnet, or None if it does not restrict them (or is unreadable).
+
+        Tailscale Serve is not affected: tailscaled accepts those connections itself, before this firewall."""
+        try:
+            text = Path(path).read_text()
+        except OSError:
+            return None
+        if "policy drop" not in text or re.search(r'iifname "tailscale0"\s+accept', text):
+            return None
+        ports = set()
+        for m in re.finditer(r'iifname "tailscale0"[^\n]*?tcp dport (\{[^}]*\}|\d+)[^\n]*accept', text):
+            ports.update(int(x) for x in re.findall(r"\d+", m.group(1)))
+        return ports
+
+
+def current_user():
+    try:
+        import pwd
+        return pwd.getpwuid(os.geteuid()).pw_name
+    except (ImportError, KeyError):
+        return os.environ.get("USER", "")
+
+
+# ---------------------------------------------------------------------------
+# State (one JSON file per preview; only these previews are ever stopped)
+# ---------------------------------------------------------------------------
+
+def state_dir():
+    return Path(os.environ.get("PREVIEW_STATE_DIR") or Path.home() / ".local/state/preview")
+
+
+def load_state(port):
+    try:
+        return json.loads((state_dir() / f"{port}.json").read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def save_state(entry):
+    d = state_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    tmp = d / f".{entry['port']}.json.tmp"
+    tmp.write_text(json.dumps(entry, indent=2) + "\n")
+    tmp.replace(d / f"{entry['port']}.json")
+
+
+def drop_state(port):
+    try:
+        (state_dir() / f"{port}.json").unlink()
+    except FileNotFoundError:
+        pass
+
+
+def all_states():
+    d = state_dir()
+    out = []
+    for f in sorted(d.glob("*.json"), key=lambda p: int(p.stem) if p.stem.isdigit() else 0) if d.exists() else []:
+        try:
+            out.append(json.loads(f.read_text()))
+        except (OSError, ValueError):
+            pass
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+def self_path():
+    return os.path.realpath(__file__)
+
+
+def links(sysm, port):
+    _, name = sysm.tailnet()
+    return f"https://{name}:{port}", f"http://{name}:{port}"
+
+
+def target_listening(sysm, port):
+    return sysm.can_connect("127.0.0.1", port) or sysm.can_connect("::1", port)
+
+
+def wildcard_or_public(addr, ts_ip):
+    if addr in ("*", "0.0.0.0", "::"):
+        return True
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return False
+    return not (ip.is_loopback or any(ip in n for n in TAILNET_NETS) or ip.is_link_local)
+
+
+def guess_label(sysm, port):
+    for addr, proc in sysm.listeners(port):
+        if proc and addr in ("127.0.0.1", "::1"):
+            return proc
+    return f"port {port}"
+
+
+def wait_listening(sysm, host, port, seconds=4.0):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if sysm.can_connect(host, port, timeout=0.3):
+            return True
+        sysm.sleep(0.15)
+    return False
+
+
+def proxy_argv(sysm, entry):
+    """The proxy command for a recorded preview; a Cua share always keeps its owner gate (ValueError when it cannot)."""
+    argv = ["/usr/bin/python3", "-I", self_path(), "_serve", "--listen", entry["listen"],
+            "--target", str(entry["port"]), "--public-url", entry["link"], "--tailnet-ip", sysm.tailnet()[0]]
+    if cua_unit_of(entry):
+        argv += ["--upstream-host", "127.0.0.1", "--upstream-port", str(CUA_PORT), "--owner-login", entry["owner_login"]]
+    elif cua_space_of(entry):
+        space_host, space_port = space_address(entry["space_id"])
+        argv += ["--upstream-host", space_host, "--upstream-port", str(space_port), "--owner-login", entry["owner_login"]]
+    elif entry.get("kind") in ("cua", "cua-space"):
+        raise ValueError("its Cua share record is incomplete, so it would start without the owner gate; "
+                         "run preview cua again")
+    return argv
+
+
+def start_unit(sysm, entry):
+    unit = entry["unit"]
+    host, lport = parse_hostport(entry["listen"])
+    try:
+        argv = proxy_argv(sysm, entry)
+    except ValueError as e:
+        return False, str(e)
+    ok, err = sysm.unit_start(unit, f"preview {entry['port']}: {entry['label']}", argv)
+    if not ok:
+        return False, err or "systemd-run failed"
+    if not wait_listening(sysm, host, lport):
+        log = sysm.unit_log(unit)
+        sysm.unit_stop(unit)
+        return False, log or f"proxy did not start listening on {entry['listen']}"
+    return True, ""
+
+
+def entry_healthy(sysm, entry):
+    if sysm.unit_state(entry["unit"]) != "active":
+        return False
+    host, lport = parse_hostport(entry["listen"])
+    if not sysm.can_connect(host, lport, timeout=0.5):
+        return False
+    if entry["backend"] == "https" and entry["port"] not in sysm.serve_ports():
+        return False
+    return True
+
+
+def note_for(entry, listening, sysm=None):
+    port = entry["port"]
+    parts = []
+    if entry["backend"] == "https":
+        parts.append(f"HTTPS via Tailscale Serve to localhost:{port}, tailnet devices only.")
+    else:
+        parts.append(f"HTTP to localhost:{port}, tailnet devices only. HTTP until Tailscale Serve is enabled (preview doctor).")
+        allowed = sysm.firewall_tailnet_ports() if sysm else None
+        if allowed is not None and port not in allowed:
+            parts.append(f"Warning: the VPS firewall only lets tailnet traffic reach ports {', '.join(map(str, sorted(allowed))) or 'none'}, "
+                         f"so this HTTP link will not load. Fix: enable Tailscale Serve (preview doctor), then run preview {port} again.")
+    if not listening:
+        parts.append(f"Nothing listens on localhost:{port} yet; the page waits for it.")
+    parts.append(f"Stop: preview stop {port}")
+    return "  " + " ".join(parts)
+
+
+def backend_choice(operator, forced):
+    """'https' when cmd_start tries Tailscale Serve first, 'http' when it goes straight to the tailnet-IP proxy."""
+    return "https" if forced != "http" and (operator is not False or forced == "https") else "http"
+
+
+def cmd_start(sysm, port, label=None, out=None, err=None, cua=None):
+    """`cua` is set only by cmd_cua: the Cua share's fields (owner login, viewer unit); it is HTTPS or nothing."""
+    out, err = out or sys.stdout, err or sys.stderr
+    ts_ip, _ = sysm.tailnet()
+    https_link, http_link = links(sysm, port)
+    existing = load_state(port)
+    if cua is None and existing and existing.get("kind") in ("cua", "cua-space"):
+        print(f"preview: port {port} is the Cua desktops share; run preview cua again, or preview stop cua first", file=err)
+        return 1
+
+    exposed = [a for a, _ in sysm.listeners(port) if wildcard_or_public(a, ts_ip)]
+    if exposed:
+        print(f"preview: something on this VPS already listens on {exposed[0]}:{port}, which includes the public "
+              f"internet. Restart the dev server bound to 127.0.0.1 (for example --host 127.0.0.1), then run "
+              f"preview {port} again.", file=err)
+        return 1
+    others_serve = sysm.serve_ports() - ({port} if existing and existing.get("backend") == "https" else set())
+    if port in others_serve:
+        print(f"preview: Tailscale Serve already uses port {port} for something else; pick another port.", file=err)
+        return 1
+
+    label = label or (existing or {}).get("label") or guess_label(sysm, port)
+    operator = sysm.operator_ok()
+    forced = os.environ.get("PREVIEW_BACKEND", "")
+
+    same_share = cua is None or all(existing and existing.get(k) == v for k, v in cua.items())
+    if existing and same_share and entry_healthy(sysm, existing):
+        upgrade = existing["backend"] == "http" and operator is True and forced != "http"
+        if not upgrade:
+            changed = label != existing.get("label")
+            existing["label"] = label
+            if not existing.get("persistent"):  # an older version's transient unit: same port, listen and link, as a file
+                started, msg = start_unit(sysm, existing)
+                if not started:
+                    print(f"preview: could not keep port {port} across a reboot: {msg}", file=err)
+                    return 1
+                existing["persistent"] = changed = True
+            if changed:
+                save_state(existing)
+            print(existing["link"], file=out)
+            print(note_for(existing, target_listening(sysm, port), sysm), file=err)
+            return 0
+    if existing:
+        stop_entry(sysm, existing, quiet=True)
+
+    entry = None
+    serve_error = ""
+    if backend_choice(operator, forced) == "https":
+        internal = sysm.free_local_port()
+        ok, serve_error = sysm.serve_add(port, internal)
+        if ok:
+            entry = {"port": port, "label": label, "backend": "https", "link": https_link,
+                     "listen": f"127.0.0.1:{internal}", "unit": f"{UNIT_PREFIX}{port}", "created": int(time.time()),
+                     **(cua or {})}
+            started, msg = start_unit(sysm, entry)
+            if not started:
+                sysm.serve_remove(port)
+                print(f"preview: could not start the proxy for port {port}: {msg}", file=err)
+                return 1
+            entry["persistent"] = True
+    if entry is None:
+        if cua is not None:  # the login gate only holds behind Tailscale Serve; never fall back to HTTP for this share
+            print(f"preview: the Cua desktops link needs HTTPS through Tailscale Serve, which is not available here "
+                  f"({serve_error or 'not permitted'}); see preview doctor", file=err)
+            return 1
+        if forced == "https":
+            print(f"preview: Tailscale Serve is not available: {serve_error or 'not permitted'}", file=err)
+            return 1
+        entry = {"port": port, "label": label, "backend": "http", "link": http_link,
+                 "listen": f"{ts_ip}:{port}", "unit": f"{UNIT_PREFIX}{port}", "created": int(time.time())}
+        started, msg = start_unit(sysm, entry)
+        if not started:
+            print(f"preview: could not start the proxy for port {port}: {msg}", file=err)
+            return 1
+        entry["persistent"] = True
+    save_state(entry)
+    print(entry["link"], file=out)
+    print(note_for(entry, target_listening(sysm, port), sysm), file=err)
+    return 0
+
+
+def stop_entry(sysm, entry, quiet=False):
+    sysm.unit_stop(entry["unit"])
+    if entry.get("backend") == "https":
+        sysm.serve_remove(entry["port"])
+    drop_state(entry["port"])
+
+
+def file_unit_of(entry):
+    """The file-server unit of a file share (only the name this tool gives it, whatever the state file says)."""
+    unit = f"{FILE_UNIT_PREFIX}{entry['port']}.service"
+    return unit if entry.get("file_unit") == unit else None
+
+
+def cua_unit_of(entry):
+    """The index unit of the Cua desktops share (only the name this tool gives it, whatever the state file says)."""
+    ok = entry.get("kind") == "cua" and entry.get("cua_unit") == CUA_UNIT and entry.get("port") == CUA_PORT
+    return CUA_UNIT if ok else None
+
+
+def cua_space_of(entry):
+    """True for one Cua desktop's share whose recorded upstream is the address in its Space id."""
+    address = space_address(entry.get("space_id"))
+    return bool(entry.get("kind") == "cua-space" and entry.get("port") in CUA_SPACE_PORTS and address
+                and entry.get("upstream") == space_upstream(*address) and entry.get("owner_login"))
+
+
+def legacy_cua_key():
+    return state_dir() / "cua" / "viewer.key"
+
+
+def stop_legacy_viewer(sysm, out):
+    """Stop the Cua viewer an earlier release ran (preview-cua-viewer.service on 127.0.0.1:18500, transient, so only a
+    reboot would end it) and delete its key file. True when there was one; nothing else is touched."""
+    running = sysm.unit_state(LEGACY_CUA_UNIT) in ("active", "activating", "deactivating", "reloading", "failed")
+    if running:
+        sysm.unit_stop(LEGACY_CUA_UNIT)
+    key = legacy_cua_key()
+    had_key = key.is_file() or key.is_symlink()
+    if had_key:
+        try:
+            key.unlink()
+            key.parent.rmdir()  # only when empty; the current release keeps nothing there
+        except OSError:
+            pass
+    if running or had_key:
+        print(f"stopped {LEGACY_CUA_UNIT} (the Cua viewer of an earlier release) and removed its key file", file=out)
+    return running or had_key
+
+
+def stop_share(sysm, entry):
+    """Stop a preview, and for a file share also its file server, for the Cua desktops index also its server."""
+    stop_entry(sysm, entry)
+    if file_unit_of(entry):
+        sysm.unit_stop(file_unit_of(entry))
+    if cua_unit_of(entry):
+        sysm.unit_stop(CUA_UNIT)
+
+
+def stopped_line(entry):
+    return printable(f"stopped {entry['port']} ({entry['label']}" + (f", {entry['path']})" if entry.get("path") else ")"))
+
+
+def cmd_stop(sysm, port=None, all_=False, out=None, err=None, path=None, cua=False):
+    out, err = out or sys.stdout, err or sys.stderr
+    if cua:
+        legacy = stop_legacy_viewer(sysm, out)
+        index = load_state(CUA_PORT)
+        entries = ([index] if index and cua_unit_of(index) else []) + [e for e in all_states() if cua_space_of(e)]
+        if not entries:
+            if sysm.unit_state(CUA_UNIT) == "active" or sysm.has_unit_file(CUA_UNIT):  # an index left without its link
+                sysm.unit_stop(CUA_UNIT)
+            if legacy:
+                return 0
+            print("preview: no Cua desktops share running (see preview list)", file=err)
+            return 1
+        for entry in entries:
+            stop_share(sysm, entry)
+            print(stopped_line(entry), file=out)
+        return 0
+    if all_:
+        legacy = stop_legacy_viewer(sysm, out)
+        entries = all_states()
+        for e in entries:
+            stop_share(sysm, e)
+            print(stopped_line(e), file=out)
+        orphans = sysm.own_unit_files()  # written by this tool, but their record is gone: they would come back at boot
+        for unit in orphans:
+            sysm.unit_stop(unit)
+            print(printable(f"stopped {unit} (no preview recorded it)"), file=out)
+        if not entries and not orphans and not legacy:
+            print("no previews running", file=out)
+        left = sysm.own_unit_files()
+        if left:
+            print(printable(f"preview: could not remove {', '.join(left)}; they would start again after a reboot. "
+                            f"Check: systemctl --user status {left[0]}"), file=err)
+            return 1
+        return 0
+    if path is not None:
+        wanted = {os.path.abspath(os.path.expanduser(path))}
+        try:
+            wanted.add(str(Path(os.path.expanduser(path)).resolve()))
+        except (OSError, RuntimeError):
+            pass
+        entry = next((e for e in all_states() if e.get("path") in wanted), None)
+        if not entry:
+            print(f"preview: no file share for {path} (see preview list)", file=err)
+            return 1
+    else:
+        entry = load_state(port)
+        if not entry:
+            print(f"preview: no preview on port {port} (see preview list)", file=err)
+            return 1
+    stop_share(sysm, entry)
+    print(stopped_line(entry), file=out)
+    return 0
+
+
+def pick_file_port(sysm):
+    taken = {e.get("port") for e in all_states()} | sysm.serve_ports()
+    for port in FILE_PORTS:
+        if port in taken or sysm.listeners(port) or target_listening(sysm, port):
+            continue
+        return port
+    return None
+
+
+def plan_file_share(sysm, path, label=None):
+    """What `preview file <path>` will do, without starting anything."""
+    root = check_share_root(path)
+    existing = next((e for e in all_states() if e.get("path") == str(root)), None)
+    port = existing["port"] if existing else pick_file_port(sysm)
+    if port is None:
+        raise FileShareRefused(f"no free port in {FILE_PORTS.start}-{FILE_PORTS.stop - 1} for file shares; "
+                               f"stop one first (preview list)")
+    operator, forced = sysm.operator_ok(), os.environ.get("PREVIEW_BACKEND", "")
+    backend = backend_choice(operator, forced)
+    if existing and entry_healthy(sysm, existing):
+        upgrade = existing["backend"] == "http" and operator is True and forced != "http"
+        backend = backend if upgrade else existing["backend"]
+    label = label or (existing or {}).get("label") or (root.name + ("/" if root.is_dir() else ""))
+    return {"path": str(root), "kind": "folder" if root.is_dir() else "file", "port": port, "label": label,
+            "serve": ("127.0.0.1", port), "unit": f"{FILE_UNIT_PREFIX}{port}.service", "proxy_unit": f"{UNIT_PREFIX}{port}",
+            "backend": backend, "reuse": existing is not None, "persistent": bool(existing and existing.get("persistent")),
+            "argv": file_server_argv(root, port)}
+
+
+def file_server_argv(root, port):
+    return ["/usr/bin/python3", "-I", self_path(), "_serve-file", "--root", str(root), "--port", str(port)]
+
+
+def file_plan(argv, sysm):
+    """The plan for a `file ...` command line (port, loopback bind, backend), with nothing started."""
+    cmd, a = parse(argv)
+    if cmd != "file":
+        raise ValueError("file_plan takes a `file <path>` command line")
+    return plan_file_share(sysm, a.path, a.name)
+
+
+def cmd_file(sysm, path, label=None, out=None, err=None):
+    out, err = out or sys.stdout, err or sys.stderr
+    try:
+        plan = plan_file_share(sysm, path, label)
+    except FileShareRefused as e:
+        print(f"preview: {e}", file=err)
+        return 1
+    port, unit = plan["port"], plan["unit"]
+    host, lport = plan["serve"]
+    if not (plan["persistent"] and sysm.unit_state(unit) == "active" and sysm.can_connect(host, lport)):
+        ok, msg = sysm.unit_start(unit, f"preview file {port}: {plan['label']}", plan["argv"])
+        if ok and not wait_listening(sysm, host, lport):
+            ok, msg = False, sysm.unit_log(unit) or f"file server did not start listening on {host}:{lport}"
+        if not ok:
+            sysm.unit_stop(unit)
+            print(f"preview: could not start the file server for {plan['path']}: {msg or 'systemd-run failed'}", file=err)
+            return 1
+    code = cmd_start(sysm, port, plan["label"], out=out, err=err)
+    if code != 0:
+        sysm.unit_stop(unit)
+        return code
+    entry = load_state(port) or {}
+    entry.update(path=plan["path"], kind=plan["kind"], file_unit=unit)
+    save_state(entry)
+    print(f"  Shares {plan['path']} read-only. Stop: preview stop {shlex.quote(plan['path'])}", file=err)
+    return 0
+
+
+def cmd_list(sysm, as_json=False, out=None):
+    out = out or sys.stdout
+    rows = []
+    for e in all_states():
+        row = {**e, "target_listening": target_listening(sysm, e["port"]), "proxy": sysm.unit_state(e["unit"])}
+        if file_unit_of(e):
+            row["file_server"] = sysm.unit_state(file_unit_of(e))
+        if cua_unit_of(e):
+            row["index"] = sysm.unit_state(CUA_UNIT)
+        rows.append(row)
+    if as_json:
+        print(json.dumps(rows, indent=2), file=out)
+        return 0
+    if not rows:
+        print("no previews running (start one with: preview <port>)", file=out)
+        return 0
+    table = [("PORT", "LABEL", "BACKEND", "TARGET", "PROXY", "LINK", "PATH")]
+    for r in rows:
+        table.append((str(r["port"]), printable(r["label"]), r["backend"],
+                      "listening" if r["target_listening"] else "not listening", r["proxy"], r["link"],
+                      printable(r.get("path", "") or (f"index {r['index']}" if "index" in r else "")
+                                or (f"space {r['space_id']}" if cua_space_of(r) else ""))))
+    widths = [max(len(row[i]) for row in table) for i in range(len(table[0]))]
+    for row in table:
+        print("  ".join(c.ljust(w) for c, w in zip(row, widths)).rstrip(), file=out)
+    return 0
+
+
+def cmd_doctor(sysm, out=None):
+    out = out or sys.stdout
+    try:
+        ts_ip, name = sysm.tailnet()
+    except TailnetUnknown as e:
+        ts_ip, name = "unknown", f"unknown ({e})"
+    operator = sysm.operator_ok()
+    user = current_user()
+    print(f"tailnet name   {name}", file=out)
+    print(f"tailnet IP     {ts_ip}", file=out)
+    if operator is True:
+        print("backend        https (Tailscale Serve is allowed for this user)", file=out)
+        print(f"links look like https://{name}:<port>", file=out)
+        stale = [e["port"] for e in all_states() if e.get("backend") == "http"]
+        if stale:
+            print(f"upgrade        these previews are still HTTP; run preview <port> again: {', '.join(map(str, stale))}", file=out)
+    else:
+        why = "not allowed for this user" if operator is False else "could not check"
+        print(f"backend        http (Tailscale Serve {why}; links look like http://{name}:<port>)", file=out)
+        print("enable HTTPS   run once on the VPS as an admin (needs sudo):", file=out)
+        print(f"                 sudo tailscale set --operator={user}", file=out)
+        print("               then run preview <port> again for each open preview; it switches to https://", file=out)
+    allowed = sysm.firewall_tailnet_ports()
+    if allowed is not None:
+        print(f"firewall       tailnet traffic to the VPS itself is limited to ports {', '.join(map(str, sorted(allowed)))};", file=out)
+        print("               the HTTP backend only works on those ports, HTTPS via Tailscale Serve works on any port", file=out)
+    r = sysm.run(["systemctl", "--user", "is-system-running"], timeout=10)
+    print(f"systemd --user {(r.stdout or r.stderr).strip() or 'unknown'}", file=out)
+    linger = sysm.run(["loginctl", "show-user", user, "-p", "Linger", "--value"], timeout=10).stdout.strip()
+    print(f"linger         {linger or 'unknown'} (yes = previews keep running after logout)", file=out)
+    print(f"previews       {len(all_states())} open (preview list)", file=out)
+    persistence_line(sysm, out)
+    login, share = sysm.owner_login(), load_state(CUA_PORT)
+    if not sysm.cua_path():
+        print("cua desktops   cua is not installed, so preview cua cannot run (install Cua, check cua --version)", file=out)
+    elif not login or login == "tagged-devices":
+        print("cua desktops   preview cua cannot tell which Tailscale login owns this machine (tailscale status --json)",
+              file=out)
+    elif operator is False:
+        print("cua desktops   preview cua needs the https backend (enable HTTPS above)", file=out)
+    else:
+        running = "running" if share and cua_unit_of(share) else "not running"
+        print(f"cua desktops   preview cua gives {printable(login)} one link to every Cua desktop ({running})", file=out)
+    return 0
+
+
+def entry_units(entry):
+    """Every unit a recorded preview runs: its proxy, plus the file server or the Cua desktops index."""
+    return [entry.get("unit")] + [u for u in (file_unit_of(entry), cua_unit_of(entry)) if u]
+
+
+def transient_previews(sysm):
+    """Recorded previews with a unit that is not a unit file (an older version started it with systemd-run)."""
+    return [e for e in all_states() if not all(sysm.has_unit_file(u) for u in entry_units(e))]
+
+
+def persistence_line(sysm, out):
+    transient = transient_previews(sysm)
+    if transient:
+        ports = ", ".join(printable(e.get("port")) for e in transient)
+        print(f"persistent     no ({ports} would not come back after a reboot); fix: preview restore", file=out)
+    else:
+        print("persistent     yes (every preview comes back after a reboot)", file=out)
+
+
+def unit_specs(sysm, entry):
+    """[(unit, description, argv, (host, port), seconds)] to rebuild a recorded preview's units, file server or index
+    first. ValueError (or KeyError, TypeError) when the record cannot be trusted to rebuild them."""
+    port = entry["port"]
+    if not isinstance(port, int) or entry["unit"] != f"{UNIT_PREFIX}{port}":
+        raise ValueError("its record does not name its own unit")
+    host, lport = parse_hostport(entry["listen"])
+    check_listen_host(host)
+    label = entry.get("label") or f"port {port}"
+    specs = []
+    if file_unit_of(entry):
+        root = check_share_root(entry["path"])
+        if str(root) != entry["path"]:
+            raise ValueError(f"{entry['path']} now resolves to {root}; run preview file again")
+        specs.append((file_unit_of(entry), f"preview file {port}: {label}", file_server_argv(root, port),
+                      ("127.0.0.1", port), 4.0))
+    if cua_unit_of(entry):
+        cua = sysm.cua_path()
+        if not cua:
+            raise ValueError("cua is not installed (install it from github.com/trycua/cua, then check cua --version)")
+        specs.append((CUA_UNIT, "preview cua: Cua desktops index", cua_index_argv(sysm, cua), ("127.0.0.1", CUA_PORT), 20.0))
+    specs.append((entry["unit"], f"preview {port}: {label}", proxy_argv(sysm, entry), (host, lport), 4.0))
+    return specs
+
+
+def cmd_restore(sysm, out=None, err=None):
+    """Give every recorded preview without a unit file one (stop the transient unit, write, enable, start). Ports and
+    links stay as recorded; the Tailscale Serve entries are kept by tailscaled and not touched."""
+    out, err = out or sys.stdout, err or sys.stderr
+    stop_legacy_viewer(sysm, out)  # it would hold the index port that the Cua share comes back on
+    restored, failed = 0, 0
+    for entry in all_states():
+        missing = [u for u in entry_units(entry) if not sysm.has_unit_file(u)]
+        if not missing:
+            continue
+        what = printable(f"{entry.get('port')} ({entry.get('label')})")
+        try:
+            specs = unit_specs(sysm, entry)
+        except (KeyError, TypeError, ValueError) as e:
+            print(f"preview: could not restore {what}: {printable(e)}", file=err)
+            failed += 1
+            continue
+        for unit, description, argv, (host, lport), seconds in specs:
+            if unit not in missing:
+                continue
+            ok, msg = sysm.unit_start(unit, description, argv)
+            if ok and not (wait_up(sysm, host, lport, seconds) if unit == CUA_UNIT else wait_listening(sysm, host, lport, seconds)):
+                ok, msg = False, sysm.unit_log(unit) or f"it did not come up on {host}:{lport}"
+            if not ok:
+                sysm.unit_stop(unit)
+                print(f"preview: could not restore {what}: {unit}: {printable(msg) or 'systemctl failed'}", file=err)
+                failed += 1
+                break
+        else:
+            entry["persistent"] = True
+            save_state(entry)
+            restored += 1
+            print(f"restored {what}: comes back after a reboot, link {entry['link']}", file=out)
+    if not restored and not failed:
+        print("nothing to restore: every preview already comes back after a reboot", file=out)
+    return 1 if failed else 0
+
+
+def wait_up(sysm, host, port, seconds=20.0):
+    """True once something listens on host:port (counted in sleeps, so a stand-in clock never spins)."""
+    for _ in range(int(seconds / 0.25)):
+        if sysm.can_connect(host, port, timeout=0.3):
+            return True
+        sysm.sleep(0.25)
+    return False
+
+
+def cua_plan(sysm, label=None):
+    """What `preview cua` will do, without starting anything; CuaRefused when it must not run."""
+    login = sysm.owner_login()
+    if not login:
+        raise CuaRefused("cannot tell which Tailscale login owns this machine (tailscale status --json); "
+                         "is Tailscale up?")
+    if login == "tagged-devices":
+        raise CuaRefused("this machine is a tagged Tailscale device, so no single login owns it; "
+                         "the Cua desktops link is only for an owner")
+    if backend_choice(sysm.operator_ok(), os.environ.get("PREVIEW_BACKEND", "")) != "https":
+        raise CuaRefused("the Cua desktops link needs HTTPS through Tailscale Serve (over the http backend any "
+                         "tailnet member could pass for the owner); see preview doctor")
+    cua = sysm.cua_path()
+    if not cua:
+        raise CuaRefused("cua is not installed (install it from github.com/trycua/cua, then check cua --version)")
+    existing = load_state(CUA_PORT)
+    if existing and not cua_unit_of(existing):
+        raise CuaRefused(f"port {CUA_PORT} already has another preview; run preview stop {CUA_PORT} first")
+    listed = sysm.cua_spaces(cua)
+    if listed is None:
+        raise CuaRefused("cua could not list the desktops on this machine (cua spaces ls --json)")
+    found, skipped = listed
+    states = all_states()
+    known = {e["space_id"]: e for e in states if cua_space_of(e)}
+    ids = {space["id"] for space in found}
+    stale = [e for sid, e in known.items() if sid not in ids]
+    stale_ports = {e["port"] for e in stale}
+    taken = ({e.get("port") for e in states} | sysm.serve_ports()) - stale_ports
+    spaces, unplaced = [], []
+    for space in found:
+        port = known[space["id"]]["port"] if space["id"] in known else next(
+            (p for p in CUA_SPACE_PORTS if p not in taken and not sysm.listeners(p) and not target_listening(sysm, p)), None)
+        if port is None:
+            unplaced.append(space["name"])
+            continue
+        taken.add(port)
+        spaces.append({**space, "port": port})
+    return {"port": CUA_PORT, "label": label or (existing or {}).get("label") or CUA_LABEL,
+            "serve": ("127.0.0.1", CUA_PORT), "unit": CUA_UNIT, "proxy_unit": f"{UNIT_PREFIX}{CUA_PORT}",
+            "backend": "https", "owner_login": login, "cua": cua, "spaces": spaces, "stale": stale,
+            "skipped": skipped, "unplaced": unplaced, "persistent": bool(existing and existing.get("persistent")),
+            "argv": cua_index_argv(sysm, cua)}
+
+
+def cua_index_argv(sysm, cua):
+    return ["/usr/bin/python3", "-I", self_path(), "_cua-index", "--port", str(CUA_PORT), "--cua", cua,
+            "--public-host", sysm.tailnet()[1], "--state-dir", str(state_dir())]
+
+
+def cmd_cua(sysm, label=None, out=None, err=None):
+    out, err = out or sys.stdout, err or sys.stderr
+    stop_legacy_viewer(sysm, err)  # it holds 127.0.0.1:18500 until a reboot; stdout stays the one link
+    try:
+        plan = cua_plan(sysm, label)
+    except CuaRefused as e:
+        print(f"preview: {e}", file=err)
+        return 1
+    host, lport = plan["serve"]
+    active = sysm.unit_state(CUA_UNIT) == "active"
+    if not (plan["persistent"] and active and sysm.can_connect(host, lport)):
+        if not active and (sysm.listeners(lport) or target_listening(sysm, lport)):
+            print(f"preview: something else already listens on port {lport}; stop it, then run preview cua again", file=err)
+            return 1
+        ok, msg = sysm.unit_start(CUA_UNIT, "preview cua: Cua desktops index", plan["argv"])
+        if ok and not wait_up(sysm, host, lport):
+            ok, msg = False, f"it did not come up on {host}:{lport} (journalctl --user -u {CUA_UNIT})"
+        if not ok:
+            sysm.unit_stop(CUA_UNIT)
+            print(f"preview: could not start the Cua desktops index: {printable(msg or 'systemd-run failed')}", file=err)
+            return 1
+    login = plan["owner_login"]
+    code = cmd_start(sysm, CUA_PORT, plan["label"], out=out, err=err,
+                     cua={"kind": "cua", "cua_unit": CUA_UNIT, "owner_login": login})
+    if code != 0:
+        sysm.unit_stop(CUA_UNIT)
+        return code
+    for entry in plan["stale"]:  # Spaces cua no longer lists
+        stop_share(sysm, entry)
+    failed = []
+    for space in plan["spaces"]:
+        quiet_out, why = io.StringIO(), io.StringIO()
+        share = {"kind": "cua-space", "space_id": space["id"], "space_name": space["name"],
+                 "upstream": space_upstream(space["host"], space["upstream_port"]), "owner_login": login}
+        if cmd_start(sysm, space["port"], space["name"], out=quiet_out, err=why, cua=share) != 0:
+            failed.append(f"{space['name']}: {printable(why.getvalue().strip()) or 'its proxy did not start'}")
+    names = ", ".join(space["name"] for space in plan["spaces"]) or "none registered yet (cua spaces ls)"
+    print(f"  Cua desktops: {names}. Open the link and tap one; each tap makes a fresh one-hour viewer link.", file=err)
+    for sid in plan["skipped"]:
+        print(f"  Skipped {sid}: a share only reaches loopback or tailnet addresses.", file=err)
+    for name in plan["unplaced"]:
+        print(f"  Skipped {name}: no free port in {CUA_SPACE_PORTS.start}-{CUA_SPACE_PORTS.stop - 1}.", file=err)
+    for line in failed:
+        print(f"preview: {line}", file=err)
+    print(f"  Only {printable(login)} can open these links; anyone else gets 403. Stop: preview stop cua", file=err)
+    return 1 if failed else 0
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="preview", description=HELP, formatter_class=argparse.RawDescriptionHelpFormatter,
+                                usage="preview <port> [--name LABEL] | file <path> [--name LABEL] | cua [--name LABEL] | list [--json] | "
+                                      "stop <port>|<path>|cua|--all | doctor | restore")
+    p.add_argument("--version", action="version", version=f"preview {VERSION}")
+    return p
+
+
+def parse(argv):
+    """Small hand-rolled dispatcher so `preview 5173` works without a subcommand word."""
+    parser = build_parser()
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        parser.print_help()
+        raise SystemExit(0)
+    if argv[0] == "--version":
+        parser.parse_args(argv)
+    cmd = argv[0]
+    if cmd == "list":
+        sp = argparse.ArgumentParser(prog="preview list")
+        sp.add_argument("--json", action="store_true")
+        a = sp.parse_args(argv[1:])
+        return "list", a
+    if cmd == "stop":
+        sp = argparse.ArgumentParser(prog="preview stop",
+                                     usage="preview stop <port> | preview stop <path> | preview stop cua | preview stop --all")
+        sp.add_argument("target", nargs="?", metavar="port|path")
+        sp.add_argument("--all", action="store_true", help="stop every preview created by this tool")
+        a = sp.parse_args(argv[1:])
+        if (a.target is not None) == bool(a.all):
+            sp.error("give exactly one of <port>, <path> or --all")
+        a.port = a.path = None
+        a.cua = a.target == "cua"
+        if a.cua:
+            pass
+        elif a.target is not None and a.target.isdigit():
+            try:
+                a.port = check_port(a.target)
+            except argparse.ArgumentTypeError as e:
+                sp.error(str(e))
+        elif a.target is not None:
+            a.path = a.target
+        return "stop", a
+    if cmd == "file":
+        sp = argparse.ArgumentParser(prog="preview file", usage="preview file <path> [--name LABEL]")
+        sp.add_argument("path")
+        sp.add_argument("--name", "--label", dest="name", help="short label shown in preview list")
+        return "file", sp.parse_args(argv[1:])
+    if cmd == "cua":
+        sp = argparse.ArgumentParser(prog="preview cua", usage="preview cua [--name LABEL]")
+        sp.add_argument("--name", "--label", dest="name", help="short label shown in preview list")
+        return "cua", sp.parse_args(argv[1:])
+    if cmd == "_cua-index":
+        sp = argparse.ArgumentParser(prog="preview _cua-index")
+        sp.add_argument("--port", required=True, type=int)
+        sp.add_argument("--cua", required=True)
+        sp.add_argument("--public-host", required=True)
+        sp.add_argument("--state-dir", required=True)
+        return "_cua-index", sp.parse_args(argv[1:])
+    if cmd == "_serve-file":
+        sp = argparse.ArgumentParser(prog="preview _serve-file")
+        sp.add_argument("--root", required=True)
+        sp.add_argument("--port", required=True, type=int)
+        return "_serve-file", sp.parse_args(argv[1:])
+    if cmd == "doctor":
+        argparse.ArgumentParser(prog="preview doctor").parse_args(argv[1:])
+        return "doctor", None
+    if cmd == "restore":
+        argparse.ArgumentParser(prog="preview restore").parse_args(argv[1:])
+        return "restore", None
+    if cmd == "_serve":
+        sp = argparse.ArgumentParser(prog="preview _serve")
+        sp.add_argument("--listen", required=True)
+        sp.add_argument("--target", required=True, type=int)
+        sp.add_argument("--public-url")
+        sp.add_argument("--tailnet-ip")
+        sp.add_argument("--upstream-host")
+        sp.add_argument("--upstream-port", type=int)
+        sp.add_argument("--owner-login")
+        return "_serve", sp.parse_args(argv[1:])
+    if cmd == "start":
+        argv = argv[1:]
+    sp = argparse.ArgumentParser(prog="preview", usage="preview <port> [--name LABEL]")
+    sp.add_argument("port", type=check_port)
+    sp.add_argument("--name", "--label", dest="name", help="short label shown in preview list")
+    return "start", sp.parse_args(argv)
+
+
+def main(argv=None, sysm=None):
+    cmd, a = parse(sys.argv[1:] if argv is None else argv)
+    if cmd == "_serve":
+        return cmd_serve(a)
+    if cmd == "_serve-file":
+        return cmd_serve_file(a)
+    if cmd == "_cua-index":
+        return cmd_cua_index(a)
+    sysm = sysm or System()
+    try:
+        return run_command(cmd, a, sysm)
+    except TailnetUnknown as e:
+        print(f"preview: {e}", file=sys.stderr)
+        return 1
+
+
+def run_command(cmd, a, sysm):
+    if cmd == "list":
+        return cmd_list(sysm, a.json)
+    if cmd == "stop":
+        return cmd_stop(sysm, a.port, a.all, path=a.path, cua=a.cua)
+    if cmd == "file":
+        return cmd_file(sysm, a.path, a.name)
+    if cmd == "cua":
+        return cmd_cua(sysm, a.name)
+    if cmd == "doctor":
+        return cmd_doctor(sysm)
+    if cmd == "restore":
+        return cmd_restore(sysm)
+    return cmd_start(sysm, a.port, a.name)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

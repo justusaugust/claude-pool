@@ -19,6 +19,18 @@ After shell setup, `claude` starts pooled sessions and preserves Native administ
 | `claude work --resume <id>` | Resume into a new fork, leaving the original session/pin alone |
 | `claude respawn <id>` | Native worker respawn behavior |
 | `claude pool respawn <exact-agent-id>` | Pool respawn with guarded automatic continuation |
+| `claude-pool device add <ssh-target>` | Add or repair a machine; rerun is safe |
+| `claude-pool device check [name]` | Report every check for a machine and the fix for each problem |
+| `claude-pool device list` / `sync` / `switch` | Show devices; push registry and long-lived tokens; apply a pending change |
+| `claude-pool device remove <name>` | Remove a machine safely (`--forget` for a lost one) |
+| `claude-pool device conductor status` / `move <device>` | Show or move the one Conductor |
+| `claude-pool help device` | Everything an agent needs to manage machines |
+| `claude-pool account add <email> --long-lived` | Enroll a one-year token that every device can use |
+| `claude-pool account remove <name> [--wait]` | Disconnect a subscription without interrupting requests |
+| `claude-pool account rename <old> <new> [--wait]` | Rename an account on this machine (label and shortcut stay); `claude-pool help account` |
+| `claude-pool account reserve <name> --at <pct>` / `--off` | Make an account the last choice from a percent of its limit |
+| `claude-pool conductor snapshot` / `events` / `tell` / `journal` | Tools Conductor Claude uses for herdr agents |
+| `preview file <path>` | Share one file or folder read-only over Tailscale |
 | `claude-native update` | Update Native Claude itself through its own updater |
 | `claude-native agents --json` | Native worker inventory |
 

@@ -67,11 +67,8 @@ def cli(arguments):
     start()
     if arguments == ['--chat']:
         from launch import NATIVE_CLAUDE, configured_plugin
-        env = os.environ.copy()
-        for key in ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_BASE_URL',
-                    'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY',
-                    'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC', 'DISABLE_GROWTHBOOK']:
-            env.pop(key, None)
+        from conductor import native_env
+        env = native_env(os.environ)
         raise SystemExit(subprocess.call([NATIVE_CLAUDE, '--name', 'Claude pool overview', '--remote-control', 'Claude pool overview',
             '--permission-mode', 'default', '--setting-sources', '', '--tools', '', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}',
             '--plugin-dir', str(configured_plugin('phone-hub')), '--', 'Show pool overview.'], env=env))

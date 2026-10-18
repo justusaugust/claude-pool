@@ -22,16 +22,16 @@ import tempfile
 from views import usage, history
 
 from bridge import PoolBridge, atomic_write
+import readings
 from native_auth import NativeAuth
 import service
 from validation import render as validation_view
 
-from settings import HERE, RUNTIME, STORES, NATIVE_CLAUDE, CONFIG, BASE_URL, GATEWAY_PORT, BACKEND_PORT, backend_config, connection_ts, ALIASES, private_directory
+from settings import HERE, RUNTIME, STORES, LONG_LIVED, NATIVE_CLAUDE, CONFIG, BASE_URL, GATEWAY_PORT, BACKEND_PORT, backend_config, connection_ts, SHARED_READINGS, LONG_LIVED_PROBES, ALIASES, private_directory
 ROOT = HERE.parent
 HEALTH_INTERVAL = 10
-INSTALLATION = json.loads((ROOT / 'installation.json').read_text()) if (ROOT / 'installation.json').is_file() else {}
-SERVICE_LABEL = INSTALLATION.get('serviceLabel', 'io.github.claude-pool')
-if not isinstance(SERVICE_LABEL, str) or not re.fullmatch(r'[a-zA-Z0-9.-]+', SERVICE_LABEL): raise RuntimeError('Invalid installed service label')
+INSTALLATION = service.receipt(ROOT)
+SERVICE_LABEL = service.installed_label(INSTALLATION)
 SERVICE_FILE = service.service_file(SERVICE_LABEL)
 ACCOUNT_SHORTCUTS = ALIASES
 
@@ -44,10 +44,9 @@ def service_command(*args, check=True):
 
 
 def service_definition():
-    receipt = ROOT / 'installation.json'
-    root = Path(json.loads(receipt.read_text()).get('root', ROOT)) if receipt.is_file() else ROOT
+    root = service.install_root(ROOT)
     entry = root / 'run.py' if (root / 'run.py').is_file() else HERE / 'launch.py'
-    return {'Label': SERVICE_LABEL, 'ProgramArguments': ['/opt/homebrew/bin/python3' if Path('/opt/homebrew/bin/python3').exists() else sys.executable, str(entry), '--daemon'],
+    return {'Label': SERVICE_LABEL, 'ProgramArguments': [service.python(), str(entry), '--daemon'],
             'RunAtLoad': True, 'KeepAlive': {'SuccessfulExit': False}, 'ThrottleInterval': 10,
             'ExitTimeOut': 360, 'WorkingDirectory': str(root),
             'EnvironmentVariables': {'POOL_MANAGED': '1', 'CLAUDE_POOL_CONFIG': str(CONFIG)},
@@ -68,9 +67,20 @@ def install_service():
         service_command('enable', SERVICE_LABEL + '.service')
         return SERVICE_LABEL + '.service'
     domain = f'gui/{os.getuid()}'
-    if service_command('print', domain + '/' + SERVICE_LABEL, check=False):
-        service_command('bootstrap', domain, str(SERVICE_FILE))
-    return domain + '/' + SERVICE_LABEL
+    target = domain + '/' + SERVICE_LABEL
+    printed = subprocess.run(['launchctl', 'print', target], capture_output=True, text=True)
+    if printed.returncode: service_command('bootstrap', domain, str(SERVICE_FILE))
+    else:
+        # An update rewrites the file but leaves the loaded job alone; kickstart would start launchd's cached old program
+        # (the legacy entry point). Reload only a job that is not running: a running daemon is never killed here.
+        job = service.launchd_job(printed.stdout)
+        if not job['running'] and job['arguments'] is not None and job['arguments'] != definition['ProgramArguments']:
+            service_command('bootout', target, check=False)
+            for _ in range(20):  # bootout returns before launchd lets go of the label
+                if not service_command('bootstrap', domain, str(SERVICE_FILE), check=False): break
+                time.sleep(.25)
+            else: raise RuntimeError('Background service control failed')
+    return target
 
 
 def managed_start():
@@ -155,7 +165,8 @@ def daemon(client, admin):
     server, stop, watcher = None, threading.Event(), None
     try:
         names = [a['name'] for a in tomllib.loads(config).get('providers', {}).get('anthropic', {}).get('accounts', [])]
-        server = PoolBridge(("127.0.0.1", GATEWAY_PORT), BACKEND_PORT, client, admin, RUNTIME / "sessions.json", native_auth=NativeAuth(STORES, names))
+        server = PoolBridge(("127.0.0.1", GATEWAY_PORT), BACKEND_PORT, client, admin, RUNTIME / "sessions.json", native_auth=NativeAuth(STORES, names), shared_readings=SHARED_READINGS)
+        readings.Puller(SHARED_READINGS, server.journal).start(stop, probe=readings.AuthProbe(LONG_LIVED_PROBES, outcomes=server.outcomes_since))
         def drain(signum, frame):
             server.draining = True
             server.journal.record('service_draining', requests=len(server.requests))
@@ -243,6 +254,27 @@ def recover_orphan():
         time.sleep(.1)
     if process_command(pid) == expected: os.kill(pid, signal.SIGKILL)
     return False
+
+
+STOP_EXIT_WAIT = 30  # seconds `--stop` waits for the daemon and Shunt to exit once the ports are closed
+
+
+def pool_processes():
+    """{pid: what its command line must show} for the daemon and Shunt recorded in owner.json; {} when unknown."""
+    try: owner = json.loads((RUNTIME / "owner.json").read_text())
+    except (OSError, ValueError): return {}
+    if not isinstance(owner, dict): return {}
+    expected = {owner.get("daemon"): " --daemon", owner.get("backend"): f"{HERE / 'bin/shunt'} --config {RUNTIME / 'shunt.toml'} run"}
+    return {pid: text for pid, text in expected.items() if isinstance(pid, int) and pid > 1}
+
+
+def wait_exited(processes, bound=None):
+    """True once none of `processes` runs its recorded command any more (a reused pid does not count), False after `bound`."""
+    deadline = time.monotonic() + (STOP_EXIT_WAIT if bound is None else bound)
+    while True:
+        if not any(text in process_command(pid) for pid, text in processes.items()): return True
+        if time.monotonic() >= deadline: return False
+        time.sleep(.25)
 
 
 def orphaned(parent):
@@ -417,6 +449,34 @@ def configured_plugin(name):
     return folder
 
 
+def native_identity():
+    """This machine's Native login ({'email', 'organization'}), or None when Native is signed out."""
+    from native_login import parse_auth_status
+    unreadable = RuntimeError('Could not read the Native login (claude-native auth status --json); nothing was changed')
+    try: done = subprocess.run([NATIVE_CLAUDE, 'auth', 'status', '--json'], capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired): raise unreadable from None
+    try: native = parse_auth_status(done.stdout)
+    except ValueError: raise unreadable from None
+    # A signed-out Native may exit non-zero while still reporting loggedIn false; any other failure is unreadable.
+    if native is not None and done.returncode: raise unreadable
+    return native
+
+
+def long_lived_report():
+    """Print long-lived token findings; True when any of them failed."""
+    import long_lived, registry
+    try: known = registry.load()
+    except ValueError: known = registry.EMPTY()
+    import readings
+    try: rejected = readings.reauthenticate(LONG_LIVED_PROBES)
+    except Exception: rejected = set()
+    findings = long_lived.health(STORES, LONG_LIVED, known, int(time.time() * 1000), registry.self_name(), rejected)
+    shown = [f for f in findings if f['level'] != 'ok']
+    for f in shown: print(f"  {f['level']} {f['account']}: {f['message']}" + (f" · fix: {f['fix']}" if f['fix'] else ''))
+    if not shown and findings: print(f'  ok long-lived tokens: {len({f["account"] for f in findings})} checked')
+    return any(f['level'] == 'fail' for f in shown)
+
+
 def main():
     # The shell's claude adapter preserves Native commands; claude-pool owns pool commands.
     native_entry = sys.argv[1:2] == ['exec']
@@ -435,6 +495,18 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == 'update':
         from update import cli
         raise SystemExit(cli(sys.argv[2:], HERE))
+    if len(sys.argv) > 1 and sys.argv[1] == 'device':
+        # Device verbs never start or stop the local pool (only `device switch` does, through the launcher).
+        from devices_cli import cli
+        raise SystemExit(cli(sys.argv[2:]))
+    if sys.argv[1:] == ['help', 'device']:
+        from devices_cli import DEVICE_HELP
+        print(DEVICE_HELP)
+        return
+    if sys.argv[1:] == ['help', 'account']:
+        from accounts_cli import ACCOUNT_HELP
+        print(ACCOUNT_HELP)
+        return
     if len(sys.argv) > 1 and sys.argv[1] in {'account', 'login'}:
         from accounts_cli import cli
         argv = sys.argv[2:]
@@ -442,19 +514,45 @@ def main():
             if len(argv) != 1: raise RuntimeError('Usage: claude login <name>, or claude account add <email>')
             argv = ['add', '--name', argv[0]]
         def overview():
+            # Never mints a client token: a pool running without one cannot be asked, which counts as busy below.
+            if not (STORES / '.pool-client-token').is_file(): raise OSError('No pool client token')
             return json.loads(request(token('.pool-client-token'), path='/pool/overview'))
+        checked = bool(argv) and argv[0] in ('add', 'remove', 'rename') and '--help' not in argv and '-h' not in argv
         try:
-            if not argv or argv[0] != 'add' or '--help' in argv or '-h' in argv or not (STORES / '.pool-client-token').is_file():
-                raise OSError('No live readiness check needed')
+            if not checked: raise OSError('No live readiness check needed')
             overview(); available = True
-        except (OSError, RuntimeError, ValueError): available = False
+        except (OSError, RuntimeError, ValueError):
+            # remove and rename never skip their in-flight check while the service runs (as the service manager reports
+            # it, with or without a client token file): an unanswered overview counts as busy.
+            available = checked and argv[0] in ('remove', 'rename') and service.loaded(SERVICE_LABEL)
+            if available and argv[0] == 'rename':
+                # A pool stopped with `claude-pool --stop` keeps its unit loaded (launchd) or enabled (systemd): the
+                # maintenance marker plus no answering pool port decide that it is stopped, as device remove does.
+                from devices_cli import pool_stopped
+                available = not pool_stopped()
+        def pool(flag):
+            # The same stop/start device switch uses: --stop lets running responses finish first.
+            from remote import Local
+            return Local().pool(flag, timeout=600).returncode
+        on_change = None
+        try:
+            import registry
+            me = registry.self_name()
+            if me is not None and any(row['name'] != me for row in registry.load()['devices']):
+                import device_sync, functools
+                on_change = functools.partial(device_sync.sync_all)
+        except ValueError: pass  # an unreadable registry never blocks adding or removing an account
         raise SystemExit(cli(argv, config=CONFIG, stores=STORES, binary=HERE/'bin/shunt', runtime=RUNTIME,
-                             backend_source=None, backend_env=None, overview=overview if available else None))
+                             overview=overview if available else None, long_lived=LONG_LIVED, native_identity=native_identity,
+                             on_change=on_change, pool=pool))
+    if len(sys.argv) > 1 and sys.argv[1] == 'conductor':
+        from conductor_tools import cli
+        raise SystemExit(cli(sys.argv[2:]))
     if sys.argv[1:] in [['--help'], ['-h']]: sys.argv[1:] = ['help']
     if sys.argv[1:] == ['--version']:
         raise SystemExit(subprocess.call([NATIVE_CLAUDE, *sys.argv[1:]]))
     if sys.argv[1:] == ['help']:
-        print('claude-pool [account-alias] [Claude arguments]\nCommands: update, usage [--once], history, forecast-check, doctor, account add <email>, account list, login <name>, phone, respawn <id>\nUpdates: claude update = Claude Code; claude-pool update or claude pool update = Claude Pool\nService: --start, --stop\nSetup: ' + str(ROOT / 'docs/SETUP.md'))
+        print('claude-pool [account-alias] [Claude arguments]\nCommands: update, usage [--once], history, forecast-check, doctor, account add <email>, account list, account remove <name> [--wait], account rename <old> <new> [--wait], account reserve <name> --at <pct>|--off, login <name>, device add|check|remove|list|sync|switch|conductor (details: claude-pool help device, claude-pool help account), phone, respawn <id>, conductor snapshot|events|tell|journal\nUpdates: claude update = Claude Code; claude-pool update or claude pool update = Claude Pool\nService: --start, --stop\nSetup: ' + str(ROOT / 'docs/SETUP.md'))
         return
     if len(sys.argv) > 1 and sys.argv[1] == 'phone':
         from control_main import cli
@@ -498,6 +596,7 @@ def main():
             managed_start()
         if args.stop:
             atomic_write(RUNTIME / 'maintenance', 'Deliberately stopped\n')
+            owner = pool_processes()
             try: request(client, "POST", "/pool/shutdown")
             except OSError:
                 print('Local pool already stopped.'); return
@@ -510,6 +609,11 @@ def main():
                     try:
                         conn.connect()
                     except OSError:
+                        # Closed ports are not enough: Shunt may still write a refreshed grant on its way out, and a
+                        # rename or device switch moves those files next. Wait for both processes to be gone.
+                        if not wait_exited(owner):
+                            raise RuntimeError(f"Pool stopped answering, but its daemon has not exited after {STOP_EXIT_WAIT} s; "
+                                               "retry claude-pool --stop") from None
                         print("Local pool stopped.")
                         return
                     finally:
@@ -533,6 +637,7 @@ def main():
             print(f"Claude pool · {health['supervisor']} · backend {health['backend']} · {health['activeRequests']}/{health['requestLimit']} requests")
             print('Metadata storage: ' + ('needs attention' if health['storageError'] else 'ready'))
             for incident in value['incidents'][:10]: print('  ' + incident['message'])
+            if long_lived_report(): raise SystemExit(1)
         else:
             print(validation_view(json.loads(request(client, path='/pool/validation'))))
         return

@@ -94,7 +94,7 @@ class ReleaseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="pool hook ' $ ") as folder:
             root = Path(folder); source = root / 'relocated gateway'; source.mkdir()
             shutil.copytree(launch.HERE / 'session-control', source / 'session-control')
-            for name in ['control_hook.py', 'settings.py', 'account_metadata.py']:
+            for name in ['control_hook.py', 'settings.py', 'account_metadata.py', 'private_files.py']:
                 shutil.copyfile(launch.HERE / name, source / name)
             stores = root / 'credentials'; stores.mkdir(); (stores / '.pool-client-token').write_text('fixture-token')
             config = root / "config ' $ .json"
@@ -331,12 +331,50 @@ class ReleaseTests(unittest.TestCase):
                     installer.install(root / 'app', root / 'bin', root / 'config.json', native, skip_backend=True)
             self.assertFalse((root / 'app').exists()); self.assertFalse((root / 'config.json').exists())
 
+    def test_source_version_ignores_the_platform_built_backend_and_files_the_source_archive_skips(self):
+        # Final review probe: identical sources with a darwin and a linux backend gave two versions, so device add never matched.
+        infos = []
+        for binary, checkout in ((b'MACHO-darwin-arm64', True), (b'ELF-linux-x86_64', False)):
+            release = Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, release)
+            for name, text in [('gateway/x.py', 'same source\n'), ('gateway/preview', '#!/usr/bin/env python3\n'), ('docs/a.md', 'doc\n'),
+                               ('backend/upstream.json', '{"pin": 1}'), ('run.py', 'run\n'), ('README.md', 'readme\n')]:
+                (release / name).parent.mkdir(parents=True, exist_ok=True); (release / name).write_text(text)
+            (release / 'gateway/bin').mkdir(); (release / 'gateway/bin/shunt').write_bytes(binary)
+            if checkout:  # a copy_release from a checkout carries files the source archive never sends
+                (release / 'gateway/notes.txt').write_text('scratch'); (release / 'gateway/__pycache__').mkdir()
+                (release / 'gateway/__pycache__/x.cpython-314.pyc').write_bytes(b'pyc')
+            infos.append(installer.build_info(release))
+        self.assertNotEqual(infos[0]['version'], infos[1]['version'])
+        self.assertEqual(infos[0]['sourceVersion'], infos[1]['sourceVersion'])
+        changed = Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, changed)
+        (changed / 'gateway').mkdir(); (changed / 'gateway/x.py').write_text('other source\n')
+        (changed / 'backend').mkdir(); (changed / 'backend/upstream.json').write_text('{"pin": 1}')
+        self.assertNotEqual(installer.build_info(changed)['sourceVersion'], infos[0]['sourceVersion'])
+
     def test_no_machine_home_paths_or_private_keys_in_source(self):
         forbidden = ['/Us' + 'ers/', '/ho' + 'me/', '-----BEGIN ' + 'PRIVATE KEY-----']
         for path in ROOT.rglob('*'):
             if not path.is_file() or path.suffix not in {'.py', '.ts', '.tsx', '.json', '.md', '.patch'}: continue
             if '__pycache__' in path.parts or '.scratch' in path.parts or '.claude-plugin/types' in str(path): continue
             for text in forbidden: self.assertNotIn(text, path.read_text(), str(path.relative_to(ROOT)))
+
+    def test_no_personal_identifiers_in_source(self):
+        """Tests and docs use neutral fixtures (100.64.0.x, example-vps, alex@vps), never a real machine or person.
+        The repository URL is the one allowed use of the owner's account name."""
+        forbidden = ['100.116.' + '84.79', '100.108.' + '161.69', 'personal' + '-vps', 'tail69' + 'b084', 'jus' + 'tus', 'aug' + 'ust']
+        allowed = ['github.com/' + 'jus' + 'tusau' + 'gust/claude-pool', 'github.com/' + 'jus' + 'tusau' + 'gust)',
+                   'raw.githubusercontent.com/' + 'jus' + 'tusau' + 'gust/claude-pool']
+        skip = {'.git', '.superpowers', '__pycache__', '.scratch', 'node_modules'}
+        hits = []
+        for path in ROOT.rglob('*'):
+            if not path.is_file() or skip & set(path.relative_to(ROOT).parts): continue
+            try: text = path.read_text()
+            except (UnicodeDecodeError, OSError): continue
+            for line_number, line in enumerate(text.splitlines(), 1):
+                low = line.lower()
+                for keep in allowed: low = low.replace(keep, '')
+                hits += [f'{path.relative_to(ROOT)}:{line_number}: {word}' for word in forbidden if word in low]
+        self.assertEqual(hits, [])
 
 
 if __name__ == '__main__': unittest.main()

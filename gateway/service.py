@@ -5,6 +5,7 @@ WorkingDirectory, EnvironmentVariables, ...). macOS writes it as a plist exactly
 before; Linux renders the same dict as a user unit and parses it back for ownership
 checks. No settings import: the installer uses this before any configuration exists.
 """
+import json
 import os
 from pathlib import Path
 import plistlib
@@ -16,6 +17,29 @@ import tempfile
 DEFAULTS = {'RunAtLoad': True, 'KeepAlive': {'SuccessfulExit': False}, 'ThrottleInterval': 10, 'ExitTimeOut': 360,
             'StandardOutPath': '/dev/null', 'StandardErrorPath': '/dev/null'}
 DESCRIPTION = 'Claude Pool background service '
+DEFAULT_LABEL = 'io.github.claude-pool'
+
+
+def receipt(app_root):
+    """The installation receipt next to the gateway, {} when the checkout is not installed."""
+    path = Path(app_root) / 'installation.json'
+    return json.loads(path.read_text()) if path.is_file() else {}
+
+
+def installed_label(value):
+    label = value.get('serviceLabel', DEFAULT_LABEL)
+    if not isinstance(label, str) or not re.fullmatch(r'[a-zA-Z0-9.-]+', label): raise RuntimeError('Invalid installed service label')
+    return label
+
+
+def install_root(app_root):
+    """The stable install root that holds run.py (the receipt's `root`), else the checkout itself."""
+    value = receipt(app_root)
+    return Path(value.get('root', app_root)) if value else Path(app_root)
+
+
+def python():
+    return '/opt/homebrew/bin/python3' if Path('/opt/homebrew/bin/python3').exists() else sys.executable
 
 
 def platform():
@@ -120,6 +144,21 @@ def loaded(label, run=subprocess.run):
                for check in ['is-active', 'is-enabled'])
 
 
+def launchd_job(text):
+    """The job as launchd holds it, from `launchctl print` output: {'running': bool, 'arguments': [...] or None}.
+    Only top-level lines count (nested blocks such as endpoints have their own `state`); an unknown format gives None
+    arguments, which never triggers a reload."""
+    running, arguments, block = False, None, None
+    for line in text.splitlines():
+        if block is not None:
+            if line == '\t}': arguments, block = block, None
+            elif line.startswith('\t\t'): block.append(line[2:])
+            else: block = None
+        elif line == '\tstate = running': running = True
+        elif line == '\targuments = {': block = []
+    return {'running': running, 'arguments': arguments}
+
+
 def needs_reload(label, run=subprocess.run):
     """True when the user manager holds an older copy of this unit than the file."""
     result = run(['systemctl', '--user', 'show', '-p', 'NeedDaemonReload', '--value', label + '.service'], capture_output=True, text=True)
@@ -144,6 +183,7 @@ def write(path, data):
         raise
 
 
-def unload_hint(label):
-    if platform() == 'darwin': return 'launchctl bootout gui/$(id -u)/' + label
+def unload_hint(label, system=None):
+    """The command that unloads the service; `system` ('darwin' or 'linux') names another machine's platform."""
+    if (system or platform()) == 'darwin': return 'launchctl bootout gui/$(id -u)/' + label
     return 'systemctl --user disable --now ' + label + '.service'

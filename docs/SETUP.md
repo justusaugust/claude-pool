@@ -85,7 +85,7 @@ claude-pool                     # automatic routing across all accounts
 
 The Native login stays separate and must also be among your connected subscriptions. A personal and Team subscription can share a user UUID but have different organizations. Duplicate aliases for the same user/organization do not create extra quota and are rejected. Existing credential files are reused, never silently overwritten. Revoked credentials need deliberate reauthentication with their owner; rerunning setup does not replace them.
 
-Use one active backend owner for each refreshable store. Do not run independent backends or copy rotating refresh tokens across machines.
+Refreshable stores stay on one machine: use one active backend owner for each, and never copy rotating refresh tokens across machines. Long-lived tokens are the only credentials copied, and only by `device` commands (see [devices](DEVICES.md)).
 
 ## 4. Optional configuration
 

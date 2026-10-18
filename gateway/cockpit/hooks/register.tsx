@@ -201,7 +201,7 @@ export const register: Register = on => {
       {p.accounts.map(a => <Box flexDirection="column">
         <Box flexDirection="row" columnGap={2} alignItems="center">
         <Box flexGrow={1} minWidth={0}>
-          <Text wrap="truncate-end"><Text bold>{p.active === a.name ? '● ' : '○ '}{a.label}</Text> · {a.status}{p.sessions?.some(s => s.account === a.name && s.busy) ? ` · ${p.sessions.filter(s => s.account === a.name && s.busy).length} busy` : ''}{!compact && a.plan ? ` · ${a.plan}` : ''}{dense && <Text color="inactive"> · 5h {poolBar(a.fiveHour, 4)} {a.fiveHour ? fmtPct(a.fiveHour.pct) : '?'} · <Text color={a.sevenDay && a.sevenDay.pct >= 95 ? 'error' : 'inactive'}>week all {poolBar(a.sevenDay, 4)} {a.sevenDay ? fmtPct(a.sevenDay.pct) : 'not reported'}</Text></Text>}</Text>
+          <Text wrap="truncate-end"><Text bold>{p.active === a.name ? '● ' : '○ '}{a.label}</Text> · {a.status}{a.reserveAt ? ` · reserved from ${a.reserveAt}%` : ''}{p.sessions?.some(s => s.account === a.name && s.busy) ? ` · ${p.sessions.filter(s => s.account === a.name && s.busy).length} busy` : ''}{!compact && a.plan ? ` · ${a.plan}` : ''}{dense && <Text color="inactive"> · 5h {poolBar(a.fiveHour, 4)} {a.fiveHour ? fmtPct(a.fiveHour.pct) : '?'} · <Text color={a.sevenDay && a.sevenDay.pct >= 95 ? 'error' : 'inactive'}>week all {poolBar(a.sevenDay, 4)} {a.sevenDay ? fmtPct(a.sevenDay.pct) : 'not reported'}</Text></Text>}</Text>
         </Box>
         <Button key={`pool-pin:${a.name}`} label="Pin" plain onPress={() => undefined} />
         <Button key={`pool-pause:${a.name}`} label={a.paused ? 'Resume' : 'Pause'} plain onPress={() => undefined} />
