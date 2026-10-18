@@ -126,7 +126,7 @@ class RoutingTests(DeviceCliBase):
         self.assertEqual(devices_cli.INTERNAL_VERBS, ['status', 'registry', 'receive-registry', 'receive-account', 'send-account',
                                                       'identity', 'readings', 'shell', 'cua-token', 'cua-tunnel', 'conductor serve',
                                                       'conductor install', 'conductor uninstall', 'forget-accounts', 'self',
-                                                      'preview-rules', 'herdr-units'])
+                                                      'preview-rules', 'herdr-units', 'receive-checks'])
 
     def test_cua_tunnel_verb_runs_on_this_device_and_prints_json(self):
         with patch.object(device_cua, 'tunnel_add', return_value={'port': 32342, 'running': True}) as add, \
@@ -225,6 +225,35 @@ class InternalVerbTests(DeviceCliBase):
         self.assertEqual({d['name'] for d in registry.load(self.reg)['devices']}, {'mac', 'vps'})
         code, out, err = self.run_cli(['receive-registry'], stdin=b'not json')
         self.assertNotEqual(code, 0)
+
+    def test_receive_checks_merges_newest_first_and_refuses_bad_input(self):
+        import conductor_board
+        self.runtime.chmod(0o700)
+        steps = [{'name': 'reachable', 'status': 'ok', 'detail': 'this device', 'fix': ''}]
+        code, out, err = self.run_cli(['receive-checks'], stdin=json.dumps({'devices': {'mac': {'checkedAt': 2000, 'steps': steps}}}).encode())
+        self.assertEqual((code, json.loads(out)), (0, {'merged': ['mac']}), err)
+        code, out, err = self.run_cli(['receive-checks'], stdin=json.dumps({'devices': {'mac': {'checkedAt': 1000, 'steps': []}}}).encode())
+        self.assertEqual((code, json.loads(out)), (0, {'merged': []}), err)
+        self.assertEqual(json.loads((self.runtime / conductor_board.CHECK_FILE).read_text())['devices']['mac']['checkedAt'], 2000)
+        for data in (b'not json', b'{"devices": {"mac": {"checkedAt": 5, "steps": [{"name": "x", "status": "boom"}]}}}'):
+            code, out, err = self.run_cli(['receive-checks'], stdin=data)
+            self.assertEqual(code, 2, data)
+
+    def test_sync_shares_the_check_results_with_every_peer_it_reached(self):
+        import conductor_board
+        self.runtime.chmod(0o700)
+        self.devices(MAC, VPS)
+        conductor_board.record_checks({'mac': [Step('reachable', 'ok', 'this device')]})
+        vps = FakeRemote('justus@vps', lambda argv, data: answer(0, b'{"merged": ["mac"]}'))
+        with patch.object(device_sync, 'sync_all', return_value={'vps': 'ok'}):
+            code, out, _ = self.run_cli(['sync'], remotes=lambda target: vps)
+        self.assertEqual(code, 0)
+        (argv, data), = [call for call in vps.calls if 'receive-checks' in call[0]]
+        self.assertEqual(set(json.loads(data)['devices']), {'mac'})
+        vps.calls.clear()
+        with patch.object(device_sync, 'sync_all', return_value={'vps': 'unreachable'}):
+            self.run_cli(['sync'], remotes=lambda target: vps)
+        self.assertEqual(vps.calls, [])
 
     def test_receive_account_takes_the_token_on_stdin_only(self):
         data = long_lived_file(self.root / 'src', 'team').read_bytes()
@@ -804,6 +833,8 @@ class Machine:
             self.accounts[name] = {'kind': 'long-lived', 'fingerprint': long_lived.fingerprint(value)}
             return ok('installed')
         if args[:1] == ['self']: self.self_name = args[1]; return ok()
+        if args == ['receive-checks']:
+            self.received_checks = getattr(self, 'received_checks', []) + [json.loads(data)]; return ok('{"merged": []}')
         if args[:1] == ['shell']:
             if args[1] == 'check': return answer(0 if self.shell else 1)
             if args[1] == 'add':
@@ -913,6 +944,7 @@ class AddTests(OrchestrationBase):
         import conductor_board
         cached = json.loads((self.runtime / conductor_board.CHECK_FILE).read_text())['devices']
         self.assertEqual([step['name'] for step in cached['vps']['steps']], list(ADD_ORDER))
+        self.assertEqual(self.vps.received_checks[-1], {'devices': cached})
 
     def test_usage_owner_is_refused_on_a_device_that_serves_no_refreshable_login_for_the_accounts(self):
         # A fresh machine only stages long-lived tokens; as usage owner it could poll no usage and readings would stop.
@@ -1088,6 +1120,15 @@ class CheckTests(OrchestrationBase):
         self.assertEqual([step['name'] for step in cached['vps']['steps']], list(CHECK_NAMES))
         self.assertIsInstance(cached['vps']['checkedAt'], int)
         self.assertEqual([step['name'] for step in cached['mac']['steps']], list(CHECK_NAMES))
+        # ... and shares every row with each peer it reached, so a peer without ssh back to this machine still sees it.
+        (pushed,) = self.vps.received_checks
+        self.assertEqual(pushed, {'devices': cached})
+
+    def test_check_shares_nothing_with_an_unreachable_peer(self):
+        self.runtime.chmod(0o700)
+        self.vps.reachable = False
+        self.cli('check')
+        self.assertEqual(self.count(self.vps, 'receive-checks'), 0)
 
     def tunnelled(self, running=True):
         registry.update(lambda value: (registry.device(value, 'vps').update(cua=True, tailscaleIp='100.64.0.2'),

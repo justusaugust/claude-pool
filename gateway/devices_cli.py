@@ -39,7 +39,7 @@ import settings
 USER_VERBS = ['add', 'check', 'remove', 'list', 'sync', 'switch', 'conductor move', 'conductor status']
 INTERNAL_VERBS = ['status', 'registry', 'receive-registry', 'receive-account', 'send-account', 'identity', 'readings', 'shell',
                   'cua-token', 'cua-tunnel', 'conductor serve', 'conductor install', 'conductor uninstall', 'forget-accounts', 'self', 'preview-rules',
-                  'herdr-units']
+                  'herdr-units', 'receive-checks']
 CHECK_HELP = {
     'reachable': ('ssh to the device works without a password prompt', 'ssh <ssh-target> true must work without a password prompt (BatchMode)'),
     'native-claude': ('Native Claude Code is installed', 'curl -fsSL https://claude.ai/install.sh | bash on the device'),
@@ -203,6 +203,20 @@ def receive_registry(argv, out, **_):
     parse('receive-registry', argv)
     print_json(device_sync.receive_registry(stdin_bytes(registry.LIMIT)))
     return 0
+
+
+def receive_checks(argv, out, **_):
+    """Another device's `device check` results for the Conductor Board, JSON on stdin (no secrets); newest per device wins."""
+    parse('receive-checks', argv)
+    try: value = json.loads(stdin_bytes(conductor_board.LIMIT))
+    except ValueError: raise ValueError('receive-checks reads the shared check results as JSON on stdin') from None
+    print(json.dumps({'merged': conductor_board.merge_checks(value)}))
+    return 0
+
+
+def unreachable_in(results):
+    """Devices whose check just found them unreachable: sharing would only wait for the ssh timeout."""
+    return {name for name, steps in results.items() if any(step.status == 'unreachable' for step in steps if step is not None)}
 
 
 def receive_account(argv, out, **_):
@@ -440,6 +454,8 @@ def sync(argv, out, remotes, **_):
                 print(row['name'] + ': its list could not be read; rows only it has stay')
         registry.force(peers)
     results = device_sync.sync_all(remotes)
+    # The Conductor Board on a device with no ssh back here still sees this device's check results.
+    conductor_board.share_checks(remotes, skip={name for name, result in results.items() if result == 'unreachable'})
     if not results: print('No other devices to sync with.')
     for name, result in sorted(results.items()): print(name + ': ' + result)
     return 0 if all(result == 'ok' or result.startswith('skipped') for result in results.values()) else 1
@@ -1166,6 +1182,7 @@ def add(argv, out, remotes, local, **_):
         final.append(done if prefer_ensured(done, step, t.retry) else step)
     if refused is not None: final.append(refused)
     conductor_board.record_checks({name: final})  # the Conductor Board reads the last result instead of checking again
+    conductor_board.share_checks(remotes, skip=unreachable_in({name: final}))
     print(render(name + ' (' + target + ')', final))
     print_sync(synced)
     return 0 if ready(final) else 2
@@ -1193,6 +1210,7 @@ def check(argv, out, remotes, local, **_):
         results[row['name']] = check_all(t)
     good = all(ready(steps) for steps in results.values())
     conductor_board.record_checks(results)  # the Conductor Board reads the last result instead of checking again
+    conductor_board.share_checks(remotes, skip=unreachable_in(results))  # and so does every peer's board
     if args.json:
         print_json({'ready': good, 'devices': {name: [step._asdict() for step in steps] for name, steps in results.items()}})
     else:
@@ -1390,7 +1408,8 @@ VERBS = {'add': add, 'check': check, 'remove': remove, 'list': list_devices, 'sy
          'switch': switch, 'conductor': conductor_verb, 'status': status, 'registry': show_registry,
          'receive-registry': receive_registry, 'receive-account': receive_account, 'send-account': send_account,
          'identity': identity, 'readings': export_readings, 'shell': shell, 'cua-token': cua_token, 'cua-tunnel': cua_tunnel,
-         'forget-accounts': forget_accounts, 'self': name_self, 'preview-rules': preview_rules, 'herdr-units': herdr_units}
+         'forget-accounts': forget_accounts, 'self': name_self, 'preview-rules': preview_rules, 'herdr-units': herdr_units,
+         'receive-checks': receive_checks}
 
 
 def cli(argv, *, remotes=Remote, local=Local(), out=sys.stdout):

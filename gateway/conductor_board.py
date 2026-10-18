@@ -1,15 +1,19 @@
 """What the Conductor Board shows at a glance, for `claude-pool conductor snapshot --json`: machines, accounts and quick
 links. Cheap by design. The snapshot never runs a full `device check`: it reads the last check of each device from a 0600
-cache that `device check` and `device add` write (record_checks), checks this machine's own pool locally, and asks another
+cache that `device check` and `device add` write (record_checks) and that
+`device check`, `device add` and `device sync` share with every peer they reach (share_checks, merge_checks: per device
+the newest result wins, so a device with no ssh back to the Mac still shows the Mac's own result), checks this machine's own pool locally, and asks another
 device for its `device status` at most once per PROBE_EVERY seconds, bounded by PROBE_TIMEOUT. A probe is cached whether
 or not the device answered, and a device check younger than PROBE_EVERY counts as one. Accounts come from the overview
 `claude-pool usage --once` reads (the local pool, which merges the usage owner's shared readings); no call per account."""
 import concurrent.futures
 import json
+import re
 import time
 
 from account_metadata import load as load_config
 from conductor_tools import _locked, clean
+from device_report import STATUSES
 from private_files import read_private, write_private
 import readings
 import registry
@@ -22,7 +26,8 @@ PROBE_EVERY = 600                         # seconds between two probes of one de
 PROBE_TIMEOUT = 20                        # seconds one `device status` over ssh may take
 LIMIT = 256 * 1024
 LIVE_STEPS = ('reachable', 'service', 'version')  # what a probe measures again; a newer probe replaces these cached steps
-RANK = {'red': 0, 'amber': 1}
+RANK = {'red': 0, 'amber': 1, 'grey': 2}
+STEP_NAME = re.compile(r'[a-z][a-z-]{0,39}')
 CUA_SPACES = range(18501, 18600)          # per-desktop shares: they need the ticket the index hands out, never linked directly
 APP = {'label': 'Conductor in der Claude-App', 'link': 'https://claude.ai/code', 'kind': 'app'}
 WINDOWS = (('fiveHour', 'fiveHour', 'fiveHourPct'), ('sevenDay', 'week', 'weekPct'), ('fableWeekly', 'fableWeek', 'fableWeekPct'))
@@ -38,11 +43,21 @@ def _load(path):
     return {name: entry for name, entry in devices.items() if isinstance(entry, dict)} if isinstance(devices, dict) else {}
 
 
-def _store(path, entries):
+def _store(path, entries, newer=False):
+    """Write `entries` into the cache under its lock; with `newer`, only a device whose entry is newer than the kept one.
+    Returns the names written."""
     with _locked(path):
         current = _load(path)
-        current.update(entries)
-        write_private(path, json.dumps({'devices': current}, ensure_ascii=False, sort_keys=True))
+        written = sorted(name for name, entry in entries.items()
+                         if not newer or entry['checkedAt'] > (current.get(name) or {}).get('checkedAt', -1))
+        if written:
+            current.update({name: entries[name] for name in written})
+            write_private(path, json.dumps({'devices': current}, ensure_ascii=False, sort_keys=True))
+    return written
+
+
+def _step(name, status, detail, fix):
+    return {'name': name, 'status': status, 'detail': clean(detail or '', 200), 'fix': clean(fix or '', 500)}
 
 
 def record_checks(results, now=None):
@@ -53,11 +68,59 @@ def record_checks(results, now=None):
     for name, steps in results.items():
         steps = [step for step in steps if step is not None]
         if not steps or all(step.status == 'skipped' for step in steps): continue
-        entries[name] = {'checkedAt': at, 'steps': [{'name': step.name, 'status': step.status, 'detail': clean(step.detail or '', 200),
-                                                     'fix': clean(step.fix or '', 500)} for step in steps]}
+        entries[name] = {'checkedAt': at, 'steps': [_step(step.name, step.status, step.detail, step.fix) for step in steps]}
     if not entries: return
     try: _store(_path(CHECK_FILE), entries)
     except (OSError, ValueError, RuntimeError): pass
+
+
+def checked_entries(value):
+    """The `{devices: {name: {checkedAt, steps}}}` another device shares, validated and redacted; ValueError otherwise."""
+    devices = value.get('devices') if isinstance(value, dict) else None
+    if not isinstance(devices, dict) or len(devices) > 64: raise ValueError('checks must be {"devices": {name: entry}}')
+    out = {}
+    for name, entry in devices.items():
+        if not isinstance(name, str) or not registry.NAME.fullmatch(name): raise ValueError('invalid device name in checks')
+        if not isinstance(entry, dict) or type(entry.get('checkedAt')) is not int or entry['checkedAt'] < 0:
+            raise ValueError('checks need an integer checkedAt per device')
+        steps = entry.get('steps')
+        if not isinstance(steps, list) or len(steps) > 64: raise ValueError('checks need a list of steps per device')
+        rows = []
+        for step in steps:
+            if (not isinstance(step, dict) or not isinstance(step.get('name'), str) or not STEP_NAME.fullmatch(step['name'])
+                    or step.get('status') not in STATUSES
+                    or not all(isinstance(step.get(key, ''), str) for key in ('detail', 'fix'))):
+                raise ValueError('invalid step in checks')
+            rows.append(_step(step['name'], step['status'], step.get('detail'), step.get('fix')))
+        out[name] = {'checkedAt': entry['checkedAt'], 'steps': rows}
+    return out
+
+
+def merge_checks(value):
+    """`device receive-checks`: merge the results another device shares; per device the newest checkedAt wins. Returns
+    the names that changed; raises ValueError on input that is not a check result (nothing is written then)."""
+    return _store(_path(CHECK_FILE), checked_entries(value), newer=True)
+
+
+def share_checks(remotes, skip=()):
+    """Send this device's whole check cache to every other registry device it has an ssh target for (except `skip`, the
+    ones just found unreachable), so a device with no ssh back here still shows this one. Best effort, never raises:
+    {device: 'ok' | 'unreachable' | 'failed'}."""
+    try:
+        value, me = registry.load(), registry.self_name()
+        cached = _load(_path(CHECK_FILE))
+    except (OSError, ValueError, RuntimeError): return {}
+    peers = [row for row in value['devices'] if row['name'] != me and row.get('ssh') and row['name'] not in skip]
+    if not cached or not peers: return {}
+    payload = json.dumps({'devices': cached}, ensure_ascii=False, sort_keys=True).encode()
+
+    def send(row):
+        try:
+            done = remotes(row['ssh']).device('receive-checks', stdin=payload, timeout=PROBE_TIMEOUT)
+            return 'ok' if done.returncode == 0 else 'unreachable' if done.returncode == 255 else 'failed'
+        except Exception: return 'failed'
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(peers))) as pool:
+        return dict(zip([row['name'] for row in peers], pool.map(send, peers)))
 
 
 def _from_steps(steps):
@@ -67,6 +130,14 @@ def _from_steps(steps):
     if reachable is False: return {'reachable': False, 'poolRunning': None, 'versionMatches': None}
     if reachable is None or 'service' not in found or found.get('version') not in ('ok', 'missing'): return None
     return {'reachable': True, 'poolRunning': found['service'] == 'ok', 'versionMatches': found['version'] == 'ok'}
+
+
+def _facts(steps):
+    """What a check result says about reachable, pool and version, each None when it did not say."""
+    found = {step.get('name'): step.get('status') for step in steps}
+    return {'reachable': {'ok': True, 'unreachable': False}.get(found.get('reachable')),
+            'poolRunning': None if 'service' not in found else found['service'] == 'ok',
+            'versionMatches': {'ok': True, 'missing': False, 'failed': False}.get(found.get('version'))}
 
 
 class Board:
@@ -135,32 +206,39 @@ class Board:
         name, ssh = row['name'], row.get('ssh')
         checked = check.get('checkedAt') if isinstance(check.get('checkedAt'), int) else None
         steps = [step for step in check.get('steps') or [] if isinstance(step, dict)]
-        live = live or {'reachable': None, 'poolRunning': None, 'versionMatches': None}
-        if mine or (checked is not None and live.get('at') is not None and live['at'] * 1000 >= checked):
+        if live is None and checked is not None:
+            live = _facts(steps)  # no ssh from here: the result the device itself (or another peer) shared is all there is
+        if live is not None and checked is not None and (mine or live.get('at') is None or live['at'] * 1000 >= checked):
             steps = [step for step in steps if step.get('name') not in LIVE_STEPS]
-        issues = []  # (light, reason, fix) in the order they are found; the worst one leads
+        live = live or {'reachable': None, 'poolRunning': None, 'versionMatches': None}
+        issues = []  # (light, code, reason, fix) in the order they are found; the worst light leads
+        start_fix = 'claude-pool --start' if mine else 'claude-pool device add ' + str(ssh)
         if live.get('reachable') is False:
-            issues.append(('red', 'Not reachable over ssh.', 'ssh ' + str(ssh) + ' true must work without a password prompt (BatchMode)'))
+            issues.append(('red', 'unreachable', 'Not reachable over ssh.', 'ssh ' + str(ssh) + ' true must work without a password prompt (BatchMode)'))
         elif live.get('note') == 'slow':
-            issues.append(('amber', 'It did not answer within ' + str(PROBE_TIMEOUT) + ' s.', 'claude-pool device check ' + name))
-        elif not mine and not ssh and live.get('reachable') is None:
-            issues.append(('amber', 'Not checked from here: this machine has no ssh to it.', 'claude-pool device check ' + name + ' on that machine'))
-        if live.get('poolRunning') is False:
-            issues.append(('red', 'The pool is not running.', 'claude-pool --start' if mine else 'claude-pool device add ' + str(ssh)))
+            issues.append(('grey', 'not-checkable', 'It did not answer within ' + str(PROBE_TIMEOUT) + ' s.', 'claude-pool device check ' + name))
+        elif not mine and not ssh and checked is None:
+            issues.append(('grey', 'not-checkable', 'Not checked from here: this machine has no ssh to it and it shared no result yet.',
+                           'claude-pool device check ' + name + ' on that machine'))
+        if live.get('poolRunning') is False: issues.append(('red', 'pool-stopped', 'The pool is not running.', start_fix))
         if live.get('versionMatches') is False:
-            issues.append(('amber', 'It runs another claude-pool version.', 'claude-pool device add ' + str(ssh)))
+            issues.append(('amber', 'version-mismatch', 'It runs another claude-pool version.', 'claude-pool device add ' + str(ssh)))
         for step in steps:
-            status, label, detail = step.get('status'), step.get('name', 'step'), step.get('detail') or ''
-            if status in ('failed', 'unreachable'): issues.append(('red', label + ' failed: ' + detail, step.get('fix') or ''))
-            elif status == 'missing': issues.append(('amber', label + ' needs work: ' + detail, step.get('fix') or ''))
-            elif status == 'manual': issues.append(('amber', label + ' needs you: ' + detail, step.get('fix') or ''))
-        if checked is None and not issues and (mine or ssh):
-            issues.append(('amber', 'Never checked with claude-pool device check.', 'claude-pool device check ' + name))
+            status, label, detail, fix = step.get('status'), step.get('name', 'step'), step.get('detail') or '', step.get('fix') or ''
+            if status in ('ok', 'skipped'): continue
+            if label == 'reachable' and status == 'unreachable': issues.append(('red', 'unreachable', 'Not reachable over ssh.', fix))
+            elif label == 'service': issues.append(('red', 'pool-stopped', 'The pool is not running: ' + detail, fix or start_fix))
+            elif label == 'version' and status == 'missing': issues.append(('amber', 'version-mismatch', 'It runs another claude-pool version: ' + detail, fix))
+            elif status in ('failed', 'unreachable'): issues.append(('red', 'failed:' + label, label + ' failed: ' + detail, fix))
+            elif status == 'missing': issues.append(('amber', 'missing:' + label, label + ' needs work: ' + detail, fix))
+            elif status == 'manual': issues.append(('amber', 'manual:' + label, label + ' needs you: ' + detail, fix))
+        if checked is None and (mine or ssh):
+            issues.append(('grey', 'never-checked', 'Never checked with claude-pool device check.', 'claude-pool device check ' + name))
         worst = min(issues, key=lambda issue: RANK[issue[0]], default=None)
         return {'name': name, 'platform': row.get('platform') or '', 'self': mine, 'reachable': live.get('reachable'),
                 'poolRunning': live.get('poolRunning'), 'versionMatches': live.get('versionMatches'),
-                'light': worst[0] if worst else 'green', 'reason': clean(worst[1], 200) if worst else '',
-                'fix': clean(worst[2], 500) if worst else '', 'checkedAt': checked}
+                'light': worst[0] if worst else 'green', 'code': worst[1] if worst else 'ok',
+                'reason': clean(worst[2], 200) if worst else '', 'fix': clean(worst[3], 500) if worst else '', 'checkedAt': checked}
 
     # accounts --------------------------------------------------------------------------------------------------------
 

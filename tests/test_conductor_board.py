@@ -28,7 +28,8 @@ WANTED = 'src-1'
 MAC = {'name': 'mac', 'platform': 'darwin', 'roles': [], 'addedAt': 1}
 VPS = {'name': 'vps', 'ssh': 'justus@vps', 'platform': 'linux', 'roles': ['usage'], 'addedAt': 2}
 PI = {'name': 'pi', 'ssh': 'justus@pi', 'platform': 'linux', 'roles': [], 'addedAt': 3}
-MACHINE_KEYS = {'name', 'platform', 'self', 'reachable', 'poolRunning', 'versionMatches', 'light', 'reason', 'fix', 'checkedAt'}
+MACHINE_KEYS = {'name', 'platform', 'self', 'reachable', 'poolRunning', 'versionMatches', 'light', 'code', 'reason', 'fix', 'checkedAt'}
+CODE = r'^(ok|unreachable|pool-stopped|version-mismatch|never-checked|not-checkable|(failed|missing|manual):[a-z-]+)$'
 ACCOUNT_KEYS = {'name', 'label', 'alias', 'registryName', 'fiveHourPct', 'weekPct', 'fableWeekPct', 'resetsAt', 'reserveAt', 'kind',
                 'expiresAt', 'status'}
 
@@ -107,7 +108,8 @@ class ShapeTests(BoardBase):
         for row in value['machines']:
             self.assertEqual(set(row), MACHINE_KEYS)
             self.assertIsInstance(row['name'], str); self.assertIn(row['platform'], ('darwin', 'linux'))
-            self.assertIsInstance(row['self'], bool); self.assertIn(row['light'], ('green', 'amber', 'red'))
+            self.assertIsInstance(row['self'], bool); self.assertIn(row['light'], ('green', 'amber', 'red', 'grey'))
+            self.assertRegex(row['code'], CODE)
             for key in ('reachable', 'poolRunning', 'versionMatches'): self.assertIn(type(row[key]), (bool, type(None)))
             self.assertIsInstance(row['reason'], str); self.assertIsInstance(row['fix'], str)
             self.assertIn(type(row['checkedAt']), (int, type(None)))
@@ -152,21 +154,21 @@ class LightTests(BoardBase):
         value = self.snap()
         for name in ('mac', 'vps'):
             row = self.machine(value, name)
-            self.assertEqual((row['light'], row['reason'], row['fix']), ('green', '', ''), row)
+            self.assertEqual((row['light'], row['code'], row['reason'], row['fix']), ('green', 'ok', '', ''), row)
             self.assertEqual((row['reachable'], row['poolRunning'], row['versionMatches']), (True, True, True))
             self.assertEqual(row['checkedAt'], int(NOW * 1000))
 
     def test_unreachable_is_red_with_the_ssh_fix(self):
         self.peers['justus@vps'].code = 255
         row = self.machine(self.snap(NOW + 700), 'vps')
-        self.assertEqual((row['light'], row['reachable']), ('red', False))
+        self.assertEqual((row['light'], row['code'], row['reachable']), ('red', 'unreachable', False))
         self.assertIn('not reachable', row['reason'].lower())
         self.assertEqual(row['fix'], 'ssh justus@vps true must work without a password prompt (BatchMode)')
 
     def test_pool_not_running_is_red(self):
         self.peers['justus@vps'].service = 'stopped'
         row = self.machine(self.snap(NOW + 700), 'vps')
-        self.assertEqual((row['light'], row['poolRunning']), ('red', False))
+        self.assertEqual((row['light'], row['code'], row['poolRunning']), ('red', 'pool-stopped', False))
         self.assertIn('pool is not running', row['reason'])
         self.assertEqual(row['fix'], 'claude-pool device add justus@vps')
         self.service = 'stopped'
@@ -177,7 +179,7 @@ class LightTests(BoardBase):
         self.checked('vps', ('reachable', 'ok', 'ssh works'), ('doctor', 'failed', 'fail store mode', 'chmod 600 store'),
                      ('app', 'manual', 'add the SSH environment', 'open the Claude app'))
         row = self.machine(self.snap(), 'vps')
-        self.assertEqual(row['light'], 'red'); self.assertIn('doctor', row['reason']); self.assertIn('fail store mode', row['reason'])
+        self.assertEqual((row['light'], row['code']), ('red', 'failed:doctor')); self.assertIn('doctor', row['reason']); self.assertIn('fail store mode', row['reason'])
         self.assertEqual(row['fix'], 'chmod 600 store')
 
     def test_missing_or_manual_steps_are_amber(self):
@@ -185,7 +187,7 @@ class LightTests(BoardBase):
             with self.subTest(status=status):
                 self.checked('vps', ('reachable', 'ok', 'ssh works'), ('app', status, 'add the SSH environment', 'open the Claude app'))
                 row = self.machine(self.snap(), 'vps')
-                self.assertEqual((row['light'], row['fix']), ('amber', 'open the Claude app'))
+                self.assertEqual((row['light'], row['code'], row['fix']), ('amber', status + ':app', 'open the Claude app'))
                 self.assertIn('app', row['reason'])
 
     def test_live_facts_win_over_an_older_cached_check(self):
@@ -196,24 +198,55 @@ class LightTests(BoardBase):
     def test_another_version_is_amber(self):
         self.peers['justus@vps'].version = 'src-0'
         row = self.machine(self.snap(NOW + 700), 'vps')
-        self.assertEqual((row['light'], row['versionMatches'], row['fix']), ('amber', False, 'claude-pool device add justus@vps'))
+        self.assertEqual((row['light'], row['code'], row['versionMatches'], row['fix']),
+                         ('amber', 'version-mismatch', False, 'claude-pool device add justus@vps'))
 
-    def test_a_slow_answer_is_amber_not_unreachable(self):
+    def test_a_slow_answer_is_grey_not_unreachable(self):
         self.peers['justus@vps'].code, self.peers['justus@vps'].stderr = 255, b'timed out'
         row = self.machine(self.snap(NOW + 700), 'vps')
-        self.assertEqual((row['light'], row['reachable']), ('amber', None)); self.assertIn('did not answer', row['reason'])
+        self.assertEqual((row['light'], row['code'], row['reachable']), ('grey', 'not-checkable', None))
+        self.assertIn('did not answer', row['reason'])
 
-    def test_never_checked_is_amber_with_the_check_command(self):
+    def test_never_checked_is_grey_with_the_check_command(self):
         self.devices(PI)
         row = self.machine(self.snap(), 'pi')
-        self.assertEqual((row['light'], row['checkedAt'], row['fix']), ('amber', None, 'claude-pool device check pi'))
+        self.assertEqual((row['light'], row['code'], row['checkedAt'], row['fix']), ('grey', 'never-checked', None, 'claude-pool device check pi'))
+        self.peers['justus@pi'].service = 'stopped'
+        row = self.machine(self.snap(NOW + 700), 'pi')  # a live problem still outranks never checked
+        self.assertEqual((row['light'], row['code']), ('red', 'pool-stopped'))
 
-    def test_a_device_without_ssh_from_here_is_amber_and_never_probed(self):
+    def test_a_device_without_ssh_from_here_is_grey_and_never_probed(self):
         registry.set_self('vps', settings.SELF)
         (settings.RUNTIME / cb.CHECK_FILE).unlink()
         row = self.machine(self.snap(), 'mac')
-        self.assertEqual((row['light'], row['reachable']), ('amber', None)); self.assertIn('no ssh', row['reason'].lower())
+        self.assertEqual((row['light'], row['code'], row['reachable']), ('grey', 'not-checkable', None))
+        self.assertIn('no ssh', row['reason'].lower())
         self.assertEqual(self.ssh_count(), 0)
+
+    def test_a_shared_result_lights_a_device_this_machine_cannot_reach(self):
+        registry.set_self('vps', settings.SELF)
+        (settings.RUNTIME / cb.CHECK_FILE).unlink()
+        steps = [{'name': 'reachable', 'status': 'ok', 'detail': 'this device', 'fix': ''},
+                 {'name': 'version', 'status': 'ok', 'detail': WANTED, 'fix': ''},
+                 {'name': 'service', 'status': 'ok', 'detail': 'running', 'fix': ''},
+                 {'name': 'app', 'status': 'manual', 'detail': 'add the SSH environment', 'fix': 'open the Claude app'}]
+        self.assertEqual(cb.merge_checks({'devices': {'mac': {'checkedAt': int(NOW * 1000) - 5000, 'steps': steps}}}), ['mac'])
+        row = self.machine(self.snap(), 'mac')
+        self.assertEqual((row['light'], row['code'], row['reachable'], row['poolRunning'], row['versionMatches']),
+                         ('amber', 'manual:app', True, True, True))
+        self.assertEqual(row['checkedAt'], int(NOW * 1000) - 5000)
+        steps[3]['status'] = 'ok'
+        cb.merge_checks({'devices': {'mac': {'checkedAt': int(NOW * 1000), 'steps': steps}}})
+        row = self.machine(self.snap(), 'mac')
+        self.assertEqual((row['light'], row['code']), ('green', 'ok'))
+        self.assertEqual(self.ssh_count(), 0)
+
+    def test_this_machines_own_row_stays_live_after_a_shared_result(self):
+        steps = [{'name': 'reachable', 'status': 'ok', 'detail': 'ssh works', 'fix': ''},
+                 {'name': 'service', 'status': 'missing', 'detail': 'service is stopped', 'fix': 'claude-pool device add mac'}]
+        cb.merge_checks({'devices': {'mac': {'checkedAt': int(NOW * 1000) + 1000, 'steps': steps}}})
+        row = self.machine(self.snap(), 'mac')
+        self.assertEqual((row['light'], row['code'], row['poolRunning']), ('green', 'ok', True))
 
 
 class CacheTests(BoardBase):
@@ -246,6 +279,39 @@ class CacheTests(BoardBase):
         text = path.read_text(); self.assertNotIn(token, text)
         entry = json.loads(text)['devices']['vps']
         self.assertEqual(entry['checkedAt'], int(NOW * 1000)); self.assertEqual(entry['steps'][0]['status'], 'failed')
+
+    def test_merge_keeps_the_newest_result_per_device_and_refuses_bad_input(self):
+        token = fixture_token()
+        old = {'checkedAt': 1000, 'steps': [{'name': 'doctor', 'status': 'failed', 'detail': 'x', 'fix': 'y'}]}
+        new = {'checkedAt': 2000, 'steps': [{'name': 'doctor', 'status': 'ok', 'detail': 'no findings ' + token, 'fix': ''}]}
+        self.assertEqual(cb.merge_checks({'devices': {'vps': new}}), ['vps'])
+        self.assertEqual(cb.merge_checks({'devices': {'vps': old}}), [])
+        path = settings.RUNTIME / cb.CHECK_FILE
+        entry = json.loads(path.read_text())['devices']['vps']
+        self.assertEqual((entry['checkedAt'], entry['steps'][0]['status']), (2000, 'ok'))
+        self.assertNotIn(token, path.read_text()); self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        for bad in ({}, {'devices': []}, {'devices': {'Bad Name': new}}, {'devices': {'vps': {'checkedAt': 'x', 'steps': []}}},
+                    {'devices': {'vps': {'checkedAt': 3000, 'steps': [{'name': 'doctor', 'status': 'great', 'detail': '', 'fix': ''}]}}},
+                    {'devices': {'vps': {'checkedAt': 3000, 'steps': 'no'}}}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError): cb.merge_checks(bad)
+        self.assertEqual(json.loads(path.read_text())['devices']['vps']['checkedAt'], 2000)
+
+    def test_share_sends_the_cache_to_every_reachable_peer_once(self):
+        self.devices(MAC, VPS, PI)
+        self.checked('mac', ('reachable', 'ok', 'this device'))
+        self.checked('vps', ('reachable', 'ok', 'ssh works'))
+        sent = []
+        class Receiver(Peer):
+            def device(peer, *args, stdin=None, timeout=120):
+                sent.append((args, json.loads(stdin), timeout)); return Completed(0, b'{}', b'')
+        self.peers = {'justus@vps': Receiver(), 'justus@pi': Receiver()}
+        results = cb.share_checks(lambda target: self.peers[target], skip=('pi',))
+        self.assertEqual(results, {'vps': 'ok'})
+        (args, payload, timeout), = sent
+        self.assertEqual(args, ('receive-checks',)); self.assertEqual(set(payload['devices']), {'mac', 'vps'})
+        self.assertLessEqual(timeout, cb.PROBE_TIMEOUT)
+        self.peers['justus@vps'] = Peer(code=255)
+        self.assertEqual(cb.share_checks(lambda target: self.peers[target]), {'vps': 'unreachable', 'pi': 'ok'})
 
     def test_budget_under_five_seconds_with_cached_machines(self):
         self.devices(MAC, VPS, PI)
@@ -379,7 +445,9 @@ class QueueTests(BoardBase):
         code, out, err = self.run_cli('tell', '--help')
         self.assertIn('--list', out); self.assertIn('--cancel', out)
         docs = (ROOT / 'docs/DEVICES.md').read_text()
-        for words in ('tell --list [--json]', 'tell --cancel <id>', '`machines`', '`accounts`', '`quickAccess`', '`queue`', '`generatedAt`'):
+        for words in ('tell --list [--json]', 'tell --cancel <id>', '`machines`', '`accounts`', '`quickAccess`', '`queue`', '`generatedAt`',
+                      '`queued for <session>/<agent> (id <id>)`', '`grey`', '`never-checked`', '`not-checkable`', '`manual:<step>`',
+                      '`device receive-checks`'):
             self.assertIn(words, docs)
 
 
