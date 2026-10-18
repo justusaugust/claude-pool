@@ -20,7 +20,7 @@ import device_sync
 from fakes import FakeRemote
 from remote import Completed
 
-TOOL_SHA = 'a438b2b2d9be03093528ea9b36a695a0cd84d13acd05dd1e0400365a476ed8d9'
+TOOL_SHA = '816678a1f5c50db711feac2a813d7e1cf3c409d0d20d290023040324ba97b79d'
 PREVIOUS_SHA = 'b3e645e7ba9750057b68c12f7dd518d19ff792a98062eeea857115b194358d94'  # the copy live on the VPS
 FIRST_FILE_SHARE_SHA = '89c880b1411939c7996239273e28aa51399a1dca1cd56e387754e82e235faabe'  # Task 16's first release
 BEFORE_HOST_CHECK_SHA = '7894d83a893ab63cc07ec07244b910ae8fce1949b080ba355a3b08f6e3903efd'  # the release before the Host check

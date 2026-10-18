@@ -334,7 +334,8 @@ class RestoreTests(Base):
         code, out, _ = self.main(["restore"], fake)
         self.assertEqual(code, 0)
         self.assertIn("nothing to restore", out)
-        self.assertFalse([a for a in fake.argvs()[commands:] if a[:2] == ["systemctl", "--user"]])
+        # Only queries (is the old Cua viewer still there?); nothing is started, stopped or written again.
+        self.assertFalse([a for a in fake.argvs()[commands:] if a[:2] == ["systemctl", "--user"] and a[2] != "is-active"])
         self.assertEqual({name: unit_text(fake, name) for name in unit_files(fake)}, files)
 
     def test_restore_with_no_previews(self):
@@ -410,6 +411,40 @@ class DoctorTests(Base):
         (fake.unit_dir() / f"preview-file-{port}.service").unlink()
         self.assertIn(port, self.doctor_line(fake))
         self.assertEqual(self.doctor_line(fake).split()[1], "no")
+
+
+class LegacyViewerTests(Base):
+    """Two earlier releases ran `cua viewer` as the transient unit preview-cua-viewer.service on 127.0.0.1:18500 with a key
+    file; until a reboot it holds the index port. Every command that owns the Cua share stops it and drops its key."""
+
+    def legacy(self):
+        fake = tpc.CuaSystem(operator=True, serve_allowed=True)
+        fake.active["preview-cua-viewer.service"] = ("127.0.0.1", pv.CUA_PORT)
+        fake.transient["preview-cua-viewer.service"] = TRANSIENT + "preview-cua-viewer.service"
+        key = Path(os.environ["PREVIEW_STATE_DIR"]) / "cua" / "viewer.key"
+        key.parent.mkdir(parents=True)
+        key.write_text("k" * 40)
+        key.chmod(0o600)
+        return fake, key
+
+    def test_every_cua_owning_command_stops_the_old_viewer_and_drops_its_key(self):
+        for argv in (["stop", "--all"], ["stop", "cua"], ["restore"], ["cua"]):
+            with self.subTest(argv=argv):
+                self.setUp()
+                fake, key = self.legacy()
+                code, out, err = self.main(argv, fake)
+                self.assertNotIn("preview-cua-viewer.service", fake.active, argv)
+                self.assertIn(["preview-cua-viewer.service"], systemctl(fake, "stop"))
+                self.assertFalse(key.exists())
+                self.assertIn("preview-cua-viewer.service", out + err)
+                if argv == ["cua"]:
+                    self.assertEqual(code, 0, err)
+                    self.assertEqual(fake.active[pv.CUA_UNIT], ("127.0.0.1", pv.CUA_PORT))
+
+    def test_nothing_happens_without_the_old_viewer(self):
+        fake = tpc.CuaSystem(operator=True, serve_allowed=True)
+        self.main(["stop", "--all"], fake)
+        self.assertNotIn(["preview-cua-viewer.service"], systemctl(fake, "stop"))
 
 
 class ServeTests(unittest.TestCase):

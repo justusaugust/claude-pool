@@ -36,6 +36,7 @@ TAILNET_NETS = (ipaddress.ip_network("100.64.0.0/10"), ipaddress.ip_network("fd7
 EXIT_CONFIG = 78  # systemd does not restart on this exit status (RestartPreventExitStatus)
 CUA_PORT = 18500  # `preview cua`: the index of Cua desktops on 127.0.0.1:18500, shared as https://<vps>:18500
 CUA_UNIT = "preview-cua-index.service"
+LEGACY_CUA_UNIT = "preview-cua-viewer.service"  # `cua viewer` of two earlier releases: a transient unit plus a key file
 CUA_SPACE_PORTS = range(18501, 18600)  # one share per Cua desktop (Space)
 CUA_LABEL = "Cua desktops"
 
@@ -1938,6 +1939,29 @@ def cua_space_of(entry):
                 and entry.get("upstream") == space_upstream(*address) and entry.get("owner_login"))
 
 
+def legacy_cua_key():
+    return state_dir() / "cua" / "viewer.key"
+
+
+def stop_legacy_viewer(sysm, out):
+    """Stop the Cua viewer an earlier release ran (preview-cua-viewer.service on 127.0.0.1:18500, transient, so only a
+    reboot would end it) and delete its key file. True when there was one; nothing else is touched."""
+    running = sysm.unit_state(LEGACY_CUA_UNIT) in ("active", "activating", "deactivating", "reloading", "failed")
+    if running:
+        sysm.unit_stop(LEGACY_CUA_UNIT)
+    key = legacy_cua_key()
+    had_key = key.is_file() or key.is_symlink()
+    if had_key:
+        try:
+            key.unlink()
+            key.parent.rmdir()  # only when empty; the current release keeps nothing there
+        except OSError:
+            pass
+    if running or had_key:
+        print(f"stopped {LEGACY_CUA_UNIT} (the Cua viewer of an earlier release) and removed its key file", file=out)
+    return running or had_key
+
+
 def stop_share(sysm, entry):
     """Stop a preview, and for a file share also its file server, for the Cua desktops index also its server."""
     stop_entry(sysm, entry)
@@ -1954,11 +1978,14 @@ def stopped_line(entry):
 def cmd_stop(sysm, port=None, all_=False, out=None, err=None, path=None, cua=False):
     out, err = out or sys.stdout, err or sys.stderr
     if cua:
+        legacy = stop_legacy_viewer(sysm, out)
         index = load_state(CUA_PORT)
         entries = ([index] if index and cua_unit_of(index) else []) + [e for e in all_states() if cua_space_of(e)]
         if not entries:
             if sysm.unit_state(CUA_UNIT) == "active" or sysm.has_unit_file(CUA_UNIT):  # an index left without its link
                 sysm.unit_stop(CUA_UNIT)
+            if legacy:
+                return 0
             print("preview: no Cua desktops share running (see preview list)", file=err)
             return 1
         for entry in entries:
@@ -1966,6 +1993,7 @@ def cmd_stop(sysm, port=None, all_=False, out=None, err=None, path=None, cua=Fal
             print(stopped_line(entry), file=out)
         return 0
     if all_:
+        legacy = stop_legacy_viewer(sysm, out)
         entries = all_states()
         for e in entries:
             stop_share(sysm, e)
@@ -1974,7 +2002,7 @@ def cmd_stop(sysm, port=None, all_=False, out=None, err=None, path=None, cua=Fal
         for unit in orphans:
             sysm.unit_stop(unit)
             print(printable(f"stopped {unit} (no preview recorded it)"), file=out)
-        if not entries and not orphans:
+        if not entries and not orphans and not legacy:
             print("no previews running", file=out)
         left = sysm.own_unit_files()
         if left:
@@ -2193,6 +2221,7 @@ def cmd_restore(sysm, out=None, err=None):
     """Give every recorded preview without a unit file one (stop the transient unit, write, enable, start). Ports and
     links stay as recorded; the Tailscale Serve entries are kept by tailscaled and not touched."""
     out, err = out or sys.stdout, err or sys.stderr
+    stop_legacy_viewer(sysm, out)  # it would hold the index port that the Cua share comes back on
     restored, failed = 0, 0
     for entry in all_states():
         missing = [u for u in entry_units(entry) if not sysm.has_unit_file(u)]
@@ -2286,6 +2315,7 @@ def cua_index_argv(sysm, cua):
 
 def cmd_cua(sysm, label=None, out=None, err=None):
     out, err = out or sys.stdout, err or sys.stderr
+    stop_legacy_viewer(sysm, err)  # it holds 127.0.0.1:18500 until a reboot; stdout stays the one link
     try:
         plan = cua_plan(sysm, label)
     except CuaRefused as e:
