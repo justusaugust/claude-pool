@@ -48,7 +48,9 @@ CHECK_HELP = {
     'linger': ('Linux services survive logout (macOS: skipped)', 'claude-pool device add <ssh-target> tries it without root; if it stays failed, a root user runs sudo loginctl enable-linger <user> on the device'),
     'shell': ('the claude shell function sends claude through the pool', 'claude-pool device add <ssh-target>'),
     'accounts': ('registry, token fingerprints, reserve settings and account health match', 'claude-pool device sync; claude-pool device sync --force-registry on the device whose list is right; claude-pool account add <email> --long-lived --replace --name <name> on the device that first enrolled it, then device sync; claude-pool account reserve <name> --at <pct>; claude-pool device switch; ok with a name hint: claude-pool account rename <local-name> <registry-name> on that device'),
-    'service': ('the pool service is running', 'claude-pool device add <ssh-target>; or ssh <ssh-target> .local/bin/claude-pool --start'),
+    'service': ('the pool service is running the current program (stale: launchd still runs the one from before an update)',
+                'claude-pool device add <ssh-target>; or ssh <ssh-target> .local/bin/claude-pool --start; stale, when no task runs: '
+                + device_install.restart_fix('<ssh-target>')),
     'doctor': ('claude-pool doctor on the device reports nothing', 'run ssh <device> .local/bin/claude-pool doctor and apply the fix it prints'),
     'native-login': ('Native Claude is logged in to an account the pool serves', 'claude-pool device add <ssh-target> and click Authorize; claude-native auth status if it cannot be read'),
     'herdr': ('this machine has a herdr profile for the device', 'herdr machine add <ssh-target> --label <name>'),
@@ -768,11 +770,15 @@ def ensure_accounts(t):
     return check_accounts(t)
 
 
-def check_service(t): return device_install.check_service(t.remote) if t.supported else t.needs_install('service')
+def check_service(t):
+    if not t.supported: return t.needs_install('service')
+    return device_install.check_service(t.remote, None if t.mine else t.where)
 
 
 def ensure_service(t):
     if not t.supported: return t.needs_install('service')
+    step = check_service(t)
+    if step.detail.startswith('stale'): return step  # --start never reloads a running daemon; a restart would cut running tasks
     step = device_install.start_service(t.remote, t.where)
     t.forget()
     return step
@@ -1026,6 +1032,8 @@ def check_readings(t):
     if owner is None: return Step('readings', 'skipped', 'no usage owner')
     if owner['name'] == t.row['name']: return Step('readings', 'skipped', 'this device is the usage owner')
     if not t.supported: return t.needs_install('readings')
+    if t.status().get('serviceStale') is True:
+        return Step('readings', 'skipped', 'the pool there runs a program from before the last update; see the service step')
     at = t.status().get('sharedReadingsAt')
     now, reach = int(time.time() * 1000), owner.get('ssh') or owner['name']
     if not isinstance(at, int):

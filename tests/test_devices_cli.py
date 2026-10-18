@@ -714,6 +714,7 @@ class Machine:
         self.conductor = conductor_part or {'installed': False, 'running': False, 'ready': False, 'fresh': False, 'duplicates': []}
         self.switch_pending, self.herdr = list(switch_pending), herdr
         self.label, self.unit_loaded = label, True
+        self.service_stale = False
         self.fail = set()  # e.g. {'shell add'}
         self.calls = []
         machine = self
@@ -738,6 +739,7 @@ class Machine:
             if n in self.uuids: rows[-1].update(userId=self.uuids[n][0], organizationId=self.uuids[n][1])
         known = self.registry or registry.EMPTY()
         return {'name': self.self_name, 'version': self.version, 'platform': self.platform, 'service': self.service,
+                'serviceStale': self.service_stale,
                 'accounts': rows, 'switchPending': self.switch_pending, 'registryGeneration': known['generation'],
                 'registryHash': registry.digest(known), 'linger': self.linger == 'yes', 'shell': self.shell,
                 'nativeLogin': {'email': self.login['email'], 'organization': self.login['orgName']} if self.login else None,
@@ -1587,6 +1589,21 @@ class FixRoundCheckTests(OrchestrationBase):
         code, out, _ = self.cli('check', 'vps')
         self.assertEqual(code, 2)
         self.assertRegex(out, r'\n  failed +readings +the usage readings from mac have no row for team.*\n      fix: .*account add team@x\.de --name team')
+
+    def test_a_daemon_on_an_older_program_is_stale_and_readings_wait_for_it(self):
+        # launchd still runs the program from before an update (no readings Puller); ssh is not the problem.
+        self.vps.service_stale = True; self.vps.shared_at = int(time.time() * 1000) - 20 * 60_000
+        restart = "ssh alex@vps '.local/bin/claude-pool --stop && .local/bin/claude-pool --start'"
+        code, out, _ = self.cli('check', 'vps')
+        self.assertEqual(code, 2)
+        self.assertRegex(out, r'\n  failed +service +stale: .*\n      fix: ' + re.escape(restart) + '\n')
+        self.assertRegex(out, r'\n  skipped +readings +.*service')
+        self.assertNotIn('BatchMode', out)
+        self.log.clear()
+        code, out, _ = self.cli('add', 'alex@vps', '--name', 'vps')
+        self.assertEqual(code, 2)
+        self.assertEqual([argv for argv, _ in self.vps.calls if '--start' in argv], [])  # a restart would cut running tasks
+        self.assertIn(restart, out)
 
     def test_doctor_fixes_are_run_on_the_device(self):
         self.vps.doctor = False

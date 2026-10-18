@@ -484,8 +484,32 @@ class DeviceSyncTests(unittest.TestCase):
         self.assertEqual((team['kind'], team['active']), ('long-lived', False))
         self.assertEqual(len(team['fingerprint']), 12)
         self.assertIn(status['service'], ('running', 'stopped', 'missing'))
+        self.assertIn(status['serviceStale'], (True, False))
         self.assertEqual(team['servingFingerprint'], None)
         SecretWatch(fixture_token()).text(json.dumps(status))
+
+    def test_service_is_stale_while_launchd_runs_other_arguments_than_the_plist(self):
+        # An update rewrote the plist, but a running daemon is never reloaded: it keeps the old program (no readings Puller).
+        import plistlib, service
+        printed = ('gui/501/io.github.claude-pool = {{\n\tstate = {state}\n\targuments = {{\n{arguments}\t}}\n'
+                   '\tendpoints = {{\n\t\t"x" = {{\n\t\t\tstate = running\n\t\t}}\n\t}}\n}}\n')
+        current = ['/opt/homebrew/bin/python3', '/h/.local/share/claude-pool/run.py', '--daemon']
+        with tempfile.TemporaryDirectory() as folder, patch.object(service.sys, 'platform', 'darwin'):
+            plist = Path(folder) / 'io.github.claude-pool.plist'
+            plist.write_bytes(plistlib.dumps({'Label': 'io.github.claude-pool', 'ProgramArguments': current}))
+            def stale(state, arguments, code=0):
+                text = printed.format(state=state, arguments=''.join('\t\t' + a + '\n' for a in arguments))
+                run = Mock(return_value=Mock(returncode=code, stdout=text, stderr=''))
+                with patch.object(device_sync.service, 'service_file', return_value=plist):
+                    value = device_sync.service_stale(run=run)
+                self.assertEqual(run.call_args.args[0][:2], ['launchctl', 'print'])
+                return value
+            self.assertTrue(stale('running', ['/opt/homebrew/bin/python3', '/old/pool-gateway/launch.py', '--daemon']))
+            self.assertFalse(stale('running', current))
+            self.assertFalse(stale('not running', ['/old/launch.py', '--daemon']))  # --start reloads a stopped job itself
+            self.assertFalse(stale('running', ['/old/launch.py'], code=113))  # not loaded: nothing to tell
+        with patch.object(service.sys, 'platform', 'linux'):
+            self.assertFalse(device_sync.service_stale(run=Mock(side_effect=AssertionError('never asked on Linux'))))
 
 
 class OnChangeTests(unittest.TestCase):

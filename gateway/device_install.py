@@ -119,9 +119,22 @@ def install(remote, archive, native):
     return Step('install', 'ok', 'installed from this checkout', None)
 
 
-def check_service(remote):
+RESTART = 'claude-pool --stop && claude-pool --start'
+
+
+def restart_fix(target=None):
+    """The restart that makes a stale daemon (an older program than its service file) load the current one; on another
+    device both launchers are named by their home-relative path inside one quoted ssh command."""
+    if target is None: return RESTART
+    return 'ssh ' + target + " '.local/bin/claude-pool --stop && .local/bin/claude-pool --start'"
+
+
+def check_service(remote, target=None):
     done, value = _status(remote)
     state = value.get('service') if value else None
+    if state == 'running' and value.get('serviceStale') is True:
+        return Step('service', 'failed', 'stale: launchd still runs the program from before the last update; restart the pool '
+                    'when no task is running', restart_fix(target))
     if state == 'running': return Step('service', 'ok', 'running', None)
     return Step('service', 'missing', 'service is ' + (state or 'unknown'), 'claude-pool device add ' + remote.name)
 

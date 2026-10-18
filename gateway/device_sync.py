@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 import time
 import urllib.error
@@ -74,6 +75,24 @@ def service_state():
         if not service.service_file(label).exists() and not settings.RUNTIME.exists(): return 'missing'
         return 'running' if service.loaded(label) else 'stopped'
     except (OSError, ValueError, RuntimeError): return 'missing'
+
+
+def service_stale(run=None):
+    """macOS: True while launchd runs other program arguments than the service file says. An update rewrites the plist, but
+    a running daemon is never reloaded (it would cut running tasks), so it keeps the old program, for example one without the
+    readings Puller. False when they match, when the job does not run, on Linux, or when it cannot be told."""
+    try:
+        if service.platform() != 'darwin': return False
+        label = service_label()
+        path = service.service_file(label)
+        if not path.is_file(): return False
+        wanted = service.load(path.read_bytes()).get('ProgramArguments')
+        done = (run or subprocess.run)(['launchctl', 'print', 'gui/' + str(os.getuid()) + '/' + label],
+                                       capture_output=True, text=True, timeout=10)
+        if done.returncode: return False
+        job = service.launchd_job(done.stdout)
+        return bool(job['running'] and isinstance(wanted, list) and job['arguments'] is not None and job['arguments'] != wanted)
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError): return False
 
 
 def pool_overview():
@@ -151,6 +170,7 @@ def status():
     """Non-secret state of this device: fingerprints only, never a token."""
     known = registry.load()
     value = {'name': registry.self_name(), 'version': build_version(), 'platform': service.platform(), 'service': service_state(),
+             'serviceStale': service_stale(),
              'accounts': account_rows(), 'switchPending': switch_pending(settings.STORES, settings.LONG_LIVED, known, registry.self_name()),
              'registryGeneration': known['generation'], 'registryHash': registry.digest(known), 'serviceLabel': service_label()}
     for part in STATUS_PARTS: value.update(part())
