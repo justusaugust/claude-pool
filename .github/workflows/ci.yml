@@ -108,3 +108,51 @@ jobs:
           test ! -e "$CARGO_TARGET_DIR/release/shunt"
           python3 scripts/smoke_install_update.py --native-claude "$RUNNER_TEMP/claude-code/node_modules/.bin/claude"
           test ! -e "$CARGO_TARGET_DIR/release/shunt"
+
+  required-python-311:
+    name: Python 3.11
+    needs: python
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every matrix leg of python to pass
+        env:
+          RESULT: ${{ needs.python.result }}
+        run: test "$RESULT" = success
+
+  required-python-314:
+    name: Python 3.14
+    needs: python
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every matrix leg of python to pass
+        env:
+          RESULT: ${{ needs.python.result }}
+        run: test "$RESULT" = success
+
+  required-mods:
+    name: Native Mod fixtures
+    needs: mods
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every matrix leg of mods to pass
+        env:
+          RESULT: ${{ needs.mods.result }}
+        run: test "$RESULT" = success
+
+  required-install:
+    name: Clean install and update
+    needs: install
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every matrix leg of install to pass
+        env:
+          RESULT: ${{ needs.install.result }}
+        run: test "$RESULT" = success
