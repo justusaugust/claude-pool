@@ -333,12 +333,13 @@ class LaunchTests(unittest.TestCase):
         self.assertEqual(cli.call_args.args[0], ['remove', 'x'])
         self.assertTrue(callable(kwargs['native_identity']))
 
-    def launch_remove(self, request, loaded):
+    def launch_remove(self, request, loaded, client_token=True):
         import launch
         with tempfile.TemporaryDirectory() as folder:
             stores = Path(folder)
-            fd = os.open(stores / '.pool-client-token', os.O_WRONLY | os.O_CREAT, 0o600)
-            with os.fdopen(fd, 'w') as file: file.write('fixture-client-token-' + 'x' * 32 + '\n')
+            if client_token:
+                fd = os.open(stores / '.pool-client-token', os.O_WRONLY | os.O_CREAT, 0o600)
+                with os.fdopen(fd, 'w') as file: file.write('fixture-client-token-' + 'x' * 32 + '\n')
             with patch.object(launch.sys, 'argv', ['claude-pool', 'account', 'remove', 'x']), \
                  patch.object(launch, 'STORES', stores), patch.object(launch, 'request', side_effect=request), \
                  patch.object(launch.service, 'loaded', return_value=loaded), \
@@ -351,6 +352,10 @@ class LaunchTests(unittest.TestCase):
     def test_launch_keeps_the_check_when_the_running_pool_does_not_answer(self):
         idle = self.launch_remove(OSError('no answer'), loaded=True)
         self.assertIs(idle, False)
+
+    def test_launch_keeps_the_check_when_the_running_pool_has_no_client_token(self):
+        self.assertIs(self.launch_remove(OSError('no answer'), loaded=True, client_token=False), False)
+        self.assertIsNone(self.launch_remove(OSError('no answer'), loaded=False, client_token=False))
 
     def test_launch_skips_the_check_only_when_the_pool_is_not_running(self):
         self.assertIsNone(self.launch_remove(OSError('no answer'), loaded=False))

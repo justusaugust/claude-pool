@@ -352,14 +352,15 @@ class RemoveUnderLocalNameTests(RenameBase):
 
 
 class LaunchTests(unittest.TestCase):
-    def launch_rename(self, request, loaded, argv=('rename', 'team', NEW), marker=False):
+    def launch_rename(self, request, loaded, argv=('rename', 'team', NEW), marker=False, client_token=True):
         import launch, devices_cli
         with tempfile.TemporaryDirectory() as folder:
             stores = Path(folder) / 'stores'; stores.mkdir()
             runtime = Path(folder) / 'runtime'; runtime.mkdir()
             if marker: (runtime / 'maintenance').write_text('Deliberately stopped\n')  # what `claude-pool --stop` leaves
-            fd = os.open(stores / '.pool-client-token', os.O_WRONLY | os.O_CREAT, 0o600)
-            with os.fdopen(fd, 'w') as file: file.write('fixture-client-token-' + 'x' * 32 + '\n')
+            if client_token:
+                fd = os.open(stores / '.pool-client-token', os.O_WRONLY | os.O_CREAT, 0o600)
+                with os.fdopen(fd, 'w') as file: file.write('fixture-client-token-' + 'x' * 32 + '\n')
             def refused(*args, **kwargs): raise ConnectionRefusedError()  # no pool port answers; the real ports are never asked
             with patch.object(launch.sys, 'argv', ['claude-pool', 'account', *argv]), \
                  patch.object(launch, 'STORES', stores), patch.object(launch, 'request', side_effect=request), \
@@ -369,7 +370,9 @@ class LaunchTests(unittest.TestCase):
                 with self.assertRaises(SystemExit): launch.main()
                 kwargs = cli.call_args.kwargs
                 overview = kwargs['overview']
-                return kwargs, overview and routing.wait_idle(overview, 'team', False)
+                idle = overview and routing.wait_idle(overview, 'team', False)
+                self.assertEqual((stores / '.pool-client-token').exists(), client_token)  # the check never mints a token
+                return kwargs, idle
 
     def test_a_pool_stopped_with_stop_is_stopped_although_its_service_is_loaded(self):
         import service
@@ -395,6 +398,11 @@ class LaunchTests(unittest.TestCase):
 
     def test_a_running_pool_that_does_not_answer_counts_as_busy(self):
         self.assertIs(self.launch_rename(OSError('no answer'), loaded=True)[1], False)
+
+    def test_a_running_pool_without_a_client_token_counts_as_busy(self):
+        # The service manager says the pool runs: without its token nobody can ask it, so files never move under it.
+        self.assertIs(self.launch_rename(OSError('no answer'), loaded=True, client_token=False)[1], False)
+        self.assertIsNone(self.launch_rename(OSError('no answer'), loaded=False, client_token=False)[1])
 
     def test_a_stopped_pool_has_no_overview(self):
         self.assertIsNone(self.launch_rename(OSError('no answer'), loaded=False)[1])

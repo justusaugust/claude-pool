@@ -514,14 +514,17 @@ def main():
             if len(argv) != 1: raise RuntimeError('Usage: claude login <name>, or claude account add <email>')
             argv = ['add', '--name', argv[0]]
         def overview():
+            # Never mints a client token: a pool running without one cannot be asked, which counts as busy below.
+            if not (STORES / '.pool-client-token').is_file(): raise OSError('No pool client token')
             return json.loads(request(token('.pool-client-token'), path='/pool/overview'))
-        live = bool(argv) and argv[0] in ('add', 'remove', 'rename') and '--help' not in argv and '-h' not in argv and (STORES / '.pool-client-token').is_file()
+        checked = bool(argv) and argv[0] in ('add', 'remove', 'rename') and '--help' not in argv and '-h' not in argv
         try:
-            if not live: raise OSError('No live readiness check needed')
+            if not checked: raise OSError('No live readiness check needed')
             overview(); available = True
         except (OSError, RuntimeError, ValueError):
-            # remove and rename never skip their in-flight check while the service runs: an unanswered overview counts as busy.
-            available = live and argv[0] in ('remove', 'rename') and service.loaded(SERVICE_LABEL)
+            # remove and rename never skip their in-flight check while the service runs (as the service manager reports
+            # it, with or without a client token file): an unanswered overview counts as busy.
+            available = checked and argv[0] in ('remove', 'rename') and service.loaded(SERVICE_LABEL)
             if available and argv[0] == 'rename':
                 # A pool stopped with `claude-pool --stop` keeps its unit loaded (launchd) or enabled (systemd): the
                 # maintenance marker plus no answering pool port decide that it is stopped, as device remove does.
