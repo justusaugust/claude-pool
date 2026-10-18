@@ -358,7 +358,7 @@ class TwoDeviceTests(cli_base.OrchestrationBase):
         code, out, err = self.cli('check', 'vps')
         line = next(l for l in out.splitlines() if l.strip().startswith('ok') and ' accounts ' in l)
         self.assertIn('team (registry: ai-vaerk-team-premium)', line)
-        self.assertIn('fix: ssh justus@vps .local/bin/claude-pool account rename team ai-vaerk-team-premium', out)
+        self.assertIn('fix: ssh justus@vps .local/bin/claude-pool account rename team ai-vaerk-team-premium --wait', out)
 
     def test_a_refused_usage_owner_names_both_names(self):
         self.vps.refreshable = set(VPS_NAMES[1:])  # `team` only long-lived there

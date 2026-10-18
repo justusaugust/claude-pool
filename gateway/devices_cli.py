@@ -695,7 +695,7 @@ def check_accounts(t):
     if renames:
         fine += '; ' + ', '.join(local + ' (registry: ' + name + ')' for local, name in renames)
         if not issues:
-            return Step('accounts', 'ok', fine, '; '.join(t.on('claude-pool account rename ' + local + ' ' + name) for local, name in renames))
+            return Step('accounts', 'ok', fine, '; '.join(t.on('claude-pool account rename ' + local + ' ' + name + ' --wait') for local, name in renames))
     return issues_step('accounts', issues, fine)
 
 

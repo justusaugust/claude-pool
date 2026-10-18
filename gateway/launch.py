@@ -490,6 +490,11 @@ def main():
         except (OSError, RuntimeError, ValueError):
             # remove and rename never skip their in-flight check while the service runs: an unanswered overview counts as busy.
             available = live and argv[0] in ('remove', 'rename') and service.loaded(SERVICE_LABEL)
+            if available and argv[0] == 'rename':
+                # A pool stopped with `claude-pool --stop` keeps its unit loaded (launchd) or enabled (systemd): the
+                # maintenance marker plus no answering pool port decide that it is stopped, as device remove does.
+                from devices_cli import pool_stopped
+                available = not pool_stopped()
         def pool(flag):
             # The same stop/start device switch uses: --stop lets running responses finish first.
             from remote import Local

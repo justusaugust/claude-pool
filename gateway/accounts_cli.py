@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import tomllib
@@ -812,6 +813,12 @@ def rename_account(old, new, wait, *, config, stores, binary, runtime, backend_s
     known = registry.load(registry_path)
     member = {'name': old, **mine}
     entry = registry.entry_for(known, member)
+    marker = next((t for t in known.get('removed', []) if t['kind'] == 'account' and t['name'] == new), None)
+    if marker is not None:
+        # A removal marker carries no UUIDs: every later sync would apply it to whatever this machine calls `new`.
+        raise RuntimeError('The registry has a removal marker for ' + new + ' (removed at generation ' + str(marker['generation'])
+                           + (', token ' + marker['fingerprint'] if marker.get('fingerprint') else '') + '); a later sync would '
+                           'remove the renamed account. Choose another name. Nothing was renamed.')
     clash = registry.account(known, new)
     if clash is not None and not registry.same_subscription(clash, member):
         raise RuntimeError('The registry uses ' + new + ' for another subscription; nothing was renamed')
@@ -842,7 +849,7 @@ def rename_account(old, new, wait, *, config, stores, binary, runtime, backend_s
         try:
             lines = _rename(old, new, label, follow, config=config, stores=stores, binary=binary, runtime=runtime,
                             backend_source=backend_source, backend_env=backend_env, directory=directory, registry_path=registry_path)
-        except Exception:
+        except BaseException:  # Ctrl-C and SystemExit too: _rename has put everything back, the pool must run again
             if stopped and pool('--start'): print('The pool service did not restart. Run: claude-pool --start')
             raise
     started = stopped and pool('--start')
@@ -877,8 +884,12 @@ def _rename(old, new, label, follow, *, config, stores, binary, runtime, backend
         if follow:
             def note(value): registry.account(value, old)['name'] = new
             registry.update(note, registry_path)
-    except Exception as error:
+    except BaseException as error:
         failed = undo.rollback()
+        if not isinstance(error, Exception):  # Ctrl-C or SystemExit: put back, say so, keep the interruption
+            print('Interrupted; ' + ('everything was put back, it is still named ' + old + '.' if not failed else
+                                     'could not put back: ' + ', '.join(failed) + '.'), file=sys.stderr)
+            raise
         reason = type(error).__name__ + ': ' + str(error)
         if not failed: raise RuntimeError('Renaming ' + label + ' failed (' + reason + '); everything was put back, it is still named ' + old + '.') from None
         raise RuntimeError('Renaming ' + label + ' failed (' + reason + ') and these could not be put back: ' + ', '.join(failed)

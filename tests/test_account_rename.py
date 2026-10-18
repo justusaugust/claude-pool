@@ -223,6 +223,28 @@ class RenameTests(RenameBase):
                 self.assertEqual(list(self.stores.glob('.rename-*')) + list(self.directory.glob('.rename-*')), [])
 
 
+    def test_a_new_name_with_a_removal_marker_refuses(self):
+        registry.update(lambda value: value['accounts'].append({'name': 'justus-gmail', 'userId': 'user-g', 'organizationId': 'org-g',
+                                                               'fingerprint': 'f00d00000000'}), self.reg)
+        registry.update(lambda value: value.update(accounts=[r for r in value['accounts'] if r['name'] != 'justus-gmail']), self.reg)
+        before = self.snapshot()
+        with self.assertRaises(RuntimeError) as caught: self.rename(new='justus-gmail')
+        self.assertIn('removal marker for justus-gmail', str(caught.exception)); self.assertIn('f00d00000000', str(caught.exception))
+        self.assertEqual(self.snapshot(), before)
+
+    def test_an_interrupt_inside_the_rename_puts_everything_back_and_restarts_the_pool(self):
+        self.put(self.directory, NEW, self.token); self.put(self.stores, NEW, self.token)
+        overview = lambda: {'health': {'activeRequests': 0}, 'sessions': []}
+        before = self.snapshot()
+        for error in (KeyboardInterrupt, SystemExit):
+            with self.subTest(error.__name__):
+                self.pool_calls = []
+                with patch.object(setup, '_rename_state', side_effect=error()):
+                    with self.assertRaises(error): self.rename(overview=overview)
+                self.assertEqual(self.snapshot(), before)
+                self.assertEqual([flag for flag, _ in self.pool_calls], ['--stop', '--start'])
+                self.assertEqual(list(self.stores.glob('.rename-*')), [])
+
 class RegistryRenameTests(RenameBase):
     """The Mac: it enrolled the subscription, so the registry row carries its local name and is renamed with it."""
     def setUp(self):
@@ -330,20 +352,42 @@ class RemoveUnderLocalNameTests(RenameBase):
 
 
 class LaunchTests(unittest.TestCase):
-    def launch_rename(self, request, loaded, argv=('rename', 'team', NEW)):
-        import launch
+    def launch_rename(self, request, loaded, argv=('rename', 'team', NEW), marker=False):
+        import launch, devices_cli
         with tempfile.TemporaryDirectory() as folder:
-            stores = Path(folder)
+            stores = Path(folder) / 'stores'; stores.mkdir()
+            runtime = Path(folder) / 'runtime'; runtime.mkdir()
+            if marker: (runtime / 'maintenance').write_text('Deliberately stopped\n')  # what `claude-pool --stop` leaves
             fd = os.open(stores / '.pool-client-token', os.O_WRONLY | os.O_CREAT, 0o600)
             with os.fdopen(fd, 'w') as file: file.write('fixture-client-token-' + 'x' * 32 + '\n')
+            def refused(*args, **kwargs): raise ConnectionRefusedError()  # no pool port answers; the real ports are never asked
             with patch.object(launch.sys, 'argv', ['claude-pool', 'account', *argv]), \
                  patch.object(launch, 'STORES', stores), patch.object(launch, 'request', side_effect=request), \
-                 patch.object(launch.service, 'loaded', return_value=loaded), \
+                 patch.object(settings, 'RUNTIME', runtime), patch.object(devices_cli.socket, 'create_connection', refused), \
+                 patch.object(launch.service, 'loaded', loaded if callable(loaded) else (lambda label: loaded)), \
                  patch.object(setup, 'cli', return_value=0) as cli:
                 with self.assertRaises(SystemExit): launch.main()
                 kwargs = cli.call_args.kwargs
                 overview = kwargs['overview']
                 return kwargs, overview and routing.wait_idle(overview, 'team', False)
+
+    def test_a_pool_stopped_with_stop_is_stopped_although_its_service_is_loaded(self):
+        import service
+        real = service.loaded
+        answers = {'darwin': lambda argv: argv[:2] == ['launchctl', 'print'],          # the job stays bootstrapped
+                   'linux': lambda argv: argv[:3] == ['systemctl', '--user', 'is-enabled']}  # enabled, not active
+        for platform, ok in answers.items():
+            with self.subTest(platform):
+                calls = []
+                def fake(argv, **kwargs):
+                    calls.append(argv)
+                    return type('Done', (), {'returncode': 0 if ok(argv) else 3})()
+                with patch.object(service, 'platform', return_value=platform):
+                    loaded = lambda label: real(label, run=fake)
+                    self.assertTrue(loaded('io.github.claude-pool'))
+                    self.assertIsNone(self.launch_rename(OSError('no answer'), loaded, marker=True)[1])  # just renamed
+                    # Without the marker the same loaded service that does not answer still counts as busy.
+                    self.assertIs(self.launch_rename(OSError('no answer'), loaded)[1], False)
 
     def test_launch_passes_the_overview_and_the_restart_path(self):
         kwargs, idle = self.launch_rename(lambda *a, **k: '{"sessions": []}', loaded=True)
