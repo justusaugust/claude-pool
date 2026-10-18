@@ -79,6 +79,12 @@ class DeviceDocs(unittest.TestCase):
             self.assertIn(word, text)
         self.assertNotIn('exit 86', text)
 
+    def test_preview_docs_name_the_same_user_trust_boundary(self):
+        # The owner gate checks the Tailscale login header; a local process of the same user can reach 127.0.0.1 directly.
+        preview = DEVICES.read_text().split('## Preview links', 1)[1].split('\n## ', 1)[0]
+        self.assertIn('processes of the same user', preview)
+        self.assertIn('without the owner gate', preview)
+
     def test_docs_and_help_have_no_em_dashes(self):
         for text in [devices_cli.DEVICE_HELP, *(path.read_text() for path in DOCS + [DEVICES] if path.exists())]:
             self.assertNotIn('—', text)
