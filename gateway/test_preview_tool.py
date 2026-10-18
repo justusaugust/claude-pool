@@ -115,6 +115,16 @@ class BindAddressTests(unittest.TestCase):
             self.assertEqual(listen, f"{TS_IP}:5173")
             self.assertIn(f"--listen {TS_IP}:5173", " ".join(s.units["preview-5173"]["argv"]))
 
+    def test_every_proxy_unit_knows_the_tailnet_address_it_accepts_as_host(self):
+        with tempfile.TemporaryDirectory() as d, env(PREVIEW_STATE_DIR=d):
+            for operator, serve in ((False, False), (True, True)):
+                s = FakeSystem(operator=operator, serve_allowed=serve)
+                run_start(s, 5173)
+                argv = s.units["preview-5173"]["argv"]
+                self.assertEqual(argv[argv.index("--tailnet-ip") + 1], TS_IP)
+                self.assertEqual(pv.parse(argv[3:])[1].tailnet_ip, TS_IP)
+                pv.cmd_stop(s, 5173, out=io.StringIO())
+
 
 # ---------------------------------------------------------------------------
 # Proxy behaviour against a real local upstream
@@ -230,6 +240,45 @@ class ProxyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.up.heads[0][1][b"origin"], b"http://" + local)
         self.assertEqual(self.up.heads[0][1][b"referer"], b"http://" + local + b"/page?x=1")
         self.assertEqual(self.up.heads[1][1][b"origin"], b"http://" + local)
+
+    async def status_for(self, host, proxy=None):
+        server = await pv.start_proxy_server("127.0.0.1", 0, proxy) if proxy else None
+        port = server.sockets[0].getsockname()[1] if server else self.pport
+        try:
+            r, w = await asyncio.open_connection("127.0.0.1", port)
+            w.write(b"GET /x HTTP/1.1\r\n" + (b"Host: " + host + b"\r\n" if host is not None else b"") + b"\r\n")
+            await w.drain()
+            start, _, _ = await asyncio.wait_for(self.read_response(r), 5)
+            w.close()
+            return start.split(b" ")[1]
+        finally:
+            if server:
+                server.close(); await server.wait_closed()
+
+    async def test_a_foreign_host_header_gets_421_and_never_reaches_the_server(self):
+        # DNS rebinding: a web page rebinds its own name to the tailnet IP; the browser then sends that name as Host.
+        for host in (f"evil.example:{self.port}".encode(), b"evil.example", f"{TS_NAME}.evil.example:{self.port}".encode(), None):
+            with self.subTest(host=host):
+                self.assertEqual(await self.status_for(host), b"421")
+        self.assertEqual(self.up.heads, [])
+
+    async def test_tailnet_names_addresses_and_localhost_with_the_share_port_are_accepted(self):
+        proxy = pv.Proxy(self.port, self.public, tailnet_ip=TS_IP)
+        for host in (f"{TS_NAME}:{self.port}", f"{TS_NAME.upper()}.:{self.port}", f"personal-vps:{self.port}",
+                     f"{TS_IP}:{self.port}", f"127.0.0.1:{self.port}", f"localhost:{self.port}"):
+            with self.subTest(host=host):
+                self.assertEqual(await self.status_for(host.encode(), proxy), b"200")
+        self.assertEqual(await self.status_for(f"{TS_IP}:{self.port + 1}".encode(), proxy), b"421")
+
+    async def test_a_foreign_host_later_on_a_keepalive_connection_ends_it(self):
+        r, w = await self.open()
+        w.write(b"GET /a HTTP/1.1\r\nHost: " + self.ext_host + b"\r\n\r\nGET /b HTTP/1.1\r\nHost: evil.example\r\n\r\n")
+        await w.drain()
+        start, _, _ = await self.read_response(r)
+        self.assertIn(b"200", start)
+        self.assertIsNone(await asyncio.wait_for(pv.read_head(r), 5))
+        w.close()
+        self.assertEqual([start.split(b" ")[1] for start, _ in self.up.heads], [b"/a"])
 
     async def test_foreign_origin_left_alone(self):
         r, w = await self.open()

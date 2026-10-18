@@ -303,12 +303,52 @@ def unavailable_page(port):
             b"Connection: close\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
 
 
+MISDIRECTED = (b"HTTP/1.1 421 Misdirected Request\r\nContent-Type: text/plain; charset=utf-8\r\nCache-Control: no-store\r\n"
+               b"Connection: close\r\nContent-Length: 46\r\n\r\nThis preview answers only its own tailnet name.")
+
+
+def split_host(value):
+    """(host, port or None) of a Host header value, lower case, without a trailing dot; None when it is not one."""
+    try:
+        text = value.decode("ascii").strip().lower()
+    except UnicodeDecodeError:
+        return None
+    match = re.fullmatch(r"(\[[0-9a-f:.]+\]|[a-z0-9.-]+)(?::([0-9]{1,5}))?", text)
+    if not match:
+        return None
+    return match.group(1).rstrip("."), int(match.group(2)) if match.group(2) else None
+
+
 class Proxy:
-    def __init__(self, target_port, public_base=None, target_hosts=("127.0.0.1", "::1")):
+    def __init__(self, target_port, public_base=None, target_hosts=("127.0.0.1", "::1"), tailnet_ip=None, listen_port=None):
         self.target_port = target_port
         self.target_host_header = f"localhost:{target_port}".encode()
         self.public_base = public_base.rstrip("/").encode() if public_base else None
         self.target_hosts = target_hosts
+        # DNS rebinding guard: a request is served only when its Host names this machine on the tailnet (MagicDNS name,
+        # its short form, the tailnet IPv4) or localhost, with the share's port. Rewriting Host would otherwise defeat a
+        # dev server's own rebinding check, and any web page could read the share through a rebound name.
+        names, ports = {"localhost", "127.0.0.1"}, {target_port}
+        if tailnet_ip:
+            names.add(tailnet_ip)
+        if public_base:
+            public = urllib.parse.urlsplit(public_base)
+            if public.hostname:
+                names.add(public.hostname.rstrip(".").lower())
+                names.add(public.hostname.split(".")[0].lower())
+            if public.port:
+                ports.add(public.port)
+        if listen_port:
+            ports.add(listen_port)
+        self.allowed_names, self.allowed_ports = names, ports
+
+    def host_allowed(self, headers):
+        value = header(headers, "host")
+        found = split_host(value) if value is not None else None
+        if not found:
+            return False
+        name, port = found
+        return name in self.allowed_names and (port is None or port in self.allowed_ports)
 
     async def connect_upstream(self):
         last = None
@@ -326,6 +366,10 @@ class Proxy:
         try:
             head = await read_head(creader)
             if head is None:
+                return
+            if not self.host_allowed(split_head(head)[1]):
+                cwriter.write(MISDIRECTED)
+                await cwriter.drain()
                 return
             try:
                 ureader, uwriter = await self.connect_upstream()
@@ -355,6 +399,8 @@ class Proxy:
         try:
             while head is not None:
                 start, headers = split_head(head)
+                if not self.host_allowed(headers):
+                    break  # a foreign Host later on the connection: earlier answers finish, nothing more reaches the server
                 method = start.split(b" ", 1)[0].upper()
                 headers = rewrite_request(headers, self.target_host_header, peer_ip)
                 upgrade = b"upgrade" in header_tokens(headers, "connection") and header(headers, "upgrade") is not None
@@ -424,7 +470,7 @@ def cmd_serve(args):
     except UnsafeListenAddress as e:
         print(f"preview: {e}", file=sys.stderr)
         return EXIT_CONFIG
-    proxy = Proxy(args.target, args.public_url)
+    proxy = Proxy(args.target, args.public_url, tailnet_ip=args.tailnet_ip, listen_port=port)
 
     async def main():
         try:
@@ -1314,7 +1360,7 @@ def start_unit(sysm, entry):
     unit = entry["unit"]
     host, lport = parse_hostport(entry["listen"])
     argv = ["/usr/bin/python3", "-I", self_path(), "_serve", "--listen", entry["listen"],
-            "--target", str(entry["port"]), "--public-url", entry["link"]]
+            "--target", str(entry["port"]), "--public-url", entry["link"], "--tailnet-ip", sysm.tailnet()[0]]
     ok, err = sysm.unit_start(unit, f"preview {entry['port']}: {entry['label']}", argv)
     if not ok:
         return False, err or "systemd-run failed"
@@ -1654,6 +1700,7 @@ def parse(argv):
         sp.add_argument("--listen", required=True)
         sp.add_argument("--target", required=True, type=int)
         sp.add_argument("--public-url")
+        sp.add_argument("--tailnet-ip")
         return "_serve", sp.parse_args(argv[1:])
     if cmd == "start":
         argv = argv[1:]
