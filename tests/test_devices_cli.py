@@ -1651,12 +1651,29 @@ class FixRoundRemoveTests(OrchestrationBase):
         self.vps.reachable = False
         code, out, err = self.cli('remove', 'vps', '--forget')
         self.assertEqual(code, 0, out + err)
-        self.assertEqual(self.vps.calls, [])
+        self.assertEqual(self.vps.calls, [(['true'], None)])  # only the probe that finds it unreachable
         self.assertIsNone(registry.device(registry.load(self.reg), 'vps'))
         self.assertEqual(self.local.herdr, [{'id': 'p2', 'label': 'vps', 'target': 'alex@other'}])
         self.assertEqual(self.local.spaces, ['direct:100.64.0.9:3211'])
         self.assertIn('tokens copied to vps remain', out); self.assertIn('revoke', out)
         self.assertIn('--long-lived --replace --name <name> on the device that first enrolled it', out)
+        # Its enabled preview units would keep serving across reboots: say how to stop them once it answers again.
+        self.assertRegex(out, r'manual +preview'); self.assertIn('ssh alex@vps .local/bin/preview stop --all', out)
+
+    def test_forget_stops_the_previews_of_a_device_that_still_answers(self):
+        code, out, err = self.cli('remove', 'vps', '--forget')
+        self.assertEqual(code, 0, out + err)
+        self.assertIn(['stop', '--all'], [argv[4:] for argv, _ in self.vps.calls if argv[:2] == ['sh', '-c'] and argv[3:4] == ['preview']])
+        self.assertEqual(self.vps.preview, 'absent')  # the same removal path as device remove: units gone, tool unlinked
+        self.assertEqual([argv for argv, _ in self.vps.calls if '--stop' in argv or 'forget-accounts' in argv], [])
+        self.assertIsNone(registry.device(registry.load(self.reg), 'vps'))
+
+    def test_forget_keeps_the_device_when_its_previews_do_not_stop(self):
+        self.vps.fail = {'preview'}
+        code, out, err = self.cli('remove', 'vps', '--forget')
+        self.assertEqual(code, 1, out + err)
+        self.assertIn('preview stop --all', out)
+        self.assertIsNotNone(registry.device(registry.load(self.reg), 'vps'))
 
     def test_forget_refuses_the_conductor_device_and_the_usage_owner(self):
         for prepare in [lambda value: value.update(conductor={'device': 'vps', 'email': 'team@x.de', 'organization': 'Team A', 'cwd': '/c'}),

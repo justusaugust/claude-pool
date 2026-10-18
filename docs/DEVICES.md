@@ -80,7 +80,7 @@ It refuses, changing nothing, when:
 - tasks are running there: exit code 3. Use `--wait`, or rerun later.
 - it is the Conductor device (move it first, see below) or the usage owner (make another device the owner with `claude-pool device add <other-target> --usage-owner`).
 
-`--forget` is for a machine that is gone for good. It removes the device from this device's records and syncs that registry to the other devices, and touches nothing on the lost machine. Tokens already copied there remain valid: revoke them (see Tokens) and re-enroll. The internal verb `forget-accounts` does the account part on the device and runs only when its pool is stopped.
+`--forget` is for a machine that is gone for good. It removes the device from this device's records and syncs that registry to the other devices. On the machine itself it only stops the previews, and only while it still answers (their enabled units would otherwise keep serving across reboots); when it does not answer, it prints the `preview stop --all` to run there later. Tokens already copied there remain valid: revoke them (see Tokens) and re-enroll. The internal verb `forget-accounts` does the account part on the device and runs only when its pool is stopped.
 
 On a Mac, also remove the SSH environment in the Claude app by hand: Code tab, environment menu.
 

@@ -208,6 +208,26 @@ class StopTests(Base):
         self.assertEqual((fake.enabled, fake.active), (set(), {}))
         self.assertEqual(fake.argvs()[-1], ["systemctl", "--user", "daemon-reload"])
 
+    def test_stop_all_also_removes_its_unit_files_that_lost_their_state(self):
+        fake = tpf.FakeSystem(operator=False)
+        self.main(["5173"], fake)
+        (Path(os.environ["PREVIEW_STATE_DIR"]) / "5173.json").unlink()  # the unit stays, enabled, with no record
+        code, out, err = self.main(["stop", "--all"], fake)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(unit_files(fake), [])
+        self.assertIn(["preview-5173.service"], systemctl(fake, "disable"))
+
+    def test_stop_all_fails_while_one_of_its_unit_files_is_left(self):
+        class Stuck(tpf.FakeSystem):
+            def unit_stop(self, unit):
+                self.run(["systemctl", "--user", "stop", unit])  # stopped, but the file and its enablement stay
+        fake = Stuck(operator=False)
+        self.main(["5173"], fake)
+        code, out, err = self.main(["stop", "--all"], fake)
+        self.assertEqual(code, 1)
+        self.assertIn("preview-5173.service", err)
+        self.assertEqual(unit_files(fake), ["preview-5173.service"])
+
     def test_stopping_one_preview_keeps_the_others(self):
         fake = tpf.FakeSystem(operator=False)
         self.main(["5173"], fake)

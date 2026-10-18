@@ -405,6 +405,9 @@ class FakeSystem(pv.System):
     def unit_log(self, unit, lines=5):
         return ""
 
+    def own_unit_files(self):
+        return []  # these units live in memory only; nothing on disk is ever read
+
     def listeners(self, port):
         out = [(pv.parse_hostport(u["listen"])[0], "python3") for u in self.units.values()
                if pv.parse_hostport(u["listen"])[1] == port]

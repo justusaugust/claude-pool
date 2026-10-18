@@ -20,7 +20,7 @@ import device_sync
 from fakes import FakeRemote
 from remote import Completed
 
-TOOL_SHA = 'a84d717ecc96ad5d47a7affe395a3a53351d23d2d4dcf28434c9f3812d7efffd'
+TOOL_SHA = 'a438b2b2d9be03093528ea9b36a695a0cd84d13acd05dd1e0400365a476ed8d9'
 PREVIOUS_SHA = 'b3e645e7ba9750057b68c12f7dd518d19ff792a98062eeea857115b194358d94'  # the copy live on the VPS
 FIRST_FILE_SHARE_SHA = '89c880b1411939c7996239273e28aa51399a1dca1cd56e387754e82e235faabe'  # Task 16's first release
 BEFORE_HOST_CHECK_SHA = '7894d83a893ab63cc07ec07244b910ae8fce1949b080ba355a3b08f6e3903efd'  # the release before the Host check
@@ -346,6 +346,20 @@ class RemoveTests(unittest.TestCase):
         self.assertIn(['stop', '--all'], runs(remote))
         self.assertNotIn('systemctl', ' '.join(' '.join(map(str, argv)) for argv in argvs(remote)))
         self.assertIn(['.local/bin/claude-pool', 'device', 'preview-rules', 'remove'], argvs(remote))
+
+    def test_a_failed_stop_keeps_the_tool_and_fails(self):
+        # Units left enabled would restart forever after the next boot; the tool stays so `preview stop --all` can still run.
+        def handler(argv, stdin):
+            if argv == ['uname', '-s']: return done('Linux\n')
+            if argv[0] == 'sh' and 'sha256' in argv[2]: return done(TOOL_SHA + '\n')
+            if argv[-2:] == ['stop', '--all']: return Completed(1, b'', b'preview: could not remove preview-5173.service\n')
+            return done()
+        remote = FakeRemote('box', handler)
+        step = device_preview.remove(remote)
+        self.assertEqual(step.status, 'failed')
+        self.assertIn('preview-5173.service', step.detail)
+        self.assertIn('preview stop --all', step.fix)
+        self.assertEqual([a for a in argvs(remote) if a[0] == 'sh' and 'rm -f' in a[2]], [])
 
     def test_remove_unlinks_only_an_identical_tool(self):
         remote = device(target_sha=TOOL_SHA)

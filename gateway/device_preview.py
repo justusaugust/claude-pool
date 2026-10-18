@@ -34,6 +34,7 @@ KNOWN_PREVIOUS = {'b3e645e7ba9750057b68c12f7dd518d19ff792a98062eeea857115b194358
                   '8cba203c1f2566ec033d47dc39189c7dbf0643fc68fd619720f8a19c1bc4c0d0'}
 # Run on the device when `preview doctor` says previews would not come back after a reboot (made by an older release).
 RESTORE = 'preview restore'
+STOP_ALL = 'preview stop --all'
 
 _HASH = ('if command -v sha256sum >/dev/null 2>&1; then h=$(sha256sum "$f" | cut -d" " -f1); '
          'else h=$(shasum -a 256 "$f" | cut -d" " -f1); fi; ')
@@ -166,7 +167,12 @@ def remove(remote):
     if _is_mac(remote): return Step('preview', 'skipped', LINUX_ONLY)
     have = _inspect(remote)
     if _ours(have):
-        _run_tool(remote, 'stop', '--all')  # stops only previews and file shares this tool created
+        done = _run_tool(remote, 'stop', '--all')  # stops only previews and file shares this tool created
+        if done.returncode:
+            # The tool stays: its enabled units would otherwise restart forever after the next boot with nothing to stop them.
+            why = (_text(done.stderr) or _text(done.stdout)).splitlines()
+            return Step('preview', 'failed', 'preview stop --all failed' + (': ' + why[-1][:160] if why else ''),
+                        remote_command(remote.name, STOP_ALL))
         stopped = 'previews stopped'
     elif have in ('absent', 'broken'):
         stopped = 'no preview tool installed'

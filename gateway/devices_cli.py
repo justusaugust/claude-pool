@@ -80,7 +80,7 @@ DEVICE_HELP = '\n'.join([
     '  device check [name] [--probe] [--json]   Reads every check below, changes nothing. --probe sends one tiny Claude request per long-lived account.',
     '  device remove <name> [--wait] [--uninstall] [--forget]',
     '      Stops the pool there, removes its token copies and herdr profile; never destroys the only copy of a token (run device sync first).',
-    '      Exit 3: tasks are running there, use --wait. --forget drops a lost machine from the registry of every device and touches nothing on it.',
+    '      Exit 3: tasks are running there, use --wait. --forget drops a lost machine from the registry of every device; on it, only its previews are stopped if it answers.',
     '      The Conductor device and the usage owner cannot be removed first.',
     '  device list                              Devices, roles and the account count',
     '  device sync [--force-registry]           Merges the registry row by row and copies long-lived tokens between devices.',
@@ -1250,8 +1250,22 @@ def _refuse_role(value, row):
 
 
 def forget(row, local, remotes):
-    """`remove --forget`: a device that cannot be reached leaves this device's records only; nothing on it is touched."""
+    """`remove --forget`: drops a lost device from this device's records. On the device itself only its previews are
+    stopped, and only while it still answers: their enabled units would otherwise serve on across reboots."""
     name, steps = row['name'], []
+    previews_stopped = False
+    if row.get('ssh') and row.get('platform') != 'darwin':
+        remote = remotes(row['ssh'])
+        if remote.reachable():
+            step = run_step(lambda t: device_preview.remove(remote), 'preview', _Plain(row))
+            if step.status == 'failed':
+                print(render(name + ' (' + row['ssh'] + ')', [step]))
+                print(name + ' stays registered; once its previews are stopped, run: claude-pool device remove ' + name + ' --forget')
+                return 1
+            steps.append(step); previews_stopped = True
+        else:
+            steps.append(Step('preview', 'manual', 'its previews keep serving there, also after a reboot',
+                              remote_command(row['ssh'], device_preview.STOP_ALL)))
     ip = row.get('tailscaleIp')
     if row.get('cua') and ip:
         space = f'direct:{ip}:{device_cua.PORT}'
@@ -1276,12 +1290,13 @@ def forget(row, local, remotes):
     except Exception as error: synced = {'all devices': 'failed: ' + _redacted(error)}
     print(render(name + ' (forgotten here)', steps))
     print_sync(synced)
-    print('Removed ' + name + ' from the registry. Nothing on ' + name + ' was changed: tokens copied to ' + name + ' remain there. '
+    print('Removed ' + name + ' from the registry. ' + ('Only its previews were stopped' if previews_stopped else 'Nothing on ' + name + ' was changed')
+          + ': tokens copied to ' + name + ' remain there. '
           'If the machine is lost, revoke those long-lived tokens in claude.ai settings and re-enroll each with '
           + replace_fix(None, None) + REPLACE_GONE + '.')
     if local_platform() == 'darwin' and row.get('ssh'):
         print('In the Claude app: Code tab, environment menu, remove the ' + row['ssh'] + ' environment.')
-    return 0 if all(step.status in ('ok', 'skipped') for step in steps) else 1
+    return 0 if all(step.status in ('ok', 'skipped', 'manual') for step in steps) else 1
 
 
 def unique_long_lived(theirs):
