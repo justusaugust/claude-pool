@@ -38,66 +38,75 @@ USER_VERBS = ['add', 'check', 'remove', 'list', 'sync', 'switch', 'conductor mov
 INTERNAL_VERBS = ['status', 'registry', 'receive-registry', 'receive-account', 'send-account', 'identity', 'readings', 'shell',
                   'cua-token', 'conductor serve', 'conductor install', 'conductor uninstall', 'forget-accounts', 'self', 'preview-rules']
 CHECK_HELP = {
-    'reachable': ('ssh to the device works without a password prompt', 'make ssh keys and Tailscale work, then rerun'),
+    'reachable': ('ssh to the device works without a password prompt', 'ssh <ssh-target> true must work without a password prompt (BatchMode)'),
     'native-claude': ('Native Claude Code is installed', 'curl -fsSL https://claude.ai/install.sh | bash on the device'),
-    'install': ('claude-pool is installed and knows the device commands', 'claude-pool device add <ssh-target>'),
+    'install': ('claude-pool is installed and knows the device commands', 'claude-pool device add <ssh-target>; if it says Python 3.11 or newer is missing, install Python 3.11 or newer on the device first'),
     'version': ('the device runs the same build as this one', 'claude-pool device add <ssh-target>'),
-    'linger': ('Linux services survive logout (macOS: skipped)', 'sudo loginctl enable-linger <user> as root on the device'),
+    'linger': ('Linux services survive logout (macOS: skipped)', 'claude-pool device add <ssh-target> tries it without root; if it stays failed, a root user runs sudo loginctl enable-linger <user> on the device'),
     'shell': ('the claude shell function sends claude through the pool', 'claude-pool device add <ssh-target>'),
-    'accounts': ('registry, token fingerprints, reserve settings and account health match here', 'the fix printed on the line: device sync, --force-registry, or account add --long-lived'),
-    'service': ('the pool service is running', 'claude-pool device add <ssh-target>'),
-    'doctor': ('claude-pool doctor reports nothing on the device', 'the fix doctor prints'),
-    'native-login': ('Native Claude is logged in to an account the pool serves', 'claude-pool device add <ssh-target>, then the one Authorize click'),
+    'accounts': ('registry, token fingerprints, reserve settings and account health match', 'claude-pool device sync; claude-pool device sync --force-registry on the device whose list is right; claude-pool account add <email> --long-lived --replace --name <name> on the device that first enrolled it, then device sync; claude-pool account reserve <name> --at <pct>; claude-pool device switch'),
+    'service': ('the pool service is running', 'claude-pool device add <ssh-target>; or ssh <ssh-target> claude-pool --start'),
+    'doctor': ('claude-pool doctor on the device reports nothing', 'run ssh <device> claude-pool doctor and apply the fix it prints'),
+    'native-login': ('Native Claude is logged in to an account the pool serves', 'claude-pool device add <ssh-target> and click Authorize; claude-native auth status if it cannot be read'),
     'herdr': ('this machine has a herdr profile for the device', 'herdr machine add <ssh-target> --label <name>'),
-    'app': ('the Claude app lists and trusts the SSH environment (macOS only)', 'the Claude app clicks printed under Needs you'),
-    'cua': ('the device shares its desktop through Cua, and this machine can reach it', 'macOS Accessibility for cua-spacesd, or docs/DEVICES.md, Cua'),
-    'conductor': ('exactly one Conductor runs, on the registry device, connected to Remote Control', 'claude-pool device conductor move <device>'),
+    'app': ('the Mac that runs the Claude app lists and trusts the SSH environment', 'the Claude app clicks printed under Needs you'),
+    'cua': ('the device shares its desktop through Cua and the machines can reach each other', 'see docs/DEVICES.md, Cua; macOS: switch on cua-spacesd in Accessibility, then claude-pool device add <ssh-target> --cua'),
+    'conductor': ('exactly one Conductor runs, on the registry device, connected to Remote Control', 'ssh <device> claude-pool device conductor install; claude-pool device conductor move <device>; stop the hand-started Conductor (herdr session conductor)'),
     'readings': ('usage readings from the usage owner are fresh', 'ssh -o BatchMode=yes <owner> true must work from the device'),
-    'preview': ('the preview tool is installed and links are HTTPS (Linux only)', 'sudo tailscale set --operator=<user> as root, then device add'),
+    'preview': ('the preview tool is installed and links are HTTPS (Linux devices only)', 'claude-pool device add <ssh-target>; a root user runs sudo tailscale set --operator=<user> for HTTPS'),
 }
 assert tuple(CHECK_HELP) == CHECK_NAMES
 DEVICE_HELP = '\n'.join([
     'claude-pool device <verb>: connect several machines to one pool. An agent can add, check, repair and remove a machine alone.',
-    'Details and the same table: docs/DEVICES.md', '',
+    'The full guide with the same table: docs/DEVICES.md', '',
+    'BEFORE device add <ssh-target>',
+    '  - Both machines are in the same tailnet; ssh from this machine to the target works with no password prompt (ssh-keygen, ssh-copy-id).',
+    '  - The target has Python 3.11 or newer. add installs claude-pool there from this machine\'s checkout.',
+    '  - This machine has at least one long-lived account: claude-pool account add <email> --long-lived (opens a browser; or --from-file).',
+    '  - Another device to use as usage owner needs ssh from the new machine to the owner without a prompt (readings).', '',
     'VERBS',
     '  device add <ssh-target> [--name N] [--cua] [--usage-owner] [--herdr-session S]',
-    '      Adds or repairs a machine. Safe to rerun: it finishes whatever is missing. Needs ssh without a password prompt.',
+    '      Adds or repairs a machine; rerun to finish what is missing. N matches [a-z0-9-]{1,40}, default from the host name.',
+    '      --cua also shares desktops through Cua. --usage-owner makes it the usage poller (and creates the Conductor if none exists).',
+    '      --herdr-session S: the herdr profile on this machine opens session S on the target (herdr machine add --remote-session S).',
     '  device check [name] [--probe] [--json]   Reads every check below, changes nothing. --probe sends one tiny Claude request per long-lived account.',
     '  device remove <name> [--wait] [--uninstall] [--forget]',
-    '      Removes the machine safely: its pool is stopped, its token copies and herdr profile are removed. A refreshable grant stays where it is.',
-    '      --forget drops a lost machine from this device only and touches nothing on it. The Conductor device and the usage owner cannot be removed first.',
+    '      Stops the pool there, removes its token copies and herdr profile; never destroys the only copy of a token (run device sync first).',
+    '      Exit 3: tasks are running there, use --wait. --forget drops a lost machine from the registry of every device and touches nothing on it.',
+    '      The Conductor device and the usage owner cannot be removed first.',
     '  device list                              Devices, roles and the account count',
     '  device sync [--force-registry]           Pushes the registry and long-lived tokens to every device. --force-registry makes this device\'s list win.',
     '  device switch [--wait]                   Restarts the local pool when no request is in flight, to apply a pending membership change',
-    '  device conductor move <device>           Moves the one Conductor (its Native login must be the iPhone app account)',
-    '  device conductor status                  Shows where the Conductor runs and whether it is connected', '',
-    'WHAT add DOES, IN ORDER (each is a check name; the last column of docs/DEVICES.md says what it proves)',
-    '  ' + ', '.join(ADD_ORDER),
-    '  Exit 0 means no check is missing, failed or unreachable. Items under "Needs you" are manual and do not block.',
-    '  Exit 2 means at least one check needs work: read the fix line under it and run it.',
-    '  Exit 86 from a device means its launcher is too old for device commands: run claude-pool device add <ssh-target> from here.', '',
-    'CHECKS: name, what it proves, fix',
+    '  device conductor move <device>           Moves the one Conductor to a device whose Native login is the Conductor account, linger is on and the pool runs.',
+    '                                           It starts a new conversation: open "Conductor Claude" in the Claude app.',
+    '  device conductor status                  Shows where the Conductor runs and whether it is connected',
+    '  (on the Conductor device: claude-pool device conductor install [--session-id ID] [--fresh] | uninstall)', '',
+    'EXIT CODES: 0 nothing is missing, failed or unreachable (manual steps do not block); 2 a step needs work, read its fix line; 3 remove: tasks running.',
+    'A failed linger step (root needed) also gives exit 2 until the root command ran.',
+    'A device that prints "outdated launcher (no device support)" needs claude-pool device add <ssh-target> from this machine;',
+    '"missing" means no launcher is installed there: the same command.', '',
+    'CHECKS in the order add runs them: name, what it proves, fix',
     *('  %-14s %s. Fix: %s' % (name, proves, fix) for name, (proves, fix) in CHECK_HELP.items()), '',
     'WHAT ONLY A HUMAN CAN DO',
     '  - One Native Authorize click per new machine: add opens claude.ai in this machine\'s browser. Nothing is pasted. If the click alone cannot',
-    '    work, the native-login step is manual and prints the exact commands to run on the machine.',
+    '    work, native-login is manual and prints the commands to run on the machine.',
     '  - macOS Accessibility for cua-spacesd (System Settings, Privacy & Security, Accessibility), then run add --cua again.',
-    '  - Linux linger and the Tailscale operator setting need root, so add only prints them:',
-    '      sudo loginctl enable-linger <user>        sudo tailscale set --operator=<user>   (HTTPS preview links)',
-    '  - In the Claude app (macOS): Code tab, environment menu, add the SSH environment, open it once and trust it.', '',
+    '  - Cua is never installed by claude-pool: install it from github.com/trycua/cua and check cua --version on both machines first.',
+    '  - Root commands that add only prints: sudo loginctl enable-linger <user> (Linux) and sudo tailscale set --operator=<user> (HTTPS previews).',
+    '  - Claude app on the Mac (Code tab, environment menu): add the SSH environment, open it once and trust it.', '',
     'ACCOUNTS AND TOKENS',
-    '  Refreshable accounts stay on the one machine that logged in. Long-lived tokens (account add <email> --long-lived) are the only',
-    '  credentials copied between machines, and only through a pipe by these commands. Machines are told apart by a token fingerprint.',
-    '  The usage owner (add --usage-owner) polls usage and the other devices read it every 5 minutes.',
+    '  Refreshable accounts stay on the machine that logged in. Long-lived tokens are the only credentials copied, only by these commands,',
+    '  through a pipe; machines are compared by token fingerprint. The usage owner polls usage; others read it every 5 minutes.',
     '  account reserve <name> --at <pct>|--off keeps an account as the last choice (the Conductor account is reserved from 85%).',
-    '  A long-lived token lasts one year; doctor warns 30 days before and fails 7 days before. Revoking a token is manual in claude.ai',
-    '  settings; then re-enroll with account add <email> --long-lived --name <name> and run device sync.',
-    '  Status reauthenticate on a device means that token was revoked or expired: same fix.', '',
+    '  A long-lived token lasts one year; doctor warns 30 days before and fails 7 days before. Revoking is manual in claude.ai settings.',
+    '  Status reauthenticate means the token is revoked or expired: on the device that first enrolled the account run',
+    '  claude-pool account add <email> --long-lived --replace --name <name> (needs a browser), then claude-pool device sync.', '',
     'RELATED TOOLS',
     '  claude-pool conductor snapshot|events|tell|journal   what Conductor Claude uses to watch and prompt herdr agents',
-    '  preview <port> | preview file <path>                 share a dev server or one file or folder over Tailscale, read-only',
+    '  preview <port> | preview file <path>                 share a dev server or one file or folder over Tailscale (Linux devices)',
     '  Removal runs forget-accounts on the device, only after its pool is stopped. A lost machine: device remove <name> --forget.',
     '', 'Internal verbs (called over SSH): ' + ', '.join(INTERNAL_VERBS)])
+REPLACE_WHERE = ' on the device that first enrolled it (it holds the old token and has a browser), then claude-pool device sync'
 POOL_TIMEOUT = 600  # `--stop` waits up to 40 s for the bridge to drain; `--start` waits for the backend
 
 
@@ -628,8 +637,8 @@ def check_accounts(t):
         if isinstance(row, dict) and row.get('status') == 'reauthenticate':
             entry = registry.account(value, row.get('name')) or {}
             issues.append(('failed', str(row.get('name')) + ' needs reauthenticate (token revoked or expired)',
-                           'claude-pool account add ' + (entry.get('email') or '<email>') + ' --long-lived --name ' + str(row.get('name')) +
-                           ', then claude-pool device sync'))
+                           'claude-pool account add ' + (entry.get('email') or '<email>') + ' --long-lived --replace --name ' + str(row.get('name')) +
+                           REPLACE_WHERE))
     if t.s.probe:
         for account, row in sorted(theirs.items()):
             if row.get('kind') != 'long-lived' or not row.get('active', True): continue
@@ -638,7 +647,7 @@ def check_accounts(t):
             if done.returncode or b'OK' not in (done.stdout or b''):
                 entry = registry.account(value, account) or {}
                 issues.append(('failed', 'probe failed for ' + account, 'claude-pool account add ' + (entry.get('email') or '<email>') +
-                               ' --long-lived --name ' + account + ', then claude-pool device sync'))
+                               ' --long-lived --replace --name ' + account + REPLACE_WHERE))
     if t.mine: issues += _reserve_issues(value)
     pending = st.get('switchPending') or []
     if pending:

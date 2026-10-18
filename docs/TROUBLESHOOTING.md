@@ -48,7 +48,7 @@
 
 Start with `claude-pool device check`; each problem has a `fix:` line. See [devices](DEVICES.md).
 
-**`reauthenticate` on every device.** A long-lived token was revoked or expired. Run `claude-pool account add <email> --long-lived --name <name> --replace`, then `claude-pool device sync`.
+**`reauthenticate` on every device.** A long-lived token was revoked or expired. Run `claude-pool account add <email> --long-lived --replace --name <name>` on the device that first enrolled the account (it holds the old token and has a browser), then `claude-pool device sync`.
 
 **Usage readings are not fresh on a device.** Readings are pulled from the usage owner over SSH by the pool service, which cannot answer a password prompt. Make `ssh -o BatchMode=yes <owner> true` work from that device.
 
@@ -60,4 +60,4 @@ Start with `claude-pool device check`; each problem has a `fix:` line. See [devi
 
 **Preview links are HTTP only.** Tailscale Serve is not allowed for that user. A root user runs `sudo tailscale set --operator=<user>`, then `claude-pool device add <ssh-target>`.
 
-**A device answers with exit 86.** Its launcher is older than device support. Run `claude-pool device add <ssh-target>` from an up-to-date device.
+**A device prints "outdated launcher (no device support)".** Its launcher is older than device commands (`missing` means none is installed). Run `claude-pool device add <ssh-target>` from an up-to-date device.

@@ -418,6 +418,11 @@ IDLE = {'platform': 'darwin', 'linger': None, 'conductor': {'installed': False, 
 
 
 class CheckTests(unittest.TestCase):
+    def test_not_connected_to_remote_control_has_a_fix(self):
+        step = conductor.check({'personal-vps': {**RUNNING, 'conductor': {**RUNNING['conductor'], 'ready': False}}, 'mac': IDLE}, value_with())
+        self.assertEqual(step.status, 'failed')
+        self.assertRegex(step.fix, r'^ssh \S+ claude-pool device conductor install .*Remote Control')
+
     def test_check_is_not_ready_without_linger_or_with_two_conductors(self):
         value = value_with()
         self.assertEqual(conductor.check({'personal-vps': RUNNING, 'mac': IDLE}, value).status, 'ok')

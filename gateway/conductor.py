@@ -430,7 +430,10 @@ def check(statuses, value):
     if not running:
         return Step(STEP, 'failed', 'not running on ' + device, 'ssh ' + str(_target(value, device) or device) + ' claude-pool device conductor install')
     here = statuses[device]
-    if not parts[device].get('ready'): return Step(STEP, 'failed', 'running on ' + device + ' but not connected to Remote Control', None)
+    if not parts[device].get('ready'):
+        return Step(STEP, 'failed', 'running on ' + device + ' but not connected to Remote Control',
+                    'ssh ' + str(_target(value, device) or device) + ' claude-pool device conductor install'
+                    ' (first check that Remote Control is on in the Claude app settings)')
     if here.get('platform') == 'linux' and here.get('linger') is False:
         return Step(STEP, 'failed', 'stops when ' + device + ' logs out (linger is off)', 'claude-pool device add ' + str(_target(value, device) or device))
     if parts[device].get('fresh'):

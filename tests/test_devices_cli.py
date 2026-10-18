@@ -983,7 +983,7 @@ class CheckTests(OrchestrationBase):
         self.vps.overview = {'health': {'activeRequests': 0}, 'sessions': [], 'accounts': [{'name': 'team', 'status': 'reauthenticate'}]}
         code, out, _ = self.cli('check', 'vps')
         self.assertEqual(code, 2)
-        self.assertRegex(out, r'accounts .*reauthenticate.*\n      fix: .*account add team@x\.de --long-lived --name team')
+        self.assertRegex(out, r'accounts .*reauthenticate.*\n      fix: .*account add team@x\.de --long-lived --replace --name team.*first enrolled.*browser')
         self.assertEqual(self.count(self.vps, '-p'), 0)
 
     def test_check_detects_fingerprint_drift_and_registry_divergence(self):

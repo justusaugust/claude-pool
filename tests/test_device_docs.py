@@ -8,6 +8,9 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'gateway'))
+import conductor
+import device_cua
+import device_install
 import device_report
 import devices_cli
 
@@ -36,7 +39,7 @@ class DeviceDocs(unittest.TestCase):
         text = DEVICES.read_text()
         for name in device_report.CHECK_NAMES: self.assertIn('| `' + name + '`', text)
         self.assertIn('docs/DEVICES.md', (ROOT / 'README.md').read_text())
-        for word in ['conductor snapshot', 'preview file', 'account reserve', 'forget-accounts', '--forget', 'exit 86',
+        for word in ['conductor snapshot', 'preview file', 'account reserve', 'forget-accounts', '--forget',
                      'one Native Authorize click', 'cua-spacesd', 'tailscale set --operator']:
             self.assertIn(word.lower(), text.lower())
 
@@ -48,6 +51,27 @@ class DeviceDocs(unittest.TestCase):
         for name, words in wanted.items():
             text = (ROOT / name).read_text()
             for word in words: self.assertIn(word, text, name)
+
+    def test_fix_column_is_tied_to_the_real_fix_constants(self):
+        table = DEVICES.read_text()
+        pieces = {'native-claude': [device_install.NATIVE_FIX], 'cua': [device_cua.DOCS_FIX, 'device add <ssh-target> --cua'],
+                  'linger': ['sudo loginctl enable-linger'], 'readings': ['BatchMode'], 'service': ['claude-pool --start'],
+                  'install': ['Python 3.11'], 'doctor': ['ssh <device>'],
+                  'conductor': ['ssh <device> claude-pool device conductor install', conductor.adopt_fix('abc').split(',')[0]]}
+        for name, words in pieces.items():
+            row = next(line for line in table.splitlines() if line.startswith('| `' + name + '`'))
+            for word in words:
+                self.assertIn(word, row.replace('\\|', '|'), name)
+                self.assertIn(word, devices_cli.CHECK_HELP[name][1], name)
+
+    def test_help_and_docs_cover_prerequisites_and_conductor_details(self):
+        text = DEVICES.read_text() + devices_cli.DEVICE_HELP
+        for word in ['Python 3.11', 'same tailnet', '[a-z0-9-]{1,40}', '--from-file', '--herdr-session', '--remote-session',
+                     '--replace', 'first enrolled', 'conductor install', '--fresh', 'Conductor Claude', 'outdated launcher (no device support)',
+                     'preview stop --all', 'preview doctor', 'github.com/trycua/cua', 'cua --version', 'exit code 3', 'enable-linger',
+                     'ssh-keygen', 'ssh-copy-id']:
+            self.assertIn(word, text)
+        self.assertNotIn('exit 86', text)
 
     def test_docs_and_help_have_no_em_dashes(self):
         for text in [devices_cli.DEVICE_HELP, *(path.read_text() for path in DOCS + [DEVICES] if path.exists())]:
