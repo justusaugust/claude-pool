@@ -674,12 +674,12 @@ def ensure_cua(t):
         for device, address in ((t.row['name'], there), (me, here)):
             row = registry.device(value, device)
             if row is not None and row.get('tailscaleIp') != address: row['tailscaleIp'] = address
-    current = registry.load()
-    wanted = copy.deepcopy(current); note(wanted)
-    if wanted != current: registry.update(note)
     hosts = [device_cua.ensure_host(t.remote, t.row['name'], there), device_cua.ensure_host(t.s.local, me, here)]
     steps = list(hosts)
     if all(step.status == 'ok' for step in hosts):
+        current = registry.load()  # the addresses are recorded only once both hosts share their desktop there
+        wanted = copy.deepcopy(current); note(wanted)
+        if wanted != current: registry.update(note)
         steps.append(device_cua.register(t.s.local, device_cua.host_token(t.remote), there, t.row['name']))
         steps.append(device_cua.register(t.remote, device_cua.host_token(t.s.local), here, me))
     if t.native: steps.append(device_cua.ensure_mcp(t.remote, t.native))
@@ -768,7 +768,9 @@ def _user(t):
 def check_preview(t):
     if t.row.get('platform') == 'darwin': return Step('preview', 'skipped', device_preview.LINUX_ONLY)
     if not t.supported: return t.needs_install('preview')
-    if device_preview._inspect(t.remote) in device_preview.KNOWN_PREVIOUS:
+    have = device_preview._inspect(t.remote) or ''
+    if have.split()[-1:] and have.split()[-1] in device_preview.KNOWN_PREVIOUS:
+        # a file or a symlink to one; the install path updates a plain file and refuses a symlink with its own fix
         return Step('preview', 'missing', 'an earlier release of the preview tool is installed', t.retry)
     tool = device_preview.check(t.remote, _user(t))
     if tool.status in ('missing', 'failed'): return tool

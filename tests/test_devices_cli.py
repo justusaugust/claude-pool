@@ -1343,5 +1343,53 @@ class DoctorOutputTests(unittest.TestCase):
         self.assertEqual((step.status, step.fix), ('failed', 'claude-pool account add x'))
 
 
+class FixRoundTwoTests(OrchestrationBase):
+    def test_the_real_status_reports_the_installed_service_label_and_remove_uses_it(self):
+        (self.root / 'installation.json').write_text(json.dumps({'serviceLabel': 'io.example.pool'}))
+        status = device_sync.status()
+        self.assertEqual(status['serviceLabel'], 'io.example.pool')
+        self.assertEqual(devices_cli._service_label(status), 'io.example.pool')
+        (self.root / 'installation.json').write_text(json.dumps({'serviceLabel': 'bad label; rm'}))
+        self.assertEqual(device_sync.status()['serviceLabel'], service.DEFAULT_LABEL)
+        (self.root / 'installation.json').unlink()
+        self.assertEqual(device_sync.status()['serviceLabel'], service.DEFAULT_LABEL)
+
+    def test_remove_disables_the_label_the_real_status_reports(self):
+        (self.root / 'installation.json').write_text(json.dumps({'serviceLabel': 'io.example.pool'}))
+        real = device_sync.status()
+        registry.update(lambda value: value['devices'].extend([dict(SELF_ROW, roles=['usage']), dict(VPS, ssh='justus@vps', roles=[])]), self.reg)
+        self.vps.registry, self.vps.self_name = registry.load(self.reg), 'vps'
+        self.vps.label = real['serviceLabel']
+        code, out, err = self.cli('remove', 'vps')
+        self.assertEqual(code, 0, out + err)
+        self.assertIn(['sh', '-c', service.unload_hint('io.example.pool', 'linux')], [argv for argv, _ in self.vps.calls])
+
+    def test_a_symlinked_earlier_preview_tool_is_reported_and_never_replaced(self):
+        old = sorted(device_preview.KNOWN_PREVIOUS)[0]
+        self.vps.preview = 'previous'
+        original = self.vps.script
+        def script(text, rest, data):
+            if text == device_preview._SHA_SCRIPT: return ok('link ' + old)
+            return original(text, rest, data)
+        self.vps.script = script
+        code, out, err = self.cli('add', 'justus@vps', '--name', 'vps')
+        self.assertEqual(code, 2)
+        self.assertRegex(out, r'\n  failed +preview .*\n      fix: remove or rename ~/.local/bin/preview on justus@vps')
+        self.assertEqual(getattr(self.vps, 'updates', 0), 0)
+        self.assertEqual(sum(1 for argv, _ in self.vps.calls if device_preview._SHA_SCRIPT in argv), 3)  # check, install, recheck
+
+    def test_the_tailscale_address_is_recorded_only_after_both_hosts_run(self):
+        self.vps.cua, self.vps.ip, self.local.cua = True, '100.64.0.2', True
+        original = self.vps.cua_call
+        def cua_call(script, rest, data):
+            if rest[2:4] == ['host', 'setup']: return answer(1)
+            return original(script, rest, data)
+        self.vps.cua_call = cua_call
+        code, out, err = self.cli('add', 'justus@vps', '--name', 'vps', '--cua')
+        self.assertEqual(code, 2)
+        value = registry.load(self.reg)
+        self.assertNotIn('tailscaleIp', registry.device(value, 'vps')); self.assertNotIn('tailscaleIp', registry.device(value, 'mac'))
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -51,6 +51,20 @@ def config_names():
     return [row['name'] for row in load(settings.CONFIG).get('accounts', [])]
 
 
+def _receipt_label():
+    """The `serviceLabel` of installation.json (the default when absent); None when it cannot be read or is not a valid label."""
+    try: receipt = json.loads((settings.HERE.parent / 'installation.json').read_text())
+    except FileNotFoundError: return service.DEFAULT_LABEL
+    label = receipt.get('serviceLabel', service.DEFAULT_LABEL) if isinstance(receipt, dict) else None
+    return label if isinstance(label, str) and re.fullmatch(r'[a-zA-Z0-9.-]+', label) else None
+
+
+def service_label():
+    """The installed pool service label another device disables at removal; the default label when the receipt names none."""
+    try: return _receipt_label() or service.DEFAULT_LABEL
+    except (OSError, ValueError): return service.DEFAULT_LABEL
+
+
 def service_state():
     """'running', 'stopped' (installed but not loaded) or 'missing' (no service file)."""
     try:
@@ -119,7 +133,7 @@ def status():
     known = registry.load()
     value = {'name': registry.self_name(), 'version': build_version(), 'platform': service.platform(), 'service': service_state(),
              'accounts': account_rows(), 'switchPending': switch_pending(settings.STORES, settings.LONG_LIVED, known, registry.self_name()),
-             'registryGeneration': known['generation'], 'registryHash': registry.digest(known)}
+             'registryGeneration': known['generation'], 'registryHash': registry.digest(known), 'serviceLabel': service_label()}
     for part in STATUS_PARTS: value.update(part())
     return value
 
