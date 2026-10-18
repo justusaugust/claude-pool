@@ -153,6 +153,8 @@ claude-pool conductor journal add|show|prune  # append-only journal
 
 Cua lets machines see and operate each other's desktops. claude-pool never installs Cua. Install it with Cua's own installer from github.com/trycua/cua on both machines, check `cua --version` on both, then run `claude-pool device add <ssh-target> --cua` again. The host binds `<tailscale-ip>:3211` only, the peer registers it as a Space, and `cua mcp` is added for Claude. On macOS, grant Accessibility to `cua-spacesd`. The Cua token travels over a pipe only. If `check` says `see docs/DEVICES.md, Cua`, one of these steps is missing.
 
+When a firewall lets only ssh through to a machine (so port 3211 cannot be reached and `cua spaces add` times out), `add --cua` reaches that machine's host through an SSH tunnel that claude-pool owns on the registering machine: a LaunchAgent `io.github.claude-pool.cua-tunnel.<device>` on macOS or a systemd user unit `claude-pool-cua-tunnel-<device>.service` on Linux, running `ssh -N -L 127.0.0.1:<port>:<tailscale-ip>:3211 <ssh-target>` with a port from 32300 to 32399. The Space is registered at `127.0.0.1:<port>`, bound to loopback only; no root is needed on either machine. `check` reports `linked both ways (<device> through an SSH tunnel)` and flags a tunnel that is not loaded or not running; `remove` deletes the tunnel and its Space. A refused token never opens a tunnel, and tunnels claude-pool did not create are never touched.
+
 ## Preview links
 
 Preview runs on Linux devices (macOS devices are `skipped`); `add` installs the `preview` tool there plus a rule in the user's Claude instructions.

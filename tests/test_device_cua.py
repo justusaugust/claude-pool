@@ -204,11 +204,243 @@ class CuaTests(unittest.TestCase):
         class Rec:
             name = 'local'
             def call(self, argv, stdin=None, timeout=120): timeouts.append(timeout); return target.handle(list(argv), stdin)
-        with mock.patch('device_cua.Local', Rec):
-            self.assertEqual(device_cua._status(), {'cua': {'host': True, 'spaces': ['direct:x:1'], 'mcp': True}})
+        tunnels = mock.Mock(return_value={'vps': {'port': 32345, 'running': True}})
+        with mock.patch('device_cua.Local', Rec), mock.patch('device_cua.tunnels', tunnels):
+            self.assertEqual(device_cua._status(), {'cua': {'host': True, 'spaces': ['direct:x:1'], 'mcp': True,
+                                                            'tunnels': {'vps': {'port': 32345, 'running': True}}}})
             self.assertEqual(set(timeouts), {10})
             target.cua = False
             self.assertEqual(device_cua._status(), {'cua': None})
+
+
+# SSH tunnel when the peer's Cua port is blocked ----------------------------------------------------------------------------
+
+SSH = 'justus@vps'
+PEER = '100.108.161.69'
+CONNECT_ERROR = Completed(5, b'', b'Error: tcp connect error (deadline has elapsed)\n')
+AUTH_ERROR = Completed(5, b'', b'Error: 401 Unauthorized: invalid token\n')
+
+
+def exact_argv(port, ip=PEER, ssh=SSH):
+    return ['/usr/bin/ssh', '-N', '-T', '-o', 'BatchMode=yes', '-o', 'ExitOnForwardFailure=yes', '-o', 'ServerAliveInterval=20',
+            '-o', 'ServerAliveCountMax=3', '-o', 'ForwardAgent=no', '-o', 'ControlMaster=no', '-o', 'ControlPath=none',
+            '-L', f'127.0.0.1:{port}:{ip}:3211', ssh]
+
+
+class Manager:
+    """launchctl and systemctl --user as a fake: which of our units are loaded and whether they run."""
+    def __init__(self, running=True, fail=()):
+        self.calls, self.loaded, self.running, self.fail = [], set(), running, set(fail)
+
+    def call(self, argv, stdin=None, timeout=120):
+        argv = list(argv); self.calls.append(argv)
+        if any(word in self.fail for word in argv): return NO
+        if argv[:2] == ['launchctl', 'print']:
+            label = argv[2].rsplit('/', 1)[1]
+            if label not in self.loaded: return Completed(113, b'', b'Could not find service')
+            return Completed(0, b'state = ' + (b'running' if self.running else b'waiting') + b'\n', b'')
+        if argv[:2] == ['launchctl', 'bootstrap']: self.loaded.add(Path(argv[3]).stem); return OK
+        if argv[:2] == ['launchctl', 'bootout']: self.loaded.discard(argv[2].rsplit('/', 1)[1]); return OK
+        if argv[:2] == ['systemctl', '--user']:
+            verb = argv[2:]
+            if verb[:2] == ['enable', '--now']: self.loaded.add(verb[2]); return OK
+            if verb[:2] == ['disable', '--now']: self.loaded.discard(verb[2]); return OK
+            if verb[:2] == ['is-active', '--quiet']: return OK if verb[2] in self.loaded and self.running else NO
+            return OK
+        return Completed(127, b'', b'')
+
+    def managed(self, *words): return [a for a in self.calls if has(a, *words)]
+
+
+class TunnelDevice:
+    """The registering device: cua spaces (with a blocked address) and the `device cua-tunnel` verb backed by tunnel_add."""
+    def __init__(self, home, blocked=(), add_error=CONNECT_ERROR, listening=(), system='darwin', manager=None, spaces=()):
+        self.home, self.blocked, self.add_error, self.system = home, set(blocked), add_error, system
+        self.manager, self.spaces, self.busy = manager or Manager(), list(spaces), set(listening)
+        self.remote = FakeRemote('local', self.handle)
+
+    def listening(self, port): return port in self.busy or (self.manager.running and port in self.open_ports())
+
+    def open_ports(self):
+        return [entry['port'] for entry in device_cua.tunnels(run=self.manager, system=self.system, home=self.home,
+                                                               listening=lambda port: True).values()]
+
+    def handle(self, argv, stdin):
+        if argv[:2] == ['sh', '-c'] and argv[2] == device_cua.TOKEN_WRAPPER:
+            url = argv[argv.index('--embedded') + 1]
+            if url in self.blocked: return self.add_error
+            self.spaces.append('direct:' + url); return OK
+        if has(argv, 'spaces', 'ls'): return Completed(0, json.dumps({'spaces': [{'id': s} for s in self.spaces]}).encode(), b'')
+        if has(argv, 'spaces', 'rm'): self.spaces = [s for s in self.spaces if s not in argv]; return OK
+        if 'cua-tunnel' in argv:
+            verb = argv[argv.index('cua-tunnel') + 1:]
+            if verb[0] == 'add':
+                value = device_cua.tunnel_add(*verb[1:], run=self.manager, system=self.system, home=self.home,
+                                              listening=self.listening, sleep=lambda s: None)
+                return Completed(0, json.dumps(value).encode(), b'')
+            if verb[0] == 'remove':
+                device_cua.tunnel_remove(verb[1], run=self.manager, system=self.system, home=self.home)
+                return OK
+        return Completed(127, b'', b'')
+
+    def adds(self): return [(a, s) for a, s in self.remote.calls if a[:3] == ['sh', '-c', device_cua.TOKEN_WRAPPER]]
+
+
+class TunnelTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name)
+
+    def agent(self, name='vps'): return self.home / 'Library/LaunchAgents' / ('io.github.claude-pool.cua-tunnel.' + name + '.plist')
+
+    def unit(self, name='vps'): return self.home / '.config/systemd/user' / ('claude-pool-cua-tunnel-' + name + '.service')
+
+    def up(self, manager):
+        """Our ssh listens once its unit is loaded and runs."""
+        return lambda port: manager.running and bool(manager.loaded & {'io.github.claude-pool.cua-tunnel.vps', 'claude-pool-cua-tunnel-vps.service'})
+
+    def register(self, device, port=None):
+        tunnel = device_cua.Tunnel(device.remote, 'vps', PEER, SSH, port)
+        return device_cua.register(device.remote, TOKEN, PEER, 'vps', tunnel=tunnel), tunnel
+
+    def test_a_connect_failure_registers_the_peer_through_an_ssh_tunnel_on_loopback(self):
+        device = TunnelDevice(self.home, blocked=[PEER + ':3211'])
+        step, tunnel = self.register(device)
+        self.assertEqual(step.status, 'ok', step); self.assertIn('SSH tunnel', step.detail)
+        port = tunnel.port
+        self.assertIn(port, device_cua.TUNNEL_PORTS)
+        verbs = [a for a, _ in device.remote.calls if 'cua-tunnel' in a]
+        self.assertEqual(verbs[0][-5:], ['cua-tunnel', 'add', 'vps', PEER, SSH])
+        adds = device.adds()
+        self.assertEqual([a[a.index('--embedded') + 1:] for a, _ in adds],
+                         [[PEER + ':3211', '--name', 'vps'], [f'127.0.0.1:{port}', '--name', 'vps']])
+        self.assertTrue(all(s == TOKEN + b'\n' for _, s in adds))
+        SecretWatch(fixture_token()).argv(device.remote.calls)
+        self.assertIn(f'direct:127.0.0.1:{port}', device.spaces)
+        import plistlib
+        agent = plistlib.loads(self.agent().read_bytes())
+        self.assertEqual(agent['ProgramArguments'], exact_argv(port))
+        self.assertEqual(agent['Label'], 'io.github.claude-pool.cua-tunnel.vps')
+        self.assertIs(agent['KeepAlive'], True); self.assertIs(agent['RunAtLoad'], True)
+        self.assertNotIn('0.0.0.0', self.agent().read_text())
+        self.assertEqual(device.manager.managed('launchctl', 'bootstrap'),
+                         [['launchctl', 'bootstrap', 'gui/' + str(os.getuid()), str(self.agent())]])
+        self.assertEqual(self.agent().stat().st_mode & 0o777, 0o644)
+
+    def test_an_auth_failure_creates_no_tunnel(self):
+        device = TunnelDevice(self.home, blocked=[PEER + ':3211'], add_error=AUTH_ERROR)
+        step, tunnel = self.register(device)
+        self.assertEqual(step.status, 'failed'); self.assertIsNone(tunnel.port)
+        self.assertEqual([a for a, _ in device.remote.calls if 'cua-tunnel' in a], [])
+        self.assertFalse(self.agent().exists()); self.assertEqual(device.manager.calls, [])
+
+    def test_unreachable_tells_connect_failures_from_auth_failures(self):
+        for text in (b'tcp connect error (deadline has elapsed)', b'connect: Connection refused', b'Connection timed out',
+                     b'No route to host'):
+            self.assertTrue(device_cua.unreachable(Completed(5, b'', text)), text)
+        for done in (AUTH_ERROR, Completed(5, b'', b'403 Forbidden after tcp connect error'), Completed(0, b'', b''),
+                     Completed(1, b'', b'something else')):
+            self.assertFalse(device_cua.unreachable(done), done)
+
+    def test_a_recorded_tunnel_is_reused_and_nothing_is_registered_twice(self):
+        device = TunnelDevice(self.home, blocked=[PEER + ':3211'])
+        _, first = self.register(device)
+        device.remote.calls.clear(); device.manager.calls.clear()
+        step, again = self.register(device, first.port)
+        self.assertEqual(step.status, 'ok', step); self.assertEqual(again.port, first.port)
+        self.assertEqual(device.adds(), [])
+        self.assertEqual(device.manager.managed('bootstrap'), []); self.assertEqual(device.manager.managed('bootout'), [])
+
+    def test_a_tunnel_that_does_not_come_up_fails_with_the_ssh_fix(self):
+        device = TunnelDevice(self.home, blocked=[PEER + ':3211'], manager=Manager(running=False))
+        step, _ = self.register(device)
+        self.assertEqual(step.status, 'failed'); self.assertIn('SSH tunnel', step.detail)
+        self.assertIn('ssh ' + SSH + ' true', step.fix)
+        self.assertEqual(len(device.adds()), 1)
+
+    def test_the_port_is_deterministic_per_name_and_skips_listening_ports(self):
+        first = device_cua.tunnel_port('vps', listening=lambda port: False)
+        self.assertEqual(first, device_cua.tunnel_port('vps', listening=lambda port: False))
+        self.assertIn(first, device_cua.TUNNEL_PORTS)
+        self.assertNotEqual(first, device_cua.tunnel_port('lap', listening=lambda port: False))
+        skipped = device_cua.tunnel_port('vps', listening=lambda port: port == first)
+        self.assertIn(skipped, device_cua.TUNNEL_PORTS); self.assertNotEqual(skipped, first)
+        self.assertNotEqual(device_cua.tunnel_port('vps', listening=lambda port: False, taken={first}), first)
+        with self.assertRaises(RuntimeError): device_cua.tunnel_port('vps', listening=lambda port: True)
+
+    def test_linux_writes_a_systemd_user_unit_that_restarts_always(self):
+        manager = Manager()
+        value = device_cua.tunnel_add('vps', PEER, SSH, run=manager, system='linux', home=self.home,
+                                      listening=lambda port: manager.running and 'claude-pool-cua-tunnel-vps.service' in manager.loaded,
+                                      sleep=lambda s: None)
+        self.assertTrue(value['running']); port = value['port']
+        text = self.unit().read_text()
+        import service
+        exec_line = next(line for line in text.splitlines() if line.startswith('ExecStart='))
+        self.assertEqual(service.words(exec_line[len('ExecStart='):], exec=True), exact_argv(port))
+        self.assertIn('\nRestart=always\n', text); self.assertIn('\nWantedBy=default.target\n', text)
+        self.assertNotIn('0.0.0.0', text)
+        self.assertEqual(manager.managed('enable', '--now'), [['systemctl', '--user', 'enable', '--now', 'claude-pool-cua-tunnel-vps.service']])
+        self.assertTrue(manager.managed('daemon-reload'))
+        self.assertFalse(self.agent().exists())
+        self.assertEqual(device_cua.tunnels(run=manager, system='linux', home=self.home, listening=lambda port: True),
+                         {'vps': {'port': port, 'running': True}})
+
+    def test_remove_deletes_only_our_unit_and_is_idempotent(self):
+        manager = Manager()
+        value = device_cua.tunnel_add('vps', PEER, SSH, run=manager, system='darwin', home=self.home, listening=self.up(manager),
+                                      sleep=lambda s: None)
+        agents = self.agent().parent
+        hand_made = agents / 'de.cua.personal-vps-tunnel.plist'; hand_made.write_bytes(b'theirs')
+        pool = agents / 'io.github.claude-pool.plist'; pool.write_bytes(b'pool')
+        manager.loaded |= {'de.cua.personal-vps-tunnel', 'io.github.claude-pool'}
+        self.assertEqual(device_cua.tunnels(run=manager, system='darwin', home=self.home, listening=lambda port: True),
+                         {'vps': {'port': value['port'], 'running': True}})
+        for _ in range(2): self.assertTrue(device_cua.tunnel_remove('vps', run=manager, system='darwin', home=self.home))
+        self.assertFalse(self.agent().exists())
+        self.assertEqual(hand_made.read_bytes(), b'theirs'); self.assertEqual(pool.read_bytes(), b'pool')
+        self.assertEqual({'de.cua.personal-vps-tunnel', 'io.github.claude-pool'}, manager.loaded)
+        self.assertTrue(all(a[-1].endswith('io.github.claude-pool.cua-tunnel.vps') for a in manager.managed('bootout')))
+        for bad in ('personal-vps-tunnel.x', '../vps', '', 'VPS'):
+            with self.assertRaises(ValueError): device_cua.tunnel_remove(bad, run=manager, system='darwin', home=self.home)
+
+    def test_a_stopped_tunnel_reports_not_running(self):
+        manager = Manager()
+        device_cua.tunnel_add('vps', PEER, SSH, run=manager, system='darwin', home=self.home, listening=self.up(manager),
+                              sleep=lambda s: None)
+        manager.running = False
+        self.assertEqual(device_cua.tunnels(run=manager, system='darwin', home=self.home, listening=lambda port: True)['vps']['running'], False)
+        manager.loaded.clear()
+        self.assertEqual(device_cua.tunnels(run=manager, system='darwin', home=self.home, listening=lambda port: True)['vps']['running'], False)
+
+    def test_a_changed_address_rewrites_the_unit_on_the_same_port(self):
+        manager = Manager()
+        first = device_cua.tunnel_add('vps', PEER, SSH, run=manager, system='darwin', home=self.home, listening=self.up(manager),
+                                      sleep=lambda s: None)
+        second = device_cua.tunnel_add('vps', '100.64.0.7', SSH, run=manager, system='darwin', home=self.home,
+                                       listening=self.up(manager), sleep=lambda s: None)
+        self.assertEqual(first['port'], second['port'])
+        import plistlib
+        self.assertEqual(plistlib.loads(self.agent().read_bytes())['ProgramArguments'], exact_argv(first['port'], ip='100.64.0.7'))
+        self.assertEqual(len(manager.managed('bootout')), 1); self.assertEqual(len(manager.managed('bootstrap')), 2)
+
+    def test_tunnel_inputs_are_checked(self):
+        manager = Manager()
+        for args in [('vps', '192.168.1.5', SSH), ('vps', PEER, '-oProxyCommand=x'), ('../vps', PEER, SSH), ('vps', PEER, 'a b')]:
+            with self.assertRaises(ValueError): device_cua.tunnel_add(*args, run=manager, system='darwin', home=self.home,
+                                                                      listening=lambda port: False, sleep=lambda s: None)
+        self.assertEqual(manager.calls, []); self.assertFalse((self.home / 'Library').exists())
+
+    def test_forget_tunnel_forgets_the_space_and_removes_the_unit(self):
+        device = TunnelDevice(self.home, blocked=[PEER + ':3211'])
+        _, tunnel = self.register(device)
+        device.spaces.append('direct:' + PEER + ':3211-other')
+        for _ in range(2):
+            steps = device_cua.forget_tunnel(device.remote, 'vps', tunnel.port)
+            self.assertTrue(all(s.status == 'ok' for s in steps), steps)
+        self.assertNotIn(f'direct:127.0.0.1:{tunnel.port}', device.spaces)
+        self.assertFalse(self.agent().exists())
+        self.assertEqual(len([a for a, _ in device.remote.calls if has(a, 'spaces', 'rm')]), 1)
 
 
 if __name__ == '__main__': unittest.main()

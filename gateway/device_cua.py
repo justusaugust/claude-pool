@@ -1,18 +1,29 @@
 """Cua between machines: one machine shares its desktop on its Tailscale address, the others register it as a Space.
 
 Never downloads or installs Cua. The host token (the pairing secret) travels on stdin only into the cua process
-environment and is never printed, logged or put in argv. `host setup` output can contain it, so it is discarded."""
+environment and is never printed, logged or put in argv. `host setup` output can contain it, so it is discarded.
+
+When a firewall drops port 3211 on the way to a peer (only ssh gets through), the registering device reaches the peer's host
+through an SSH tunnel that claude-pool owns there: a LaunchAgent or systemd user unit bound to 127.0.0.1 only, named by our
+label prefix, so a tunnel claude-pool did not create is never touched. No root is needed on either machine."""
+import hashlib
 import ipaddress
 import json
 import os
 from pathlib import Path
+import plistlib
+import re
+import socket
 import stat
 import sys
+import time
 
 import device_install
 import device_sync
 from device_report import Step
-from remote import Local, require_pipe
+import registry
+from remote import _TARGET, Local, require_pipe
+import service
 
 PORT = 3211
 DOCS_FIX = 'see docs/DEVICES.md, Cua'
@@ -137,15 +148,239 @@ def _space_ids(remote, **options):
     return [s['id'] for s in spaces if isinstance(s, dict) and isinstance(s.get('id'), str)] if isinstance(spaces, list) else None
 
 
-def register(peer, host_token, host_ip, name):
+def _add_space(peer, token, url, name):
+    filled = [word.format(url=url, name=name) for word in SPACES_ADD_TEMPLATE]
+    return peer.call(['sh', '-c', TOKEN_WRAPPER, 'sh', 'cua', *filled], stdin=token + b'\n')
+
+
+# What `cua spaces add` prints when the address cannot be reached, and when the host answered but refused the token.
+CONNECT_ERRORS = ('tcp connect error', 'deadline has elapsed', 'connection refused', 'timed out', 'no route to host',
+                  'network is unreachable', 'host is unreachable', 'connect timeout')
+AUTH_ERRORS = ('401', '403', 'unauthori', 'forbidden', 'token', 'authenticat', 'permission denied')
+
+
+def unreachable(done):
+    """True when a failed `cua spaces add` could not connect at all; an answer that refused the token is never unreachable.
+    The output is only matched here, never printed."""
+    if done.returncode == 0: return False
+    text = ((done.stdout or b'') + b'\n' + (done.stderr or b'')).decode('utf-8', 'replace').lower()
+    if any(word in text for word in AUTH_ERRORS): return False
+    return any(word in text for word in CONNECT_ERRORS)
+
+
+def register(peer, host_token, host_ip, name, tunnel=None):
+    """Register the host at host_ip as Space `name` on `peer`. With a Tunnel (a tunnel this device may own to that host),
+    a connect failure, or a tunnel recorded earlier, registers it at the tunnel's loopback port instead."""
     host_ip = _checked(host_ip)
     token = bytes(host_token).strip()
     if not token: return Step('cua', 'failed', 'no Cua token to register with', DOCS_FIX)
-    if f'direct:{host_ip}:{PORT}' in (_space_ids(peer) or []): return Step('cua', 'ok', 'already registered')
-    filled = [word.format(url=f'{host_ip}:{PORT}', name=name) for word in SPACES_ADD_TEMPLATE]
-    done = peer.call(['sh', '-c', TOKEN_WRAPPER, 'sh', 'cua', *filled], stdin=token + b'\n')
-    if done.returncode: return Step('cua', 'failed', 'could not register the Space', DOCS_FIX)
-    return Step('cua', 'ok', 'registered')
+    ids = _space_ids(peer) or []
+    if f'direct:{host_ip}:{PORT}' in ids: return Step('cua', 'ok', 'already registered')
+    if tunnel is None or tunnel.port is None:
+        done = _add_space(peer, token, f'{host_ip}:{PORT}', name)
+        if done.returncode == 0: return Step('cua', 'ok', 'registered')
+        if not unreachable(done): return Step('cua', 'failed', 'could not register the Space', DOCS_FIX)
+        if tunnel is None:
+            return Step('cua', 'failed', f'{name} cannot be reached on port {PORT} from {peer.name} (a firewall drops it)', DOCS_FIX)
+    if not tunnel.open():
+        return Step('cua', 'failed', 'the SSH tunnel to ' + name + ' did not come up',
+                    'ssh ' + tunnel.ssh + ' true must work without a password prompt (BatchMode), then claude-pool device add '
+                    + tunnel.ssh + ' --cua')
+    if tunnel.space in ids: return Step('cua', 'ok', 'already registered through an SSH tunnel')
+    done = _add_space(peer, token, f'{LOOPBACK}:{tunnel.port}', name)
+    if done.returncode: return Step('cua', 'failed', 'could not register the Space through the SSH tunnel', DOCS_FIX)
+    return Step('cua', 'ok', 'registered through an SSH tunnel')
+
+
+# SSH tunnel to a peer's host ------------------------------------------------------------------------------------------------
+
+LOOPBACK = '127.0.0.1'
+TUNNEL_PORTS = range(32300, 32400)
+TUNNEL_LABEL = 'io.github.claude-pool.cua-tunnel.'  # launchd label prefix; the systemd user unit is TUNNEL_UNIT<name>.service
+TUNNEL_UNIT = 'claude-pool-cua-tunnel-'
+TUNNEL_WAIT = 15  # seconds a new tunnel gets to log in and listen
+_PORT_IN = re.compile(rb'127\.0\.0\.1:([0-9]{4,5}):')
+
+
+def _peer(name):
+    if not isinstance(name, str) or not registry.NAME.fullmatch(name): raise ValueError('Invalid device name')
+    return name
+
+
+def _ssh(target):
+    if not isinstance(target, str) or not _TARGET.fullmatch(target) or target.startswith('-'): raise ValueError('Invalid ssh target')
+    return target
+
+
+def tunnel_label(peer, system): return (TUNNEL_LABEL if system == 'darwin' else TUNNEL_UNIT) + _peer(peer)
+
+
+def tunnel_file(peer, system, home):
+    if system == 'darwin': return Path(home) / 'Library/LaunchAgents' / (tunnel_label(peer, system) + '.plist')
+    return Path(home) / '.config/systemd/user' / (tunnel_label(peer, system) + '.service')
+
+
+def tunnel_argv(port, peer_ip, ssh):
+    """The ssh that forwards 127.0.0.1:<port> on this device to the peer's host. Never a 0.0.0.0 bind, no agent, no master."""
+    if port not in TUNNEL_PORTS: raise ValueError('Tunnel port out of range')
+    return ['/usr/bin/ssh', '-N', '-T', '-o', 'BatchMode=yes', '-o', 'ExitOnForwardFailure=yes', '-o', 'ServerAliveInterval=20',
+            '-o', 'ServerAliveCountMax=3', '-o', 'ForwardAgent=no', '-o', 'ControlMaster=no', '-o', 'ControlPath=none',
+            '-L', f'{LOOPBACK}:{port}:{_checked(peer_ip)}:{PORT}', _ssh(ssh)]
+
+
+def tunnel_unit(peer, port, peer_ip, ssh, system):
+    argv, label = tunnel_argv(port, peer_ip, ssh), tunnel_label(peer, system)
+    if system == 'darwin':
+        return plistlib.dumps({'Label': label, 'ProgramArguments': argv, 'KeepAlive': True, 'RunAtLoad': True, 'ThrottleInterval': 10,
+                               'ProcessType': 'Background', 'StandardOutPath': '/dev/null', 'StandardErrorPath': '/dev/null'})
+    lines = ['[Unit]', 'Description=claude-pool Cua tunnel to ' + peer, '', '[Service]', 'Type=simple',
+             'ExecStart=' + ' '.join(service.exec_quote(word) for word in argv), 'Restart=always', 'RestartSec=10',
+             'StandardOutput=null', 'StandardError=null', '', '[Install]', 'WantedBy=default.target']
+    return ('\n'.join(lines) + '\n').encode()
+
+
+def _listening(port):
+    try:
+        with socket.create_connection((LOOPBACK, port), timeout=0.5): return True
+    except OSError: return False
+
+
+def tunnel_port(peer, listening=None, taken=()):
+    """The first free port from a start fixed by the device name: the same name gets the same port while it is free."""
+    listening = listening or _listening
+    start = int(hashlib.sha256(_peer(peer).encode()).hexdigest(), 16) % len(TUNNEL_PORTS)
+    for step in range(len(TUNNEL_PORTS)):
+        port = TUNNEL_PORTS[(start + step) % len(TUNNEL_PORTS)]
+        if port not in taken and not listening(port): return port
+    raise RuntimeError(f'No free port for a Cua tunnel between {TUNNEL_PORTS.start} and {TUNNEL_PORTS.stop - 1}')
+
+
+def _recorded_port(path):
+    try: found = _PORT_IN.search(path.read_bytes())
+    except OSError: return None
+    port = int(found.group(1)) if found else None
+    return port if port in TUNNEL_PORTS else None
+
+
+def _ours(system, home):
+    """Our tunnel files by peer name: only files with our prefix and a valid device name; nobody else's units."""
+    folder = tunnel_file('x', system, home).parent
+    prefix, suffix = (TUNNEL_LABEL, '.plist') if system == 'darwin' else (TUNNEL_UNIT, '.service')
+    try: names = sorted(os.listdir(folder))
+    except OSError: return {}
+    found = {}
+    for entry in names:
+        peer = entry[len(prefix):-len(suffix)] if entry.startswith(prefix) and entry.endswith(suffix) else ''
+        if registry.NAME.fullmatch(peer): found[peer] = folder / entry
+    return found
+
+
+def _gui(): return 'gui/' + str(os.getuid())
+
+
+def _loaded(run, label, system):
+    if system == 'darwin': return run.call(['launchctl', 'print', _gui() + '/' + label]).returncode == 0
+    return run.call(['systemctl', '--user', 'is-active', '--quiet', label + '.service']).returncode == 0
+
+
+def _unit_runs(run, label, system):
+    if system == 'darwin':
+        done = run.call(['launchctl', 'print', _gui() + '/' + label])
+        return done.returncode == 0 and b'state = running' in (done.stdout or b'')
+    return run.call(['systemctl', '--user', 'is-active', '--quiet', label + '.service']).returncode == 0
+
+
+def _defaults(run, system, home, listening=None):
+    return (run or Local(), system or service.platform(), Path(home) if home else Path.home(), listening or _listening)
+
+
+def tunnel_add(peer, peer_ip, ssh, *, run=None, system=None, home=None, listening=None, sleep=time.sleep, wait=TUNNEL_WAIT):
+    """This device's tunnel to `peer`'s host: written, loaded and given `wait` seconds to listen. Idempotent; keeps its port."""
+    peer, peer_ip, ssh = _peer(peer), _checked(peer_ip), _ssh(ssh)
+    run, system, home, listening = _defaults(run, system, home, listening)
+    label, path = tunnel_label(peer, system), tunnel_file(peer, system, home)
+    ours = _ours(system, home)
+    taken = {port for name, other in ours.items() if name != peer for port in [_recorded_port(other)] if port}
+    port = _recorded_port(path) if peer in ours else None
+    if port is not None and (port in taken or (listening(port) and not _unit_runs(run, label, system))): port = None
+    if port is None: port = tunnel_port(peer, listening, taken)
+    data = tunnel_unit(peer, port, peer_ip, ssh, system)
+    try: changed = path.read_bytes() != data
+    except OSError: changed = True
+    if system == 'darwin':
+        target = _gui() + '/' + label
+        loaded = _loaded(run, label, system)
+        if changed and loaded: run.call(['launchctl', 'bootout', target]); loaded = False
+        if changed: path.parent.mkdir(parents=True, exist_ok=True); service.write(path, data)
+        if not loaded and run.call(['launchctl', 'bootstrap', _gui(), str(path)]).returncode:
+            raise RuntimeError('launchd did not load the Cua tunnel to ' + peer)
+    else:
+        unit = label + '.service'
+        active = _loaded(run, label, system)
+        if changed:
+            path.parent.mkdir(parents=True, exist_ok=True); service.write(path, data)
+            run.call(['systemctl', '--user', 'daemon-reload'])
+        if run.call(['systemctl', '--user', 'enable', '--now', unit]).returncode:
+            raise RuntimeError('systemd did not start the Cua tunnel to ' + peer)
+        if changed and active: run.call(['systemctl', '--user', 'restart', unit])
+    for _ in range(int(wait * 2) + 1):
+        if _unit_runs(run, label, system) and listening(port): return {'port': port, 'running': True}
+        sleep(0.5)
+    return {'port': port, 'running': False}
+
+
+def tunnel_remove(peer, *, run=None, system=None, home=None):
+    """Stop and delete this device's tunnel to `peer`; only our own unit, and ok when it is already gone."""
+    peer = _peer(peer)
+    run, system, home, _ = _defaults(run, system, home)
+    label, path = tunnel_label(peer, system), tunnel_file(peer, system, home)
+    existed = path.exists()
+    if system == 'darwin':
+        if _loaded(run, label, system): run.call(['launchctl', 'bootout', _gui() + '/' + label])
+    elif existed or _loaded(run, label, system): run.call(['systemctl', '--user', 'disable', '--now', label + '.service'])
+    path.unlink(missing_ok=True)
+    if existed and system != 'darwin': run.call(['systemctl', '--user', 'daemon-reload'])
+    if _loaded(run, label, system): raise RuntimeError('the Cua tunnel to ' + peer + ' is still loaded')
+    return True
+
+
+def tunnels(*, run=None, system=None, home=None, listening=None):
+    """{peer: {'port', 'running'}} for every tunnel claude-pool made on this device; running = the unit runs and listens."""
+    run, system, home, listening = _defaults(run, system, home, listening)
+    found = {}
+    for peer, path in _ours(system, home).items():
+        port = _recorded_port(path)
+        found[peer] = {'port': port, 'running': bool(port) and _unit_runs(run, tunnel_label(peer, system), system) and listening(port)}
+    return found
+
+
+class Tunnel:
+    """The tunnel the registering device may own to a peer's host. `device cua-tunnel` writes the unit there, so it works the
+    same for this machine and for one reached over ssh."""
+    def __init__(self, device, peer, peer_ip, ssh, port=None):
+        self.device, self.peer, self.peer_ip, self.ssh, self.port = device, _peer(peer), _checked(peer_ip), _ssh(ssh), port
+
+    @property
+    def space(self): return f'direct:{LOOPBACK}:{self.port}'
+
+    def open(self):
+        """True when the tunnel runs; sets `port` to the one the device chose."""
+        value = _json(self.device.device('cua-tunnel', 'add', self.peer, self.peer_ip, self.ssh, timeout=120))
+        port = value.get('port') if value else None
+        if type(port) is not int or port not in TUNNEL_PORTS: return False
+        self.port = port
+        return value.get('running') is True
+
+
+def forget_tunnel(device, peer, port):
+    """Forget the tunnel Space for `peer` on `device` and delete the tunnel unit; ok when either is already gone."""
+    steps, space = [], f'direct:{LOOPBACK}:{port}'
+    ids = _space_ids(device)
+    if ids is not None and space not in ids: steps.append(Step('cua', 'ok', 'tunnel Space already forgotten'))
+    else: steps.append(_step(_cua(device, 'spaces', 'rm', space), 'tunnel Space forgotten', 'could not forget the tunnel Space'))
+    steps.append(_step(device.device('cua-tunnel', 'remove', peer), 'SSH tunnel to ' + peer + ' removed',
+                       'could not remove the SSH tunnel to ' + peer))
+    return steps
 
 
 def ensure_mcp(remote, native):
@@ -191,8 +426,10 @@ def _status():
         local = _Bounded(Local())
         if not _has_cua(local): return {'cua': None}
         native = device_install.check_native(local)[1]
+        try: found = tunnels(run=local)
+        except Exception: found = {}
         return {'cua': {'host': _running(_host_status(local)), 'spaces': _space_ids(local) or [],
-                        'mcp': bool(native) and local.call([native, 'mcp', 'get', 'cua']).returncode == 0}}
+                        'mcp': bool(native) and local.call([native, 'mcp', 'get', 'cua']).returncode == 0, 'tunnels': found}}
     except Exception: return {'cua': None}
 
 

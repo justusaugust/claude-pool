@@ -36,7 +36,7 @@ import settings
 
 USER_VERBS = ['add', 'check', 'remove', 'list', 'sync', 'switch', 'conductor move', 'conductor status']
 INTERNAL_VERBS = ['status', 'registry', 'receive-registry', 'receive-account', 'send-account', 'identity', 'readings', 'shell',
-                  'cua-token', 'conductor serve', 'conductor install', 'conductor uninstall', 'forget-accounts', 'self', 'preview-rules']
+                  'cua-token', 'cua-tunnel', 'conductor serve', 'conductor install', 'conductor uninstall', 'forget-accounts', 'self', 'preview-rules']
 CHECK_HELP = {
     'reachable': ('ssh to the device works without a password prompt', 'ssh <ssh-target> true must work without a password prompt (BatchMode)'),
     'native-claude': ('Native Claude Code is installed', 'curl -fsSL https://claude.ai/install.sh | bash on the device'),
@@ -241,6 +241,20 @@ def shell(argv, out, **_):
 def cua_token(argv, out, **_):
     parse('cua-token', argv)
     device_cua.send_token(binary(out))
+    return 0
+
+
+def cua_tunnel(argv, out, **_):
+    """This device's SSH tunnel to another device's Cua host (add prints its port and state as JSON; remove deletes ours only)."""
+    args = parse('cua-tunnel', argv, (['action'], {'choices': ['add', 'remove']}), (['peer'], {}), (['ip'], {'nargs': '?'}),
+                 (['ssh'], {'nargs': '?'}))
+    if args.action == 'add':
+        if not (args.ip and args.ssh): raise Usage('cua-tunnel add needs <device> <tailscale-ip> <ssh-target>')
+        print_json(device_cua.tunnel_add(args.peer, args.ip, args.ssh))
+        return 0
+    if args.ip or args.ssh: raise Usage('cua-tunnel remove takes only <device>')
+    device_cua.tunnel_remove(args.peer)
+    print('removed')
     return 0
 
 
@@ -756,6 +770,23 @@ def _cua_ips(t):
     return there, here, None
 
 
+def _tunnel_ports(value, device):
+    """The loopback ports of the SSH tunnels `device` reaches other devices' Cua hosts through, by device name."""
+    return dict((registry.device(value, device) or {}).get('cuaTunnels') or {}) if device else {}
+
+
+def _space_issue(part, ip, port, peer, holder, missing, again):
+    """(issue or None, through a tunnel): whether `peer` is a Space on `holder`, directly or at the recorded tunnel port."""
+    spaces = part.get('spaces') or []
+    if f'direct:{ip}:{device_cua.PORT}' in spaces: return None, False
+    if port is None or f'direct:{device_cua.LOOPBACK}:{port}' not in spaces: return ('missing', missing, again), False
+    state = (part.get('tunnels') or {}).get(peer)
+    if not isinstance(state, dict) or state.get('port') != port:
+        return ('missing', 'the SSH tunnel to ' + peer + ' is not loaded on ' + holder, again), True
+    if state.get('running') is not True: return ('missing', 'the SSH tunnel to ' + peer + ' does not run on ' + holder, again), True
+    return None, True
+
+
 def check_cua(t):
     if not t.row.get('cua'): return Step('cua', 'skipped', 'not requested (add it with claude-pool device add ' + t.where + ' --cua)')
     if t.mine: return Step('cua', 'skipped', 'this device; each linked device checks it')
@@ -764,15 +795,63 @@ def check_cua(t):
     if not t.supported: return t.needs_install('cua')
     part, mine = t.status().get('cua'), t.s.local_status().get('cua') or {}
     again = t.retry + ' --cua'
-    if not part: return Step('cua', 'missing', 'Cua is not installed on ' + t.row['name'], device_cua.DOCS_FIX)
+    name, me = t.row['name'], t.s.me
+    if not part: return Step('cua', 'missing', 'Cua is not installed on ' + name, device_cua.DOCS_FIX)
     issues = []
-    if not part.get('host'): issues.append(('missing', 'the Cua host does not run on ' + t.row['name'], again))
-    if not part.get('mcp'): issues.append(('missing', 'the Cua MCP server is missing on ' + t.row['name'], again))
-    if f'direct:{there}:{device_cua.PORT}' not in (mine.get('spaces') or []):
-        issues.append(('missing', t.row['name'] + ' is not a Space on this device', again))
-    if f'direct:{here}:{device_cua.PORT}' not in (part.get('spaces') or []):
-        issues.append(('missing', 'this device is not a Space on ' + t.row['name'], again))
-    return issues_step('cua', issues, 'linked both ways')
+    if not part.get('host'): issues.append(('missing', 'the Cua host does not run on ' + name, again))
+    if not part.get('mcp'): issues.append(('missing', 'the Cua MCP server is missing on ' + name, again))
+    value = registry.load()
+    found, here_via = _space_issue(mine, there, _tunnel_ports(value, me).get(name), name, 'this device',
+                                   name + ' is not a Space on this device', again)
+    if found: issues.append(found)
+    found, there_via = _space_issue(part, here, _tunnel_ports(value, name).get(me), me or 'this device', name,
+                                    'this device is not a Space on ' + name, again)
+    if found: issues.append(found)
+    via = [who for who, used in ((name, here_via), (me, there_via)) if used and who]
+    return issues_step('cua', issues, 'linked both ways' + (' (' + ' and '.join(via) + ' through an SSH tunnel)' if via else ''))
+
+
+def _register_here(t, there, me):
+    """Register the device's Cua host on this one; when a firewall drops port 3211, through an SSH tunnel claude-pool owns
+    here. The tunnel's port is recorded on this device's registry row, so check and remove find it."""
+    name = t.row['name']
+    port = _tunnel_ports(registry.load(), me).get(name)
+    tunnel = device_cua.Tunnel(t.s.local, name, there, t.row['ssh'], port) if t.row.get('ssh') else None
+    step = device_cua.register(t.s.local, device_cua.host_token(t.remote), there, name, tunnel=tunnel)
+    if tunnel is not None and tunnel.port is not None and tunnel.port != port and registry.device(registry.load(), me) is not None:
+        def record(value):
+            row = registry.device(value, me)
+            if row is not None: row['cuaTunnels'] = {**(row.get('cuaTunnels') or {}), name: tunnel.port}
+        registry.update(record)
+    return step
+
+
+def _drop_tunnel(me, name):
+    """A registry change: this device no longer records a tunnel to `name`."""
+    def change(value):
+        row = registry.device(value, me) if me else None
+        tunnels = dict((row or {}).get('cuaTunnels') or {})
+        if name not in tunnels: return
+        del tunnels[name]
+        if tunnels: row['cuaTunnels'] = tunnels
+        else: row.pop('cuaTunnels')
+    return change
+
+
+def forget_tunnels(row, local, remote, me):
+    """Steps that delete the SSH tunnel this device owns to the device in `row` (and its Space), and, when `remote` is given,
+    the tunnels that device owns to others. Returns (steps, whether this device's own tunnel is gone)."""
+    steps, gone = [], True
+    port = _tunnel_ports(registry.load(), me).get(row['name'])
+    if port is not None:
+        here = device_cua.forget_tunnel(local, row['name'], port)
+        steps += here; gone = all(step.status == 'ok' for step in here)
+    if remote is not None:
+        for peer in sorted(row.get('cuaTunnels') or {}):
+            done = remote.device('cua-tunnel', 'remove', peer)
+            steps.append(Step('cua', 'ok', 'SSH tunnel to ' + peer + ' removed on ' + row['name']) if done.returncode == 0 else
+                         Step('cua', 'failed', 'could not remove the SSH tunnel to ' + peer + ' on ' + row['name']))
+    return steps, gone
 
 
 def ensure_cua(t):
@@ -791,7 +870,7 @@ def ensure_cua(t):
         current = registry.load()  # the addresses are recorded only once both hosts share their desktop there
         wanted = copy.deepcopy(current); note(wanted)
         if wanted != current: registry.update(note)
-        steps.append(device_cua.register(t.s.local, device_cua.host_token(t.remote), there, t.row['name']))
+        steps.append(_register_here(t, there, me))
         steps.append(device_cua.register(t.remote, device_cua.host_token(t.s.local), here, me))
     if t.native: steps.append(device_cua.ensure_mcp(t.remote, t.native))
     t.forget(); t.s.forget(t.s.me)
@@ -1119,8 +1198,16 @@ def forget(row, local, remotes):
             steps.append(Step('cua', 'ok', 'Space forgotten') if done.returncode == 0 else
                          Step('cua', 'failed', 'could not forget the Space', 'cua spaces rm ' + space))
     else: steps.append(Step('cua', 'skipped', 'not linked' if not row.get('cua') else 'no Tailscale address recorded'))
+    me, gone = registry.self_name(), False
+    if row.get('cua'):
+        try: tunnel_steps, gone = forget_tunnels(row, local, None, me)
+        except Exception as error: tunnel_steps = [Step('cua', 'failed', _redacted(error), 'claude-pool device remove ' + name + ' --forget')]
+        steps += tunnel_steps
     steps.append(run_step(lambda t: device_integrations.remove_herdr(row, local), 'herdr', _Plain(row)))
-    registry.update(lambda current: current.update(devices=[r for r in current['devices'] if r['name'] != name]))
+    def drop(current):
+        current.update(devices=[r for r in current['devices'] if r['name'] != name])
+        if gone: _drop_tunnel(me, name)(current)
+    registry.update(drop)
     try: synced = device_sync.sync_all(remotes)
     except Exception as error: synced = {'all devices': 'failed: ' + _redacted(error)}
     print(render(name + ' (forgotten here)', steps))
@@ -1216,12 +1303,20 @@ def remove(argv, out, remotes, local, **_):
     if forgot.returncode:
         return stop_here(steps + [Step('accounts', 'failed', 'could not remove the synced accounts', on('claude-pool device forget-accounts'))])
     steps.append(Step('accounts', 'ok', 'synced long-lived accounts removed; its own logins stay'))
+    me, gone = registry.self_name(), False
     if row.get('cua'):
         try: steps += device_cua.remove(remote, [local])
         except Exception as error: steps.append(Step('cua', 'failed', _redacted(error), again))
+        try:
+            tunnel_steps, gone = forget_tunnels(row, local, remote, me)
+            steps += tunnel_steps
+        except Exception as error: steps.append(Step('cua', 'failed', _redacted(error), again))
     else: steps.append(Step('cua', 'skipped', 'not linked'))
     steps.append(run_step(lambda t: device_integrations.remove_herdr(row, local), 'herdr', _Plain(row)))
-    registry.update(lambda current: current.update(devices=[r for r in current['devices'] if r['name'] != args.name]))
+    def drop(current):
+        current.update(devices=[r for r in current['devices'] if r['name'] != args.name])
+        if gone: _drop_tunnel(me, args.name)(current)
+    registry.update(drop)
     try: synced = device_sync.sync_all(remotes)
     except Exception as error: synced = {'all devices': 'failed: ' + _redacted(error)}
     if args.uninstall:
@@ -1244,7 +1339,7 @@ class _Plain:
 VERBS = {'add': add, 'check': check, 'remove': remove, 'list': list_devices, 'sync': sync,
          'switch': switch, 'conductor': conductor_verb, 'status': status, 'registry': show_registry,
          'receive-registry': receive_registry, 'receive-account': receive_account, 'send-account': send_account,
-         'identity': identity, 'readings': export_readings, 'shell': shell, 'cua-token': cua_token,
+         'identity': identity, 'readings': export_readings, 'shell': shell, 'cua-token': cua_token, 'cua-tunnel': cua_tunnel,
          'forget-accounts': forget_accounts, 'self': name_self, 'preview-rules': preview_rules}
 
 

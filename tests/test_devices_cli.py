@@ -123,9 +123,24 @@ class RoutingTests(DeviceCliBase):
     def test_verb_lists_use_the_conductor_names(self):
         self.assertEqual(devices_cli.USER_VERBS, ['add', 'check', 'remove', 'list', 'sync', 'switch', 'conductor move', 'conductor status'])
         self.assertEqual(devices_cli.INTERNAL_VERBS, ['status', 'registry', 'receive-registry', 'receive-account', 'send-account',
-                                                      'identity', 'readings', 'shell', 'cua-token', 'conductor serve',
+                                                      'identity', 'readings', 'shell', 'cua-token', 'cua-tunnel', 'conductor serve',
                                                       'conductor install', 'conductor uninstall', 'forget-accounts', 'self',
                                                       'preview-rules'])
+
+    def test_cua_tunnel_verb_runs_on_this_device_and_prints_json(self):
+        with patch.object(device_cua, 'tunnel_add', return_value={'port': 32342, 'running': True}) as add, \
+             patch.object(device_cua, 'tunnel_remove', return_value=True) as remove:
+            code, out, err = self.run_cli(['cua-tunnel', 'add', 'vps', '100.64.0.2', 'justus@vps'])
+            self.assertEqual(code, 0, err); self.assertEqual(json.loads(out), {'port': 32342, 'running': True})
+            add.assert_called_once_with('vps', '100.64.0.2', 'justus@vps')
+            code, out, err = self.run_cli(['cua-tunnel', 'remove', 'vps'])
+            self.assertEqual(code, 0, err); remove.assert_called_once_with('vps')
+            self.assertEqual(self.run_cli(['cua-tunnel', 'add', 'vps'])[0], 2)
+
+    def test_the_registry_keeps_tunnel_ports_and_checks_them(self):
+        registry.check_device(dict(MAC, cuaTunnels={'vps': 32342}))
+        for bad in ({'vps': '32342'}, {'VPS': 32342}, {'vps': 80}, {'vps': True}, ['vps']):
+            with self.assertRaises(ValueError): registry.check_device(dict(MAC, cuaTunnels=bad))
 
     def test_help_and_unknown_verbs(self):
         code, out, _ = self.run_cli(['--help'])
@@ -639,6 +654,8 @@ class Machine:
         self.accounts = dict(accounts or {})
         self.service, self.doctor, self.login = service, doctor, login
         self.cua, self.ip, self.host, self.spaces, self.mcp = cua, ip, False, [], False
+        # Cua addresses this machine cannot reach (a firewall drops port 3211) and the SSH tunnels claude-pool made here
+        self.blocked, self.add_error, self.tunnels = set(), answer(5, b'tcp connect error (deadline has elapsed)'), {}
         self.preview, self.rules, self.https = preview, rules, https
         self.overview = overview if overview is not None else {'health': {'activeRequests': 0}, 'sessions': [], 'accounts': []}
         self.shared_at = int(time.time() * 1000) - 60_000 if shared_at == 'fresh' else shared_at
@@ -673,7 +690,8 @@ class Machine:
                 'registryHash': registry.digest(known), 'linger': self.linger == 'yes', 'shell': self.shell,
                 'nativeLogin': {'email': self.login['email'], 'organization': self.login['orgName']} if self.login else None,
                 'herdrProfiles': [], 'conductor': self.conductor,
-                'cua': {'host': self.host, 'spaces': list(self.spaces), 'mcp': self.mcp} if self.cua else None,
+                'cua': {'host': self.host, 'spaces': list(self.spaces), 'mcp': self.mcp,
+                        'tunnels': json.loads(json.dumps(self.tunnels))} if self.cua else None,
                 'preview': {'installed': self.preview == 'ours', 'https': self.https}, 'overview': self.overview,
                 'sharedReadingsAt': self.shared_at, 'sharedReadingsAccounts': list(self.shared_accounts), 'serviceLabel': self.label}
 
@@ -745,7 +763,9 @@ class Machine:
         args = rest[1:]
         if script == device_cua.TOKEN_WRAPPER:
             if not data or not data.strip(): return answer(1)
-            self.spaces.append('direct:' + args[args.index('--embedded') + 1]); return ok()
+            url = args[args.index('--embedded') + 1]
+            if url in self.blocked: return self.add_error
+            self.spaces.append('direct:' + url); return ok()
         if args[:3] == ['tailscale', 'ip', '-4']: return ok(self.ip + '\n') if self.ip else answer(127)
         if not self.cua or args[:1] != ['cua']: return answer(127)
         if args[1:] == ['host', 'status', '--embedded', '--json']:
@@ -801,6 +821,11 @@ class Machine:
                 return answer(1, b'vps\n  failed      conductor     another Conductor is running\n')
             self.conductor = {'installed': True, 'running': True, 'ready': True, 'fresh': False, 'duplicates': []}; return ok()
         if args == ['cua-token']: return ok(CUA_FIXTURE_TOKEN) if self.host else answer(1)
+        if args[:2] == ['cua-tunnel', 'add']:
+            port = (self.tunnels.get(args[2]) or {}).get('port', 32342)
+            self.tunnels[args[2]] = {'port': port, 'running': True}
+            return ok(json.dumps({'port': port, 'running': True}))
+        if args[:2] == ['cua-tunnel', 'remove']: self.event('cua'); self.tunnels.pop(args[2], None); return ok()
         if args == ['forget-accounts']:
             if self.service != 'stopped': return answer(1)
             self.event('forget-accounts')
@@ -931,6 +956,34 @@ class AddTests(OrchestrationBase):
         receive = [data for argv, data in self.vps.calls if 'receive-account' in argv]
         self.assertEqual(receive, [self.team.read_bytes()])
 
+    def test_a_blocked_cua_port_is_reached_through_an_ssh_tunnel_owned_by_claude_pool(self):
+        self.fresh_vps(cua=True, ip='100.64.0.2'); self.local.cua = True
+        self.local.blocked = {'100.64.0.2:3211'}
+        code, out, err = self.cli('add', 'justus@vps', '--name', 'vps', '--cua')
+        self.assertEqual(code, 0, out + err)
+        port = self.local.tunnels['vps']['port']
+        self.assertIn(f'direct:127.0.0.1:{port}', self.local.spaces); self.assertIn('direct:100.64.0.1:3211', self.vps.spaces)
+        self.assertEqual(registry.device(registry.load(self.reg), 'mac')['cuaTunnels'], {'vps': port})
+        tunnel = [argv for argv, _ in self.local.calls if 'cua-tunnel' in argv]
+        self.assertEqual(tunnel[0][-5:], ['cua-tunnel', 'add', 'vps', '100.64.0.2', 'justus@vps'])
+        self.assertEqual([argv for argv, _ in self.vps.calls if 'cua-tunnel' in argv], [])
+        self.assertRegex(out, r'\n  ok +cua +linked both ways \(vps through an SSH tunnel\)\n')
+        SecretWatch(fixture_token(), CUA_FIXTURE_TOKEN).argv(self.all_calls())
+        # a rerun keeps the tunnel and registers nothing again
+        self.local.calls.clear()
+        code, out, err = self.cli('add', 'justus@vps', '--name', 'vps', '--cua')
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual([argv for argv, _ in self.local.calls if argv[:3] == ['sh', '-c', device_cua.TOKEN_WRAPPER]], [])
+
+    def test_an_auth_failure_on_the_cua_port_makes_no_tunnel(self):
+        self.fresh_vps(cua=True, ip='100.64.0.2'); self.local.cua = True
+        self.local.blocked = {'100.64.0.2:3211'}; self.local.add_error = answer(5, b'401 Unauthorized')
+        code, out, err = self.cli('add', 'justus@vps', '--name', 'vps', '--cua')
+        self.assertEqual(code, 2, out + err)
+        self.assertEqual([argv for argv, _ in self.local.calls if 'cua-tunnel' in argv], []); self.assertEqual(self.local.tunnels, {})
+        self.assertNotIn('cuaTunnels', registry.device(registry.load(self.reg), 'mac'))
+        self.assertRegex(out, r'\n  missing +cua +vps is not a Space on this device')
+
     def snapshot(self):
         return {str(p): (p.read_bytes() if p.is_file() else None) for p in self.root.rglob('*')}
 
@@ -1009,6 +1062,35 @@ class CheckTests(OrchestrationBase):
         code, out, err = self.cli('check', 'vps')
         self.assertEqual(code, 0, out + err); self.assertEqual(step_names(out), list(CHECK_NAMES))
         self.assertEqual(self.count(self.vps, '-p'), 0)
+
+    def tunnelled(self, running=True):
+        registry.update(lambda value: (registry.device(value, 'vps').update(cua=True, tailscaleIp='100.64.0.2'),
+                                       registry.device(value, 'mac').update(cuaTunnels={'vps': 32342})), self.reg)
+        self.vps.registry = self.local.registry = registry.load(self.reg)
+        self.vps.cua, self.vps.ip, self.vps.host, self.vps.mcp, self.vps.spaces = True, '100.64.0.2', True, True, ['direct:100.64.0.1:3211']
+        self.local.cua, self.local.spaces = True, ['direct:127.0.0.1:32342']
+        self.local.tunnels = {'vps': {'port': 32342, 'running': running}}
+
+    def test_check_accepts_the_tunnel_space_and_says_so(self):
+        self.tunnelled()
+        code, out, err = self.cli('check', 'vps')
+        self.assertEqual(code, 0, out + err)
+        self.assertRegex(out, r'\n  ok +cua +linked both ways \(vps through an SSH tunnel\)\n')
+
+    def test_check_flags_a_stopped_or_missing_tunnel_with_the_add_fix(self):
+        self.tunnelled(running=False)
+        code, out, err = self.cli('check', 'vps')
+        self.assertEqual(code, 2, out + err)
+        self.assertRegex(out, r'\n  missing +cua +the SSH tunnel to vps does not run on this device\n      fix: claude-pool device add justus@vps --cua\n')
+        self.local.tunnels = {}
+        code, out, err = self.cli('check', 'vps')
+        self.assertEqual(code, 2, out + err)
+        self.assertRegex(out, r'\n  missing +cua +the SSH tunnel to vps is not loaded on this device\n      fix: claude-pool device add justus@vps --cua\n')
+
+    def test_a_tunnel_space_for_another_port_does_not_count(self):
+        self.tunnelled(); self.local.spaces = ['direct:127.0.0.1:32399']
+        code, out, err = self.cli('check', 'vps')
+        self.assertEqual(code, 2, out + err); self.assertRegex(out, r'\n  missing +cua +vps is not a Space on this device')
 
     def test_check_never_changes_the_target(self):
         self.vps.shell = False; self.vps.service = 'stopped'; self.vps.linger = 'no'; self.vps.rules = False
@@ -1131,6 +1213,26 @@ class RemoveTests(OrchestrationBase):
         for _, label in self.log:
             if label not in seen: seen.append(label)
         return seen
+
+    def tunnel_here(self):
+        registry.update(lambda value: registry.device(value, 'mac').update(cuaTunnels={'vps': 32342}), self.reg)
+        self.vps.registry = registry.load(self.reg)
+        self.local.spaces = ['direct:127.0.0.1:32342']; self.local.tunnels = {'vps': {'port': 32342, 'running': True}}
+
+    def test_remove_deletes_our_tunnel_and_its_space(self):
+        self.tunnel_here()
+        code, out, err = self.cli('remove', 'vps')
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(self.local.tunnels, {}); self.assertEqual(self.local.spaces, [])
+        self.assertEqual([argv[-3:] for argv, _ in self.local.calls if 'cua-tunnel' in argv], [['cua-tunnel', 'remove', 'vps']])
+        self.assertNotIn('vps', registry.device(registry.load(self.reg), 'mac').get('cuaTunnels', {}))
+
+    def test_remove_forget_deletes_our_tunnel_too(self):
+        self.tunnel_here(); self.vps.reachable = False
+        code, out, err = self.cli('remove', 'vps', '--forget')
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(self.local.tunnels, {}); self.assertEqual(self.local.spaces, [])
+        self.assertNotIn('vps', registry.device(registry.load(self.reg), 'mac').get('cuaTunnels', {}))
 
     def test_remove_undoes_preview_shell_service_accounts_cua_herdr_and_registry(self):
         code, out, err = self.cli('remove', 'vps')
