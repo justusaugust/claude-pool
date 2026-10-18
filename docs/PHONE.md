@@ -23,3 +23,7 @@ Start new Claude sessions after preparing phone configuration. `/phone` links th
 Supported controls include targeted ordinary instructions, exact-request approval/denial for supported permission hooks and structured question answers. Unsupported Native dialogs remain in Native. Instructions cannot approve actions, and approvals cannot be reused for changed tool input or a new worker generation.
 
 `claude-pool phone --chat` optionally opens a separate Native Remote Control overview with model-free `tasks`, `usage` and targeted `send` commands. It does not add Native Remote Control to the pooled workers; their detailed view and supported approvals remain in private web Cockpit. Keep this optional overview open only while needed.
+
+## Conductor Claude (Native Remote Control in the iOS app)
+
+Separate from the private Cockpit above, a Conductor runs Native Claude with its own Native login (not through the pool) and connects to Remote Control, so the Claude iOS app can talk to it as "Conductor". It is one permanent conversation on one device, started by a service; manage it with `claude-pool device conductor status` and `move <device>`. The iPhone uses the Native login's account, so the pool account with the same identity is reserved from 85% unless you set it otherwise (`claude-pool account reserve <name> --at <pct>`). That keeps the phone usable when the pool is busy. See [devices](DEVICES.md).

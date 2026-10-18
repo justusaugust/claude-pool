@@ -43,3 +43,21 @@
 **A stream failed after a tool call.** The gateway does not blindly replay partial output or tool effects. Inspect the last step before retrying when Native cannot safely continue. An API error is not proof that a file write or external side effect did not complete.
 
 **A reset wait ended when the terminal closed.** The waiting process must remain alive. This release does not recreate exited clients or guarantee sleep/network recovery across a long quota wait.
+
+## Several machines
+
+Start with `claude-pool device check`; each problem has a `fix:` line. See [devices](DEVICES.md).
+
+**`reauthenticate` on every device.** A long-lived token was revoked or expired. Run `claude-pool account add <email> --long-lived --name <name> --replace`, then `claude-pool device sync`.
+
+**Usage readings are not fresh on a device.** Readings are pulled from the usage owner over SSH by the pool service, which cannot answer a password prompt. Make `ssh -o BatchMode=yes <owner> true` work from that device.
+
+**Services stop when I log out of a Linux device.** Linger is off. A root user runs `sudo loginctl enable-linger <user>` once; `device add` only prints it.
+
+**Two Conductors, or Conductor not ready.** Only one may run. `claude-pool device conductor status` names where; stop the extra one and run the fix it prints, or `claude-pool device conductor move <device>`.
+
+**`registry diverged`.** Two devices have different lists at the same generation. On the device whose list is right run `claude-pool device sync --force-registry`.
+
+**Preview links are HTTP only.** Tailscale Serve is not allowed for that user. A root user runs `sudo tailscale set --operator=<user>`, then `claude-pool device add <ssh-target>`.
+
+**A device answers with exit 86.** Its launcher is older than device support. Run `claude-pool device add <ssh-target>` from an up-to-date device.

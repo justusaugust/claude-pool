@@ -15,3 +15,9 @@ The one-command installer and updater fetch public code from this repository and
 For public releases, export this source directory only. Never publish the original development workspace, account store, runtime directory, Native configuration, raw task transcripts, private receipts or browser state. Demo material must use public fixture content and generic account labels.
 
 No dedicated vulnerability-reporting channel is configured for this alpha. Contact the [repository maintainer](https://github.com/justusaugust) privately before disclosing a security issue. Never include secrets in public issues.
+
+## Several machines
+
+Long-lived tokens are one-year bearer tokens that are good for inference only. They do not rotate, so there is no refresh-token tripwire, and a copy on a lost machine stays valid until it expires or you revoke it in claude.ai settings (revocation is manual and weak: re-enroll and run `claude-pool device sync`). `device` commands copy them to every device through an SSH pipe into 0600 files in 0700 directories, never through arguments, logs, `devices.json` or git. Tokens are compared by fingerprint, the first 12 hex digits of the SHA-256 of the access token, never by value.
+
+Machines talk only over Tailscale. Cua binds the Tailscale address and preview proxies bind loopback or the Tailscale address, never 0.0.0.0. `preview file` shares are read-only, refuse dot paths, and listen on loopback plus the tailnet only. See [devices](DEVICES.md).
