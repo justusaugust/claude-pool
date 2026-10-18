@@ -93,7 +93,10 @@ def build_version():
 def account_rows():
     members, rows = set(config_names()), []
     names = set(members) | {p.stem for p in settings.LONG_LIVED.glob('*.json') if not p.stem.startswith('.')}
-    for name in sorted(names):
+    # A long-lived store file with no membership and no replica is listed too (`stray`): it may be the only copy.
+    strays = {p.stem for p in settings.STORES.glob('*.json') if not p.stem.startswith('.') and p.stem not in names
+              and not p.is_symlink() and accounts_cli.stored_kind(p) == 'long-lived'}
+    for name in sorted(names | strays):
         replica_path, store = settings.LONG_LIVED / (name + '.json'), settings.STORES / (name + '.json')
         have = accounts_cli.stored_kind(replica_path) == 'long-lived'
         path = replica_path if have else store
@@ -102,6 +105,7 @@ def account_rows():
         try:
             row = {'name': name, 'kind': 'long-lived' if have else kind(value), 'fingerprint': fingerprint(value),
                    'expiresAt': long_lived.expires_at_ms(value), 'active': name in members, 'servingFingerprint': None}
+            if name in strays: row['stray'] = True
             if name in members and store.exists() and not store.is_symlink():
                 try: row['servingFingerprint'] = fingerprint(read_private(store))
                 except (OSError, ValueError, RuntimeError): pass
@@ -304,7 +308,7 @@ def pull(remote):
         known = {row['name'] for row in registry.load()['accounts']}
         for name, row in sorted(theirs['accounts'].items()):
             path = settings.LONG_LIVED / (name + '.json')
-            if row.get('kind') != 'long-lived' or name not in known or not NAME.fullmatch(name): continue
+            if row.get('kind') != 'long-lived' or row.get('stray') or name not in known or not NAME.fullmatch(name): continue
             if accounts_cli.stored_kind(path) == 'long-lived' and fingerprint(read_private(path)) == row.get('fingerprint'): continue
             receive_account(name, peer(remote, 'send-account', name))
     return guarded(work, remote.name)

@@ -9,9 +9,11 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -22,15 +24,18 @@ import device_cua
 import device_install
 import device_integrations
 import device_preview
-from device_report import Step
+from device_report import ADD_ORDER, CHECK_NAMES, Step
 import device_sync
 import devices_cli
 import launch
+import long_lived
+import native_login
 import readings
 import remote
 import registry
+import service
 import settings
-from remote import Completed, Local, Remote
+from remote import POOL, Completed, Local, Remote
 from fakes import FakeRemote, SecretWatch, fixture_token, long_lived_file, refreshable_file
 
 MAC = {'name': 'mac', 'ssh': 'justus@mac', 'platform': 'darwin', 'roles': [], 'addedAt': 1}
@@ -569,12 +574,6 @@ class DeviceScriptTests(DeviceCliBase):
 
 # Orchestration: device add, check and remove ----------------------------------------------------------------------------
 
-import re
-import time
-from remote import POOL
-import long_lived
-import service
-from device_report import ADD_ORDER, CHECK_NAMES
 
 CUA_FIXTURE_TOKEN = 'cua-pairing-' + 'k' * 24
 WANTED = '1.2.3'
@@ -591,7 +590,7 @@ class Machine:
     def __init__(self, ssh, log, *, platform='linux', reachable=True, launcher='current', native=NATIVE_PATH, version=WANTED,
                  linger='yes', shell=True, self_name=None, registry_value=None, accounts=None, service='running',
                  doctor=True, login=TEAM_LOGIN, cua=False, ip=None, preview='ours', rules=True, https=True,
-                 overview=None, shared_at='fresh', conductor_part=None, switch_pending=(), herdr=None):
+                 overview=None, shared_at='fresh', conductor_part=None, switch_pending=(), herdr=None, label='io.github.claude-pool'):
         self.ssh, self.log = ssh, log
         self.platform, self.reachable, self.launcher, self.native, self.version = platform, reachable, launcher, native, version
         self.linger, self.shell, self.self_name, self.registry = linger, shell, self_name, registry_value
@@ -603,6 +602,7 @@ class Machine:
         self.shared_at = int(time.time() * 1000) - 60_000 if shared_at == 'fresh' else shared_at
         self.conductor = conductor_part or {'installed': False, 'running': False, 'ready': False, 'fresh': False, 'duplicates': []}
         self.switch_pending, self.herdr = list(switch_pending), herdr
+        self.label, self.unit_loaded = label, True
         self.fail = set()  # e.g. {'shell add'}
         self.calls = []
         machine = self
@@ -628,7 +628,7 @@ class Machine:
                 'herdrProfiles': [], 'conductor': self.conductor,
                 'cua': {'host': self.host, 'spaces': list(self.spaces), 'mcp': self.mcp} if self.cua else None,
                 'preview': {'installed': self.preview == 'ours', 'https': self.https}, 'overview': self.overview,
-                'sharedReadingsAt': self.shared_at}
+                'sharedReadingsAt': self.shared_at, 'serviceLabel': self.label}
 
     def event(self, label): self.log.append((self.ssh, label))
 
@@ -674,13 +674,20 @@ class Machine:
             return ok()
         if 'loginctl show-user' in script: return ok(self.linger)
         if script == devices_cli.UNINSTALL_SCRIPT: self.event('uninstall'); self.launcher = 'none'; return ok()
-        if 'systemctl --user disable' in script or 'launchctl bootout' in script: self.event('unit'); return ok()
+        if 'systemctl --user disable' in script or 'launchctl bootout' in script:
+            self.event('unit')
+            if 'unit' in self.fail: return answer(1)
+            self.unit_loaded = False; return ok()
+        if 'is-active' in script or 'launchctl print' in script: return answer(0 if self.unit_loaded else 1)
         if script == device_preview._SHA_SCRIPT:
-            return ok({'ours': device_preview._tool_sha(), 'absent': 'absent', 'other': 'f' * 64}[self.preview])
+            return ok({'ours': device_preview._tool_sha(), 'absent': 'absent', 'other': 'f' * 64,
+                       'previous': sorted(device_preview.KNOWN_PREVIOUS)[0]}[self.preview])
+        if script == device_preview._UPDATE_SCRIPT: self.updates = getattr(self, 'updates', 0) + 1; self.preview = 'ours'; return ok()
         if script == device_preview._INSTALL_SCRIPT: self.preview = 'ours'; return ok()
         if script == device_preview._UNLINK_SCRIPT: self.event('preview'); self.preview = 'absent'; return ok()
         if script == device_preview._RUN_SCRIPT:
-            if self.preview != 'ours': return answer(127)
+            if self.preview not in ('ours', 'previous'): return answer(127)
+            if rest[1:] == ['stop', '--all'] and 'preview' in self.fail: return answer(1)
             if rest[1:] == ['doctor']: return ok('backend ' + ('https' if self.https else 'http') + '\n')
             self.event('preview'); return ok()
         if script.startswith(device_cua.PATH_PREFIX): return self.cua_call(script, rest, data)
@@ -727,12 +734,19 @@ class Machine:
             if args[1] == 'add':
                 if 'shell add' in self.fail: return answer(1)
                 self.shell = True; return ok()
+            if 'shell remove' in self.fail: return answer(1)
             self.event('shell'); self.shell = False; return ok()
         if args[:1] == ['preview-rules']:
             if args[1] == 'check': return answer(0 if self.rules else 1)
-            if args[1] == 'remove': self.event('preview')
+            if args[1] == 'remove':
+                if 'preview' in self.fail: return answer(1)
+                self.event('preview')
             self.rules = args[1] == 'add'; return ok()
         if args == ['conductor', 'install']:
+            self.conductor_installs = getattr(self, 'conductor_installs', 0) + 1
+            if self.conductor.get('duplicates') or 'conductor install' in self.fail:
+                self.conductor = dict(self.conductor, **getattr(self, 'after_failed_install', {}))
+                return answer(1, b'vps\n  failed      conductor     another Conductor is running\n')
             self.conductor = {'installed': True, 'running': True, 'ready': True, 'fresh': False, 'duplicates': []}; return ok()
         if args == ['cua-token']: return ok(CUA_FIXTURE_TOKEN) if self.host else answer(1)
         if args == ['forget-accounts']:
@@ -783,7 +797,6 @@ class OrchestrationBase(DeviceCliBase):
         return sum(1 for argv, _ in machine.calls if has(argv) or (words[0] in script and script[words[0]] in argv))
 
 
-import native_login
 
 
 class AddTests(OrchestrationBase):
@@ -1122,6 +1135,212 @@ class LocalPoolTests(OrchestrationBase):
         start.assert_not_called(); command.assert_not_called()
         self.assertFalse([argv for argv, _ in self.local.calls if '--start' in argv or '--stop' in argv])
         self.assertIn('--stop', [argv[-1] for argv, _ in self.vps.calls])
+
+
+SESSION_FIXTURE = 'cse_' + 'adopt123'
+ADOPT_FIX = ('stop the hand-started Conductor (herdr session conductor), then run: '
+             'ssh justus@vps claude-pool device conductor install --session-id ' + SESSION_FIXTURE)
+HAND_STARTED = {'installed': False, 'running': False, 'ready': False, 'fresh': False, 'duplicates': [4242],
+                'adoptSessionId': SESSION_FIXTURE}
+IDLE_CONDUCTOR = {'installed': False, 'running': False, 'ready': False, 'fresh': False, 'duplicates': []}
+
+
+class ConductorAddTests(OrchestrationBase):
+    def test_a_hand_started_conductor_is_adopted_by_hand_then_the_rerun_installs(self):
+        self.vps.conductor = dict(HAND_STARTED)
+        code, out, err = self.cli('add', 'justus@vps', '--name', 'vps', '--usage-owner')
+        self.assertEqual(getattr(self.vps, 'conductor_installs', 0), 0)  # never installs next to a running Conductor
+        self.assertRegex(out, r'\n  manual +conductor .*\n      fix: ' + re.escape(ADOPT_FIX))
+        self.assertIn('\nNeeds you:\n', out); self.assertIn('  conductor: ' + ADOPT_FIX, out)
+        self.assertEqual(registry.load(self.reg)['conductor']['device'], 'vps')
+        self.vps.conductor = dict(IDLE_CONDUCTOR)  # Justus stops the hand-started one
+        code, out, err = self.cli('add', 'justus@vps', '--name', 'vps', '--usage-owner')
+        self.assertEqual(code, 0, out + err); self.assertEqual(self.vps.conductor_installs, 1)
+        self.assertRegex(out, r'\n  ok +conductor +ready on vps')
+
+    def test_a_registered_conductor_that_is_not_running_is_installed_again(self):
+        registry.update(lambda value: (value['devices'].extend([dict(SELF_ROW), dict(VPS, ssh='justus@vps', roles=[])]), value.update(
+            conductor={'device': 'vps', 'email': 'team@x.de', 'organization': 'Team A', 'cwd': '/srv/c'})), self.reg)
+        code, out, err = self.cli('add', 'justus@vps', '--name', 'vps')
+        self.assertEqual(code, 0, out + err); self.assertEqual(self.vps.conductor_installs, 1)
+
+    def test_a_failed_install_reports_the_real_conductor_step_not_a_generic_one(self):
+        self.vps.after_failed_install = dict(HAND_STARTED)  # someone started one by hand meanwhile
+        self.vps.fail.add('conductor install')
+        code, out, err = self.cli('add', 'justus@vps', '--name', 'vps', '--usage-owner')
+        self.assertEqual(self.vps.conductor_installs, 1)
+        self.assertRegex(out, r'\n  manual +conductor .*\n      fix: ' + re.escape(ADOPT_FIX))
+        self.assertNotIn('install failed', out); self.assertNotIn('installing the Conductor', out)
+
+
+class ConductorAdoptTests(unittest.TestCase):
+    def test_status_reports_the_session_id_of_a_hand_started_conductor(self):
+        ps = ('  10     1 /opt/claude remote-control --session-id ' + SESSION_FIXTURE + ' --name Conductor Claude --permission-mode auto\n'
+              '  11     1 /opt/claude remote-control --name Other\n')
+        self.assertEqual(conductor.adoptable(ps, [10]), SESSION_FIXTURE)
+        self.assertIsNone(conductor.adoptable(ps.replace(SESSION_FIXTURE, 'not-a-session'), [10]))
+        self.assertIsNone(conductor.adoptable(ps, []))
+
+    def test_check_names_the_adopt_command_for_the_device_it_runs_on(self):
+        value = {'devices': [dict(VPS, roles=[]), MAC], 'accounts': [],
+                 'conductor': {'device': 'vps', 'email': 'team@x.de', 'organization': 'Team A', 'cwd': '/c'}}
+        step = conductor.check({'vps': {'platform': 'linux', 'linger': True, 'conductor': dict(HAND_STARTED)}}, value)
+        self.assertEqual(step.fix, ADOPT_FIX)
+        with patch.object(registry, 'self_name', return_value='vps'):
+            step = conductor.check({'vps': {'platform': 'linux', 'linger': True, 'conductor': dict(HAND_STARTED)}}, value)
+        self.assertEqual(step.fix, ADOPT_FIX.replace('ssh justus@vps ', ''))
+
+
+class FixRoundCheckTests(OrchestrationBase):
+    def setUp(self):
+        super().setUp()
+        registry.update(lambda value: value['devices'].extend([dict(SELF_ROW, roles=['usage']), dict(VPS, ssh='justus@vps', roles=[])]), self.reg)
+        known = registry.load(self.reg)
+        self.vps.registry, self.vps.self_name = known, 'vps'
+        self.vps.accounts = {'team': {'kind': 'long-lived', 'fingerprint': self.team_fp}}
+        self.local.herdr = [{'id': 'p1', 'label': 'vps', 'target': 'justus@vps'}]
+        self.local.registry = known
+
+    def test_readings_not_yet_arrived_are_manual_and_stale_readings_are_missing(self):
+        fix = 'first readings arrive within 5 min; needs ssh from justus@vps to mac without a password prompt'
+        self.vps.shared_at = None
+        code, out, _ = self.cli('check', 'vps')
+        self.assertEqual(code, 0, out); self.assertRegex(out, r'\n  manual +readings .*\n      fix: ' + re.escape(fix))
+        self.vps.shared_at = int(time.time() * 1000) - 20 * 60_000
+        code, out, _ = self.cli('check', 'vps')
+        self.assertEqual(code, 2); self.assertRegex(out, r'\n  missing +readings ')
+
+    def test_doctor_fixes_are_run_on_the_device(self):
+        self.vps.doctor = False
+        code, out, _ = self.cli('check', 'vps')
+        self.assertRegex(out, r'\n  failed +doctor +fail tokens.*\n      fix: ssh justus@vps claude-pool account add x')
+
+    def test_a_peer_whose_registry_is_ahead_is_reported(self):
+        ahead = json.loads(json.dumps(self.vps.registry)); ahead['generation'] += 3
+        self.vps.registry = ahead
+        code, out, _ = self.cli('check', 'vps')
+        self.assertEqual(code, 2); self.assertRegex(out, r'accounts .*ahead.*\n      fix: claude-pool device sync')
+
+
+class FixRoundAddTests(OrchestrationBase):
+    def test_add_waits_for_readings_then_leaves_a_manual_step(self):
+        registry.update(lambda value: value['devices'].append(dict(SELF_ROW, roles=['usage'])), self.reg)
+        self.vps.shared_at = None
+        code, out, err = self.cli('add', 'justus@vps', '--name', 'vps')
+        self.assertEqual(code, 0, out + err)
+        self.assertIn('  readings: first readings arrive within 5 min; needs ssh from justus@vps to mac without a password prompt', out)
+
+    def test_add_updates_an_earlier_preview_tool_even_when_it_answers(self):
+        self.vps.preview = 'previous'
+        code, out, err = self.cli('add', 'justus@vps', '--name', 'vps')
+        self.assertEqual(code, 0, out + err); self.assertEqual(self.vps.updates, 1); self.assertEqual(self.vps.preview, 'ours')
+
+    def test_add_prints_each_devices_sync_result_and_records_the_tailscale_address(self):
+        self.vps.cua, self.vps.ip, self.local.cua = True, '100.64.0.2', True
+        code, out, err = self.cli('add', 'justus@vps', '--name', 'vps', '--cua')
+        self.assertEqual(code, 0, out + err); self.assertIn('sync vps: ok', out)
+        value = registry.load(self.reg)
+        self.assertEqual(registry.device(value, 'vps')['tailscaleIp'], '100.64.0.2')
+        self.assertEqual(registry.device(value, 'mac')['tailscaleIp'], '100.64.0.1')
+
+
+class FixRoundRemoveTests(OrchestrationBase):
+    def setUp(self):
+        super().setUp()
+        self.local.herdr = [{'id': 'p1', 'label': 'vps', 'target': 'justus@vps'}, {'id': 'p2', 'label': 'vps', 'target': 'justus@other'}]
+        registry.update(lambda value: value['devices'].extend([dict(SELF_ROW, roles=['usage']),
+                                                               dict(VPS, ssh='justus@vps', roles=[], cua=True, tailscaleIp='100.64.0.2')]), self.reg)
+        self.vps.registry, self.vps.self_name = registry.load(self.reg), 'vps'
+        self.vps.accounts = {'team': {'kind': 'long-lived', 'fingerprint': self.team_fp}}
+        self.vps.cua, self.vps.ip, self.vps.host, self.vps.mcp = True, '100.64.0.2', True, True
+        self.local.cua, self.local.spaces = True, ['direct:100.64.0.2:3211', 'direct:100.64.0.9:3211']
+
+    def test_a_failed_preview_or_shell_removal_stops_before_anything_irreversible_and_a_rerun_completes(self):
+        for part, fix in [('preview', 'claude-pool device remove vps'), ('shell remove', 'ssh justus@vps claude-pool device shell remove')]:
+            with self.subTest(part=part):
+                self.vps.fail = {part}; self.vps.calls.clear()
+                code, out, err = self.cli('remove', 'vps')
+                self.assertNotEqual(code, 0); self.assertIn('fix: ' + fix, out)
+                self.assertEqual([argv for argv, _ in self.vps.calls if '--stop' in argv or 'forget-accounts' in argv], [])
+                self.assertIsNotNone(registry.device(registry.load(self.reg), 'vps'))
+        self.vps.fail = set()
+        code, out, err = self.cli('remove', 'vps')
+        self.assertEqual(code, 0, out + err); self.assertIsNone(registry.device(registry.load(self.reg), 'vps'))
+
+    def test_the_unit_is_disabled_by_the_installed_label_and_a_still_loaded_unit_fails(self):
+        self.vps.label = 'io.example.pool'
+        code, out, err = self.cli('remove', 'vps')
+        self.assertEqual(code, 0, out + err)
+        self.assertIn(['sh', '-c', service.unload_hint('io.example.pool', 'linux')], [argv for argv, _ in self.vps.calls])
+
+    def test_a_unit_that_stays_loaded_is_a_failed_step(self):
+        self.vps.fail = {'unit'}
+        code, out, err = self.cli('remove', 'vps')
+        self.assertNotEqual(code, 0); self.assertRegex(out, r'\n  failed +service .*\n      fix: ')
+        self.assertIsNotNone(registry.device(registry.load(self.reg), 'vps'))
+
+    def test_a_unit_that_was_not_loaded_is_fine(self):
+        self.vps.fail = {'unit'}; self.vps.unit_loaded = False
+        code, out, err = self.cli('remove', 'vps')
+        self.assertEqual(code, 0, out + err)
+
+    def test_remove_prints_each_devices_sync_result(self):
+        registry.update(lambda value: value['devices'].append({'name': 'lap', 'ssh': 'justus@lap', 'platform': 'darwin', 'roles': []}), self.reg)
+        self.machines['justus@lap'] = Machine('justus@lap', self.log, platform='darwin', self_name='lap', registry_value=registry.load(self.reg))
+        code, out, err = self.cli('remove', 'vps')
+        self.assertEqual(code, 0, out + err); self.assertIn('sync lap: ok', out)
+
+    def test_forget_drops_an_unreachable_device_here_without_any_remote_call(self):
+        self.vps.reachable = False
+        code, out, err = self.cli('remove', 'vps', '--forget')
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(self.vps.calls, [])
+        self.assertIsNone(registry.device(registry.load(self.reg), 'vps'))
+        self.assertEqual(self.local.herdr, [{'id': 'p2', 'label': 'vps', 'target': 'justus@other'}])
+        self.assertEqual(self.local.spaces, ['direct:100.64.0.9:3211'])
+        self.assertIn('tokens copied to vps remain', out); self.assertIn('revoke', out)
+
+    def test_forget_refuses_the_conductor_device_and_the_usage_owner(self):
+        for prepare in [lambda value: value.update(conductor={'device': 'vps', 'email': 'team@x.de', 'organization': 'Team A', 'cwd': '/c'}),
+                        lambda value: (registry.device(value, 'mac')['roles'].clear(), registry.device(value, 'vps')['roles'].append('usage'))]:
+            with self.subTest():
+                registry.update(prepare, self.reg); state = registry.load(self.reg)
+                self.vps.calls.clear(); self.local.calls.clear()
+                code, out, err = self.cli('remove', 'vps', '--forget')
+                self.assertNotEqual(code, 0); self.assertEqual(registry.load(self.reg), state)
+                self.assertEqual(self.vps.calls + self.local.calls, [])
+                registry.update(lambda value: (value.update(conductor=None), registry.device(value, 'vps')['roles'].clear(),
+                                               registry.device(value, 'mac').update(roles=['usage'])), self.reg)
+
+
+class StrayLongLivedTests(DeviceCliBase):
+    def setUp(self):
+        super().setUp(); self.parts_off()
+
+    def test_status_lists_a_long_lived_store_file_that_has_no_member_and_no_replica(self):
+        long_lived_file(self.stores, 'stray')
+        code, out, _ = self.run_cli(['status'])
+        row = next(r for r in json.loads(out)['accounts'] if r['name'] == 'stray')
+        self.assertEqual((row['kind'], row['active']), ('long-lived', False))
+
+    def test_forget_accounts_moves_a_stray_long_lived_file_aside_and_never_deletes_it(self):
+        (self.runtime / 'maintenance').write_text('Deliberately stopped\n')
+        for key in ('GATEWAY_PORT', 'BACKEND_PORT', 'CONTROL_PORT'):
+            probe = socket.socket(); probe.bind(('127.0.0.1', 0)); port = probe.getsockname()[1]; probe.close()
+            item = patch.object(settings, key, port); item.start(); self.addCleanup(item.stop)
+        data = long_lived_file(self.stores, 'stray').read_bytes()
+        code, out, err = self.run_cli(['forget-accounts'])
+        self.assertEqual(code, 0, out + err)
+        self.assertFalse((self.stores / 'stray.json').exists())
+        moved = list((self.stores / '.retired').glob('stray-*.json'))
+        self.assertEqual([path.read_bytes() for path in moved], [data])
+
+
+class DoctorOutputTests(unittest.TestCase):
+    def test_a_failing_first_line_keeps_its_fix(self):
+        fake = FakeRemote('justus@vps', lambda argv, data: answer(1, '  fail tokens · fix: claude-pool account add x\n'.encode()))
+        step = device_install.check_doctor(fake)
+        self.assertEqual((step.status, step.fix), ('failed', 'claude-pool account add x'))
 
 
 if __name__ == '__main__':

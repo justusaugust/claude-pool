@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import socket
 import sys
 import tempfile
@@ -224,7 +225,7 @@ def forget_accounts(argv, out, **_):
     for folder in (settings.STORES, settings.LONG_LIVED):
         names |= {p.stem for p in folder.glob('*.json') if not p.stem.startswith('.')}
     names = sorted(name for name in names if device_sync.NAME.fullmatch(name))
-    report = {'removed': [], 'kept': [], 'failed': {}}
+    report = {'removed': [], 'kept': [], 'retired': [], 'failed': {}}
     private_directory(settings.STORES)
     with contextlib.ExitStack() as held:
         created = []
@@ -241,10 +242,15 @@ def forget_accounts(argv, out, **_):
             members = set(device_sync.config_names())
             served = [n for n in names if not (settings.STORES / (n + '.json')).is_symlink()
                       and accounts_cli.stored_kind(settings.STORES / (n + '.json')) == 'long-lived']
+            # A long-lived store file with no membership and no replica may be the only copy: moved aside, never deleted.
+            strays = {n for n in served if n not in members and accounts_cli.stored_kind(settings.LONG_LIVED / (n + '.json')) != 'long-lived'}
             # Membership goes first, so no member list points at a file while it is unlinked.
             drop_members({n for n in served if n in members})
             for name in names:
                 try:
+                    if name in strays:
+                        device_sync.retire_store(settings.STORES / (name + '.json'), settings.STORES / '.retired')
+                        report['retired'].append(name); continue
                     done = _unlink_long_lived(settings.STORES / (name + '.json')) if name in served else False
                     done = _unlink_long_lived(settings.LONG_LIVED / (name + '.json')) or done
                     (report['removed'] if done else report['kept']).append(name)
@@ -546,6 +552,9 @@ def check_accounts(t):
     elif not isinstance(generation, int) or generation < value['generation']:
         issues.append(('missing', 'registry generation ' + str(generation) + ' there, ' + str(value['generation']) + ' here',
                        'claude-pool device sync'))
+    elif generation > value['generation']:
+        issues.append(('missing', 'registry generation ' + str(generation) + ' there is ahead of ' + str(value['generation']) + ' here',
+                       'claude-pool device sync'))
     theirs = st.get('accounts') or {}
     for row in value['accounts']:
         want = row.get('fingerprint') or _local_fingerprint(row['name'])
@@ -599,7 +608,10 @@ def ensure_service(t):
     return step
 
 
-def check_doctor(t): return device_install.check_doctor(t.remote) if t.supported else t.needs_install('doctor')
+def check_doctor(t):
+    if not t.supported: return t.needs_install('doctor')
+    step = device_install.check_doctor(t.remote)
+    return step._replace(fix=t.on(step.fix)) if step.fix else step
 
 
 def check_native_login(t):
@@ -658,6 +670,13 @@ def ensure_cua(t):
     if skipped: return skipped
     if not t.supported: return t.needs_install('cua')
     me = t.s.me or 'this-device'
+    def note(value):
+        for device, address in ((t.row['name'], there), (me, here)):
+            row = registry.device(value, device)
+            if row is not None and row.get('tailscaleIp') != address: row['tailscaleIp'] = address
+    current = registry.load()
+    wanted = copy.deepcopy(current); note(wanted)
+    if wanted != current: registry.update(note)
     hosts = [device_cua.ensure_host(t.remote, t.row['name'], there), device_cua.ensure_host(t.s.local, me, here)]
     steps = list(hosts)
     if all(step.status == 'ok' for step in hosts):
@@ -666,6 +685,12 @@ def ensure_cua(t):
     if t.native: steps.append(device_cua.ensure_mcp(t.remote, t.native))
     t.forget(); t.s.forget(t.s.me)
     return worst('cua', steps)
+
+
+def _adopt(step):
+    """A hand-started Conductor is running; handing it to the service is Justus's step, so it is listed under Needs you."""
+    if step.status == 'failed' and (step.fix or '').startswith('stop the hand-started Conductor'): return step._replace(status='manual')
+    return step
 
 
 def check_conductor(t):
@@ -682,25 +707,31 @@ def check_conductor(t):
     for device in dict.fromkeys([lead, name, *(row['name'] for row in value['devices'])]):
         found = t.s.status_of(device)
         if found is not None: statuses[device] = found
-    return conductor.check(statuses, value)
+    return _adopt(conductor.check(statuses, value))
 
 
 def ensure_conductor(t):
-    if not (t.args and t.args.usage_owner) or registry.load().get('conductor'): return check_conductor(t)
+    """Idempotent: creates the registry entry (with --usage-owner, when there is none) and installs the Conductor on the
+    target whenever the registry names it and nothing runs there yet. Never installs next to a running Conductor."""
+    entry = registry.load().get('conductor')
+    if not entry and not (t.args and t.args.usage_owner): return check_conductor(t)
+    if entry and entry['device'] != t.row['name']: return check_conductor(t)
     if not t.supported: return t.needs_install('conductor')
-    login = t.status(fresh=True).get('nativeLogin')
-    if not isinstance(login, dict) or not login.get('email'):
-        return Step('conductor', 'missing', 'the Conductor needs a Native login on ' + t.row['name'] + ' first', t.retry + ' --usage-owner')
-    entry = {'device': t.row['name'], 'email': login['email'], 'organization': login.get('organization') or '', 'cwd': CONDUCTOR_DIR}
-    def place(value):
-        if not value.get('conductor'): value['conductor'] = entry
-    registry.update(place)
+    status = t.status(fresh=True)
+    if not entry:
+        login = status.get('nativeLogin')
+        if not isinstance(login, dict) or not login.get('email'):
+            return Step('conductor', 'missing', 'the Conductor needs a Native login on ' + t.row['name'] + ' first', t.retry + ' --usage-owner')
+        entry = {'device': t.row['name'], 'email': login['email'], 'organization': login.get('organization') or '', 'cwd': CONDUCTOR_DIR}
+        def place(value):
+            if not value.get('conductor'): value['conductor'] = entry
+        registry.update(place)
+    part = status.get('conductor') or {}
+    if part.get('running') or part.get('duplicates') or part.get('error'): return check_conductor(t)
     device_sync.peer(t.remote, 'receive-registry', stdin=json.dumps(registry.load()).encode())
-    done = t.remote.device('conductor', 'install', timeout=300)
+    t.remote.device('conductor', 'install', timeout=300)
     t.forget()
-    if done.returncode:
-        return Step('conductor', 'failed', 'installing the Conductor on ' + t.row['name'] + ' failed', t.on('claude-pool device conductor install'))
-    return check_conductor(t)
+    return check_conductor(t)  # the device's own report after the install, never a generic one
 
 
 def check_readings(t):
@@ -710,10 +741,12 @@ def check_readings(t):
     if owner['name'] == t.row['name']: return Step('readings', 'skipped', 'this device is the usage owner')
     if not t.supported: return t.needs_install('readings')
     at = t.status().get('sharedReadingsAt')
-    now = int(time.time() * 1000)
-    if isinstance(at, int) and now - at <= READINGS_MAX_AGE_MS:
+    now, reach = int(time.time() * 1000), owner.get('ssh') or owner['name']
+    if not isinstance(at, int):
+        return Step('readings', 'manual', 'no usage readings from ' + owner['name'] + ' yet',
+                    'first readings arrive within 5 min; needs ssh from ' + t.where + ' to ' + reach + ' without a password prompt')
+    if now - at <= READINGS_MAX_AGE_MS:
         return Step('readings', 'ok', 'from ' + owner['name'] + ', ' + str(max(0, now - at) // 60000) + ' min old')
-    reach = owner.get('ssh') or owner['name']
     return Step('readings', 'missing', 'no usage readings from ' + owner['name'] + ' in the last 15 minutes',
                 t.on('ssh -o BatchMode=yes ' + reach + ' true') + ' must work (readings are pulled from the usage owner every 5 minutes)')
 
@@ -721,7 +754,7 @@ def check_readings(t):
 def ensure_readings(t):
     step = check_readings(t)
     waited = 0
-    while step.status == 'missing' and t.supported and waited < READINGS_WAIT:
+    while step.status in ('missing', 'manual') and t.supported and waited < READINGS_WAIT:
         _sleep(READINGS_POLL); waited += READINGS_POLL
         t.forget(); step = check_readings(t)
     return step
@@ -735,6 +768,8 @@ def _user(t):
 def check_preview(t):
     if t.row.get('platform') == 'darwin': return Step('preview', 'skipped', device_preview.LINUX_ONLY)
     if not t.supported: return t.needs_install('preview')
+    if device_preview._inspect(t.remote) in device_preview.KNOWN_PREVIOUS:
+        return Step('preview', 'missing', 'an earlier release of the preview tool is installed', t.retry)
     tool = device_preview.check(t.remote, _user(t))
     if tool.status in ('missing', 'failed'): return tool
     if t.remote.device('preview-rules', 'check').returncode:
@@ -789,6 +824,17 @@ def _desired(value, me, name, target, platform, args):
         row['roles'] = ['usage']
 
 
+def prefer_ensured(done, step, retry):
+    """The final report shows the recheck, which names the current fix, unless it says nothing better than the ensure did:
+    the ensure step stays when it is manual (Justus's part) or when the recheck has no fix or only the generic rerun."""
+    if done is None or step.status == 'ok' or done.status == 'ok': return False
+    return done.status == 'manual' or not step.fix or step.fix == retry
+
+
+def print_sync(results):
+    for name, result in sorted(results.items()): print('sync ' + name + ': ' + result)
+
+
 def add(argv, out, remotes, local, **_):
     args = parse('add', argv, (['target'], {}), (['--name'], {}), (['--cua'], {'action': 'store_true'}),
                  (['--usage-owner'], {'action': 'store_true'}), (['--herdr-session'], {}))
@@ -828,16 +874,18 @@ def add(argv, out, remotes, local, **_):
         ensured[step_name] = None
         if step.status != 'ok' and step_name in ENSURES:
             ensured[step_name] = run_step(ENSURES[step_name], step_name, t)
+    synced = {}
     if registry.load()['generation'] != start:  # every other device learns about this one (and runs its herdr hook)
-        try: device_sync.sync_all(remotes)
-        except Exception: pass
+        try: synced = device_sync.sync_all(remotes)
+        except Exception as error: synced = {'all devices': 'failed: ' + _redacted(error)}
     session._statuses.clear()
     t.row = registry.device(registry.load(), name)
     final = []
     for step in check_all(t):
         done = ensured.get(step.name)
-        final.append(done if done is not None and step.status != 'ok' and done.status != 'ok' else step)
+        final.append(done if prefer_ensured(done, step, t.retry) else step)
     print(render(name + ' (' + target + ')', final))
+    print_sync(synced)
     return 0 if ready(final) else 2
 
 
@@ -867,32 +915,80 @@ def check(argv, out, remotes, local, **_):
     return 0 if good else 2
 
 
-def _unit_command(row):
-    return service.unload_hint(service.DEFAULT_LABEL, row.get('platform'))
+LABEL = re.compile(r'[A-Za-z0-9.-]{1,200}')
+
+
+def _service_label(status):
+    label = status.get('serviceLabel')
+    return label if isinstance(label, str) and LABEL.fullmatch(label) else service.DEFAULT_LABEL
+
+
+def _unit_command(label, platform):
+    return service.unload_hint(label, platform)
+
+
+def _loaded_command(label, platform):
+    if platform == 'darwin': return 'launchctl print gui/$(id -u)/' + label + ' >/dev/null 2>&1'
+    return 'systemctl --user is-active --quiet ' + label + '.service || systemctl --user is-enabled --quiet ' + label + '.service'
+
+
+def _refuse_role(value, row):
+    """Why this device cannot leave the registry now (Conductor device or usage owner), or None."""
+    name = row['name']
+    if name == (value.get('conductor') or {}).get('device'):
+        other = next((r['name'] for r in value['devices'] if r['name'] != name), '<other>')
+        return 'The Conductor runs on ' + name + '. Move it first: claude-pool device conductor move ' + other + '. Nothing was changed.'
+    if 'usage' in row.get('roles', []):
+        return (name + ' is the usage owner. Make another device the owner first: claude-pool device add <other-target> --usage-owner. '
+                'Nothing was changed.')
+    return None
+
+
+def forget(row, local, remotes):
+    """`remove --forget`: a device that cannot be reached leaves this device's records only; nothing on it is touched."""
+    name, steps = row['name'], []
+    ip = row.get('tailscaleIp')
+    if row.get('cua') and ip:
+        space = f'direct:{ip}:{device_cua.PORT}'
+        ids = device_cua._space_ids(local)
+        if ids is None or space not in ids: steps.append(Step('cua', 'ok', 'no Space for ' + name + ' here'))
+        else:
+            done = device_cua._cua(local, 'spaces', 'rm', space)
+            steps.append(Step('cua', 'ok', 'Space forgotten') if done.returncode == 0 else
+                         Step('cua', 'failed', 'could not forget the Space', 'cua spaces rm ' + space))
+    else: steps.append(Step('cua', 'skipped', 'not linked' if not row.get('cua') else 'no Tailscale address recorded'))
+    steps.append(run_step(lambda t: device_integrations.remove_herdr(row, local), 'herdr', _Plain(row)))
+    registry.update(lambda current: current.update(devices=[r for r in current['devices'] if r['name'] != name]))
+    try: synced = device_sync.sync_all(remotes)
+    except Exception as error: synced = {'all devices': 'failed: ' + _redacted(error)}
+    print(render(name + ' (forgotten here)', steps))
+    print_sync(synced)
+    print('Removed ' + name + ' from the registry. Nothing on ' + name + ' was changed: tokens copied to ' + name + ' remain there. '
+          'If the machine is lost, revoke those long-lived tokens in claude.ai settings and re-enroll them with '
+          'claude-pool account add <email> --long-lived --name <name>, then claude-pool device sync.')
+    if local_platform() == 'darwin' and row.get('ssh'):
+        print('In the Claude app: Code tab, environment menu, remove the ' + row['ssh'] + ' environment.')
+    return 0 if all(step.status in ('ok', 'skipped') for step in steps) else 1
 
 
 def remove(argv, out, remotes, local, **_):
-    args = parse('remove', argv, (['name'], {}), (['--wait'], {'action': 'store_true'}), (['--uninstall'], {'action': 'store_true'}))
+    args = parse('remove', argv, (['name'], {}), (['--wait'], {'action': 'store_true'}), (['--uninstall'], {'action': 'store_true'}),
+                 (['--forget'], {'action': 'store_true'}))
     value, me = registry.load(), registry.self_name()
     row = registry.device(value, args.name)
     if row is None:
         print('No device named ' + args.name + ' (see claude-pool device list).'); return 2
     if args.name == me:
         print(args.name + ' is this device; remove it from another device. Nothing was changed.'); return 2
-    lead = (value.get('conductor') or {}).get('device')
-    if args.name == lead:
-        other = next((r['name'] for r in value['devices'] if r['name'] != args.name), '<other>')
-        print('The Conductor runs on ' + args.name + '. Move it first: claude-pool device conductor move ' + other + '. Nothing was changed.')
-        return 2
-    if 'usage' in row.get('roles', []):
-        print(args.name + ' is the usage owner. Make another device the owner first: claude-pool device add <other-target> --usage-owner. '
-              'Nothing was changed.')
-        return 2
+    refused = _refuse_role(value, row)
+    if refused: print(refused); return 2
+    if args.forget: return forget(row, local, remotes)
     if not row.get('ssh'):
-        print(args.name + ' has no ssh target; nothing was changed.'); return 2
+        print(args.name + ' has no ssh target; drop it with claude-pool device remove ' + args.name + ' --forget.'); return 2
     remote = remotes(row['ssh'])
     if not remote.reachable():
-        print(args.name + ' is unreachable (ssh ' + row['ssh'] + ' true must work without a password prompt). Nothing was changed.')
+        print(args.name + ' is unreachable (ssh ' + row['ssh'] + ' true must work without a password prompt). Nothing was changed. '
+              'If it is gone for good: claude-pool device remove ' + args.name + ' --forget')
         return 2
     def read():
         return device_sync.peer_status(remote)
@@ -922,41 +1018,46 @@ def remove(argv, out, remotes, local, **_):
         print('Claude tasks are running on ' + args.name + '; run claude-pool device remove ' + args.name +
               ' --wait or rerun later. Nothing was changed.')
         return 3
-    steps = [run_step(lambda t: device_preview.remove(remote), 'preview', _Plain(row)),
-             Step('shell', 'ok', 'claude function removed') if device_install.remove_shell(remote)
-             else Step('shell', 'failed', 'could not remove the claude function', 'claude-pool device remove ' + args.name)]
+    title, again, on = args.name + ' (' + row['ssh'] + ')', 'claude-pool device remove ' + args.name, 'ssh ' + row['ssh'] + ' '
+    def stop_here(steps):
+        print(render(title, steps))
+        print(args.name + ' stays registered; once the fix is done, run: ' + again)
+        return 1
+    preview = run_step(lambda t: device_preview.remove(remote), 'preview', _Plain(row))
+    steps = [preview._replace(fix=again) if preview.status == 'failed' else preview]
+    if preview.status == 'failed': return stop_here(steps)
+    if not device_install.remove_shell(remote):
+        return stop_here(steps + [Step('shell', 'failed', 'could not remove the claude function', on + 'claude-pool device shell remove')])
+    steps.append(Step('shell', 'ok', 'claude function removed'))
     stopped = remote.pool('--stop', timeout=POOL_TIMEOUT)
     if stopped.returncode:
-        steps.append(Step('service', 'failed', 'the pool on ' + args.name + ' did not stop; nothing else was removed',
-                          'ssh ' + row['ssh'] + ' claude-pool --stop, then claude-pool device remove ' + args.name))
-        print(render(args.name + ' (' + row['ssh'] + ')', steps)); return 1
-    unit = remote.call(['sh', '-c', _unit_command(row)])
-    if unit.returncode == 255:
-        steps.append(Step('service', 'failed', 'pool stopped, but its service could not be disabled', 'ssh ' + row['ssh'] + " '" + _unit_command(row) + "'"))
-    else:  # nonzero here means the service manager no longer had it loaded
-        steps.append(Step('service', 'ok', 'pool stopped and its service disabled' if unit.returncode == 0 else 'pool stopped; its service was not loaded'))
+        return stop_here(steps + [Step('service', 'failed', 'the pool on ' + args.name + ' did not stop', on + 'claude-pool --stop')])
+    label = _service_label(theirs)
+    unit = remote.call(['sh', '-c', _unit_command(label, row.get('platform'))])
+    if unit.returncode == 0: steps.append(Step('service', 'ok', 'pool stopped and its service disabled'))
+    elif unit.returncode != 255 and remote.call(['sh', '-c', _loaded_command(label, row.get('platform'))]).returncode not in (0, 255):
+        steps.append(Step('service', 'ok', 'pool stopped; its service was not loaded'))
+    else:
+        return stop_here(steps + [Step('service', 'failed', 'pool stopped, but its service is still loaded',
+                                       on + shlex.quote(_unit_command(label, row.get('platform'))))])
     forgot = remote.device('forget-accounts', timeout=POOL_TIMEOUT)
     if forgot.returncode:
-        steps.append(Step('accounts', 'failed', 'could not remove the synced accounts; the device stays registered',
-                          'claude-pool device remove ' + args.name))
-        print(render(args.name + ' (' + row['ssh'] + ')', steps)); return 1
+        return stop_here(steps + [Step('accounts', 'failed', 'could not remove the synced accounts', on + 'claude-pool device forget-accounts')])
     steps.append(Step('accounts', 'ok', 'synced long-lived accounts removed; its own logins stay'))
     if row.get('cua'):
-        peers = [local]
-        try: steps += device_cua.remove(remote, peers)
-        except Exception as error: steps.append(Step('cua', 'failed', _redacted(error), 'claude-pool device remove ' + args.name))
+        try: steps += device_cua.remove(remote, [local])
+        except Exception as error: steps.append(Step('cua', 'failed', _redacted(error), again))
     else: steps.append(Step('cua', 'skipped', 'not linked'))
     steps.append(run_step(lambda t: device_integrations.remove_herdr(row, local), 'herdr', _Plain(row)))
-    def drop(current):
-        current['devices'] = [r for r in current['devices'] if r['name'] != args.name]
-    registry.update(drop)
-    try: device_sync.sync_all(remotes)
-    except Exception: pass
+    registry.update(lambda current: current.update(devices=[r for r in current['devices'] if r['name'] != args.name]))
+    try: synced = device_sync.sync_all(remotes)
+    except Exception as error: synced = {'all devices': 'failed: ' + _redacted(error)}
     if args.uninstall:
         done = remote.call(['sh', '-c', UNINSTALL_SCRIPT], timeout=600)
         if done.returncode == 0: steps.append(Step('install', 'ok', 'claude-pool uninstalled; config, credentials and Native Claude stay'))
         else: steps.append(Step('install', 'failed', 'uninstall failed', 'on ' + row['ssh'] + ', run install.py --uninstall from the claude-pool application folder'))
-    print(render(args.name + ' (' + row['ssh'] + ')', steps))
+    print(render(title, steps))
+    print_sync(synced)
     print('Removed ' + args.name + ' from the registry.')
     if local_platform() == 'darwin':
         print('In the Claude app: Code tab, environment menu, remove the ' + row['ssh'] + ' environment.')

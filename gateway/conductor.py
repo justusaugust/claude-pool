@@ -253,6 +253,24 @@ def duplicates(ps_output, own_pid, session_id=None):
     return found
 
 
+def adoptable(ps_output, pids):
+    """The `--session-id` of a hand-started Conductor among `pids` (its conversation can be adopted), or None."""
+    for line in ps_output.splitlines():
+        parts = line.split()
+        if len(parts) < 3 or not parts[0].isdigit() or int(parts[0]) not in pids: continue
+        words = parts[2:]
+        for i in range(len(words) - 1):
+            if words[i] == '--session-id' and SESSION_ID.fullmatch(words[i + 1]): return words[i + 1]
+    return None
+
+
+def adopt_fix(session_id, prefix=''):
+    """How Justus hands a hand-started Conductor to the service; `prefix` is `ssh <target> ` when shown from another device."""
+    if not session_id: return HERDR_FIX
+    return ('stop the hand-started Conductor (herdr session conductor), then run: ' + prefix +
+            'claude-pool device conductor install --session-id ' + session_id)
+
+
 def _alive(pid):
     if not isinstance(pid, int) or pid <= 0: return False
     try: os.kill(pid, 0); return True
@@ -314,8 +332,10 @@ def install(session_id=None, fresh=False, moving=False):
         changes = {'fresh': True, 'sessionId': DELETE}
         if record.get('sessionId'): changes['previousSessionId'] = record['sessionId']
     if changes: record = _update(state, **changes)
-    found = duplicates(processes(), _own_child(record), record.get('sessionId'))
-    if found: return Step(STEP, 'failed', 'another Conductor is running (pid ' + ', '.join(map(str, found)) + ')', HERDR_FIX)
+    listing = processes()
+    found = duplicates(listing, _own_child(record), record.get('sessionId'))
+    if found: return Step(STEP, 'failed', 'another Conductor is running (pid ' + ', '.join(map(str, found)) + ')',
+                          adopt_fix(adoptable(listing, found)))
     cwd = Path(entry['cwd']).expanduser()
     if not cwd.is_absolute(): return Step(STEP, 'failed', 'the Conductor folder must be an absolute path', None)
     cwd.mkdir(parents=True, exist_ok=True)
@@ -367,8 +387,10 @@ def status():
         record = read_state()
         installed = service.service_file(LABEL).exists()
         own = _own_child(record) if installed else None
+        listing = processes()
+        found = duplicates(listing, own, record.get('sessionId'))
         return {'installed': installed, 'running': own is not None, 'ready': own is not None and bool(record.get('ready')),
-                'fresh': bool(record.get('fresh')), 'duplicates': duplicates(processes(), own, record.get('sessionId'))}
+                'fresh': bool(record.get('fresh')), 'duplicates': found, 'adoptSessionId': adoptable(listing, found)}
     except Exception as error:
         return {'error': type(error).__name__}
 
@@ -391,7 +413,12 @@ def check(statuses, value):
     if broken:
         return Step(STEP, 'failed', '; '.join('status error on ' + name + ': ' + str(parts[name]['error']) for name in broken), None)
     extra = {name: part.get('duplicates') for name, part in parts.items() if part.get('duplicates')}
-    if extra: return Step(STEP, 'failed', 'another Conductor runs on ' + ', '.join(sorted(extra)), HERDR_FIX)
+    if extra:
+        first = sorted(extra)[0]
+        session = parts[first].get('adoptSessionId')
+        session = session if isinstance(session, str) and SESSION_ID.fullmatch(session) else None
+        prefix = '' if first == registry.self_name() else 'ssh ' + str(_target(value, first) or first) + ' '
+        return Step(STEP, 'failed', 'another Conductor runs on ' + ', '.join(sorted(extra)), adopt_fix(session, prefix))
     if len(running) > 1:
         others = [name for name in running if name != device] or running[1:]
         return Step(STEP, 'failed', 'the Conductor runs on ' + ', '.join(running), 'ssh ' + str(_target(value, others[0]) or others[0]) +

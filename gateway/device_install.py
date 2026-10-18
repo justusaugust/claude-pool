@@ -136,7 +136,7 @@ def check_doctor(remote):
     done = remote.pool('doctor')
     if done.returncode == 0: return Step('doctor', 'ok', 'no findings', None)
     fix = 'claude-pool doctor'
-    for line in _text(done.stdout).splitlines():
+    for line in (done.stdout or b'').decode('utf-8', 'replace').splitlines():  # unstripped: the first line keeps its indent
         if line.startswith('  fail '):
             fix = line.partition(' · fix: ')[2] or fix
             return Step('doctor', 'failed', line.strip(), fix)
