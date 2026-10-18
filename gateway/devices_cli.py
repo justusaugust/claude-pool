@@ -154,6 +154,9 @@ def overview_part():
     health = value.get('health') if isinstance(value.get('health'), dict) else {}
     sessions = [row for row in value.get('sessions') or [] if isinstance(row, dict)]
     accounts = [row for row in value.get('accounts') or [] if isinstance(row, dict) and isinstance(row.get('name'), str)]
+    try: rejected = readings.reauthenticate(settings.LONG_LIVED_PROBES)  # Shunt only cools a revoked long-lived token
+    except Exception: rejected = set()
+    accounts = [{**row, 'status': 'reauthenticate'} if row['name'] in rejected else row for row in accounts]
     return {'overview': {'health': {'activeRequests': health.get('activeRequests', 0) if isinstance(health.get('activeRequests', 0), int) else 0},
                          'sessions': [{'account': row.get('account'), 'busy': bool(row.get('busy'))} for row in sessions],
                          'accounts': [{'name': row['name'], 'status': row.get('status')} for row in accounts]}}

@@ -448,6 +448,16 @@ class UserVerbTests(DeviceCliBase):
             code, out, err = self.run_cli(['sync'], remotes=remotes)
         self.assertEqual(code, 0, out + err); self.assertIn('mac: skipped', out)
 
+    def test_the_status_overview_shows_reauthenticate_for_a_rejected_probe(self):
+        from private_files import write_private
+        token = long_lived_file(self.stores, 'team')
+        probes = self.cfg / 'long-lived-probes.json'
+        write_private(probes, json.dumps({'team': {'at': 1, 'fingerprint': long_lived.fingerprint(json.loads(token.read_text())), 'result': 'rejected'}}))
+        overview = {'health': {'activeRequests': 0}, 'sessions': [], 'accounts': [{'name': 'team', 'status': 'cooling'}, {'name': 'ops', 'status': 'cooling'}]}
+        with patch.object(settings, 'LONG_LIVED_PROBES', probes), patch.object(device_sync, 'local_overview', lambda _: lambda: overview):
+            part = devices_cli.overview_part()['overview']
+        self.assertEqual(part['accounts'], [{'name': 'team', 'status': 'reauthenticate'}, {'name': 'ops', 'status': 'cooling'}])
+
     def test_force_registry_reads_every_peer_list_and_tombstones_what_only_the_peer_has(self):
         self.devices(MAC, VPS)
         theirs = {**registry.load(self.reg), 'generation': 7,

@@ -228,3 +228,54 @@ class PullTests(unittest.TestCase):
 
 
 if __name__ == '__main__': unittest.main()
+
+
+class AuthProbeTests(unittest.TestCase):
+    """A long-lived account that Shunt only cools after a 401 is probed, at most every 15 minutes, by the device that serves it."""
+    def setUp(self):
+        from fakes import long_lived_file, refreshable_file
+        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.stores = root / 'credentials'; self.stores.mkdir(mode=0o700)
+        self.path = root / 'state' / 'long-lived-probes.json'
+        self.config = root / 'config.json'
+        self.config.write_text(json.dumps({'accounts': [{'name': 'team', 'alias': 'teamx'}, {'name': 'ops'}]}))
+        long_lived_file(self.stores, 'team'); refreshable_file(self.stores, 'ops', 'u', 'o')
+        for item in [patch.object(settings, 'STORES', self.stores), patch.object(settings, 'CONFIG', self.config)]:
+            item.start(); self.addCleanup(item.stop)
+        self.now, self.calls, self.answer = NOW, [], Completed(1, b'', b'API Error: 401')
+        self.status = {'team': 'cooling', 'ops': 'cooling'}
+
+    def probe(self):
+        def run(alias):
+            self.calls.append(alias); return self.answer
+        overview = lambda: {'accounts': [{'name': n, 'status': s} for n, s in self.status.items()]}
+        return readings.AuthProbe(self.path, overview=overview, run=run, clock=lambda: self.now).run_once()
+
+    def test_a_cooling_long_lived_account_is_probed_once_per_15_minutes_and_stored_without_its_token(self):
+        from fakes import fixture_token
+        self.probe()
+        self.assertEqual(self.calls, ['teamx'])  # the refreshable account is never probed
+        self.assertEqual(readings.reauthenticate(self.path), {'team'})
+        self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
+        self.assertNotIn(fixture_token(), self.path.read_text())
+        self.now += 14 * 60_000; self.probe(); self.assertEqual(self.calls, ['teamx'])
+        self.now += 2 * 60_000; self.answer = Completed(0, b'OK', b''); self.probe()
+        self.assertEqual(self.calls, ['teamx', 'teamx']); self.assertEqual(readings.reauthenticate(self.path), set())
+
+    def test_nothing_is_probed_while_the_account_serves_and_a_ready_account_clears_its_mark(self):
+        self.probe(); self.assertEqual(readings.reauthenticate(self.path), {'team'})
+        self.status = {'team': 'ready', 'ops': 'ready'}
+        self.now += 60 * 60_000; self.probe()
+        self.assertEqual(self.calls, ['teamx']); self.assertEqual(readings.reauthenticate(self.path), set())
+
+    def test_a_replaced_token_is_not_marked_by_the_old_probe(self):
+        from fakes import long_lived_file, fixture_token
+        self.probe()
+        (self.stores / 'team.json').unlink(); long_lived_file(self.stores, 'team', token=fixture_token('z'))
+        self.assertEqual(readings.reauthenticate(self.path), set())
+
+    def test_an_unreadable_overview_probes_nothing(self):
+        def boom(): raise OSError('down')
+        readings.AuthProbe(self.path, overview=boom, run=lambda alias: self.calls.append(alias)).run_once()
+        self.assertEqual(self.calls, []); self.assertFalse(self.path.exists())

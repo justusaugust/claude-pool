@@ -27,7 +27,7 @@ from native_auth import NativeAuth
 import service
 from validation import render as validation_view
 
-from settings import HERE, RUNTIME, STORES, LONG_LIVED, NATIVE_CLAUDE, CONFIG, BASE_URL, GATEWAY_PORT, BACKEND_PORT, backend_config, connection_ts, SHARED_READINGS, ALIASES, private_directory
+from settings import HERE, RUNTIME, STORES, LONG_LIVED, NATIVE_CLAUDE, CONFIG, BASE_URL, GATEWAY_PORT, BACKEND_PORT, backend_config, connection_ts, SHARED_READINGS, LONG_LIVED_PROBES, ALIASES, private_directory
 ROOT = HERE.parent
 HEALTH_INTERVAL = 10
 INSTALLATION = service.receipt(ROOT)
@@ -155,7 +155,7 @@ def daemon(client, admin):
     try:
         names = [a['name'] for a in tomllib.loads(config).get('providers', {}).get('anthropic', {}).get('accounts', [])]
         server = PoolBridge(("127.0.0.1", GATEWAY_PORT), BACKEND_PORT, client, admin, RUNTIME / "sessions.json", native_auth=NativeAuth(STORES, names), shared_readings=SHARED_READINGS)
-        readings.Puller(SHARED_READINGS, server.journal).start(stop)
+        readings.Puller(SHARED_READINGS, server.journal).start(stop, probe=readings.AuthProbe(LONG_LIVED_PROBES))
         def drain(signum, frame):
             server.draining = True
             server.journal.record('service_draining', requests=len(server.requests))
@@ -435,7 +435,10 @@ def long_lived_report():
     import long_lived, registry
     try: known = registry.load()
     except ValueError: known = registry.EMPTY()
-    findings = long_lived.health(STORES, LONG_LIVED, known, int(time.time() * 1000), registry.self_name())
+    import readings
+    try: rejected = readings.reauthenticate(LONG_LIVED_PROBES)
+    except Exception: rejected = set()
+    findings = long_lived.health(STORES, LONG_LIVED, known, int(time.time() * 1000), registry.self_name(), rejected)
     shown = [f for f in findings if f['level'] != 'ok']
     for f in shown: print(f"  {f['level']} {f['account']}: {f['message']}" + (f" · fix: {f['fix']}" if f['fix'] else ''))
     if not shown and findings: print(f'  ok long-lived tokens: {len({f["account"] for f in findings})} checked')

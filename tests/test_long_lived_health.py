@@ -101,6 +101,17 @@ class HealthTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertRegex(text, r'  fail team: expires in 3 days · fix: claude-pool account add .* --long-lived --replace --name team')
 
+    def test_a_rejected_probe_fails_doctor_with_the_replace_fix(self):
+        import readings
+        path = long_lived_file(self.stores, 'team', expires_ms=NOW + 200 * DAY)
+        probes = self.root / 'runtime' / 'long-lived-probes.json'
+        from private_files import write_private
+        write_private(probes, json.dumps({'team': {'at': NOW, 'fingerprint': long_lived.fingerprint(json.loads(path.read_text())), 'result': 'rejected'}}))
+        with patch.object(settings, 'STORES', self.stores), patch.object(launch, 'LONG_LIVED_PROBES', probes):
+            code, text = self.run_doctor()
+        self.assertEqual(code, 1)
+        self.assertRegex(text, r'  fail team: needs reauthenticate .*· fix: claude-pool account add .* --long-lived --replace --name team')
+
     def test_doctor_without_long_lived_tokens_prints_nothing_extra_and_keeps_its_exit(self):
         refreshable_file(self.stores, 'own', 'user-o', 'org-o')
         code, text = self.run_doctor()

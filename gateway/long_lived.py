@@ -114,8 +114,9 @@ def replace_fix(email, name):
             REPLACE_WHERE)
 
 
-def health(stores, directory, value, now_ms, self_name):
-    """Findings for every long-lived token on this device. An account without a problem gets one 'ok' finding."""
+def health(stores, directory, value, now_ms, self_name, rejected=()):
+    """Findings for every long-lived token on this device. An account without a problem gets one 'ok' finding.
+    `rejected` names accounts whose served token the cooling probe found rejected (readings.AuthProbe)."""
     stores, directory = Path(stores), Path(directory)
     findings = []
     problem = _mode_problem(directory, 0o700) if directory.exists() or directory.is_symlink() else None
@@ -168,6 +169,8 @@ def health(stores, directory, value, now_ms, self_name):
                 if fingerprint(replica) != row['fingerprint']:
                     mine.append(_finding('fail', name, 'local token %s differs from the registry %s' % (fingerprint(replica), row['fingerprint']), 'claude-pool device sync'))
             except RuntimeError: pass
+        if name in rejected:
+            mine.append(_finding('fail', name, 'needs reauthenticate (the token was rejected while the account was cooling)', fix))
         if name in pending: mine.append(_finding('warn', name, 'switch pending', 'claude-pool device switch'))
         findings.extend(mine or [_finding('ok', name, 'ok')])
     return findings

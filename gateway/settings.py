@@ -34,6 +34,7 @@ STORES = Path(OPTIONS.get('credential_dir', Path.home() / '.shunt/accounts/claud
 LONG_LIVED = STORES.parent / 'claude-long-lived'  # 0700; long-lived token files before they join STORES
 REGISTRY = CONFIG.parent / 'devices.json'  # non-secret, generation-numbered device registry
 SELF = CONFIG.parent / 'device.json'  # this machine's registry name
+LONG_LIVED_PROBES = RUNTIME / 'long-lived-probes.json'  # 0600 last probe of each cooling long-lived account (no token)
 SHARED_READINGS = RUNTIME / 'shared-readings.json'  # usage readings pulled from the usage owner
 CONDUCTOR_HOME = '~/projects/conductor'  # the Conductor's working directory: its CLAUDE.md (with the managed device block), journal.md, bin/, board/
 CONDUCTOR_STATE = RUNTIME / 'conductor.json'  # 0600 supervisor state of Conductor Claude: pid, readiness, session id

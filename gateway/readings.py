@@ -73,6 +73,84 @@ def load_shared(path):
     except (OSError, ValueError, RuntimeError): return None
 
 
+PROBE_EVERY_MS = 900_000
+PROBE = ['-p', 'Reply with OK.', '--model', 'haiku']
+PROBE_RESULTS = ('ok', 'rejected')
+
+
+def _store_fingerprint(name):
+    """The fingerprint of the long-lived token this device serves for `name`, or None (refreshable, missing, unreadable)."""
+    import settings
+    from long_lived import fingerprint, kind
+    path = settings.STORES / (name + '.json')
+    if not registry.NAME.fullmatch(name) or path.is_symlink(): return None
+    try:
+        value = read_private(path)
+        return fingerprint(value) if kind(value) == 'long-lived' else None
+    except (OSError, ValueError, RuntimeError): return None
+
+
+def load_probes(path):
+    """name -> {at, fingerprint, result}: the last probe of each long-lived account. Never holds a token."""
+    try: value = read_private(path, LIMIT)
+    except (OSError, ValueError, RuntimeError): return {}
+    if not isinstance(value, dict): return {}
+    return {name: entry for name, entry in value.items()
+            if isinstance(name, str) and registry.NAME.fullmatch(name) and isinstance(entry, dict) and integer(entry.get('at'))
+            and isinstance(entry.get('fingerprint'), str) and entry.get('result') in PROBE_RESULTS}
+
+
+def reauthenticate(path):
+    """Accounts whose served long-lived token the last probe found rejected (a replaced token clears the mark)."""
+    return {name for name, entry in load_probes(path).items()
+            if entry['result'] == 'rejected' and _store_fingerprint(name) == entry['fingerprint']}
+
+
+class AuthProbe:
+    """Shunt answers a 401 on a setup-token account by cooling it for five minutes and rotating, so a revoked long-lived
+    token only ever shows as cooling. On the device that serves it, a long-lived account that is cooling gets the cheap
+    probe (one real Claude Code request through the pool, `claude-pool <alias> -p 'Reply with OK.' --model haiku`) at most
+    every 15 minutes; a failed probe marks it `reauthenticate` for device check and doctor. A served (ready) account
+    clears its mark. The result file holds names, times, fingerprints and the result, never a token."""
+    def __init__(self, path, overview=None, run=None, clock=None):
+        self.path, self.overview, self.run = path, overview, run
+        self.clock = clock or (lambda: int(time.time() * 1000))
+
+    def default_run(self, alias):
+        from remote import Local
+        return Local().pool(alias, *PROBE, timeout=300)
+
+    def default_overview(self):
+        import device_sync
+        return device_sync.pool_overview()
+
+    def run_once(self):
+        try: value = (self.overview or self.default_overview)()
+        except Exception: return {}
+        rows = [row for row in value.get('accounts') or [] if isinstance(row, dict) and isinstance(row.get('name'), str)]
+        state, changed, now = load_probes(self.path), False, self.clock()
+        try:
+            from account_metadata import load
+            import settings
+            aliases = {row['name']: row.get('alias') or row['name'] for row in load(settings.CONFIG).get('accounts', [])}
+        except Exception: aliases = {}
+        for row in rows:
+            name = row['name']
+            if row.get('status') in ('ready', 'limited') and name in state:
+                del state[name]; changed = True; continue
+            if row.get('status') != 'cooling': continue
+            fp = _store_fingerprint(name)
+            if fp is None: continue
+            last = state.get(name)
+            if last and last['fingerprint'] == fp and now - last['at'] < PROBE_EVERY_MS: continue
+            done = (self.run or self.default_run)(aliases.get(name, name))
+            passed = done is not None and done.returncode == 0 and b'OK' in (done.stdout or b'')
+            state[name] = {'at': now, 'fingerprint': fp, 'result': 'ok' if passed else 'rejected'}
+            changed = True
+        if changed: write_private(self.path, json.dumps(state, sort_keys=True))
+        return state
+
+
 class Puller:
     def __init__(self, path, journal, remotes=Remote, interval=300, registry_every=3):
         self.path, self.journal, self.remotes = path, journal, remotes
@@ -111,9 +189,12 @@ class Puller:
             except Exception: pass  # sync reports its own problems
         return True
 
-    def start(self, stop):
+    def start(self, stop, probe=None):
         def loop():
             while True:
+                if probe is not None:
+                    try: probe.run_once()
+                    except Exception: pass  # the probe never stops the readings
                 try: self.run_once()
                 except Exception: self.fail('error')
                 if stop.wait(self.interval): return
