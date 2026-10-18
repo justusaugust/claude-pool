@@ -49,6 +49,11 @@ class RenameBase(unittest.TestCase):
         self.reg = self.cfg / 'devices.json'
         self.backend = self.runtime / 'shunt.toml'; self.backend.write_text(BASE)
         self.binary = self.root / 'fake-shunt'; self.binary.write_text(shunt(0)); self.binary.chmod(0o700)
+        # The fake backend is the only command these tests run; nothing real is reachable on PATH.
+        fake_bin = self.root / 'bin'; fake_bin.mkdir()
+        for name in ['launchctl', 'systemctl', 'claude', 'claude-pool', 'herdr', 'tailscale', 'shunt']:
+            (fake_bin / name).write_text('#!/bin/sh\nexit 97\n'); (fake_bin / name).chmod(0o755)
+        guard = patch.dict(os.environ, {'PATH': str(fake_bin) + ':/usr/bin:/bin'}); guard.start(); self.addCleanup(guard.stop)
         refreshable_file(self.stores, 'operations', 'user-o', 'org-o')
         self.grant = refreshable_file(self.stores, OLD, *IDS[0]).read_bytes()
         self.token = long_lived_file(self.root / 'src', NEW, *IDS[0]).read_bytes()
