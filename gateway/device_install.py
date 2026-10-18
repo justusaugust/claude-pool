@@ -185,7 +185,16 @@ def shell_add(rc):
 
 
 def shell_remove(rc):
-    return managed_block.write(rc, START, END, None)
+    """Remove the managed block and every line that is exactly the hand-written `claude()` line shell_check counts as
+    present (add adopts it instead of writing a block), so removal undoes what add accepted. Every other byte stays."""
+    changed = managed_block.write(rc, START, END, None)
+    data = managed_block._load(rc)
+    if data is None: return changed
+    lines = data.splitlines(keepends=True)
+    kept = [line for line in lines if line.strip() != FUNCTION.encode()]
+    if len(kept) == len(lines): return changed
+    managed_block._save(rc, b''.join(kept))
+    return True
 
 
 def check_shell(remote):
@@ -201,6 +210,11 @@ def add_shell(remote):
 
 def remove_shell(remote):
     return remote.device('shell', 'remove').returncode == 0
+
+
+def shell_left(remote):
+    """True while the target still has a claude function going through the pool (checked after removing it)."""
+    return remote.device('shell', 'check').returncode == 0
 
 
 def _local_status():

@@ -71,7 +71,7 @@ claude-pool device remove <name> [--wait] [--uninstall]
 claude-pool device remove <name> --forget
 ```
 
-Removal stops the pool on the device, removes the long-lived token copies and the herdr profile, forgets the Cua Space and syncs the new registry to the other devices. The refreshable grant stays on its own machine, byte for byte. `--uninstall` also removes claude-pool from the device. A partly failed removal exits 1 and the device stays registered: fix what it prints and rerun `claude-pool device remove <name>`, which completes it.
+Removal removes the `claude` shell function there (claude-pool's block and a hand-written `claude() { command claude-pool exec "$@"; }` line that `add` accepted), stops the pool on the device, removes the long-lived token copies and the herdr profile, forgets the Cua Space and syncs the new registry to the other devices. The refreshable grant stays on its own machine, byte for byte. `--uninstall` also removes claude-pool from the device. A partly failed removal exits 1 and the device stays registered: fix what it prints and rerun `claude-pool device remove <name>`, which completes it.
 
 It refuses, changing nothing, when:
 

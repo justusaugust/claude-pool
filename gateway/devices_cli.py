@@ -1114,7 +1114,10 @@ def remove(argv, out, remotes, local, **_):
     if preview.status == 'failed': return stop_here(steps)
     if not device_install.remove_shell(remote):
         return stop_here(steps + [Step('shell', 'failed', 'could not remove the claude function', on('claude-pool device shell remove'))])
-    steps.append(Step('shell', 'ok', 'claude function removed'))
+    if device_install.shell_left(remote):
+        steps.append(Step('shell', 'manual', 'a claude function that runs claude-pool is still in the shell rc file',
+                          'on ' + args.name + ', delete this line from ~/.zshrc or ~/.bashrc: ' + device_install.FUNCTION))
+    else: steps.append(Step('shell', 'ok', 'claude function removed'))
     stopped = remote.pool('--stop', timeout=POOL_TIMEOUT)
     if stopped.returncode:
         return stop_here(steps + [Step('service', 'failed', 'the pool on ' + args.name + ' did not stop', on('claude-pool --stop'))])
@@ -1147,7 +1150,7 @@ def remove(argv, out, remotes, local, **_):
     print('Removed ' + args.name + ' from the registry.')
     if local_platform() == 'darwin':
         print('In the Claude app: Code tab, environment menu, remove the ' + row['ssh'] + ' environment.')
-    return 0 if all(step.status in ('ok', 'skipped') for step in steps) else 1
+    return 0 if all(step.status in ('ok', 'skipped', 'manual') for step in steps) else 1
 
 
 class _Plain:

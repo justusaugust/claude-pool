@@ -763,6 +763,7 @@ class Machine:
                 if 'shell add' in self.fail: return answer(1)
                 self.shell = True; return ok()
             if 'shell remove' in self.fail: return answer(1)
+            if 'shell stays' in self.fail: self.event('shell'); return ok()  # an older claude-pool leaves a hand-written line
             self.event('shell'); self.shell = False; return ok()
         if args[:1] == ['preview-rules']:
             if args[1] == 'check': return answer(0 if self.rules else 1)
@@ -1105,6 +1106,13 @@ class RemoveTests(OrchestrationBase):
         self.assertEqual(unit, [['sh', '-c', service.unload_hint(service.DEFAULT_LABEL, 'linux')]])
         self.assertIn('remove the justus@vps environment', out)
         self.assertEqual(self.count(self.vps, 'uninstall'), 0)
+
+    def test_remove_never_reports_the_claude_function_removed_while_it_is_still_there(self):
+        self.vps.fail = set(self.vps.fail) | {'shell stays'}
+        code, out, err = self.cli('remove', 'vps')
+        self.assertNotIn('claude function removed', out)
+        self.assertRegex(out, r'manual +shell .*\n      fix: .*' + re.escape(device_install.FUNCTION))
+        self.assertIsNone(registry.device(registry.load(self.reg), 'vps'))
 
     def test_remove_with_uninstall_runs_the_target_uninstaller_last(self):
         code, out, err = self.cli('remove', 'vps', '--uninstall')

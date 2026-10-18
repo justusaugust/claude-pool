@@ -186,9 +186,20 @@ class ShellTests(unittest.TestCase):
         self.assertTrue(device_install.shell_add(self.rc)); self.assertFalse(device_install.shell_add(self.rc))
         self.assertTrue(device_install.shell_remove(self.rc)); self.assertEqual(self.rc.read_text(), 'export X=1\n')
 
-    def test_remove_leaves_a_legacy_line_alone(self):
-        self.rc.write_text('claude() { command claude-pool exec "$@"; }\n')
-        self.assertFalse(device_install.shell_remove(self.rc)); self.assertTrue(device_install.shell_check(self.rc))
+    def test_remove_also_deletes_the_adopted_legacy_line_and_nothing_else(self):
+        # add counts this exact hand-written line as present, so remove must undo it: after removal `claude` would run
+        # claude-pool exec on a stopped (or uninstalled) pool.
+        self.rc.write_text('export X=1\nclaude() { command claude-pool exec "$@"; }\n# claude() { command claude-pool exec "$@"; } note\n')
+        self.assertTrue(device_install.shell_remove(self.rc)); self.assertFalse(device_install.shell_check(self.rc))
+        self.assertEqual(self.rc.read_text(), 'export X=1\n# claude() { command claude-pool exec "$@"; } note\n')
+        self.assertFalse(device_install.shell_remove(self.rc))
+
+    def test_remove_deletes_the_block_and_a_legacy_line_together(self):
+        self.rc.write_text('  claude() { command claude-pool exec "$@"; }  \r\nexport X=1\n')
+        device_install.shell_add(self.rc)  # present already: no block is added
+        self.rc.write_text(self.rc.read_text() + '# >>> claude-pool >>>\nclaude() { command claude-pool exec "$@"; }\n# <<< claude-pool <<<\n')
+        self.assertTrue(device_install.shell_remove(self.rc))
+        self.assertEqual(self.rc.read_bytes(), b'export X=1\n'); self.assertFalse(device_install.shell_check(self.rc))
 
     def test_status_part_is_registered_and_never_raises(self):
         self.assertIn(device_install._local_status, device_sync.STATUS_PARTS)
