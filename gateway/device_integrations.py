@@ -100,13 +100,16 @@ def app_environments(app_dir):
     return None if parsed is None else parsed[0]
 
 
+def _same_host(a, b): return a == b or a.rsplit('@', 1)[-1] == b.rsplit('@', 1)[-1]
+
+
 def check_app(device, app_dir, platform):
     ssh = device.get('ssh')
     if platform != 'darwin' or not ssh: return Step('app', 'skipped', 'the Claude app environment is for macOS only')
     parsed = _app(app_dir)
     if parsed is None: return Step('app', 'manual', "could not read the Claude app's environment list", APP_LOOK_FOR(ssh))
-    if ssh not in parsed[0]: return Step('app', 'manual', 'environment not found in the Claude app', APP_CLICKS_FOR(ssh))
-    if ssh not in parsed[1]:
+    if not any(_same_host(ssh, h) for h in parsed[0]): return Step('app', 'manual', 'environment not found in the Claude app', APP_CLICKS_FOR(ssh))
+    if not any(_same_host(ssh, h) for h in parsed[1]):
         return Step('app', 'manual', 'environment listed but not trusted', f'In the Claude app: open the {ssh} environment once and trust it.')
     return Step('app', 'ok', 'environment listed and trusted')
 

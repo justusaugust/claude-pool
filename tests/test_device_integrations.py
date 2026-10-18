@@ -128,6 +128,17 @@ class AppTests(Base):
         self.store.write_text(json.dumps({'configs': [], 'trustedHosts': []}))
         self.assertEqual(device_integrations.check_app(VPS, self.app_dir, 'darwin').detail, 'environment not found in the Claude app')
 
+    def test_a_user_prefix_on_either_side_still_matches(self):
+        def put(host, trusted): self.store.write_text(json.dumps({'configs': [{'name': 'vps', 'sshHost': host, 'id': '1'}], 'trustedHosts': trusted}))
+        put('justus@personal-vps', ['justus@personal-vps'])
+        self.assertEqual(device_integrations.check_app(VPS, self.app_dir, 'darwin').status, 'ok')
+        put('personal-vps', ['personal-vps'])
+        self.assertEqual(device_integrations.check_app(dict(VPS, ssh='justus@personal-vps'), self.app_dir, 'darwin').status, 'ok')
+        put('justus@personal-vps', [])
+        self.assertIn('trust it', device_integrations.check_app(VPS, self.app_dir, 'darwin').fix)
+        put('justus@other-vps', ['justus@other-vps'])
+        self.assertEqual(device_integrations.check_app(VPS, self.app_dir, 'darwin').detail, 'environment not found in the Claude app')
+
     def test_not_macos_is_skipped(self):
         self.assertEqual(device_integrations.check_app(VPS, self.app_dir, 'linux').status, 'skipped')
 
