@@ -63,6 +63,24 @@ class FailureTests(unittest.TestCase):
         self.assertIn('request_idle_timeout', [r['code'] for r in self.bridge.journal.snapshot()])
         self.release.set()
 
+    def test_cancelled_request_never_answers_after_the_upstream_closes(self):
+        # Replays the monitor's window deterministically: the upstream socket is already shut, the
+        # client socket not yet. The handler must close without a late 502 that races the shutdown.
+        self.hold = True
+        with socket.create_connection(self.bridge.server_address) as client:
+            client.sendall(b'POST /v1/messages HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer fixture-client\r\n'
+                           b'x-claude-code-session-id: test-session\r\nContent-Length: 29\r\n\r\n{"messages":[],"stream":true}')
+            self.assertTrue(self.entered.wait(2))
+            with self.bridge.lock: row, = self.bridge.requests.values()
+            self.wait_for(lambda: row['upstream'] is not None)
+            row['cancelled'] = 'request_idle_timeout'
+            row['upstream'].shutdown(socket.SHUT_RDWR)
+            self.wait_for(lambda: not self.bridge.requests)
+            client.settimeout(3)
+            self.assertEqual(client.recv(1024), b'')
+        self.assertNotIn('upstream_unavailable', [r['code'] for r in self.bridge.journal.snapshot()])
+        self.release.set()
+
     def test_auxiliary_saturation_keeps_main_request_capacity(self):
         self.bridge.max_requests, self.bridge.main_reserve = 3, 1
         clients = []
