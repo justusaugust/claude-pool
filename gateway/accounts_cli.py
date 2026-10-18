@@ -579,6 +579,12 @@ def remove_account(name, wait, *, config, stores, binary, runtime, backend_sourc
     row = next((r for r in rows if r['name'] == name), None)
     known = registry.load(registry_path)
     entry = registry.account(known, name)
+    if entry is None:
+        # This machine may hold the subscription under its own name; its registry row (enrolled elsewhere) is found by
+        # UUIDs, so the removal reaches every device instead of coming back with the next sync.
+        try: mine = _account_ids(stores, directory, name)
+        except (OSError, ValueError, RuntimeError): mine = {}
+        if mine: entry = registry.entry_for(known, {'name': name, **mine})
     files = [stores / (name + '.json'), directory / (name + '.json')]
     if row is None and entry is None and not any(p.exists() or p.is_symlink() for p in files):
         raise RuntimeError('No account named ' + name + ' is connected (see claude-pool account list)')
@@ -591,7 +597,7 @@ def remove_account(name, wait, *, config, stores, binary, runtime, backend_sourc
     with (stores / ('.' + name + '.add.lock')).open('a') as lock:
         try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError: raise RuntimeError('This account has a connection in progress; nothing was removed') from None
-        if matches_native(native_identity() if native_identity else None, name, known, stores):
+        if matches_native(native_identity() if native_identity else None, name, {'accounts': [{**entry, 'name': name}] if entry else []}, stores):
             raise RuntimeError(label + ' is the Native login of this machine and must stay connected. '
                                'Sign Native in with another connected account first (claude-native auth login). Nothing was removed.')
         if overview:
@@ -605,14 +611,15 @@ def remove_account(name, wait, *, config, stores, binary, runtime, backend_sourc
         unregister(config, stores, binary, paths, name, env)
         retire(stores, directory, name)
         if entry is not None:
-            registry.update(lambda value: value.update(accounts=[r for r in value['accounts'] if r['name'] != name]), registry_path)
+            registry.update(lambda value: value.update(accounts=[r for r in value['accounts'] if r['name'] != entry['name']]), registry_path)
     print('Removed ' + label + ' from the pool.')
     if kept:
         print('Its login is kept in ' + str(stores / '.retired') + ' (a refreshable login cannot be recreated without a browser).')
     aside = sorted({p.name for folder in (stores, directory) for p in folder.glob(name + '.json.replaced-*')})
     if aside:
         print('Earlier replaced tokens are kept, never deleted automatically: ' + ', '.join(aside))
-    if entry is not None: print('Other devices drop it after claude-pool device sync.')
+    if entry is not None:
+        print('Other devices drop it after claude-pool device sync' + (' (registry: ' + entry['name'] + ').' if entry['name'] != name else '.'))
     return 0
 
 

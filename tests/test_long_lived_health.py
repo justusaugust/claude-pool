@@ -63,6 +63,22 @@ class HealthTests(unittest.TestCase):
         self.assertEqual([f['message'] for f in found], ['switch pending'])
         self.assertEqual(found[0]['fix'], 'claude-pool device switch')
 
+    def test_every_store_only_token_gets_its_expiry_check_not_just_the_first(self):
+        long_lived_file(self.stores, 'alpha', 'user-a', 'org-a', token=fixture_token('a'), expires_ms=NOW + 200 * DAY)
+        long_lived_file(self.stores, 'beta', 'user-b', 'org-b', token=fixture_token('b'), expires_ms=NOW + 3 * DAY)
+        found = {f['account']: f for f in long_lived.health(self.stores, self.directory, registry.EMPTY(), NOW, 'mac')}
+        self.assertEqual((found['alpha']['level'], found['beta']['level']), ('ok', 'fail'))
+        self.assertEqual(found['beta']['message'], 'expires in 3 days')
+
+    def test_the_served_token_is_checked_after_the_first_account_too(self):
+        long_lived_file(self.stores, 'alpha', 'user-a', 'org-a', token=fixture_token('a'), expires_ms=NOW + 200 * DAY)
+        # beta serves a token that expires in 3 days; its synced replica is a newer one (a switch is pending).
+        long_lived_file(self.directory, 'beta', 'user-b', 'org-b', token=fixture_token('c'), expires_ms=NOW + 300 * DAY)
+        long_lived_file(self.stores, 'beta', 'user-b', 'org-b', token=fixture_token('b'), expires_ms=NOW + 3 * DAY)
+        beta = [f for f in long_lived.health(self.stores, self.directory, registry.EMPTY(), NOW, 'mac') if f['account'] == 'beta']
+        self.assertIn(('fail', 'expires in 3 days'), [(f['level'], f['message']) for f in beta])
+        self.assertIn('switch pending', [f['message'] for f in beta])
+
     def test_missing_seven_day_window_is_not_a_finding(self):
         self.assertEqual(self.levels(days=200, seven_day=None), ['ok'])
 

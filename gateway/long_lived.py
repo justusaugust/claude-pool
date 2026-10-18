@@ -155,10 +155,10 @@ def health(stores, directory, value, now_ms, self_name, rejected=()):
                     mine.append(_finding('warn', name, 'not a long-lived token', 'move ' + str(path) + ' out of ' + str(directory))); continue
             values[label] = loaded
         served = values.get('store') or values.get('replica')
-        held = values.get('replica') or served or {}
+        token = values.get('replica') or served or {}  # never `held`: that is the per-name map of store files above
         # The registry row of this subscription, which may carry another name on the device that enrolled it.
-        row = registry.entry_for(value, {'name': name, 'userId': held.get('shuntAccountUuid'),
-                                         'organizationId': held.get('shuntOrganizationUuid')}) or {}
+        row = registry.entry_for(value, {'name': name, 'userId': token.get('shuntAccountUuid'),
+                                         'organizationId': token.get('shuntOrganizationUuid')}) or {}
         who = registry.describe(row, name) if row else name
         fix = replace_fix(row.get('email'), row.get('name') or name)
         if served is not None:

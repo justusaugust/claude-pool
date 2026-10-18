@@ -309,6 +309,21 @@ class EnrollAfterRenameTests(RenameBase):
         self.assertNotIn(fixture_token('n'), out)
 
 
+class RemoveUnderLocalNameTests(RenameBase):
+    """`account remove` of a subscription this machine holds under its own name finds the registry row by UUIDs."""
+    def test_removing_the_local_name_removes_the_registry_row_of_the_subscription(self):
+        self.put(self.directory, OLD, self.token)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = setup.cli(['remove', OLD], config=self.config, stores=self.stores, binary=self.binary, runtime=self.runtime,
+                             long_lived=self.directory, registry_path=self.reg, native_identity=lambda: None)
+        self.assertEqual(code, 0, out.getvalue())
+        value = registry.load(self.reg)
+        self.assertIsNone(registry.account(value, NEW))
+        self.assertIn({'kind': 'account', 'name': NEW, 'generation': value['generation'], 'fingerprint': self.fp}, value['removed'])
+        self.assertEqual(self.names(), ['operations'])
+        self.assertIn('Other devices drop it', out.getvalue()); self.assertIn('registry: ' + NEW, out.getvalue())
+
+
 class LaunchTests(unittest.TestCase):
     def launch_rename(self, request, loaded, argv=('rename', 'team', NEW)):
         import launch

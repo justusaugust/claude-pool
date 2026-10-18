@@ -287,7 +287,13 @@ def receive_registry(data, overview=None, native_identity=None, elsewhere=()):
         if not NAME.fullmatch(name): continue
         try:
             if name not in config_names() and not any((folder / (name + '.json')).exists() for folder in (settings.STORES, settings.LONG_LIVED)):
-                report['retired'] += retire_renamed(name, tomb.get('fingerprint'), now)
+                retired, serving = retire_renamed(name, tomb.get('fingerprint'), now)
+                report['retired'] += retired
+                email = next((r.get('email') for r in previous['accounts'] if r['name'] == name), None) or '<email>'
+                for local in serving:
+                    report['failed'][local] = (local + ' on this device serves the removed token of ' + name + ' (it was switched to it). '
+                                               'Switch it back to a refreshable login: claude-pool account remove ' + local +
+                                               ', then claude-pool account add ' + email + ' --name ' + local)
                 continue
             held = long_lived_fingerprint(name)
             if held is not None and held != tomb.get('fingerprint') and held not in set(elsewhere):
@@ -344,16 +350,18 @@ def renamed_elsewhere(name, tomb, value):
 def retire_renamed(name, fp, value):
     """A removed registry account this device holds under another local name: only the long-lived replica of exactly the
     removed token is moved aside (never unlinked), so a later switch cannot serve it; the local login and its membership
-    stay. A replica the pool store already serves stays too (the account is in use; device check shows the drift), and so
-    does a token a registry row still names (enrolled again under another name)."""
-    if not fp or any(row.get('fingerprint') == fp for row in value['accounts']): return []
-    retired = []
+    stay. A token a registry row still names stays (enrolled again under another name). A replica the pool store already
+    serves (switched to it) stays as well, because moving it would not stop the pool serving it: it is returned in
+    `serving` so the receiver reports it with the fix (switch that account back to a refreshable login).
+    Returns (retired, serving): local names."""
+    if not fp or any(row.get('fingerprint') == fp for row in value['accounts']): return [], []
+    retired, serving = [], []
     for path in sorted(settings.LONG_LIVED.glob('*.json')):
         local = path.stem
         if local == name or local.startswith('.') or not NAME.fullmatch(local) or _long_lived_at(path) != fp: continue
-        if _long_lived_at(settings.STORES / path.name) == fp: continue
+        if _long_lived_at(settings.STORES / path.name) == fp: serving.append(local); continue
         retire_store(path, settings.STORES / '.retired'); retired.append(local)
-    return retired
+    return retired, serving
 
 
 def secrets():

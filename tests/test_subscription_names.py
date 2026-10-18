@@ -226,6 +226,16 @@ class RemovalTests(FileDevice):
         self.assertEqual(device_sync.status()['switchPending'], [])
         self.assertIn('team', report['retired'])
 
+    def test_a_removed_token_this_device_already_serves_is_reported_with_a_fix(self):
+        device_sync.receive_account('ai-vaerk-team-premium', self.blob)
+        (self.stores / 'team.json').write_bytes(self.blob)  # after device switch: the pool store serves the synced token
+        report = device_sync.receive_registry(self.removal(self.fp))
+        self.assertTrue((self.directory / 'team.json').exists()); self.assertEqual(self.config_names(), ['team'])
+        self.assertNotIn('team', report['retired'])
+        message = report['failed']['team']
+        self.assertIn('serves the removed token of ai-vaerk-team-premium', message)
+        self.assertIn('claude-pool account remove team', message); self.assertIn('claude-pool account add team@x.de --name team', message)
+
     def test_another_token_under_the_local_name_stays(self):
         device_sync.receive_account('ai-vaerk-team-premium', self.blob)
         device_sync.receive_registry(self.removal('0' * 12))
