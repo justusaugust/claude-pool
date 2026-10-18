@@ -108,7 +108,8 @@ DEVICE_HELP = '\n'.join([
     '  preview <port> | preview file <path>                 share a dev server or one file or folder over Tailscale (Linux devices)',
     '  Removal runs forget-accounts on the device, only after its pool is stopped. A lost machine: device remove <name> --forget.',
     '', 'Internal verbs (called over SSH): ' + ', '.join(INTERNAL_VERBS)])
-REPLACE_WHERE = ' on the device that first enrolled it (it holds the old token and has a browser), then claude-pool device sync'
+from long_lived import REPLACE_GONE, REPLACE_WHERE, replace_fix
+NO_SSH = 'no ssh target from this device'
 POOL_TIMEOUT = 600  # `--stop` waits up to 40 s for the bridge to drain; `--start` waits for the backend
 
 
@@ -394,7 +395,7 @@ def sync(argv, out, remotes, **_):
     results = device_sync.sync_all(remotes)
     if not results: print('No other devices to sync with.')
     for name, result in sorted(results.items()): print(name + ': ' + result)
-    return 0 if all(result == 'ok' for result in results.values()) else 1
+    return 0 if all(result == 'ok' or result.startswith('skipped') for result in results.values()) else 1
 
 
 def switch(argv, out, local, **_):
@@ -438,7 +439,6 @@ def conductor_verb(argv, out, remotes, local, **_):
 
 READINGS_MAX_AGE_MS = 900_000
 READINGS_WAIT, READINGS_POLL = 30, 5  # seconds `add` waits for a new device's first usage readings
-CONDUCTOR_DIR = '~/conductor'
 PROBE = ['-p', 'Reply with OK.', '--model', 'haiku']
 SEVERITY = {'failed': 0, 'unreachable': 0, 'missing': 1, 'manual': 2, 'skipped': 3, 'ok': 4}
 UNINSTALL_SCRIPT = r'''PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; export PATH
@@ -505,7 +505,9 @@ class Session:
     def value(self): return registry.load()
 
     def target(self, row, args=None):
+        """The device's Target, or None for another device this one has no ssh target for (the device that ran add)."""
         mine = row['name'] == self.me
+        if not mine and not row.get('ssh'): return None
         return Target(self, row, self.local if mine else self.remotes(row['ssh']), mine, args)
 
     def status_of(self, name):
@@ -649,8 +651,7 @@ def check_accounts(t):
         if isinstance(row, dict) and row.get('status') == 'reauthenticate':
             entry = registry.account(value, row.get('name')) or {}
             issues.append(('failed', str(row.get('name')) + ' needs reauthenticate (token revoked or expired)',
-                           'claude-pool account add ' + (entry.get('email') or '<email>') + ' --long-lived --replace --name ' + str(row.get('name')) +
-                           REPLACE_WHERE))
+                           replace_fix(entry.get('email'), row.get('name'))))
     if t.s.probe:
         for account, row in sorted(theirs.items()):
             if row.get('kind') != 'long-lived' or not row.get('active', True): continue
@@ -658,8 +659,7 @@ def check_accounts(t):
             done = t.remote.pool(alias, *PROBE, timeout=300)
             if done.returncode or b'OK' not in (done.stdout or b''):
                 entry = registry.account(value, account) or {}
-                issues.append(('failed', 'probe failed for ' + account, 'claude-pool account add ' + (entry.get('email') or '<email>') +
-                               ' --long-lived --replace --name ' + account + REPLACE_WHERE))
+                issues.append(('failed', 'probe failed for ' + account, replace_fix(entry.get('email'), account)))
     if t.mine: issues += _reserve_issues(value)
     pending = st.get('switchPending') or []
     if pending:
@@ -802,7 +802,7 @@ def ensure_conductor(t):
         login = status.get('nativeLogin')
         if not isinstance(login, dict) or not login.get('email'):
             return Step('conductor', 'missing', 'the Conductor needs a Native login on ' + t.row['name'] + ' first', t.retry + ' --usage-owner')
-        entry = {'device': t.row['name'], 'email': login['email'], 'organization': login.get('organization') or '', 'cwd': CONDUCTOR_DIR}
+        entry = {'device': t.row['name'], 'email': login['email'], 'organization': login.get('organization') or '', 'cwd': settings.CONDUCTOR_HOME}
         def place(value):
             if not value.get('conductor'): value['conductor'] = entry
         registry.update(place)
@@ -987,6 +987,9 @@ def check(argv, out, remotes, local, **_):
         except ValueError:
             results[row['name']] = [Step('reachable', 'failed', 'invalid ssh target ' + str(row.get('ssh')), 'claude-pool device add <ssh-target> --name ' + row['name'])]
             continue
+        if t is None:
+            results[row['name']] = [Step('reachable', 'skipped', NO_SSH + '; check it on itself: claude-pool device check ' + row['name'])]
+            continue
         results[row['name']] = check_all(t)
     good = all(ready(steps) for steps in results.values())
     if args.json:
@@ -1046,8 +1049,8 @@ def forget(row, local, remotes):
     print(render(name + ' (forgotten here)', steps))
     print_sync(synced)
     print('Removed ' + name + ' from the registry. Nothing on ' + name + ' was changed: tokens copied to ' + name + ' remain there. '
-          'If the machine is lost, revoke those long-lived tokens in claude.ai settings and re-enroll them with '
-          'claude-pool account add <email> --long-lived --name <name>, then claude-pool device sync.')
+          'If the machine is lost, revoke those long-lived tokens in claude.ai settings and re-enroll each with '
+          + replace_fix(None, None) + REPLACE_GONE + '.')
     if local_platform() == 'darwin' and row.get('ssh'):
         print('In the Claude app: Code tab, environment menu, remove the ' + row['ssh'] + ' environment.')
     return 0 if all(step.status in ('ok', 'skipped') for step in steps) else 1

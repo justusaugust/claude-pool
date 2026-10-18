@@ -203,7 +203,7 @@ class DeviceSyncTests(unittest.TestCase):
     def test_a_device_without_ssh_is_unreachable(self):
         self.devices({**MAC, 'ssh': None, 'name': 'phone'}, {**MAC, 'name': 'me', 'ssh': 'me'})
         registry.set_self('me', self.self_path)
-        self.assertEqual(device_sync.sync_all(remotes=Mock()), {'phone': 'unreachable'})
+        self.assertEqual(device_sync.sync_all(remotes=Mock()), {'phone': 'skipped: no ssh target from this device (it syncs with this one itself)'})
 
     def test_a_refused_local_gateway_means_idle_but_other_failures_mean_busy(self):
         import urllib.error

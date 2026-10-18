@@ -46,6 +46,9 @@ class HealthTests(unittest.TestCase):
     def test_expired_token_fails_and_names_the_reenroll_fix(self):
         finding = self.findings(days=-1)[0]
         self.assertEqual(finding['level'], 'fail'); self.assertIn('account add', finding['fix']); self.assertIn('device sync', finding['fix'])
+        # Without --replace a device that holds the expiring token reuses it and reports Connected; the fix would loop.
+        self.assertIn('--long-lived --replace --name team', finding['fix']); self.assertIn('first enrolled', finding['fix'])
+        self.assertIn('--replace', self.findings(days=20)[0]['fix'])
 
     def test_fingerprint_mismatch_fails_without_printing_either_token(self):
         a, b = fixture_token('a'), fixture_token('b')
@@ -96,7 +99,7 @@ class HealthTests(unittest.TestCase):
         long_lived_file(self.directory, 'team', expires_ms=NOW + 3 * DAY)
         code, text = self.run_doctor()
         self.assertEqual(code, 1)
-        self.assertRegex(text, r'  fail team: expires in 3 days · fix: claude-pool account add .* --long-lived --name team')
+        self.assertRegex(text, r'  fail team: expires in 3 days · fix: claude-pool account add .* --long-lived --replace --name team')
 
     def test_doctor_without_long_lived_tokens_prints_nothing_extra_and_keeps_its_exit(self):
         refreshable_file(self.stores, 'own', 'user-o', 'org-o')

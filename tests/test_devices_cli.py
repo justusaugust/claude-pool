@@ -434,6 +434,20 @@ class UserVerbTests(DeviceCliBase):
             code, out, _ = self.run_cli(['sync'], remotes=remotes)
         self.assertEqual(code, 1); self.assertIn('vps: unreachable', out)
 
+    def test_check_from_another_device_reports_the_device_that_added_it_as_skipped(self):
+        # The device that ran add (here: mac) is registered with no ssh key; checking it from the VPS must not crash.
+        registry.set_self('vps', self.self_path)
+        self.devices({'name': 'mac', 'platform': 'darwin', 'roles': [], 'addedAt': 1}, {**VPS, 'ssh': None})
+        def remotes(target): raise AssertionError('no remote may be called, got ' + repr(target))
+        for argv in (['check', 'mac'], ['check']):
+            with self.subTest(argv=argv):
+                code, out, err = self.run_cli(argv, remotes=remotes)
+                self.assertEqual(code if argv == ['check', 'mac'] else 0, 0, out + err)
+                self.assertRegex(out, r'skipped +reachable +no ssh target from this device')
+        with patch.object(device_sync, 'sync_all', wraps=device_sync.sync_all):
+            code, out, err = self.run_cli(['sync'], remotes=remotes)
+        self.assertEqual(code, 0, out + err); self.assertIn('mac: skipped', out)
+
     def test_force_registry_reads_every_peer_list_and_tombstones_what_only_the_peer_has(self):
         self.devices(MAC, VPS)
         theirs = {**registry.load(self.reg), 'generation': 7,
@@ -828,6 +842,8 @@ class AddTests(OrchestrationBase):
         self.assertEqual({d['name'] for d in value['devices']}, {'mac', 'vps'})
         self.assertEqual(registry.owner(value)['name'], 'vps')
         self.assertEqual(value['conductor']['device'], 'vps'); self.assertEqual(value['conductor']['email'], 'team@x.de')
+        # The Conductor's home (CLAUDE.md, bin/, board/, journal.md, state/ on personal-vps) is its working directory.
+        self.assertEqual(value['conductor']['cwd'], '~/projects/conductor')
         self.assertEqual(self.vps.self_name, 'vps'); self.assertEqual(self.vps.accounts['team']['fingerprint'], self.team_fp)
         self.assertEqual(self.vps.registry['generation'], value['generation'])
         self.assertTrue(self.vps.shell); self.assertEqual(self.vps.linger, 'yes'); self.assertEqual(self.vps.service, 'running')
@@ -1313,6 +1329,7 @@ class FixRoundRemoveTests(OrchestrationBase):
         self.assertEqual(self.local.herdr, [{'id': 'p2', 'label': 'vps', 'target': 'justus@other'}])
         self.assertEqual(self.local.spaces, ['direct:100.64.0.9:3211'])
         self.assertIn('tokens copied to vps remain', out); self.assertIn('revoke', out)
+        self.assertIn('--long-lived --replace --name <name> on the device that first enrolled it', out)
 
     def test_forget_refuses_the_conductor_device_and_the_usage_owner(self):
         for prepare in [lambda value: value.update(conductor={'device': 'vps', 'email': 'team@x.de', 'organization': 'Team A', 'cwd': '/c'}),

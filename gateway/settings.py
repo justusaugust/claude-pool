@@ -35,6 +35,7 @@ LONG_LIVED = STORES.parent / 'claude-long-lived'  # 0700; long-lived token files
 REGISTRY = CONFIG.parent / 'devices.json'  # non-secret, generation-numbered device registry
 SELF = CONFIG.parent / 'device.json'  # this machine's registry name
 SHARED_READINGS = RUNTIME / 'shared-readings.json'  # usage readings pulled from the usage owner
+CONDUCTOR_HOME = '~/projects/conductor'  # the Conductor's working directory: its CLAUDE.md (with the managed device block), journal.md, bin/, board/
 CONDUCTOR_STATE = RUNTIME / 'conductor.json'  # 0600 supervisor state of Conductor Claude: pid, readiness, session id
 NATIVE_CLAUDE = str(Path(OPTIONS.get('native_claude', shutil.which('claude') or Path.home() / '.local/bin/claude')).expanduser().absolute())
 GATEWAY_PORT = OPTIONS.get('gateway_port', 18341)

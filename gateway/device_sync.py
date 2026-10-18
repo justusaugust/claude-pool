@@ -364,7 +364,7 @@ def sync_all(remotes=Remote):
         return {}
     for row in known['devices']:
         if row['name'] == me: continue
-        if not row.get('ssh'): results[row['name']] = 'unreachable'; continue
+        if not row.get('ssh'): results[row['name']] = 'skipped: no ssh target from this device (it syncs with this one itself)'; continue
         try: remote = remotes(row['ssh'])
         except ValueError: results[row['name']] = 'failed: invalid ssh target'; continue
         results[row['name']] = sync_one(remote)

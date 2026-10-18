@@ -35,7 +35,7 @@ import settings
 
 EVENTS = settings.RUNTIME / 'conductor-events.json'  # 0600 last seen state of sessions, agents, previews and PRs
 QUEUE = settings.RUNTIME / 'conductor-queue.json'    # 0600 tasks waiting for a busy agent
-JOURNAL = Path.home() / 'projects/conductor/journal.md'
+JOURNAL = Path(settings.CONDUCTOR_HOME).expanduser() / 'journal.md'
 POLL = 20               # seconds between `events` polls
 PR_EVERY = 3            # ask gh every third poll (about once a minute)
 BATCH = 600             # at most one batch line per ten minutes

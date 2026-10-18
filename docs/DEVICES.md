@@ -115,7 +115,7 @@ One device is the usage owner (`add <ssh-target> --usage-owner`). It polls the p
 
 ## Conductor
 
-The Conductor is one permanent Native Claude conversation that watches and prompts your herdr agents. It runs on exactly one device with that machine's Native login (never through the pool) and appears in the Claude iOS app under Remote Control. In the Claude app it is listed as "Conductor Claude". The pool account with the same identity is reserved from 85% unless you set it otherwise.
+The Conductor is one permanent Native Claude conversation that watches and prompts your herdr agents. It runs on exactly one device with that machine's Native login (never through the pool) and appears in the Claude iOS app under Remote Control. In the Claude app it is listed as "Conductor Claude". It works in `~/projects/conductor` on that device: its `CLAUDE.md` (claude-pool keeps a managed device block in it), `journal.md` and its own `bin/` and `board/` live there. The pool account with the same identity is reserved from 85% unless you set it otherwise.
 
 ```sh
 claude-pool device conductor status

@@ -495,6 +495,14 @@ class CheckTests(unittest.TestCase):
         self.assertNotIn('not running', step.detail)
 
 
+class HomeTests(unittest.TestCase):
+    def test_one_conductor_home_for_the_service_the_context_and_the_journal(self):
+        import conductor_tools, devices_cli
+        self.assertEqual(settings.CONDUCTOR_HOME, '~/projects/conductor')
+        self.assertEqual(conductor_tools.JOURNAL, Path(settings.CONDUCTOR_HOME).expanduser() / 'journal.md')
+        self.assertFalse(hasattr(devices_cli, 'CONDUCTOR_DIR'))
+
+
 class ContextTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)

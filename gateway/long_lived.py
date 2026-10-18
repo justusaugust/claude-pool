@@ -103,6 +103,17 @@ def _mode_problem(path, want):
     return None if (info.st_mode & 0o777) == want else 'has mode ' + format(info.st_mode & 0o777, 'o') + ', want ' + format(want, 'o')
 
 
+REPLACE_WHERE = ' on the device that first enrolled it (it holds the old token and has a browser), then claude-pool device sync'
+REPLACE_GONE = '; if that device is gone (--replace says no token is saved), the same command without --replace on any machine with a browser'
+
+
+def replace_fix(email, name):
+    """The one fix for a long-lived token that is expiring, expired or revoked. Without --replace a device that holds the
+    old token reuses it and reports Connected, so the fix would never take effect."""
+    return ('claude-pool account add ' + (email or '<email>') + ' --long-lived --replace --name ' + str(name or '<name>') +
+            REPLACE_WHERE)
+
+
 def health(stores, directory, value, now_ms, self_name):
     """Findings for every long-lived token on this device. An account without a problem gets one 'ok' finding."""
     stores, directory = Path(stores), Path(directory)
@@ -144,7 +155,7 @@ def health(stores, directory, value, now_ms, self_name):
             values[label] = loaded
         served = values.get('store') or values.get('replica')
         row = registry.account(value, name) or {}
-        fix = 'claude-pool account add ' + (row.get('email') or '<email>') + ' --long-lived --name ' + name + ', then claude-pool device sync'
+        fix = replace_fix(row.get('email'), name)
         if served is not None:
             left = days_left(served, now_ms)
             if left is not None and left <= FAIL_DAYS:
