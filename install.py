@@ -240,7 +240,8 @@ def prepare_backend(prefix):
         subprocess.run(['brew', 'install', *packages], check=True)
         rustup_bin = Path(subprocess.check_output(['brew', '--prefix', 'rustup'], text=True).strip()) / 'bin' if 'rustup' in packages else Path.home() / '.cargo/bin'
         os.environ['PATH'] = str(rustup_bin) + os.pathsep + str(Path.home() / '.cargo/bin') + os.pathsep + os.environ.get('PATH', '')
-    subprocess.run(['rustup', 'toolchain', 'install', pin['rustToolchain'], '--profile', 'minimal'], check=True)
+    # The installer never updates the user's rustup; a self-update also refuses when CARGO_HOME is not rustup's own home.
+    subprocess.run(['rustup', 'toolchain', 'install', pin['rustToolchain'], '--profile', 'minimal', '--no-self-update'], check=True)
     subprocess.run(['nice', '-n', '10', sys.executable, str(SOURCE / 'scripts/build_backend.py')], check=True)
 
 
