@@ -100,7 +100,9 @@ def default_native_identity():
 
 
 def build_version():
-    try: return json.loads((settings.HERE.parent / 'build-info.json').read_text()).get('version')
+    """The release's source digest (`sourceVersion`): equal on every device that runs the same sources, because the
+    backend binary each platform builds itself is not part of it. None for a release built before it existed."""
+    try: return json.loads((settings.HERE.parent / 'build-info.json').read_text()).get('sourceVersion')
     except (OSError, ValueError, AttributeError): return None
 
 

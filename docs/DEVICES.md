@@ -48,7 +48,7 @@ claude-pool device switch [--wait]
 | `reachable` | ssh to the device works without a password prompt | ssh <ssh-target> true must work without a password prompt (BatchMode) |
 | `native-claude` | Native Claude Code is installed | curl -fsSL https://claude.ai/install.sh \| bash on the device |
 | `install` | claude-pool is installed and knows the device commands | claude-pool device add <ssh-target>; if it says Python 3.11 or newer is missing, install Python 3.11 or newer on the device first |
-| `version` | the device runs the same build as this one | claude-pool device add <ssh-target> |
+| `version` | the device runs the same claude-pool sources as this one (each platform builds its own backend) | claude-pool device add <ssh-target> |
 | `linger` | Linux services survive logout (macOS: skipped) | claude-pool device add <ssh-target> tries it without root; if it stays failed, a root user runs sudo loginctl enable-linger <user> on the device |
 | `shell` | the claude shell function sends claude through the pool | claude-pool device add <ssh-target> |
 | `accounts` | registry, token fingerprints, reserve settings and account health match | claude-pool device sync; claude-pool device sync --force-registry on the device whose list is right; claude-pool account add <email> --long-lived --replace --name <name> on the device that first enrolled it, then device sync; claude-pool account reserve <name> --at <pct>; claude-pool device switch |

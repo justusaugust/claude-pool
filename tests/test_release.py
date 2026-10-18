@@ -331,6 +331,26 @@ class ReleaseTests(unittest.TestCase):
                     installer.install(root / 'app', root / 'bin', root / 'config.json', native, skip_backend=True)
             self.assertFalse((root / 'app').exists()); self.assertFalse((root / 'config.json').exists())
 
+    def test_source_version_ignores_the_platform_built_backend_and_files_the_source_archive_skips(self):
+        # Final review probe: identical sources with a darwin and a linux backend gave two versions, so device add never matched.
+        infos = []
+        for binary, checkout in ((b'MACHO-darwin-arm64', True), (b'ELF-linux-x86_64', False)):
+            release = Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, release)
+            for name, text in [('gateway/x.py', 'same source\n'), ('gateway/preview', '#!/usr/bin/env python3\n'), ('docs/a.md', 'doc\n'),
+                               ('backend/upstream.json', '{"pin": 1}'), ('run.py', 'run\n'), ('README.md', 'readme\n')]:
+                (release / name).parent.mkdir(parents=True, exist_ok=True); (release / name).write_text(text)
+            (release / 'gateway/bin').mkdir(); (release / 'gateway/bin/shunt').write_bytes(binary)
+            if checkout:  # a copy_release from a checkout carries files the source archive never sends
+                (release / 'gateway/notes.txt').write_text('scratch'); (release / 'gateway/__pycache__').mkdir()
+                (release / 'gateway/__pycache__/x.cpython-314.pyc').write_bytes(b'pyc')
+            infos.append(installer.build_info(release))
+        self.assertNotEqual(infos[0]['version'], infos[1]['version'])
+        self.assertEqual(infos[0]['sourceVersion'], infos[1]['sourceVersion'])
+        changed = Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, changed)
+        (changed / 'gateway').mkdir(); (changed / 'gateway/x.py').write_text('other source\n')
+        (changed / 'backend').mkdir(); (changed / 'backend/upstream.json').write_text('{"pin": 1}')
+        self.assertNotEqual(installer.build_info(changed)['sourceVersion'], infos[0]['sourceVersion'])
+
     def test_no_machine_home_paths_or_private_keys_in_source(self):
         forbidden = ['/Us' + 'ers/', '/ho' + 'me/', '-----BEGIN ' + 'PRIVATE KEY-----']
         for path in ROOT.rglob('*'):

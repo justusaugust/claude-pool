@@ -77,6 +77,11 @@ class DeviceSyncTests(unittest.TestCase):
 
     def config_names(self): return [r['name'] for r in json.loads(self.config.read_text())['accounts']]
 
+    def test_build_version_is_the_source_version_so_mac_and_linux_builds_compare_equal(self):
+        (self.root / 'build-info.json').write_text(json.dumps({'version': 'withbackend', 'sourceVersion': 'sourceonly'}))
+        self.assertEqual(device_sync.build_version(), 'sourceonly')
+        self.assertEqual(device_sync.status()['version'], 'sourceonly')
+
     def test_send_account_refuses_a_terminal_and_refreshable_files(self):
         long_lived_file(self.directory, 'team')
         refreshable_file(self.directory, 'ops-refreshable', 'user-o', 'org-o')
