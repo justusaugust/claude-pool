@@ -199,6 +199,7 @@ TUNNEL_PORTS = range(32300, 32400)
 TUNNEL_LABEL = 'io.github.claude-pool.cua-tunnel.'  # launchd label prefix; the systemd user unit is TUNNEL_UNIT<name>.service
 TUNNEL_UNIT = 'claude-pool-cua-tunnel-'
 TUNNEL_WAIT = 15  # seconds a new tunnel gets to log in and listen
+BOOTOUT_WAIT = 5  # seconds launchd gets to let go of a booted-out label before it is loaded again
 _PORT_IN = re.compile(rb'127\.0\.0\.1:([0-9]{4,5}):')
 
 
@@ -223,7 +224,8 @@ def tunnel_file(peer, system, home):
 def tunnel_argv(port, peer_ip, ssh):
     """The ssh that forwards 127.0.0.1:<port> on this device to the peer's host. Never a 0.0.0.0 bind, no agent, no master."""
     if port not in TUNNEL_PORTS: raise ValueError('Tunnel port out of range')
-    return ['/usr/bin/ssh', '-N', '-T', '-o', 'BatchMode=yes', '-o', 'ExitOnForwardFailure=yes', '-o', 'ServerAliveInterval=20',
+    return ['/usr/bin/ssh', '-N', '-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', '-o', 'ExitOnForwardFailure=yes',
+            '-o', 'ServerAliveInterval=20',
             '-o', 'ServerAliveCountMax=3', '-o', 'ForwardAgent=no', '-o', 'ControlMaster=no', '-o', 'ControlPath=none',
             '-L', f'{LOOPBACK}:{port}:{_checked(peer_ip)}:{PORT}', _ssh(ssh)]
 
@@ -290,14 +292,46 @@ def _unit_runs(run, label, system):
     return run.call(['systemctl', '--user', 'is-active', '--quiet', label + '.service']).returncode == 0
 
 
+def _gone(run, label, sleep, wait=BOOTOUT_WAIT):
+    """launchctl bootout returns before launchd lets go of the label; a bootstrap until then fails (Input/output error)."""
+    for _ in range(int(wait * 2)):
+        if not _loaded(run, label, 'darwin'): return True
+        sleep(0.5)
+    return not _loaded(run, label, 'darwin')
+
+
+def _bootstrap(run, path, label, sleep):
+    """Load the agent; one retry after waiting for launchd again."""
+    for attempt in range(2):
+        if run.call(['launchctl', 'bootstrap', _gui(), str(path)]).returncode == 0: return True
+        if attempt == 0: _gone(run, label, sleep)
+    return False
+
+
 def _defaults(run, system, home, listening=None):
     return (run or Local(), system or service.platform(), Path(home) if home else Path.home(), listening or _listening)
 
 
 def tunnel_add(peer, peer_ip, ssh, *, run=None, system=None, home=None, listening=None, sleep=time.sleep, wait=TUNNEL_WAIT):
-    """This device's tunnel to `peer`'s host: written, loaded and given `wait` seconds to listen. Idempotent; keeps its port."""
+    """This device's tunnel to `peer`'s host: written, loaded and given `wait` seconds to listen. Idempotent; keeps its port.
+    A tunnel this call created that fails to load or never comes up is removed again ({'port': None, 'running': False}), so
+    no ssh relaunches every 10 s; a tunnel from an earlier run that worked stays in place."""
     peer, peer_ip, ssh = _peer(peer), _checked(peer_ip), _ssh(ssh)
     run, system, home, listening = _defaults(run, system, home, listening)
+    fresh = peer not in _ours(system, home)
+    try: value = _tunnel_up(peer, peer_ip, ssh, run, system, home, listening, sleep, wait)
+    except BaseException:
+        if fresh:
+            try: tunnel_remove(peer, run=run, system=system, home=home)
+            except Exception: pass
+        raise
+    if fresh and not value['running']:
+        tunnel_remove(peer, run=run, system=system, home=home)
+        return {'port': None, 'running': False}
+    return value
+
+
+def _tunnel_up(peer, peer_ip, ssh, run, system, home, listening, sleep, wait):
     label, path = tunnel_label(peer, system), tunnel_file(peer, system, home)
     ours = _ours(system, home)
     taken = {port for name, other in ours.items() if name != peer for port in [_recorded_port(other)] if port}
@@ -310,9 +344,10 @@ def tunnel_add(peer, peer_ip, ssh, *, run=None, system=None, home=None, listenin
     if system == 'darwin':
         target = _gui() + '/' + label
         loaded = _loaded(run, label, system)
-        if changed and loaded: run.call(['launchctl', 'bootout', target]); loaded = False
+        if changed and loaded:
+            run.call(['launchctl', 'bootout', target]); _gone(run, label, sleep); loaded = False
         if changed: path.parent.mkdir(parents=True, exist_ok=True); service.write(path, data)
-        if not loaded and run.call(['launchctl', 'bootstrap', _gui(), str(path)]).returncode:
+        if not loaded and not _bootstrap(run, path, label, sleep):
             raise RuntimeError('launchd did not load the Cua tunnel to ' + peer)
     else:
         unit = label + '.service'

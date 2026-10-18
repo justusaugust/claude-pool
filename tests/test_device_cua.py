@@ -222,25 +222,35 @@ AUTH_ERROR = Completed(5, b'', b'Error: 401 Unauthorized: invalid token\n')
 
 
 def exact_argv(port, ip=PEER, ssh=SSH):
-    return ['/usr/bin/ssh', '-N', '-T', '-o', 'BatchMode=yes', '-o', 'ExitOnForwardFailure=yes', '-o', 'ServerAliveInterval=20',
+    return ['/usr/bin/ssh', '-N', '-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', '-o', 'ExitOnForwardFailure=yes', '-o', 'ServerAliveInterval=20',
             '-o', 'ServerAliveCountMax=3', '-o', 'ForwardAgent=no', '-o', 'ControlMaster=no', '-o', 'ControlPath=none',
             '-L', f'127.0.0.1:{port}:{ip}:3211', ssh]
 
 
 class Manager:
     """launchctl and systemctl --user as a fake: which of our units are loaded and whether they run."""
-    def __init__(self, running=True, fail=()):
+    def __init__(self, running=True, fail=(), lingers=0):
         self.calls, self.loaded, self.running, self.fail = [], set(), running, set(fail)
+        self.lingers, self.leaving = lingers, {}  # launchd: a booted-out label is still listed for `lingers` prints
 
     def call(self, argv, stdin=None, timeout=120):
         argv = list(argv); self.calls.append(argv)
         if any(word in self.fail for word in argv): return NO
         if argv[:2] == ['launchctl', 'print']:
             label = argv[2].rsplit('/', 1)[1]
+            if self.leaving.get(label):
+                self.leaving[label] -= 1; return Completed(0, b'state = exiting\n', b'')
             if label not in self.loaded: return Completed(113, b'', b'Could not find service')
             return Completed(0, b'state = ' + (b'running' if self.running else b'waiting') + b'\n', b'')
-        if argv[:2] == ['launchctl', 'bootstrap']: self.loaded.add(Path(argv[3]).stem); return OK
-        if argv[:2] == ['launchctl', 'bootout']: self.loaded.discard(argv[2].rsplit('/', 1)[1]); return OK
+        if argv[:2] == ['launchctl', 'bootstrap']:
+            label = Path(argv[3]).stem
+            if self.leaving.get(label): return Completed(5, b'', b'Bootstrap failed: 5: Input/output error')
+            self.loaded.add(label); return OK
+        if argv[:2] == ['launchctl', 'bootout']:
+            label = argv[2].rsplit('/', 1)[1]
+            self.loaded.discard(label)
+            if self.lingers: self.leaving[label] = self.lingers
+            return OK
         if argv[:2] == ['systemctl', '--user']:
             verb = argv[2:]
             if verb[:2] == ['enable', '--now']: self.loaded.add(verb[2]); return OK
@@ -353,10 +363,60 @@ class TunnelTests(unittest.TestCase):
 
     def test_a_tunnel_that_does_not_come_up_fails_with_the_ssh_fix(self):
         device = TunnelDevice(self.home, blocked=[PEER + ':3211'], manager=Manager(running=False))
-        step, _ = self.register(device)
+        step, tunnel = self.register(device)
         self.assertEqual(step.status, 'failed'); self.assertIn('SSH tunnel', step.detail)
         self.assertIn('ssh ' + SSH + ' true', step.fix)
         self.assertEqual(len(device.adds()), 1)
+        # a fresh tunnel that never came up is taken away again: nothing relaunches ssh every 10 s, no port to record
+        self.assertFalse(self.agent().exists()); self.assertEqual(device.manager.loaded, set()); self.assertIsNone(tunnel.port)
+        self.assertEqual(len(device.manager.managed('bootout')), 1)
+
+    def test_a_fresh_tunnel_that_fails_to_load_is_removed_too(self):
+        manager = Manager(fail=['bootstrap'])
+        with self.assertRaises(RuntimeError):
+            device_cua.tunnel_add('vps', PEER, SSH, run=manager, system='darwin', home=self.home, listening=self.up(manager),
+                                  sleep=lambda s: None)
+        self.assertFalse(self.agent().exists())
+        manager = Manager(running=False)
+        value = device_cua.tunnel_add('vps', PEER, SSH, run=manager, system='linux', home=self.home, listening=self.up(manager),
+                                      sleep=lambda s: None)
+        self.assertEqual(value, {'port': None, 'running': False}); self.assertFalse(self.unit().exists())
+        self.assertEqual(manager.managed('disable', '--now'), [['systemctl', '--user', 'disable', '--now', 'claude-pool-cua-tunnel-vps.service']])
+
+    def test_an_existing_tunnel_that_does_not_run_now_is_left_in_place(self):
+        manager = Manager()
+        first = device_cua.tunnel_add('vps', PEER, SSH, run=manager, system='darwin', home=self.home, listening=self.up(manager),
+                                      sleep=lambda s: None)
+        manager.running = False; manager.calls.clear()
+        value = device_cua.tunnel_add('vps', PEER, SSH, run=manager, system='darwin', home=self.home, listening=self.up(manager),
+                                      sleep=lambda s: None)
+        self.assertEqual(value, {'port': first['port'], 'running': False})
+        self.assertTrue(self.agent().exists()); self.assertEqual(manager.managed('bootout'), [])
+
+    def test_a_reload_waits_for_launchd_to_let_go_of_the_label(self):
+        manager = Manager(lingers=3)
+        first = device_cua.tunnel_add('vps', PEER, SSH, run=manager, system='darwin', home=self.home, listening=self.up(manager),
+                                      sleep=lambda s: None)
+        manager.calls.clear()
+        value = device_cua.tunnel_add('vps', '100.64.0.7', SSH, run=manager, system='darwin', home=self.home,
+                                      listening=self.up(manager), sleep=lambda s: None)
+        self.assertEqual(value, {'port': first['port'], 'running': True})
+        verbs = [a[1] for a in manager.calls if a[0] == 'launchctl']
+        out = verbs.index('bootout')
+        self.assertGreaterEqual(verbs[out + 1:verbs.index('bootstrap')].count('print'), 4)
+        self.assertEqual(verbs.count('bootstrap'), 1)
+
+    def test_a_failed_bootstrap_after_a_reload_is_retried_once(self):
+        manager = Manager(lingers=30)  # launchd keeps the label past the 5 s wait, then lets go
+        first = device_cua.tunnel_add('vps', PEER, SSH, run=manager, system='darwin', home=self.home, listening=self.up(manager),
+                                      sleep=lambda s: None)
+        def release(seconds):
+            if any(a[:2] == ['launchctl', 'bootstrap'] for a in manager.calls): manager.leaving.clear()
+        manager.calls.clear()
+        value = device_cua.tunnel_add('vps', '100.64.0.7', SSH, run=manager, system='darwin', home=self.home,
+                                      listening=self.up(manager), sleep=release)
+        self.assertEqual(len(manager.managed('bootstrap')), 2)
+        self.assertEqual(value['port'], first['port'])
 
     def test_the_port_is_deterministic_per_name_and_skips_listening_ports(self):
         first = device_cua.tunnel_port('vps', listening=lambda port: False)
