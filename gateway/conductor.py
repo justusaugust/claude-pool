@@ -346,7 +346,7 @@ def install(session_id=None, fresh=False, moving=False, restart=False):
     """Install and start the Conductor service on this device. `session_id` adopts a conversation started by hand; `fresh`
     starts a new conversation (move); `restart` restarts the Conductor unit even when nothing changed; `moving` (internal, from move) allows a device the registry does not name yet."""
     if session_id is not None and not SESSION_ID.fullmatch(session_id): raise ValueError('Invalid Conductor session id')
-    entry = registry.load().get('conductor')
+    entry = registry.conductor(registry.load())
     if not entry: return Step(STEP, 'failed', 'the registry names no Conductor', 'claude-pool device add <ssh-target> --usage-owner')
     me = registry.self_name()
     if not moving and entry['device'] != me:
@@ -432,7 +432,7 @@ def _target(value, name):
 
 
 def check(statuses, value):
-    entry = value.get('conductor')
+    entry = registry.conductor(value)
     if not entry: return Step(STEP, 'skipped', 'no Conductor configured')
     device = entry['device']
     parts = {name: (s.get('conductor') or {}) for name, s in statuses.items() if isinstance(s, dict)}
@@ -473,7 +473,7 @@ def check(statuses, value):
 
 
 def context_text(value):
-    entry = value.get('conductor') or {}
+    entry = registry.conductor(value) or {}
     lines = ['## Devices (managed by claude-pool, rewritten on every device sync)', '',
              'Work runs in herdr sessions on these machines, through the pool (`claude` there is `claude-pool exec`). '
              'This conversation coordinates; start and continue work in a herdr session, never in this process.',
@@ -499,7 +499,7 @@ def write_context(cwd, value):
 
 
 def apply_hook(value):
-    entry = value.get('conductor')
+    entry = registry.conductor(value)
     if entry and entry['device'] == registry.self_name() and Path(entry['cwd']).expanduser().is_dir(): write_context(entry['cwd'], value)
 
 
@@ -515,7 +515,7 @@ def move(target, value, remotes=Remote, local=None, sleep=time.sleep):
     """Move the Conductor to `target`: install there, wait until it is ready, then remove it from the old device."""
     from device_install import check_linger
     local = local or Local()
-    entry = value.get('conductor')
+    entry = registry.conductor(value)
     if not entry: print('The registry names no Conductor.'); return 2
     source, me = entry['device'], registry.self_name()
     if target == source: print('The Conductor already runs on ' + target + '.'); return 0
@@ -561,7 +561,7 @@ def move(target, value, remotes=Remote, local=None, sleep=time.sleep):
     elif gone.returncode:
         print('Could not remove the old Conductor on ' + source + '; run there: claude-pool device conductor uninstall')
     def note(current):
-        if current.get('conductor'): current['conductor']['device'] = target
+        if registry.conductor(current): current['conductor']['device'] = target
     registry.update(note)
     device_sync.sync_all(remotes)
     print('The Conductor now runs on ' + target + ' in a new conversation: open Conductor Claude in the Claude app '

@@ -105,7 +105,6 @@ def validate(value):
     for rows, what in [(value['devices'], 'device'), (value['accounts'], 'account')]:
         names = [row['name'] for row in rows]
         if len(set(names)) != len(names): raise ValueError('Duplicate ' + what + ' name')
-    if sum('usage' in row.get('roles', []) for row in value['devices']) > 1: raise ValueError('Only one device can be the usage owner')
     if not isinstance(value.get('removed', []), list): raise ValueError('removed must be a list')
     for row in value.get('removed', []): check_tombstone(row)
     if len({(row['kind'], row['name']) for row in value.get('removed', [])}) != len(value.get('removed', [])): raise ValueError('Duplicate tombstone')
@@ -115,8 +114,28 @@ def validate(value):
     if entry is not None:
         keys(entry, CONDUCTOR_KEYS, 'conductor')
         if set(entry) != CONDUCTOR_KEYS or any(not isinstance(item, str) for item in entry.values()): raise ValueError('conductor needs device, email, organization and cwd as text')
-        if entry['device'] not in {row['name'] for row in value['devices']}: raise ValueError('conductor.device must be a registered device')
     no_tokens(value)
+    return value
+
+
+def strict(value):
+    """What every local change must keep: one usage owner and the Conductor on a registered device. A merged registry can
+    break both for a while (two devices changed them while apart); owner() and conductor() resolve that the same way on
+    every device, and the next local change writes the resolution (resolve)."""
+    if sum('usage' in row.get('roles', []) for row in value['devices']) > 1: raise ValueError('Only one device can be the usage owner')
+    entry = value.get('conductor')
+    if entry is not None and entry['device'] not in {row['name'] for row in value['devices']}:
+        raise ValueError('conductor.device must be a registered device')
+    return value
+
+
+def resolve(value):
+    """Write the merged resolution into `value` before a local change: only the winning owner keeps the role, and a
+    Conductor entry whose device is gone is dropped."""
+    keep = owner(value)
+    for row in value['devices']:
+        if row is not keep and 'usage' in row.get('roles', []): row['roles'] = [r for r in row['roles'] if r != 'usage']
+    if value.get('conductor') is not None and conductor(value) is None: value['conductor'] = None
     return value
 
 
@@ -191,9 +210,9 @@ def update(change, path=None):
     path = path or settings.REGISTRY
     with locked(path):
         before = load(path)
-        value = copy.deepcopy(before)
+        value = resolve(copy.deepcopy(before))
         change(value)
-        validate(value)
+        strict(validate(value))
         generation = before['generation'] + 1
         stamp(before, value, generation)
         value['generation'] = generation; value['updatedAt'] = int(time.time())
@@ -228,14 +247,11 @@ def merge(local, incoming):
             tombs.pop((kind, name), None)  # the row is newer: it was added or changed again after the removal
             rows.append(row)
         out[field] = rows
-    owners = [row for row in out['devices'] if 'usage' in row.get('roles', [])]
-    if len(owners) > 1:  # two devices took the role while apart: the newest move wins
-        keep = max(owners, key=_key)
-        out['devices'] = [row if row is keep or row not in owners else {**row, 'roles': [r for r in row['roles'] if r != 'usage']}
-                          for row in out['devices']]
+    # Rows are never rewritten here: two devices that took the usage role while apart both keep it in their rows, and
+    # owner() picks the newest move; a Conductor entry is kept even while its device is absent (conductor() hides it).
+    # Rewriting either would lose information a third registry could still need, and the merge would stop being associative.
     entries = [(value.get('conductorGeneration', 0), value.get('conductor')) for value in (a, b)]
-    generation, entry = max(entries, key=lambda item: (item[0], digest(item[1])))
-    if entry is not None and entry['device'] not in {row['name'] for row in out['devices']}: entry = None
+    generation, entry = max(entries, key=lambda item: (item[0], (item[1] or {}).get('device', ''), digest(item[1])))
     out['conductor'] = entry
     if generation: out['conductorGeneration'] = generation
     out['removed'] = list(tombs.values())
@@ -260,7 +276,7 @@ def force(peers, path=None):
     fingerprint), so receivers retire only the exact token it names and never unlink it."""
     path = path or settings.REGISTRY
     with locked(path):
-        value = copy.deepcopy(load(path))
+        value = resolve(copy.deepcopy(load(path)))
         generation = max([value['generation']] + [peer['generation'] for peer in peers]) + 1
         tombs = {(row['kind'], row['name']): row for row in value.get('removed', [])}
         for kind, field in KINDS.items():
@@ -303,6 +319,17 @@ def set_self(name, path=None):
     write_private(path, json.dumps({'name': name}) + '\n')
 
 
-def owner(value): return next((row for row in value['devices'] if 'usage' in row.get('roles', [])), None)
+def owner(value):
+    """The usage owner: the device with the role; when two took it while apart, the newest move (highest row key)."""
+    return max((row for row in value['devices'] if 'usage' in row.get('roles', [])), key=_key, default=None)
+
+
+def is_owner(value, row): return row is not None and (owner(value) or {}).get('name') == row['name']
+
+
+def conductor(value):
+    """The Conductor entry, or None while the device it names is not registered (removed while it was being moved)."""
+    entry = value.get('conductor')
+    return entry if entry is not None and device(value, entry['device']) is not None else None
 def device(value, name): return next((row for row in value['devices'] if row['name'] == name), None)
 def account(value, name): return next((row for row in value['accounts'] if row['name'] == name), None)

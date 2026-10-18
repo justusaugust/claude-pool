@@ -86,8 +86,11 @@ class RegistryTests(unittest.TestCase):
         a = registry.update(move('personal-vps'), self.path)
         b = registry.update(move('third'), other)
         merged = registry.merge(a, b)
-        self.assertEqual(sum('usage' in r.get('roles', []) for r in merged['devices']), 1)
         self.assertEqual(merged, registry.merge(b, a))
+        self.assertEqual(registry.owner(merged)['name'], registry.owner(registry.merge(b, a))['name'])
+        registry.write(merged, other)  # the next local change on that device writes the one owner
+        after = registry.update(lambda v: v['accounts'].append(ENTRY), other)
+        self.assertEqual([r['name'] for r in after['devices'] if 'usage' in r.get('roles', [])], [registry.owner(merged)['name']])
 
     def test_receive_merges_under_the_lock_and_writes_only_a_change(self):
         current = registry.update(lambda v: v['devices'].append(MAC), self.path)
@@ -222,3 +225,61 @@ class RegistryTests(unittest.TestCase):
 
 
 if __name__ == '__main__': unittest.main()
+
+
+class MergeAlgebraTests(unittest.TestCase):
+    """registry.merge is a join: commutative, idempotent and associative over the whole registry, Conductor entry included,
+    so every order of syncs between any number of devices ends in the same registry."""
+    NAMES = ['mac', 'vps', 'box', 'lap']
+
+    def random_registry(self, rng):
+        devices = []
+        for name in rng.sample(self.NAMES, rng.randint(0, 4)):
+            devices.append({'name': name, 'ssh': name, 'platform': rng.choice(['darwin', 'linux']), 'roles': [],
+                            'addedAt': rng.randint(1, 3), 'generation': rng.randint(0, 4), 'cua': rng.random() < .3})
+        if devices and rng.random() < .6: rng.choice(devices)['roles'] = ['usage']
+        accounts = [{'name': name, 'label': name.title(), 'fingerprint': rng.choice(['aaaaaaaaaaaa', 'bbbbbbbbbbbb']),
+                     'reserveAt': rng.choice([0, 85]), 'generation': rng.randint(0, 4)}
+                    for name in rng.sample(['team', 'ops', 'mail'], rng.randint(0, 3))]
+        removed = [{'kind': kind, 'name': name, 'generation': rng.randint(0, 5), **({'fingerprint': 'aaaaaaaaaaaa'} if kind == 'account' else {})}
+                   for kind, name in rng.sample([('device', n) for n in self.NAMES] + [('account', n) for n in ['team', 'ops', 'mail']],
+                                                rng.randint(0, 4))]
+        value = {'version': 1, 'generation': rng.randint(0, 6), 'updatedAt': rng.randint(0, 3), 'devices': devices,
+                 'accounts': accounts, 'conductor': None}
+        if removed: value['removed'] = removed
+        if devices and rng.random() < .7:
+            value['conductor'] = {'device': rng.choice(devices)['name'], 'email': rng.choice(['a@x.de', 'b@x.de']),
+                                  'organization': 'Team', 'cwd': '~/projects/conductor'}
+            value['conductorGeneration'] = rng.randint(0, 3)
+        return registry.validate(value)
+
+    def test_merge_is_associative_commutative_and_idempotent_over_random_registries(self):
+        import random
+        rng = random.Random(20261018)
+        for i in range(3000):
+            a, b, c = (self.random_registry(rng) for _ in range(3))
+            with self.subTest(i=i):
+                left = registry.merge(registry.merge(a, b), c)
+                self.assertEqual(left, registry.merge(a, registry.merge(b, c)))
+                self.assertEqual(registry.merge(a, b), registry.merge(b, a))
+                self.assertEqual(registry.merge(left, left), left)
+
+    def test_the_conductor_entry_with_the_higher_generation_wins_and_ties_go_by_device_name(self):
+        def entry(device, generation):
+            return {**registry.EMPTY(), 'devices': [{'name': n, 'platform': 'linux'} for n in ('mac', 'vps')],
+                    'conductor': {'device': device, 'email': 'a@x.de', 'organization': 'T', 'cwd': '/c'}, 'conductorGeneration': generation}
+        self.assertEqual(registry.merge(entry('mac', 3), entry('vps', 2))['conductor']['device'], 'mac')
+        self.assertEqual(registry.merge(entry('mac', 2), entry('vps', 2))['conductor']['device'], 'vps')
+        self.assertEqual(registry.merge(entry('vps', 2), entry('mac', 2))['conductor']['device'], 'vps')
+
+    def test_a_conductor_entry_survives_a_merge_that_meets_its_device_tombstone_before_its_row(self):
+        # The re-review counterexample shape: one side removed the device, another re-added it; the entry must not be lost
+        # on the way, whatever the order.
+        base = {'name': 'vps', 'platform': 'linux', 'roles': []}
+        entry = {'device': 'vps', 'email': 'a@x.de', 'organization': 'T', 'cwd': '/c'}
+        a = {**registry.EMPTY(), 'devices': [{**base, 'generation': 1}], 'conductor': entry, 'conductorGeneration': 1}
+        b = {**registry.EMPTY(), 'removed': [{'kind': 'device', 'name': 'vps', 'generation': 2}]}
+        c = {**registry.EMPTY(), 'devices': [{**base, 'generation': 3}]}
+        first, second = registry.merge(registry.merge(a, b), c), registry.merge(a, registry.merge(b, c))
+        self.assertEqual(first, second); self.assertEqual(first['conductor'], entry)
+

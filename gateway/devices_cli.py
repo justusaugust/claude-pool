@@ -369,12 +369,12 @@ def list_devices(argv, out, **_):
     if not value['devices']:
         print('No devices registered yet. Add one with: claude-pool device add <ssh-target>')
         return 0
-    lead = (value.get('conductor') or {}).get('device')
+    lead = (registry.conductor(value) or {}).get('device')
     width = max(len(row['name']) for row in value['devices'])
     for row in value['devices']:
         notes = [{'darwin': 'macOS', 'linux': 'Linux'}.get(row.get('platform'), row.get('platform') or 'unknown')]
         if row['name'] == me: notes.append('this device')
-        if 'usage' in row.get('roles', []): notes.append('usage owner')
+        if registry.is_owner(value, row): notes.append('usage owner')
         if row['name'] == lead: notes.append('Conductor')
         if row.get('cua'): notes.append('Cua')
         print(f"{row['name']:<{width}}  {row.get('ssh') or 'no ssh target':<24}  " + ', '.join(notes))
@@ -424,7 +424,7 @@ def conductor_user(action, argv, remotes, local):
             try: statuses[row['name']] = device_sync.peer_status(remotes(row['ssh']))
             except device_sync.Outdated: outdated[row['name']] = row['ssh']
             except (ValueError, RuntimeError, OSError, device_sync.Failed, device_sync.Unreachable, device_sync.Missing): pass
-    lead = (value.get('conductor') or {}).get('device')
+    lead = (registry.conductor(value) or {}).get('device')
     if lead in outdated:
         step = Step(conductor.STEP, 'failed', 'outdated launcher on ' + lead + ' (no device support)', 'claude-pool device add ' + outdated[lead])
     else: step = conductor.check(statuses, value)
@@ -781,7 +781,7 @@ def _adopt(step):
 
 def check_conductor(t):
     value = registry.load()
-    entry = value.get('conductor')
+    entry = registry.conductor(value)
     if not entry: return Step('conductor', 'skipped', 'no Conductor configured (claude-pool device add <ssh-target> --usage-owner sets one up)')
     lead, name = entry['device'], t.row['name']
     if name != lead:
@@ -799,7 +799,7 @@ def check_conductor(t):
 def ensure_conductor(t):
     """Idempotent: creates the registry entry (with --usage-owner, when there is none) and installs the Conductor on the
     target whenever the registry names it and nothing runs there yet. Never installs next to a running Conductor."""
-    entry = registry.load().get('conductor')
+    entry = registry.conductor(registry.load())
     if not entry and not (t.args and t.args.usage_owner): return check_conductor(t)
     if entry and entry['device'] != t.row['name']: return check_conductor(t)
     if not t.supported: return t.needs_install('conductor')
@@ -810,7 +810,7 @@ def ensure_conductor(t):
             return Step('conductor', 'missing', 'the Conductor needs a Native login on ' + t.row['name'] + ' first', t.retry + ' --usage-owner')
         entry = {'device': t.row['name'], 'email': login['email'], 'organization': login.get('organization') or '', 'cwd': settings.CONDUCTOR_HOME}
         def place(value):
-            if not value.get('conductor'): value['conductor'] = entry
+            if not registry.conductor(value): value['conductor'] = entry
         registry.update(place)
     part = status.get('conductor') or {}
     if part.get('running') or part.get('duplicates') or part.get('error'): return check_conductor(t)
@@ -830,7 +830,7 @@ def take_usage_role(t):
     """`add --usage-owner`: the role moves only to a device that serves every registry account from its own refreshable
     login (status servingKind); a device that only holds long-lived tokens could read no usage. None when it moved."""
     value = registry.load()
-    if 'usage' in t.row.get('roles', []): return None
+    if registry.is_owner(value, t.row): return None
     rows = t.status(fresh=True).get('accounts') or {}
     missing = [row for row in value['accounts']
                if (rows.get(row['name']) or {}).get('servingKind') != 'refreshable' or not (rows.get(row['name']) or {}).get('active', True)]
@@ -1064,10 +1064,10 @@ def _loaded_command(label, platform):
 def _refuse_role(value, row):
     """Why this device cannot leave the registry now (Conductor device or usage owner), or None."""
     name = row['name']
-    if name == (value.get('conductor') or {}).get('device'):
+    if name == (registry.conductor(value) or {}).get('device'):
         other = next((r['name'] for r in value['devices'] if r['name'] != name), '<other>')
         return 'The Conductor runs on ' + name + '. Move it first: claude-pool device conductor move ' + other + '. Nothing was changed.'
-    if 'usage' in row.get('roles', []):
+    if registry.is_owner(value, row):
         return (name + ' is the usage owner. Make another device the owner first: claude-pool device add <other-target> --usage-owner. '
                 'Nothing was changed.')
     return None
