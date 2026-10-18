@@ -9,6 +9,57 @@ export const VM = ['vm_stat']
 export const PS = ['ps', '-axo', 'pid=,ppid=,pcpu=,args=']
 export const lsofCwd = (pids: number[]) => ['lsof', '-a', '-d', 'cwd', '-p', pids.join(','), '-Fpn']
 
+// Linux prints the same four shapes from /proc, nproc and GNU stat, so parse()
+// stays one function: load/cores/memsize/swap lines, a vm_stat-shaped memory
+// report (page size 1, used bytes as "Pages active"), lsof -Fpn pairs from
+// /proc/<pid>/cwd, and "mtime path" stat lines.
+const LINUX_SYS = ['sh', '-c', [
+  'cut -d" " -f1-3 /proc/loadavg',
+  'nproc',
+  'awk \'/^MemTotal:/{printf "%.0f\\n", $2*1024}\' /proc/meminfo',
+  'awk \'/^SwapTotal:/{t=$2} /^SwapFree:/{f=$2} END{printf "used = %.2fM\\n", (t-f)/1024}\' /proc/meminfo',
+].join('; ')]
+const LINUX_VM = ['sh', '-c', 'awk \'/^MemTotal:/{t=$2} /^MemAvailable:/{a=$2} END{printf "page size of 1\\nPages active: %.0f\\nPages wired down: 0\\nPages occupied by compressor: 0\\n", (t-a)*1024}\' /proc/meminfo']
+// procps' pcpu is a lifetime average, unlike macOS' decaying one, so Linux
+// samples utime+stime from /proc/<pid>/stat one second apart: the same
+// "pid ppid pcpu args" lines, percent of one core, args from cmdline (or
+// [comm] for kernel threads, as ps prints them).
+const LINUX_PS_AWK = [
+  '/^===$/ { second = 1; next }',
+  '{ pid = $1; line = $0; sub(/^[0-9]+ \\(.*\\) /, "", line); n = split(line, f, " "); t = f[12] + f[13]',
+  '  if (!second) { first[pid] = t } else if (pid in first) { printf "%d %d %.1f\\n", pid, f[2], (t - first[pid]) * 100 / clk } }',
+].join('\n')
+const LINUX_PS = ['sh', '-c', [
+  'clk=$(getconf CLK_TCK 2>/dev/null || echo 100)',
+  'snap() { for f in /proc/[0-9]*/stat; do IFS= read -r l < "$f" 2>/dev/null && printf "%s\\n" "$l"; done; }',
+  'a=$(snap); sleep 1; b=$(snap)',
+  '{ printf "%s\\n===\\n%s\\n" "$a" "$b"; } | awk -v clk="$clk" "$1" | while read -r pid ppid cpu; do',
+  '  args=$(tr "\\000\\n\\r" "   " < "/proc/$pid/cmdline" 2>/dev/null); [ -n "$args" ] || args="[$(cat "/proc/$pid/comm" 2>/dev/null)]"',
+  '  printf "%s %s %s %s\\n" "$pid" "$ppid" "$cpu" "$args"',
+  'done',
+].join('\n'), 'sh', LINUX_PS_AWK]
+const linuxCwd = (pids: number[]) => [
+  'sh', '-c', 'for p in "$@"; do d=$(readlink "/proc/$p/cwd" 2>/dev/null) && printf "p%s\\nn%s\\n" "$p" "$d"; done', 'sh',
+  ...pids.map(String),
+]
+const linuxFindTranscripts = (dir: string) => ['find', dir, '-maxdepth', '1', '-name', '*.jsonl', '-exec', 'stat', '-c', '%Y %n', '{}', '+']
+const linuxFindAgents = (folder: string) => ['find', `${folder}/subagents`, '-name', '*.jsonl', '-mmin', '-15', '-exec', 'stat', '-c', '%Y %n', '{}', '+']
+
+export type Commands = {
+  sys: string[]
+  vm: string[]
+  ps: string[]
+  cwd: (pids: number[]) => string[]
+  findTranscripts: (dir: string) => string[]
+  findAgents: (folder: string) => string[]
+}
+
+// The command set for the host; connection.ts names the platform ('darwin' | 'linux').
+export function commands(platform: string): Commands {
+  if (platform === 'linux') return { sys: LINUX_SYS, vm: LINUX_VM, ps: LINUX_PS, cwd: linuxCwd, findTranscripts: linuxFindTranscripts, findAgents: linuxFindAgents }
+  return { sys: SYS, vm: VM, ps: PS, cwd: lsofCwd, findTranscripts, findAgents }
+}
+
 // `tails`: the last lines of each session's transcript, by its pid; `agents`:
 // its subagents' and workflow agents' transcripts written in the last 15 min.
 export type Outputs = {

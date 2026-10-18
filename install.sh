@@ -1,10 +1,10 @@
 #!/bin/sh
-# Source-built macOS installer. Native Claude and Git must already be installed.
+# Source-built installer for macOS and Linux. Native Claude and Git must already be installed.
 set -eu
-if [ "$(uname -s)" != Darwin ]; then
-  echo 'Claude Pool currently supports macOS only.' >&2
-  exit 1
-fi
+case "$(uname -s)" in
+  Darwin|Linux) ;;
+  *) echo 'Claude Pool supports macOS and Linux only.' >&2; exit 1 ;;
+esac
 task_python=''
 for candidate in python3 python3.14 python3.13 python3.12 python3.11; do
   if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -c 'import sys; sys.exit(sys.version_info < (3,11))' 2>/dev/null; then
@@ -13,6 +13,10 @@ for candidate in python3 python3.14 python3.13 python3.12 python3.11; do
   fi
 done
 if [ -z "$task_python" ]; then
+  if [ "$(uname -s)" != Darwin ]; then
+    echo 'Install Python 3.11+ (Debian/Ubuntu: apt install python3), then rerun this command.' >&2
+    exit 1
+  fi
   if ! command -v brew >/dev/null 2>&1; then
     echo 'Install Python 3.11+ (or Homebrew), then rerun this command.' >&2
     exit 1

@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
-"""Install a source-built macOS alpha without replacing Claude or its login."""
+"""Install a source-built macOS/Linux alpha without replacing Claude or its login."""
 import argparse
 import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
-import plistlib
 import re
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.request
 
 SOURCE = Path(__file__).resolve().parent
+sys.path.insert(0, str(SOURCE / 'gateway'))
+import service
 MARKER = '# managed by claude-pool installer\n'
+RUSTUP_INIT = 'https://sh.rustup.rs'
 
 
 def atomic_write(path, content, mode=0o600):
@@ -64,11 +67,11 @@ def check_release(target, config):
 def service_path(receipt):
     label = receipt.get('serviceLabel', 'io.github.claude-pool')
     if not isinstance(label, str) or not re.fullmatch(r'[a-zA-Z0-9.-]+', label): raise RuntimeError('Invalid installed service label')
-    return label, Path.home() / ('Library/LaunchAgents/' + label + '.plist')
+    return label, service.service_file(label)
 
 
 def install(prefix, bin_dir, config, native, *, skip_backend=False, update=False):
-    if sys.platform != 'darwin': raise RuntimeError('This alpha supports macOS only')
+    service.platform()
     if sys.version_info < (3, 11): raise RuntimeError('Python 3.11 or newer is required')
     if prefix.is_symlink(): raise RuntimeError('Application root cannot be a symlink')
     prefix = prefix.resolve()
@@ -101,7 +104,7 @@ def install(prefix, bin_dir, config, native, *, skip_backend=False, update=False
         'claude-native': '#!/bin/sh\n' + MARKER + 'exec ' + shlex.quote(str(native.absolute())) + ' "$@"\n'}
     with tempfile.TemporaryDirectory(prefix='.claude-pool-install-', dir=prefix.parent) as staging:
         target = Path(staging) / 'app'
-        target.mkdir()
+        target.mkdir(mode=0o755)
         copy_release(target)
         written = {str(bin_dir / name): hashlib.sha256(body.encode()).hexdigest() for name, body in bodies.items()}
         (target / 'installation.json').write_text(json.dumps({'launchers': written, 'config': str(config), 'root': str(prefix), 'native': str(native.absolute())}, indent=2) + '\n')
@@ -138,12 +141,12 @@ def update_install(prefix, *, skip_backend=False):
     check_native(Path(options.get('native_claude', receipt.get('native', ''))))
     current = (prefix / 'current').resolve() if (prefix / 'current').is_symlink() else prefix
     if current != prefix and current.parent != prefix / 'versions': raise RuntimeError('Invalid release pointer')
-    label, service = service_path(receipt)
+    label, service_file = service_path(receipt)
     legacy_entry = receipt.get('legacyEntry', str(prefix / 'gateway/launch.py'))
     future_service = None
-    if service.is_symlink(): raise RuntimeError('Service file changed; leaving it intact')
-    if service.exists():
-        definition = plistlib.loads(service.read_bytes())
+    if service_file.is_symlink(): raise RuntimeError('Service file changed; leaving it intact')
+    if service_file.exists():
+        definition = service.load(service_file.read_bytes())
         arguments = definition.get('ProgramArguments', [])
         if definition.get('Label') != label or not any(p in arguments for p in [legacy_entry, str(prefix / 'run.py')]):
             raise RuntimeError('Service file belongs to another installation; leaving it intact')
@@ -151,12 +154,12 @@ def update_install(prefix, *, skip_backend=False):
             definition['ProgramArguments'] = [str(prefix / 'run.py') if a == legacy_entry else a for a in arguments]
             definition['WorkingDirectory'] = str(prefix)
             definition.setdefault('EnvironmentVariables', {})['CLAUDE_POOL_CONFIG'] = receipt['config']
-            future_service = plistlib.dumps(definition).decode()
+            future_service = service.render(definition).decode()
     versions = prefix / 'versions'
     if versions.is_symlink(): raise RuntimeError('Release directory cannot be a symlink')
     versions.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='.staging-', dir=versions) as folder:
-        target = Path(folder) / 'app'; target.mkdir()
+        target = Path(folder) / 'app'; target.mkdir(mode=0o755)
         copy_release(target)
         if not skip_backend and not os.access(target / 'gateway/bin/shunt', os.X_OK): raise RuntimeError('Backend build is missing or not executable; nothing activated')
         (target / 'installation.json').write_text(json.dumps(receipt | {'root': str(prefix)}) + '\n')
@@ -166,7 +169,7 @@ def update_install(prefix, *, skip_backend=False):
         check_release(target, receipt['config'])
         if (current / 'build-info.json').is_file() and json.loads((current / 'build-info.json').read_text())['version'] == info['version'] and build_info(current)['version'] == info['version'] and (skip_backend or os.access(current / 'gateway/bin/shunt', os.X_OK)):
             if future_service:
-                atomic_write(service, future_service)
+                atomic_write(service_file, future_service)
                 print('Future service entry prepared; the loaded service was left unchanged.')
             print('Claude Pool is already up to date.'); return
         destination = versions / info['version']
@@ -182,7 +185,7 @@ def update_install(prefix, *, skip_backend=False):
             receipt['launchers'][str(pool)] = hashlib.sha256(body.encode()).hexdigest()
             receipt['root'] = str(prefix)
             atomic_write(prefix / 'installation.json', json.dumps(receipt) + '\n')
-        if future_service: atomic_write(service, future_service)
+        if future_service: atomic_write(service_file, future_service)
         temporary = Path(folder) / 'current'; temporary.symlink_to(destination)
         temporary.replace(prefix / 'current')
     print('Updated Claude Pool. New sessions use the new CLI and Mods.')
@@ -204,31 +207,52 @@ def prepare_backend(prefix):
             shutil.copy2(old, binary)
             print('Reusing the verified backend; no Rust rebuild needed.'); return
     missing = [name for name in ['node', 'npm', 'rustup', 'cargo'] if not shutil.which(name)]
-    if missing:
+    if missing and service.platform() == 'linux': prepare_linux_tools(missing, pin)
+    elif missing:
         if not shutil.which('brew'): raise RuntimeError('Install Homebrew or the build tools (' + ', '.join(missing) + '), then rerun. Nothing activated.')
         packages = (['node'] if 'node' in missing or 'npm' in missing else []) + (['rustup'] if 'rustup' in missing or 'cargo' in missing else [])
         subprocess.run(['brew', 'install', *packages], check=True)
         rustup_bin = Path(subprocess.check_output(['brew', '--prefix', 'rustup'], text=True).strip()) / 'bin' if 'rustup' in packages else Path.home() / '.cargo/bin'
         os.environ['PATH'] = str(rustup_bin) + os.pathsep + str(Path.home() / '.cargo/bin') + os.pathsep + os.environ.get('PATH', '')
-    subprocess.run(['rustup', 'toolchain', 'install', pin['rustToolchain'], '--profile', 'minimal'], check=True)
+    # The installer never updates the user's rustup; a self-update also refuses when CARGO_HOME is not rustup's own home.
+    subprocess.run(['rustup', 'toolchain', 'install', pin['rustToolchain'], '--profile', 'minimal', '--no-self-update'], check=True)
     subprocess.run(['nice', '-n', '10', sys.executable, str(SOURCE / 'scripts/build_backend.py')], check=True)
+
+
+def prepare_linux_tools(missing, pin):
+    """Linux has no Homebrew step: Node comes from the distribution, Rust from rustup in the user's home."""
+    if 'node' in missing or 'npm' in missing:
+        raise RuntimeError('Install Node.js 22.12+ with npm (distribution package or nodejs.org), then rerun. Nothing activated.')
+    cargo_home = Path(os.environ.get('CARGO_HOME', Path.home() / '.cargo')).expanduser()
+    if not (cargo_home / 'bin/rustup').is_file():
+        if not shutil.which('cc'): raise RuntimeError('Install a C compiler and linker (Debian: apt install build-essential), then rerun. Nothing activated.')
+        print('Installing rustup into ' + str(cargo_home) + ' (user space, PATH untouched)…', flush=True)
+        with tempfile.TemporaryDirectory(prefix='claude-pool-rustup-') as folder:
+            script = Path(folder) / 'rustup-init.sh'
+            with urllib.request.urlopen(RUSTUP_INIT, timeout=60) as response: body = response.read(4 * 1024 * 1024 + 1)
+            if len(body) > 4 * 1024 * 1024 or not body.startswith(b'#!'): raise RuntimeError('Unexpected rustup installer download; nothing activated.')
+            script.write_bytes(body)
+            subprocess.run(['sh', str(script), '-y', '--quiet', '--no-modify-path', '--profile', 'minimal',
+                            '--default-toolchain', pin['rustToolchain']], check=True)
+    os.environ['PATH'] = str(cargo_home / 'bin') + os.pathsep + os.environ.get('PATH', '')
+    if any(not shutil.which(name) for name in ['rustup', 'cargo']): raise RuntimeError('rustup did not provide cargo; nothing activated.')
 
 
 def uninstall(prefix):
     receipt = json.loads((prefix / 'installation.json').read_text())
-    label, plist = service_path(receipt)
-    job = subprocess.run(['launchctl', 'print', 'gui/' + str(os.getuid()) + '/' + label], capture_output=True)
-    if job.returncode == 0: raise RuntimeError('Pool service is loaded. Finish tasks, run claude-pool --stop, then launchctl bootout gui/$(id -u)/' + label + ' before uninstalling')
+    label, service_file = service_path(receipt)
+    if service.loaded(label, run=subprocess.run): raise RuntimeError('Pool service is loaded. Finish tasks, run claude-pool --stop, then ' + service.unload_hint(label) + ' before uninstalling')
     for raw, expected in receipt['launchers'].items():
         path = Path(raw)
         if path.is_symlink() or (path.exists() and hashlib.sha256(path.read_bytes()).hexdigest() != expected): raise RuntimeError('Launcher changed; leaving everything intact: ' + str(path))
-    if plist.is_symlink(): raise RuntimeError('Service file changed; leaving everything intact')
-    if plist.exists():
-        definition = plistlib.loads(plist.read_bytes())
+    if service_file.is_symlink(): raise RuntimeError('Service file changed; leaving everything intact')
+    if service_file.exists():
+        definition = service.load(service_file.read_bytes())
         if definition.get('Label') != label or not any(entry in definition.get('ProgramArguments', []) for entry in [receipt.get('legacyEntry', str(prefix / 'gateway/launch.py')), str(prefix / 'run.py')]):
             raise RuntimeError('Service file belongs to another installation; leaving everything intact')
     for raw in receipt['launchers']: Path(raw).unlink(missing_ok=True)
-    plist.unlink(missing_ok=True)
+    service_file.unlink(missing_ok=True)
+    service.reload(run=subprocess.run)
     shutil.rmtree(prefix)
     print('Removed the application and unchanged launchers. Config, credentials, history and Native Claude were retained.')
 
@@ -250,7 +274,7 @@ def main():
             try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError: raise RuntimeError('Another installation/update is already running') from None
             if args.bootstrap:
-                if sys.platform != 'darwin': raise RuntimeError('This alpha supports macOS only')
+                service.platform()
                 if prefix.is_symlink(): raise RuntimeError('Application root cannot be a symlink')
                 if prefix.exists() and not (prefix / 'installation.json').is_file(): raise RuntimeError('Existing directory is not a managed installation; nothing changed')
                 if not prefix.exists():

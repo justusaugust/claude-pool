@@ -11,6 +11,7 @@ import time
 import select
 import socket
 import sqlite3
+import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlsplit, parse_qs
@@ -72,7 +73,7 @@ class PoolBridge(ThreadingHTTPServer):
         self.history_path = self.state_path.parent / 'usage-history' if self.state_path else None
         self.history_error = False
         self.journal = Journal(self.state_path.parent / 'incidents.json' if self.state_path else None, atomic_write)
-        self.health = {"backend": "starting", "failures": 0, "checkedAt": None, "supervisor": "launchd" if os.environ.get("POOL_MANAGED") == "1" else "standalone"}
+        self.health = {"backend": "starting", "failures": 0, "checkedAt": None, "supervisor": ("systemd" if sys.platform.startswith("linux") else "launchd") if os.environ.get("POOL_MANAGED") == "1" else "standalone"}
         self.last_accounts = []
         self.draining = False
         self.connections = threading.BoundedSemaphore(64)

@@ -1,4 +1,4 @@
-import { controlURL, phoneURL, tokenFile as configuredTokenFile } from './connection'
+import { controlURL, phoneURL, platform, tokenFile as configuredTokenFile } from './connection'
 import { atom, read, update } from 'claude-code'
 import { registerSuiteLimits } from './limits'
 import type { EngineInterface, Register, RenderElement, SessionRateLimit } from 'claude-code'
@@ -6,21 +6,16 @@ import type { EngineInterface, Register, RenderElement, SessionRateLimit } from 
 import {
   assignTranscripts,
   claudePids,
-  findAgents,
-  findTranscripts,
+  commands,
   sessionFolder,
   statLines,
   tailAgent,
   workflowIdOf,
   workflowNameOf,
-  lsofCwd,
   parse,
   projectDir,
-  PS,
   sessionsOf,
-  SYS,
   tailTranscript,
-  VM,
 } from './machine'
 import type { AgentFile } from './machine'
 import { drawMachine } from './machine-view'
@@ -790,13 +785,14 @@ async function pollMachine($: $) {
 
 async function collect($: $, now: number, trend: [number, number][]) {
   const opts = { timeoutMs: 5_000 }
+  const host = commands(platform)
   const [sys, vm, ps] = await Promise.all([
-    $.process.run(SYS, opts),
-    $.process.run(VM, opts),
-    $.process.run(PS, opts),
+    $.process.run(host.sys, opts),
+    $.process.run(host.vm, opts),
+    $.process.run(host.ps, opts),
   ])
   const pids = claudePids(ps.stdout)
-  const lsof = pids.length > 0 ? (await $.process.run(lsofCwd(pids), opts)).stdout : ''
+  const lsof = pids.length > 0 ? (await $.process.run(host.cwd(pids), opts)).stdout : ''
 
   // Each session's transcript: find them per directory, read the last lines.
   const home = (await $.env.get('HOME')) ?? ''
@@ -804,7 +800,7 @@ async function collect($: $, now: number, trend: [number, number][]) {
   const cwds = [...new Set(sessions.map(s => s.cwd).filter((cwd): cwd is string => cwd !== undefined))]
   const found = new Map(
     await Promise.all(
-      cwds.map(async cwd => [cwd, (await $.process.run(findTranscripts(projectDir(home, cwd)), opts)).stdout] as const),
+      cwds.map(async cwd => [cwd, (await $.process.run(host.findTranscripts(projectDir(home, cwd)), opts)).stdout] as const),
     ),
   )
   const files = assignTranscripts(sessions, found)
@@ -817,7 +813,7 @@ async function collect($: $, now: number, trend: [number, number][]) {
     await Promise.all(
       [...files].map(async ([pid, file]) => {
         const folder = sessionFolder(file)
-        const found = await $.process.run(findAgents(folder), opts)
+        const found = await $.process.run(host.findAgents(folder), opts)
         const runs = statLines(found.stdout)
         const ids = [...new Set(runs.map(r => workflowIdOf(r.file)).filter((id): id is string => id !== undefined))]
         const names = new Map(

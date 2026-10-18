@@ -1,6 +1,6 @@
 {
   "name": "cockpit",
-  "version": "0.10.2",
+  "version": "0.10.4",
   "description": "Quiet usage band above the prompt, coordinated account routing, session overview, reset outlook and workload pace; the existing /machine pane for local sessions, CPU and memory.",
   "author": {
     "name": "claude-pool contributors"

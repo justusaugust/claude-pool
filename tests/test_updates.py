@@ -131,6 +131,13 @@ class UpdateTests(unittest.TestCase):
         (self.source/'backend/shunt.patch').write_text('unreviewed patch')
         with self.assertRaisesRegex(RuntimeError,'patch digest'):installer.prepare_backend(self.app)
 
+    def test_backend_build_never_self_updates_the_users_rustup(self):
+        (self.source/'gateway/bin/shunt').unlink();(self.app/'gateway/bin/shunt').write_text('corrupted')
+        calls=[]
+        with patch.object(installer.shutil,'which',return_value='/usr/bin/tool'),patch.object(installer.subprocess,'run',side_effect=lambda args,**kw:calls.append(args)):
+            installer.prepare_backend(self.app)
+        self.assertEqual(calls[0][:3],['rustup','toolchain','install']);self.assertIn('--no-self-update',calls[0])
+
     def test_cli_update_download_failure_leaves_install_unchanged(self):
         before=(self.bin/'claude-pool').read_bytes()
         with patch.object(update.subprocess,'run',side_effect=subprocess.CalledProcessError(1,'git')):
@@ -226,6 +233,23 @@ class UpdateTests(unittest.TestCase):
         code='import sys;sys.path.insert(0,sys.argv[1]);import launch;print(launch.SERVICE_LABEL)'
         label=subprocess.check_output([sys.executable,'-c',code,str(self.current()/'gateway')],env=self.env,text=True)
         self.assertEqual(label.strip(),'example.dev.pool')
+
+    def test_linux_legacy_unit_is_rewritten_and_foreign_unit_kept(self):
+        unit=self.root/'.config/systemd/user/io.github.claude-pool.service';unit.parent.mkdir(parents=True)
+        self.patch_platform.stop();self.addCleanup(self.patch_platform.start)
+        with patch.object(installer.sys,'platform','linux'),patch.object(installer.Path,'home',return_value=self.root):
+            definition={'Label':'io.github.claude-pool','ProgramArguments':[sys.executable,str(self.app/'gateway/launch.py'),'--daemon'],'WorkingDirectory':str(self.app)}
+            unit.write_bytes(installer.service.render(definition))
+            self.change_source()
+            with patch.object(installer.os,'kill',side_effect=AssertionError('No signals')): self.apply()
+            adopted=installer.service.load(unit.read_bytes())
+            self.assertEqual(adopted['ProgramArguments'][-2:],[str(self.app/'run.py'),'--daemon'])
+            self.assertEqual(adopted['EnvironmentVariables']['CLAUDE_POOL_CONFIG'],str(self.config))
+            self.assertIn('ExecStart=',unit.read_text());self.assertNotIn('<plist',unit.read_text())
+            foreign=installer.service.render({'Label':'io.github.claude-pool','ProgramArguments':['python','/other/app/launch.py']})
+            unit.write_bytes(foreign)
+            with self.assertRaisesRegex(RuntimeError,'another installation'):self.apply()
+            self.assertEqual(unit.read_bytes(),foreign)
 
     def test_invalid_service_label_cannot_escape_launchagent_folder(self):
         with self.assertRaisesRegex(RuntimeError,'service label'):installer.service_path({'serviceLabel':'../other'})

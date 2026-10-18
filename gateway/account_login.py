@@ -41,19 +41,28 @@ def validate_code(value, state):
                 all(33 <= ord(c) <= 126 for c in value))
 
 
-def login(binary, stores, name, label, code_reader=private_code, timeout=900):
+def child_environment(stores, environ=os.environ, platform=None):
+    """Over SSH on Linux, a leftover DISPLAY would make xdg-open block on an invisible browser."""
+    env = {**environ, 'SHUNT_CLAUDE_ACCOUNTS_DIR': str(stores)}
+    platform = sys.platform if platform is None else platform
+    if platform.startswith('linux') and (env.get('SSH_CONNECTION') or env.get('SSH_TTY')):
+        for key in ['DISPLAY', 'WAYLAND_DISPLAY']: env.pop(key, None)
+    return env
+
+
+def login(binary, stores, name, label, code_reader=private_code, timeout=900, extra_args=()):
     """Own exactly one child PTY, never echo its raw output or a pasted code."""
     target = Path(stores) / (name + '.json')
     if target.exists() or target.is_symlink():
         raise RuntimeError('Credential already exists; verify it instead of overwriting it.')
+    env = child_environment(stores)
     pid, fd = pty.fork()
     if pid == 0:
         attrs = termios.tcgetattr(0)
         attrs[3] &= ~termios.ECHO
         termios.tcsetattr(0, termios.TCSANOW, attrs)
-        env = {**os.environ, 'SHUNT_CLAUDE_ACCOUNTS_DIR': str(stores)}
         os.execve(str(binary), [str(binary), 'login', 'claude', '--name', name,
-                               '--mode', 'oauth', '--manual'], env)
+                               '--mode', 'oauth', '--manual', *extra_args], env)
     buffer, state, submitted, exited = '', None, False, False
     deadline = time.monotonic() + timeout
     try:

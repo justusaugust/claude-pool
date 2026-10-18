@@ -65,6 +65,6 @@ def connection_ts():
     try: phone = json.loads((RUNTIME / 'phone-config.json').read_text())['host']
     except (OSError, ValueError, KeyError, TypeError): phone = None
     values = {'baseURL': BASE_URL, 'controlURL': CONTROL_URL, 'tokenFile': str(STORES / '.pool-client-token'), 'configFile': str(CONFIG),
-              'python': sys.executable, 'suiteHelper': str(HERE / 'heavy_queue.py'),
+              'python': sys.executable, 'platform': 'linux' if sys.platform.startswith('linux') else 'darwin', 'suiteHelper': str(HERE / 'heavy_queue.py'),
               'hookPath': str(HERE / 'control_hook.py'), 'phoneURL': 'https://' + phone + '/' if phone else ''}
     return ''.join('export const ' + key + ' = ' + json.dumps(value) + '\n' for key, value in values.items())

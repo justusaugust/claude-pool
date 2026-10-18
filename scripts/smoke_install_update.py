@@ -114,7 +114,7 @@ def smoke(native):
             assert worker.poll() is None, 'Rejected update stopped an existing worker'
             stdout, stderr = worker.communicate('\n', timeout=10)
             assert worker.returncode == 0 and 'retained release survived' in stdout, stderr
-            for path in ['Library/LaunchAgents', '.local/state/claude-pool', '.shunt', '.claude']:
+            for path in ['Library/LaunchAgents', '.config/systemd/user', '.local/state/claude-pool', '.shunt', '.claude']:
                 assert not (home / path).exists(), 'Unexpected runtime or login state: ' + path
         finally:
             if worker.poll() is None:
