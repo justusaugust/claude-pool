@@ -284,7 +284,9 @@ class CuaCommandTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class Viewer:
-    """Stands in for `cua viewer`: records request lines and Host; 401 without the key; /ws upgrades and echoes."""
+    """Behaves like `cua viewer` 0.4.1 seen on the VPS: a request with ?key=K (right key) answers 303 to `/` and sets
+    the HttpOnly cookie cua_viewer_key=K; later requests authenticate by that cookie; anything else is 401. /ws upgrades
+    and echoes when authenticated. /also-cookie answers 200 and sets the key cookie plus an unrelated cookie."""
 
     def __init__(self):
         self.heads = []
@@ -299,15 +301,24 @@ class Viewer:
                 hdrs = dict((n.lower(), v) for n, v in headers)
                 self.heads.append((start, hdrs))
                 target = start.split(b" ")[1]
-                if b"key=" + SECRET.encode() not in target:
+                path, _, query = target.partition(b"?")
+                cookies = [c.strip() for v in [v for n, v in headers if n.lower() == b"cookie"] for c in v.split(b";")]
+                authed = b"cua_viewer_key=" + SECRET.encode() in cookies
+                set_key = b"Set-Cookie: cua_viewer_key=" + SECRET.encode() + b"; HttpOnly; SameSite=Strict; Path=/\r\n"
+                if b"key=" + SECRET.encode() in query.split(b"&"):
+                    w.write(b"HTTP/1.1 303 See Other\r\nLocation: /\r\n" + set_key + b"Content-Length: 0\r\n\r\n")
+                elif not authed:
                     w.write(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 6\r\n\r\nno key")
-                elif target.startswith(b"/ws"):
+                elif path == b"/ws/desktop":
                     w.write(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
                     await w.drain()
                     while data := await r.read(1024):
                         w.write(b"echo:" + data)
                         await w.drain()
                     break
+                elif path == b"/also-cookie":
+                    w.write(b"HTTP/1.1 200 OK\r\n" + set_key + b"set-cookie: theme=dark; Path=/\r\n"
+                            b"Set-Cookie:  CUA_VIEWER_KEY=" + SECRET.encode() + b"\r\nContent-Length: 2\r\n\r\nok")
                 else:
                     w.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
                 await w.drain()
@@ -315,6 +326,10 @@ class Viewer:
             pass
         finally:
             w.close()
+
+
+def cookie_values(hdrs, name=b"cua_viewer_key"):
+    return [c.strip().split(b"=", 1)[1] for c in hdrs.get(b"cookie", b"").split(b";") if c.strip().split(b"=")[0] == name]
 
 
 class GateTests(unittest.IsolatedAsyncioTestCase):
@@ -349,83 +364,104 @@ class GateTests(unittest.IsolatedAsyncioTestCase):
         r, w = await asyncio.open_connection("127.0.0.1", self.pport)
         logins = [login] if isinstance(login, str) or login is None else login
         lines = b"".join(b"Tailscale-User-Login: " + x.encode() + b"\r\n" for x in logins if x is not None)
-        w.write(b"GET " + target + b" HTTP/1.1\r\nHost: " + self.host + b"\r\n" + lines + extra + b"\r\n")
-        await w.drain()
-        head = await asyncio.wait_for(pv.read_head(r), 5)
-        start, headers = pv.split_head(head)
-        kind, n = pv.body_length(headers)
-        body = await r.readexactly(n) if kind == "length" else b""
-        w.close()
-        return start.split(b" ")[1], dict((k.lower(), v) for k, v in headers), body
+        try:
+            w.write(b"GET " + target + b" HTTP/1.1\r\nHost: " + self.host + b"\r\n" + lines + extra + b"\r\n")
+            await w.drain()
+            head = await asyncio.wait_for(pv.read_head(r), 5)
+            start, headers = pv.split_head(head)
+            kind, n = pv.body_length(headers)
+            body = await asyncio.wait_for(r.readexactly(n), 5) if kind == "length" else b""
+        finally:
+            w.close()  # also when an assertion fails, so the servers can close in tearDown
+        return start.split(b" ")[1], headers, body
 
-    async def test_owner_gets_through_with_the_key_added_upstream(self):
-        code, _, body = await self.ask(b"/api/spaces?x=1")
+    def no_key_in(self, headers, body=b""):
+        self.assertNotIn(SECRET.encode(), b"".join(n + b":" + v for n, v in headers) + body)
+
+    async def test_owner_gets_through_with_the_key_as_the_viewer_cookie(self):
+        code, headers, body = await self.ask(b"/api/spaces?x=1")
         self.assertEqual((code, body), (b"200", b"ok"))
         [(start, hdrs)] = self.viewer.heads
-        self.assertEqual(start, b"GET /api/spaces?x=1&key=" + SECRET.encode() + b" HTTP/1.1")
+        self.assertEqual(start, b"GET /api/spaces?x=1 HTTP/1.1")
+        self.assertEqual(cookie_values(hdrs), [SECRET.encode()])
         self.assertEqual(hdrs[b"host"], f"127.0.0.1:{self.port}".encode())
+        self.no_key_in(headers, body)
 
-    async def test_a_key_sent_by_the_browser_is_replaced(self):
-        await self.ask(b"/a?key=guess&KEY=x&k%65y=y&b=2")
-        [(start, _)] = self.viewer.heads
-        self.assertEqual(start, b"GET /a?KEY=x&b=2&key=" + SECRET.encode() + b" HTTP/1.1")
+    async def test_page_load_is_not_redirected_and_never_loops(self):
+        for extra in (b"Sec-Fetch-Mode: navigate\r\nAccept: text/html\r\n", b""):
+            code, headers, body = await self.ask(b"/", extra=extra)
+            self.assertEqual((code, body), (b"200", b"ok"))
+            self.no_key_in(headers, body)
+        for start, _ in self.viewer.heads:
+            self.assertEqual(start, b"GET / HTTP/1.1")
+
+    async def test_a_key_or_cookie_sent_by_the_browser_is_replaced(self):
+        await self.ask(b"/a?key=guess&KEY=x&k%65y=y&b=2",
+                       extra=b"Cookie: cua_viewer_key=guess; theme=dark\r\nCookie: cua_viewer_key=again\r\n")
+        await self.ask(b"/?key=" + SECRET.encode())  # even the right key in the URL never reaches the viewer as a query
+        (first, hdrs), (second, _) = self.viewer.heads
+        self.assertEqual(first, b"GET /a?KEY=x&b=2 HTTP/1.1")
+        self.assertEqual(second, b"GET / HTTP/1.1")
+        self.assertEqual(cookie_values(hdrs), [SECRET.encode()])
+        self.assertEqual(cookie_values(hdrs, b"theme"), [b"dark"])
+        self.assertEqual(len([n for n in hdrs if n == b"cookie"]), 1)
+
+    async def test_the_viewer_cookie_never_reaches_the_browser(self):
+        code, headers, body = await self.ask(b"/also-cookie")
+        self.assertEqual(code, b"200")
+        cookies = [v for n, v in headers if n.lower() == b"set-cookie"]
+        self.assertEqual(cookies, [b"theme=dark; Path=/"])
+        self.no_key_in(headers, body)
 
     async def test_missing_other_or_doubled_login_gets_403_and_never_reaches_the_viewer(self):
         for login in (None, "mallory@example.com", "", OWNER.upper(), [OWNER, "mallory@example.com"], [OWNER, OWNER]):
             with self.subTest(login=login):
-                code, hdrs, body = await self.ask(b"/", login=login, extra=b"Sec-Fetch-Mode: navigate\r\n")
+                code, headers, body = await self.ask(b"/", login=login, extra=b"Sec-Fetch-Mode: navigate\r\n")
                 self.assertEqual(code, b"403")
-                self.assertNotIn(SECRET.encode(), body + b"".join(hdrs.values()))
+                self.no_key_in(headers, body)
                 self.assertNotIn(OWNER.encode(), body)
         self.assertEqual(self.viewer.heads, [])
 
-    async def test_navigation_without_the_key_is_redirected_only_after_the_gate(self):
-        code, hdrs, _ = await self.ask(b"/?s=1", extra=b"Sec-Fetch-Mode: navigate\r\nAccept: text/html\r\n")
-        self.assertEqual(code, b"302")
-        self.assertEqual(hdrs[b"location"], b"/?s=1&key=" + SECRET.encode())
-        self.assertEqual(hdrs[b"cache-control"], b"no-store")
-        self.assertEqual(hdrs[b"referrer-policy"], b"no-referrer")
-        self.assertEqual(self.viewer.heads, [])
-        code, _, _ = await self.ask(b"/?s=1&key=" + SECRET.encode(), extra=b"Sec-Fetch-Mode: navigate\r\n")
-        self.assertEqual(code, b"200")
-        code, _, _ = await self.ask(b"/app.js", extra=b"Sec-Fetch-Mode: no-cors\r\n")
-        self.assertEqual(code, b"200")
-
-    async def test_websocket_gets_the_key_and_passes_through(self):
+    async def test_websocket_carries_the_cookie_and_passes_through(self):
         r, w = await asyncio.open_connection("127.0.0.1", self.pport)
-        w.write(b"GET /ws/desktop HTTP/1.1\r\nHost: " + self.host + b"\r\nTailscale-User-Login: " + OWNER.encode() +
+        w.write(b"GET /ws/desktop?key=x HTTP/1.1\r\nHost: " + self.host + b"\r\nTailscale-User-Login: " + OWNER.encode() +
                 b"\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nOrigin: " + self.public.encode() +
                 b"\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n")
-        await w.drain()
-        head = await asyncio.wait_for(pv.read_head(r), 5)
-        self.assertTrue(head.startswith(b"HTTP/1.1 101"))
-        w.write(b"frame")
-        await w.drain()
-        self.assertEqual(await asyncio.wait_for(r.readexactly(10), 5), b"echo:frame")
-        w.close()
+        try:
+            await w.drain()
+            head = await asyncio.wait_for(pv.read_head(r), 5)
+            self.assertTrue(head.startswith(b"HTTP/1.1 101"), head)
+            w.write(b"frame")
+            await w.drain()
+            self.assertEqual(await asyncio.wait_for(r.readexactly(10), 5), b"echo:frame")
+        finally:
+            w.close()
         start, hdrs = self.viewer.heads[0]
-        self.assertEqual(start, b"GET /ws/desktop?key=" + SECRET.encode() + b" HTTP/1.1")
+        self.assertEqual(start, b"GET /ws/desktop HTTP/1.1")
+        self.assertEqual(cookie_values(hdrs), [SECRET.encode()])
         self.assertEqual(hdrs[b"origin"], f"http://127.0.0.1:{self.port}".encode())
 
     async def test_a_foreign_login_later_on_a_keepalive_connection_is_refused(self):
         r, w = await asyncio.open_connection("127.0.0.1", self.pport)
-        w.write(b"GET /a HTTP/1.1\r\nHost: " + self.host + b"\r\nTailscale-User-Login: " + OWNER.encode() + b"\r\n\r\n")
-        await w.drain()
-        head = await asyncio.wait_for(pv.read_head(r), 5)
-        self.assertIn(b"200", head)
-        await r.readexactly(2)
-        w.write(b"GET /b HTTP/1.1\r\nHost: " + self.host + b"\r\nTailscale-User-Login: mallory@example.com\r\n\r\n")
-        await w.drain()
-        head = await asyncio.wait_for(pv.read_head(r), 5)
-        self.assertIn(b"403", head)
-        w.close()
-        self.assertEqual([s.split(b" ")[1].split(b"?")[0] for s, _ in self.viewer.heads], [b"/a"])
+        try:
+            w.write(b"GET /a HTTP/1.1\r\nHost: " + self.host + b"\r\nTailscale-User-Login: " + OWNER.encode() + b"\r\n\r\n")
+            await w.drain()
+            head = await asyncio.wait_for(pv.read_head(r), 5)
+            self.assertIn(b"200", head)
+            await asyncio.wait_for(r.readexactly(2), 5)
+            w.write(b"GET /b HTTP/1.1\r\nHost: " + self.host + b"\r\nTailscale-User-Login: mallory@example.com\r\n\r\n")
+            await w.drain()
+            head = await asyncio.wait_for(pv.read_head(r), 5)
+            self.assertIn(b"403", head)
+        finally:
+            w.close()
+        self.assertEqual([s.split(b" ")[1] for s, _ in self.viewer.heads], [b"/a"])
 
     async def test_a_new_key_is_used_after_the_viewer_restarts(self):
         await self.ask(b"/a")
         self.write_key("N3wKeyAfterRestart_abcdef0123456789")
         await self.ask(b"/b")
-        self.assertTrue(self.viewer.heads[1][0].endswith(b"key=N3wKeyAfterRestart_abcdef0123456789 HTTP/1.1"))
+        self.assertEqual(cookie_values(self.viewer.heads[1][1]), [b"N3wKeyAfterRestart_abcdef0123456789"])
 
     async def test_missing_or_loose_key_file_waits_and_forwards_nothing(self):
         for setup in ("missing", "loose", "symlink"):
@@ -450,7 +486,7 @@ class GateTests(unittest.IsolatedAsyncioTestCase):
         server = await pv.start_proxy_server("127.0.0.1", 0, proxy)
         try:
             r, w = await asyncio.open_connection("127.0.0.1", server.sockets[0].getsockname()[1])
-            w.write(b"GET /plain HTTP/1.1\r\nHost: " + self.host + b"\r\n\r\n")
+            w.write(b"GET /plain HTTP/1.1\r\nHost: " + self.host + b"\r\nCookie: a=1\r\n\r\n")
             await w.drain()
             head = await asyncio.wait_for(pv.read_head(r), 5)
             self.assertIn(b"401", head)  # no gate and no key: the viewer itself refuses
@@ -460,6 +496,7 @@ class GateTests(unittest.IsolatedAsyncioTestCase):
             await server.wait_closed()
         self.assertEqual(self.viewer.heads[0][0], b"GET /plain HTTP/1.1")
         self.assertEqual(self.viewer.heads[0][1][b"host"], f"localhost:{self.port}".encode())
+        self.assertEqual(self.viewer.heads[0][1][b"cookie"], b"a=1")
 
 
 # ---------------------------------------------------------------------------

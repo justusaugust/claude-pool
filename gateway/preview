@@ -74,8 +74,9 @@ COMMANDS
   preview cua [--name LABEL]      one link to every Cua desktop this VPS knows (cua spaces ls), to see
                                   and operate them from the iPhone. Runs `cua viewer` on
                                   127.0.0.1:18500 (unit preview-cua-viewer.service) behind the proxy,
-                                  which adds the viewer's key to every request itself: the link carries
-                                  no key and the key is never printed or logged. Only the Tailscale
+                                  which hands the viewer its key (as the viewer's cookie) on every request
+                                  itself: the link carries no key, the browser never gets it, and it is
+                                  never printed or logged. Only the Tailscale
                                   login that owns this VPS may open it; anyone else, other tailnet
                                   members included, gets 403. HTTPS only (Tailscale Serve); with the
                                   http backend it refuses (preview doctor). Safe to run again.
@@ -328,9 +329,10 @@ def plain_answer(status, text, extra=b""):
 
 
 # The Cua desktops share (`preview cua`): the proxy lets through only the Tailscale login that owns this machine
-# (Tailscale Serve sets Tailscale-User-Login itself and drops any a client sends) and adds the viewer's key, which it
-# reads from the viewer wrapper's 0600 file, to every request. The browser never needs the key; a page load without it
-# is redirected to the same address with the key, after the login check, for a viewer page that reads it from location.
+# (Tailscale Serve sets Tailscale-User-Login itself and drops any a client sends) and hands the viewer its key, read
+# from the viewer wrapper's 0600 file, on every request as the cookie the viewer itself sets after `?key=` (a `?key=`
+# request would only answer with that cookie and a redirect to `/`). Any key or viewer cookie the browser sends is
+# dropped, and the viewer's own Set-Cookie for it never reaches the browser: the key stays on this machine.
 FORBIDDEN = plain_answer(b"403 Forbidden", "This link is only for the owner of this machine.\n")
 BAD_TARGET = plain_answer(b"400 Bad Request", "Bad request.\n")
 VIEWER_KEY = re.compile(rb"[A-Za-z0-9._~%-]{8,512}")
@@ -365,6 +367,9 @@ def read_viewer_key(path):
     return key if VIEWER_KEY.fullmatch(key) else None
 
 
+VIEWER_COOKIE = b"cua_viewer_key"
+
+
 def _is_key_param(pair):
     try:
         return urllib.parse.unquote_plus(pair.split(b"=", 1)[0].decode("ascii"), errors="strict") == "key"
@@ -372,25 +377,28 @@ def _is_key_param(pair):
         return False
 
 
-def target_has_key(target):
-    _, sep, query = target.partition(b"?")
-    return bool(sep) and any(_is_key_param(pair) for pair in query.split(b"&"))
-
-
-def target_with_key(target, key):
-    """The request target with every `key` parameter the client sent replaced by the viewer's own key."""
+def target_without_key(target):
+    """The request target without any `key` parameter the client sent."""
     path, sep, query = target.partition(b"?")
     kept = [pair for pair in query.split(b"&") if pair and not _is_key_param(pair)] if sep else []
-    return path + b"?" + b"&".join(kept + [b"key=" + key])
+    return path + (b"?" + b"&".join(kept) if kept else b"")
 
 
-def is_navigation(method, headers):
-    if method != b"GET":
-        return False
-    mode = header(headers, "sec-fetch-mode")
-    if mode is not None:
-        return mode.strip().lower() == b"navigate"
-    return b"text/html" in (header(headers, "accept") or b"").lower()
+def _is_viewer_cookie(pair):
+    return pair.split(b"=", 1)[0].strip().lower() == VIEWER_COOKIE
+
+
+def with_viewer_cookie(headers, key):
+    """Headers with one Cookie header: the client's cookies except any viewer key, then the viewer's own key."""
+    pairs = [pair.strip() for n, v in headers if n.lower() == b"cookie" for pair in v.split(b";")]
+    pairs = [pair for pair in pairs if pair and not _is_viewer_cookie(pair)] + [VIEWER_COOKIE + b"=" + key]
+    out = [(n, v) for n, v in headers if n.lower() != b"cookie"]
+    return out + [(b"Cookie", b"; ".join(pairs))]
+
+
+def without_viewer_cookie(headers):
+    """Response headers without any Set-Cookie that would hand the viewer's key to the browser."""
+    return [(n, v) for n, v in headers if not (n.lower() == b"set-cookie" and _is_viewer_cookie(v.split(b";", 1)[0]))]
 
 
 def split_host(value):
@@ -448,21 +456,17 @@ class Proxy:
         return len(logins) == 1 and logins[0] == self.owner_login
 
     def cua_route(self, start, headers):
-        """(start line with the viewer's key, None) to forward, or (None, a complete local answer)."""
+        """(start line without a client key, the viewer's key, None) to forward, or (None, None, a local answer)."""
         if not self.login_ok(headers):
-            return None, FORBIDDEN
+            return None, None, FORBIDDEN
         key = read_viewer_key(self.key_file)
         if key is None:
-            return None, viewer_starting_page()
+            return None, None, viewer_starting_page()
         parts = start.split(b" ", 2)
         if len(parts) != 3 or not parts[1].startswith(b"/"):
-            return None, BAD_TARGET
+            return None, None, BAD_TARGET
         method, target, version = parts
-        upgrade = b"upgrade" in header_tokens(headers, "connection") and header(headers, "upgrade") is not None
-        if not upgrade and not target_has_key(target) and is_navigation(method.upper(), headers):
-            return None, plain_answer(b"302 Found", "", b"Location: " + target_with_key(target, key) + b"\r\n"
-                                      b"Referrer-Policy: no-referrer\r\n")
-        return b" ".join((method, target_with_key(target, key), version)), None
+        return b" ".join((method, target_without_key(target), version)), key, None
 
     async def connect_upstream(self):
         last = None
@@ -486,7 +490,7 @@ class Proxy:
                 await cwriter.drain()
                 return
             if self.owner_login is not None:
-                _, answer = self.cua_route(*split_head(head))
+                _, _, answer = self.cua_route(*split_head(head))
                 if answer is not None:  # refused, starting or redirected: nothing reaches the viewer
                     cwriter.write(answer)
                     await cwriter.drain()
@@ -523,8 +527,9 @@ class Proxy:
                 start, headers = split_head(head)
                 if not self.host_allowed(headers):
                     break  # a foreign Host later on the connection: earlier answers finish, nothing more reaches the server
+                key = None
                 if self.owner_login is not None:
-                    start, answer = self.cua_route(start, headers)
+                    start, key, answer = self.cua_route(start, headers)
                     if answer is not None:
                         if open_[0] == 0 and cwriter is not None:  # answer only in order; a pipelined one just ends it
                             cwriter.write(answer)
@@ -532,6 +537,8 @@ class Proxy:
                         break
                 method = start.split(b" ", 1)[0].upper()
                 headers = rewrite_request(headers, self.target_host_header, peer_ip)
+                if key is not None:
+                    headers = with_viewer_cookie(headers, key)
                 upgrade = b"upgrade" in header_tokens(headers, "connection") and header(headers, "upgrade") is not None
                 pending.put_nowait(method)
                 if not upgrade and method != b"CONNECT":
@@ -571,6 +578,8 @@ class Proxy:
                     continue
                 method = pending.get_nowait() if not pending.empty() else b"GET"
                 headers = rewrite_response(headers, self.target_port, self.public_base)
+                if self.owner_login is not None:
+                    headers = without_viewer_cookie(headers)
                 cwriter.write(join_head(start, headers))
                 await cwriter.drain()
                 if code == 101 or (method == b"CONNECT" and 200 <= code < 300):

@@ -20,11 +20,12 @@ import device_sync
 from fakes import FakeRemote
 from remote import Completed
 
-TOOL_SHA = 'ce9f107b5620bea133df4972781e0630bc880b2b2d933f6761e3d84f855bd90b'
+TOOL_SHA = '27adcbcf4e189571c911730040e606e5a961a81debe3080d62bf9d8551b489aa'
 PREVIOUS_SHA = 'b3e645e7ba9750057b68c12f7dd518d19ff792a98062eeea857115b194358d94'  # the copy live on personal-vps
 FIRST_FILE_SHARE_SHA = '89c880b1411939c7996239273e28aa51399a1dca1cd56e387754e82e235faabe'  # Task 16's first release
 BEFORE_HOST_CHECK_SHA = '7894d83a893ab63cc07ec07244b910ae8fce1949b080ba355a3b08f6e3903efd'  # the release before the Host check
 BEFORE_CUA_SHA = 'fc7f0f3162eadf48ca4f1b942aef8b25f6446fba8fdc1e64bafc959c718a5a11'  # the release before `preview cua`
+FIRST_CUA_SHA = 'ce9f107b5620bea133df4972781e0630bc880b2b2d933f6761e3d84f855bd90b'  # first `preview cua`, on the VPS
 OTHER_SHA = '0' * 64
 RUN = 'cd "$HOME" && exec .local/bin/preview "$@"'
 DOCTOR_HTTPS = 'tailnet name   box.ts.net\nbackend        https (Tailscale Serve is allowed for this user)\n'
@@ -122,7 +123,7 @@ class InstallTests(unittest.TestCase):
         self.assertNotIn(TOOL_SHA, ' '.join(argv))
 
     def test_known_previous_copy_is_updated_in_place(self):
-        self.assertEqual(device_preview.KNOWN_PREVIOUS, {PREVIOUS_SHA, FIRST_FILE_SHARE_SHA, BEFORE_HOST_CHECK_SHA, BEFORE_CUA_SHA})
+        self.assertEqual(device_preview.KNOWN_PREVIOUS, {PREVIOUS_SHA, FIRST_FILE_SHARE_SHA, BEFORE_HOST_CHECK_SHA, BEFORE_CUA_SHA, FIRST_CUA_SHA})
         remote = device(target_sha=PREVIOUS_SHA)
         step = device_preview.install(remote)
         self.assertEqual((step.status, step.detail), ('ok', 'updated'))
