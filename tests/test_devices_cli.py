@@ -1179,6 +1179,13 @@ class CheckTests(OrchestrationBase):
         self.assertEqual(code, 2, out + err)
         self.assertRegex(out, r'\n  missing +cua +the SSH tunnel to vps is not loaded on this device\n      fix: claude-pool device add alex@vps --cua\n')
 
+    def test_check_names_the_last_ssh_error_of_a_tunnel_that_does_not_run(self):
+        self.tunnelled(running=False)
+        self.local.tunnels['vps']['error'] = 'Host key verification failed.'
+        code, out, err = self.cli('check', 'vps')
+        self.assertEqual(code, 2, out + err)
+        self.assertRegex(out, r'\n  missing +cua +the SSH tunnel to vps does not run on this device \(ssh: Host key verification failed\.\)\n')
+
     def test_a_tunnel_space_for_another_port_does_not_count(self):
         self.tunnelled(); self.local.spaces = ['direct:127.0.0.1:32399']
         code, out, err = self.cli('check', 'vps')

@@ -446,6 +446,41 @@ class TunnelTests(unittest.TestCase):
         self.assertEqual(device_cua.tunnels(run=manager, system='linux', home=self.home, listening=lambda port: True),
                          {'vps': {'port': port, 'running': True}})
 
+    def test_the_tunnel_logs_ssh_errors_to_a_private_file_and_backs_off(self):
+        # A changed host key or a revoked ssh key would otherwise loop ssh silently every 10 s.
+        import plistlib
+        log = self.home / '.local/state/claude-pool/cua-tunnel-vps.log'
+        for system in ('darwin', 'linux'):
+            with self.subTest(system):
+                manager = Manager()
+                value = device_cua.tunnel_add('vps', PEER, SSH, run=manager, system=system, home=self.home,
+                                              listening=self.up(manager), sleep=lambda s: None)
+                self.assertTrue(value['running'])
+                self.assertEqual(oct(log.stat().st_mode & 0o777), '0o600')
+                if system == 'darwin':
+                    agent = plistlib.loads(self.agent().read_bytes())
+                    self.assertEqual((agent['ThrottleInterval'], agent['StandardErrorPath'], agent['StandardOutPath'], agent['Umask']),
+                                     (60, str(log), '/dev/null', 0o077))
+                else:
+                    text = self.unit().read_text()
+                    for line in ('RestartSec=60', 'StandardError=append:' + str(log), 'StandardOutput=null', 'UMask=0077'):
+                        self.assertIn('\n' + line + '\n', text)
+                self.assertTrue(device_cua.tunnel_remove('vps', run=manager, system=system, home=self.home))
+                self.assertFalse(log.exists())
+
+    def test_a_tunnel_that_does_not_run_reports_its_last_ssh_error(self):
+        manager = Manager()
+        device_cua.tunnel_add('vps', PEER, SSH, run=manager, system='darwin', home=self.home, listening=self.up(manager),
+                              sleep=lambda s: None)
+        log = self.home / '.local/state/claude-pool/cua-tunnel-vps.log'
+        log.write_text('Warning: Permanently added x\nHost key verification failed.\n\n')
+        found = lambda: device_cua.tunnels(run=manager, system='darwin', home=self.home, listening=lambda port: True)['vps']
+        self.assertNotIn('error', found())  # it runs: an old line is history
+        manager.running = False
+        self.assertEqual(found()['error'], 'Host key verification failed.')
+        log.write_text('\x1b[31mbad\x1b[0m ' + 'x' * 400 + '\n')
+        self.assertLessEqual(len(found()['error']), 200); self.assertNotIn('\x1b', found()['error'])
+
     def test_remove_deletes_only_our_unit_and_is_idempotent(self):
         manager = Manager()
         value = device_cua.tunnel_add('vps', PEER, SSH, run=manager, system='darwin', home=self.home, listening=self.up(manager),

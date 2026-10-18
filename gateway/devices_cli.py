@@ -856,7 +856,10 @@ def _space_issue(part, ip, port, peer, holder, missing, again):
     state = (part.get('tunnels') or {}).get(peer)
     if not isinstance(state, dict) or state.get('port') != port:
         return ('missing', 'the SSH tunnel to ' + peer + ' is not loaded on ' + holder, again), True
-    if state.get('running') is not True: return ('missing', 'the SSH tunnel to ' + peer + ' does not run on ' + holder, again), True
+    if state.get('running') is not True:
+        error = state.get('error')
+        why = ' (ssh: ' + error + ')' if isinstance(error, str) and error else ''
+        return ('missing', 'the SSH tunnel to ' + peer + ' does not run on ' + holder + why, again), True
     return None, True
 
 

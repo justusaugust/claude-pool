@@ -22,6 +22,7 @@ import device_install
 import device_sync
 from device_report import Step
 import registry
+from private_files import private_directory
 from remote import _TARGET, Local, require_pipe
 import service
 
@@ -200,6 +201,8 @@ TUNNEL_LABEL = 'io.github.claude-pool.cua-tunnel.'  # launchd label prefix; the 
 TUNNEL_UNIT = 'claude-pool-cua-tunnel-'
 TUNNEL_WAIT = 15  # seconds a new tunnel gets to log in and listen
 BOOTOUT_WAIT = 5  # seconds launchd gets to let go of a booted-out label before it is loaded again
+TUNNEL_BACKOFF = 60  # seconds between ssh attempts: a changed host key or a refused key never loops quickly
+LOG_KEEP = 64 * 1024  # bytes of ssh errors kept per tunnel; a longer log starts again when the tunnel is written
 _PORT_IN = re.compile(rb'127\.0\.0\.1:([0-9]{4,5}):')
 
 
@@ -230,14 +233,49 @@ def tunnel_argv(port, peer_ip, ssh):
             '-L', f'{LOOPBACK}:{port}:{_checked(peer_ip)}:{PORT}', _ssh(ssh)]
 
 
-def tunnel_unit(peer, port, peer_ip, ssh, system):
+def tunnel_log(peer, home):
+    """The 0600 file the tunnel's ssh writes its errors to, in this device's runtime folder (0700)."""
+    if Path(home) == Path.home():
+        import settings
+        root = settings.RUNTIME
+    else: root = Path(home) / '.local/state/claude-pool'  # a home given by a test: everything stays inside it
+    return root / ('cua-tunnel-' + _peer(peer) + '.log')
+
+
+def _prepare_log(path):
+    """Create the log owner-only before the unit runs (launchd and systemd would create it with the umask's mode)."""
+    private_directory(path.parent)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        if os.fstat(fd).st_size > LOG_KEEP: os.ftruncate(fd, 0)
+    finally: os.close(fd)
+
+
+def _last_error(path):
+    """The last non-empty line of a tunnel's log, printable and short, or None."""
+    try:
+        with open(path, 'rb') as file:
+            file.seek(max(0, os.fstat(file.fileno()).st_size - 4096)); data = file.read()
+    except OSError: return None
+    lines = [line for line in data.decode('utf-8', 'replace').splitlines() if line.strip()]
+    if not lines: return None
+    text = re.sub(r'\x1b\[[0-9;?]*[A-Za-z]', '', lines[-1])
+    return ''.join(char for char in text if char.isprintable()).strip()[:200] or None
+
+
+def tunnel_unit(peer, port, peer_ip, ssh, system, log=None):
+    """ssh's errors go to `log` (else nowhere); a failing ssh is started again only every TUNNEL_BACKOFF seconds."""
     argv, label = tunnel_argv(port, peer_ip, ssh), tunnel_label(peer, system)
     if system == 'darwin':
-        return plistlib.dumps({'Label': label, 'ProgramArguments': argv, 'KeepAlive': True, 'RunAtLoad': True, 'ThrottleInterval': 10,
-                               'ProcessType': 'Background', 'StandardOutPath': '/dev/null', 'StandardErrorPath': '/dev/null'})
+        return plistlib.dumps({'Label': label, 'ProgramArguments': argv, 'KeepAlive': True, 'RunAtLoad': True,
+                               'ThrottleInterval': TUNNEL_BACKOFF, 'ProcessType': 'Background', 'Umask': 0o077,
+                               'StandardOutPath': '/dev/null', 'StandardErrorPath': str(log) if log else '/dev/null'})
+    target = str(log) if log and not re.search(r'\s', str(log)) else None  # append: takes a bare path
     lines = ['[Unit]', 'Description=claude-pool Cua tunnel to ' + peer, '', '[Service]', 'Type=simple',
-             'ExecStart=' + ' '.join(service.exec_quote(word) for word in argv), 'Restart=always', 'RestartSec=10',
-             'StandardOutput=null', 'StandardError=null', '', '[Install]', 'WantedBy=default.target']
+             'ExecStart=' + ' '.join(service.exec_quote(word) for word in argv), 'Restart=always', 'RestartSec=' + str(TUNNEL_BACKOFF),
+             'UMask=0077', 'StandardOutput=null', 'StandardError=' + ('append:' + target.replace('%', '%%') if target else 'null'),
+             '', '[Install]', 'WantedBy=default.target']
     return ('\n'.join(lines) + '\n').encode()
 
 
@@ -338,7 +376,9 @@ def _tunnel_up(peer, peer_ip, ssh, run, system, home, listening, sleep, wait):
     port = _recorded_port(path) if peer in ours else None
     if port is not None and (port in taken or (listening(port) and not _unit_runs(run, label, system))): port = None
     if port is None: port = tunnel_port(peer, listening, taken)
-    data = tunnel_unit(peer, port, peer_ip, ssh, system)
+    log = tunnel_log(peer, home)
+    _prepare_log(log)
+    data = tunnel_unit(peer, port, peer_ip, ssh, system, log)
     try: changed = path.read_bytes() != data
     except OSError: changed = True
     if system == 'darwin':
@@ -374,18 +414,22 @@ def tunnel_remove(peer, *, run=None, system=None, home=None):
         if _loaded(run, label, system): run.call(['launchctl', 'bootout', _gui() + '/' + label])
     elif existed or _loaded(run, label, system): run.call(['systemctl', '--user', 'disable', '--now', label + '.service'])
     path.unlink(missing_ok=True)
+    tunnel_log(peer, home).unlink(missing_ok=True)
     if existed and system != 'darwin': run.call(['systemctl', '--user', 'daemon-reload'])
     if _loaded(run, label, system): raise RuntimeError('the Cua tunnel to ' + peer + ' is still loaded')
     return True
 
 
 def tunnels(*, run=None, system=None, home=None, listening=None):
-    """{peer: {'port', 'running'}} for every tunnel claude-pool made on this device; running = the unit runs and listens."""
+    """{peer: {'port', 'running'}} for every tunnel claude-pool made on this device; running = the unit runs and listens.
+    A tunnel that does not run also carries 'error': the last line its ssh wrote, when there is one."""
     run, system, home, listening = _defaults(run, system, home, listening)
     found = {}
     for peer, path in _ours(system, home).items():
         port = _recorded_port(path)
         found[peer] = {'port': port, 'running': bool(port) and _unit_runs(run, tunnel_label(peer, system), system) and listening(port)}
+        error = None if found[peer]['running'] else _last_error(tunnel_log(peer, home))
+        if error: found[peer]['error'] = error
     return found
 
 
