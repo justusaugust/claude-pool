@@ -313,6 +313,47 @@ class CommandTests(unittest.TestCase):
             with patch.object(launch,'process_command',return_value='/unrelated/user/process'),patch.object(launch.os,'kill') as kill:
                 self.assertFalse(launch.recover_orphan());kill.assert_not_called()
 
+    def stop(self, alive_checks, clock_step=1.0):
+        """Run `claude-pool --stop` with closed ports; the daemon and Shunt pids answer `ps` for `alive_checks` polls."""
+        shunt = f"{launch.HERE / 'bin/shunt'} --config {{}}/shunt.toml run"
+        polls, now = [], [0.0]
+        def ps(pid):
+            polls.append(pid)
+            if len(polls) > alive_checks: return ''
+            return '/usr/bin/python3 /x/run.py --daemon' if pid == 4001 else shunt.format(folder)
+        def monotonic():
+            now[0] += clock_step; return now[0]
+        def request(client, method='GET', path='/health', body=None):
+            if method == 'POST': return b'{}'
+            raise ConnectionRefusedError
+        class Closed:
+            def __init__(self, *a, **k): pass
+            def connect(self): raise ConnectionRefusedError
+            def close(self): pass
+        with tempfile.TemporaryDirectory() as folder, patch.object(launch, 'RUNTIME', Path(folder)), \
+             patch.object(launch, 'STORES', Path(folder) / 'stores'), patch.object(launch, 'NATIVE_CLAUDE', __file__), \
+             patch.object(launch, 'token', return_value='fixture'), patch.object(launch, 'request', side_effect=request), \
+             patch.object(launch.http.client, 'HTTPConnection', Closed), patch.object(launch, 'process_command', side_effect=ps), \
+             patch.object(launch.time, 'sleep'), patch.object(launch.time, 'monotonic', side_effect=monotonic), \
+             patch.object(launch.sys, 'argv', ['claude-pool', '--stop']):
+            (Path(folder) / 'owner.json').write_text(json.dumps({'daemon': 4001, 'backend': 4002}))
+            with redirect_stdout(io.StringIO()) as out:
+                try: launch.main(); error = None
+                except RuntimeError as caught: error = caught
+            return out.getvalue(), error, polls
+
+    def test_stop_returns_only_after_the_daemon_and_shunt_exited(self):
+        out, error, polls = self.stop(alive_checks=6)
+        self.assertIsNone(error)
+        self.assertEqual(out, 'Local pool stopped.\n')
+        self.assertGreater(len(polls), 6)  # it kept asking while the processes still ran
+        self.assertEqual(set(polls), {4001, 4002})
+
+    def test_stop_fails_when_the_daemon_outlives_the_bound(self):
+        out, error, polls = self.stop(alive_checks=10 ** 6, clock_step=5.0)
+        self.assertNotIn('Local pool stopped.', out)
+        self.assertIn('has not exited', str(error))
+
 class TokenTests(unittest.TestCase):
     def test_private_token_is_stable_and_symlinks_are_refused(self):
         with tempfile.TemporaryDirectory() as folder, patch.object(launch, 'STORES', Path(folder)):

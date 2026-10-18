@@ -256,6 +256,27 @@ def recover_orphan():
     return False
 
 
+STOP_EXIT_WAIT = 30  # seconds `--stop` waits for the daemon and Shunt to exit once the ports are closed
+
+
+def pool_processes():
+    """{pid: what its command line must show} for the daemon and Shunt recorded in owner.json; {} when unknown."""
+    try: owner = json.loads((RUNTIME / "owner.json").read_text())
+    except (OSError, ValueError): return {}
+    if not isinstance(owner, dict): return {}
+    expected = {owner.get("daemon"): " --daemon", owner.get("backend"): f"{HERE / 'bin/shunt'} --config {RUNTIME / 'shunt.toml'} run"}
+    return {pid: text for pid, text in expected.items() if isinstance(pid, int) and pid > 1}
+
+
+def wait_exited(processes, bound=None):
+    """True once none of `processes` runs its recorded command any more (a reused pid does not count), False after `bound`."""
+    deadline = time.monotonic() + (STOP_EXIT_WAIT if bound is None else bound)
+    while True:
+        if not any(text in process_command(pid) for pid, text in processes.items()): return True
+        if time.monotonic() >= deadline: return False
+        time.sleep(.25)
+
+
 def orphaned(parent):
     """An orphan is reparented to init, or on Linux to the user's own systemd instance."""
     if parent == "1": return True
@@ -572,6 +593,7 @@ def main():
             managed_start()
         if args.stop:
             atomic_write(RUNTIME / 'maintenance', 'Deliberately stopped\n')
+            owner = pool_processes()
             try: request(client, "POST", "/pool/shutdown")
             except OSError:
                 print('Local pool already stopped.'); return
@@ -584,6 +606,11 @@ def main():
                     try:
                         conn.connect()
                     except OSError:
+                        # Closed ports are not enough: Shunt may still write a refreshed grant on its way out, and a
+                        # rename or device switch moves those files next. Wait for both processes to be gone.
+                        if not wait_exited(owner):
+                            raise RuntimeError(f"Pool stopped answering, but its daemon has not exited after {STOP_EXIT_WAIT} s; "
+                                               "retry claude-pool --stop") from None
                         print("Local pool stopped.")
                         return
                     finally:
