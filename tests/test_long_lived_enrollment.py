@@ -261,6 +261,17 @@ class LongLivedEnrollmentTests(unittest.TestCase):
         self.assertEqual(self.snapshot(), before)
         self.assertFalse((self.stores / 'operations.json').exists())
 
+    def test_a_name_the_registry_uses_for_another_subscription_writes_nothing(self):
+        registry.update(lambda value: value['accounts'].append({'name': 'operations', 'label': 'Ops', 'userId': 'user-z',
+                                                                 'organizationId': 'team-z', 'fingerprint': 'f' * 12}), self.reg)
+        before = self.snapshot()
+        with patch.object(setup, 'profile', return_value=self.info()), \
+             self.assertRaisesRegex(RuntimeError, 'The registry uses operations for another subscription'):
+            self.run_cli('--long-lived', '--from-file', str(self.staged()), lookup=Mock(return_value=self.info()))
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(registry.account(registry.load(self.reg), 'operations')['userId'], 'user-z')
+        self.assertFalse((self.stores / 'operations.json').exists())
+
     def test_usage_owner_never_gets_a_long_lived_store_copy(self):
         self.devices(SELF, OWNER, me='example-vps')
         staged = self.staged()

@@ -212,6 +212,11 @@ def refuse_other_name(rows, stores, name, info, known):
         raise RuntimeError('This subscription is already connected as ' + (here.get('label') or here['name']) + ' (name ' + here['name']
                            + ' on this machine); a second alias adds no quota. To use the name ' + name + ' instead, run: claude-pool account rename '
                            + here['name'] + ' ' + name + ', then rerun this command. Nothing was enrolled.')
+    clash = registry.account(known, name)
+    if clash is not None and not registry.same_subscription(clash, {'name': name, 'userId': mine[0], 'organizationId': mine[1]}):
+        # The upsert would replace that subscription's row on every device; account rename refuses the same name.
+        raise RuntimeError('The registry uses ' + name + ' for another subscription (' + (clash.get('label') or name)
+                           + '); choose another --name. Nothing was enrolled.')
 
 
 def apply_change(config, binary, paths, env, change_value, change_toml,
