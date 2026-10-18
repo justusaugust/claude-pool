@@ -344,12 +344,13 @@ class LaunchTests(unittest.TestCase):
                  patch.object(launch.service, 'loaded', return_value=loaded), \
                  patch.object(setup, 'cli', return_value=0) as cli:
                 with self.assertRaises(SystemExit): launch.main()
-                return cli.call_args.kwargs['overview']
+                overview = cli.call_args.kwargs['overview']
+                # evaluate while `request` is still patched, so the check never reaches a real pool
+                return overview and routing.wait_idle(overview, 'x', False)
 
     def test_launch_keeps_the_check_when_the_running_pool_does_not_answer(self):
-        overview = self.launch_remove(OSError('no answer'), loaded=True)
-        self.assertIsNotNone(overview)
-        self.assertFalse(routing.wait_idle(overview, 'x', False))
+        idle = self.launch_remove(OSError('no answer'), loaded=True)
+        self.assertIs(idle, False)
 
     def test_launch_skips_the_check_only_when_the_pool_is_not_running(self):
         self.assertIsNone(self.launch_remove(OSError('no answer'), loaded=False))
