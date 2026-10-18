@@ -39,8 +39,8 @@ import settings
 from remote import POOL, Completed, Local, Remote
 from fakes import FakeRemote, SecretWatch, fixture_token, long_lived_file, refreshable_file
 
-MAC = {'name': 'mac', 'ssh': 'justus@mac', 'platform': 'darwin', 'roles': [], 'addedAt': 1}
-VPS = {'name': 'vps', 'ssh': 'justus@vps', 'platform': 'linux', 'roles': ['usage'], 'addedAt': 2}
+MAC = {'name': 'mac', 'ssh': 'alex@mac', 'platform': 'darwin', 'roles': [], 'addedAt': 1}
+VPS = {'name': 'vps', 'ssh': 'alex@vps', 'platform': 'linux', 'roles': ['usage'], 'addedAt': 2}
 BASE = ('[providers.anthropic]\nkind = "anthropic"\nauth = "claude_oauth"\n\n'
         '[[providers.anthropic.accounts]]\nname = "personal"\n')
 TEAM = {'name': 'team', 'label': 'Team', 'alias': 'team', 'plan': 'Team', 'email': 'team@x.de', 'organization': 'Team A',
@@ -131,9 +131,9 @@ class RoutingTests(DeviceCliBase):
     def test_cua_tunnel_verb_runs_on_this_device_and_prints_json(self):
         with patch.object(device_cua, 'tunnel_add', return_value={'port': 32342, 'running': True}) as add, \
              patch.object(device_cua, 'tunnel_remove', return_value=True) as remove:
-            code, out, err = self.run_cli(['cua-tunnel', 'add', 'vps', '100.64.0.2', 'justus@vps'])
+            code, out, err = self.run_cli(['cua-tunnel', 'add', 'vps', '100.64.0.2', 'alex@vps'])
             self.assertEqual(code, 0, err); self.assertEqual(json.loads(out), {'port': 32342, 'running': True})
-            add.assert_called_once_with('vps', '100.64.0.2', 'justus@vps')
+            add.assert_called_once_with('vps', '100.64.0.2', 'alex@vps')
             code, out, err = self.run_cli(['cua-tunnel', 'remove', 'vps'])
             self.assertEqual(code, 0, err); remove.assert_called_once_with('vps')
             self.assertEqual(self.run_cli(['cua-tunnel', 'add', 'vps'])[0], 2)
@@ -264,7 +264,7 @@ class InternalVerbTests(DeviceCliBase):
         self.runtime.chmod(0o700)
         self.devices(MAC, VPS)
         conductor_board.record_checks({'mac': [Step('reachable', 'ok', 'this device')]})
-        vps = FakeRemote('justus@vps', lambda argv, data: answer(0, b'{"merged": ["mac"]}'))
+        vps = FakeRemote('alex@vps', lambda argv, data: answer(0, b'{"merged": ["mac"]}'))
         with patch.object(device_sync, 'sync_all', return_value={'vps': 'ok'}):
             code, out, _ = self.run_cli(['sync'], remotes=lambda target: vps)
         self.assertEqual(code, 0)
@@ -477,7 +477,7 @@ class UserVerbTests(DeviceCliBase):
         self.assertEqual(code, 0)
         mac = next(line for line in out.splitlines() if line.split()[:1] == ['mac'])
         vps = next(line for line in out.splitlines() if line.split()[:1] == ['vps'])
-        self.assertIn('justus@mac', mac); self.assertIn('this device', mac)
+        self.assertIn('alex@mac', mac); self.assertIn('this device', mac)
         self.assertIn('usage owner', vps); self.assertIn('Conductor', vps)
 
     def test_list_without_devices_says_how_to_add_one(self):
@@ -559,7 +559,7 @@ class UserVerbTests(DeviceCliBase):
         self.assertEqual(self.run_cli(['conductor', 'move'])[0], 2)
 
     def test_conductor_status_asks_each_device_after_confirming_device_support(self):
-        self.devices(MAC, VPS, {'name': 'old', 'ssh': 'justus@old', 'platform': 'linux', 'roles': [], 'addedAt': 3},
+        self.devices(MAC, VPS, {'name': 'old', 'ssh': 'alex@old', 'platform': 'linux', 'roles': [], 'addedAt': 3},
                      conductor_entry={'device': 'vps', 'email': 'team@x.de', 'organization': 'Team A', 'cwd': '/srv/c'})
         vps_status = {'name': 'vps', 'platform': 'linux', 'linger': True,
                       'conductor': {'installed': True, 'running': True, 'ready': True, 'fresh': False, 'duplicates': []}}
@@ -567,20 +567,20 @@ class UserVerbTests(DeviceCliBase):
         def vps(argv, data):
             if argv[1:3] == ['device', 'status']: return answer(0, json.dumps(vps_status).encode())
             return answer(97)
-        fakes = {'justus@vps': FakeRemote('justus@vps', vps),
-                 'justus@old': FakeRemote('justus@old', lambda argv, data: answer(97), device_exit=86)}
+        fakes = {'alex@vps': FakeRemote('alex@vps', vps),
+                 'alex@old': FakeRemote('alex@old', lambda argv, data: answer(97), device_exit=86)}
         with patch.object(device_sync, 'status', return_value={'name': 'mac', 'conductor': {'installed': False, 'running': False}}):
             code, out, _ = self.run_cli(['conductor', 'status'], remotes=fakes.__getitem__)
         self.assertEqual(code, 0, out); self.assertIn('ready on vps', out)
-        self.assertIn('outdated launcher on old', out); self.assertIn('claude-pool device add justus@old', out)
-        self.assertEqual(fakes['justus@old'].calls, [])
+        self.assertIn('outdated launcher on old', out); self.assertIn('claude-pool device add alex@old', out)
+        self.assertEqual(fakes['alex@old'].calls, [])
 
     def test_conductor_status_names_an_outdated_conductor_device(self):
         self.devices(MAC, VPS, conductor_entry={'device': 'vps', 'email': 'team@x.de', 'organization': 'Team A', 'cwd': '/srv/c'})
-        fakes = {'justus@vps': FakeRemote('justus@vps', lambda argv, data: answer(97), device_exit=86)}
+        fakes = {'alex@vps': FakeRemote('alex@vps', lambda argv, data: answer(97), device_exit=86)}
         with patch.object(device_sync, 'status', return_value={'name': 'mac', 'conductor': {}}):
             code, out, _ = self.run_cli(['conductor', 'status'], remotes=fakes.__getitem__)
-        self.assertEqual(code, 2); self.assertIn('outdated launcher', out); self.assertRegex(out, r'fix: claude-pool device add justus@vps')
+        self.assertEqual(code, 2); self.assertIn('outdated launcher', out); self.assertRegex(out, r'fix: claude-pool device add alex@vps')
 
     def test_conductor_status_without_a_conductor(self):
         self.devices(MAC)
@@ -626,7 +626,7 @@ class DeviceScriptTests(DeviceCliBase):
                              ({'current': False, 'support': False}, 86), ({'wrapper': False}, 87)]:
             with self.subTest(**kwargs):
                 home, log = self.target(**kwargs)
-                done = Remote('justus@vps', run=over_ssh(home)).device('status', '--json', 'a b; touch pwned')
+                done = Remote('alex@vps', run=over_ssh(home)).device('status', '--json', 'a b; touch pwned')
                 self.assertEqual(done.returncode, code, done.stderr)
                 self.assertFalse((home / 'pwned').exists())
                 self.assertEqual(log.read_text() if log.exists() else '', 'device status --json a b; touch pwned\n' if code == 0 else '')
@@ -651,7 +651,7 @@ class DeviceScriptTests(DeviceCliBase):
     def test_sync_never_hands_device_words_to_an_old_launcher(self):
         remotes, log = self.old_vps()
         code, out, _ = self.run_cli(['sync'], remotes=remotes)
-        self.assertEqual(code, 1); self.assertIn('vps: outdated: run claude-pool device add justus@vps', out)
+        self.assertEqual(code, 1); self.assertIn('vps: outdated: run claude-pool device add alex@vps', out)
         self.assertFalse(log.exists())
 
     def test_owner_lookup_never_hands_device_words_to_an_old_launcher(self):
@@ -669,8 +669,8 @@ class DeviceScriptTests(DeviceCliBase):
 
     def test_peer_results_name_outdated_and_missing_launchers(self):
         self.devices(MAC, VPS)
-        for code, result in [(86, 'outdated: run claude-pool device add justus@vps'), (87, 'missing')]:
-            fake = FakeRemote('justus@vps', lambda argv, data: answer(97), device_exit=code)
+        for code, result in [(86, 'outdated: run claude-pool device add alex@vps'), (87, 'missing')]:
+            fake = FakeRemote('alex@vps', lambda argv, data: answer(97), device_exit=code)
             self.assertEqual(device_sync.sync_all(lambda target: fake), {'vps': result})
             self.assertEqual(fake.calls, [])
 
@@ -755,7 +755,7 @@ class Machine:
         if not self.reachable: return answer(255)
         if argv == ['true']: return ok()
         if argv == ['uname', '-s']: return ok({'linux': 'Linux', 'darwin': 'Darwin'}[self.platform])
-        if argv == ['id', '-un']: return ok('justus')
+        if argv == ['id', '-un']: return ok('alex')
         if argv == ['loginctl', 'enable-linger']:
             if self.linger == 'no': self.linger = 'yes'
             return ok()
@@ -909,11 +909,11 @@ class OrchestrationBase(DeviceCliBase):
         self.team_fp = long_lived.fingerprint(json.loads(self.team.read_bytes()))
         registry.update(lambda value: value['accounts'].append(dict(TEAM)), self.reg)
         self.app = self.root / 'app'; self.app.mkdir()
-        (self.app / 'ssh_configs.json').write_text(json.dumps({'configs': [{'name': 'vps', 'sshHost': 'justus@vps', 'id': '1'}],
-                                                              'trustedHosts': ['justus@vps']}))
+        (self.app / 'ssh_configs.json').write_text(json.dumps({'configs': [{'name': 'vps', 'sshHost': 'alex@vps', 'id': '1'}],
+                                                              'trustedHosts': ['alex@vps']}))
         self.local = Machine('local', self.log, platform='darwin', self_name='mac', herdr=[], ip='100.64.0.1')
-        self.vps = Machine('justus@vps', self.log)
-        self.machines = {'justus@vps': self.vps}
+        self.vps = Machine('alex@vps', self.log)
+        self.machines = {'alex@vps': self.vps}
         self.login = Mock(return_value=Step('native-login', 'ok', 'logged in'))
         patches = [patch.object(device_install, 'source_archive', lambda root: b'ARCHIVE'),
                    patch.object(native_login, 'login', self.login),
@@ -943,24 +943,24 @@ class AddTests(OrchestrationBase):
     def fresh_vps(self, **kwargs):
         options = dict(launcher='none', version=None, linger='no', shell=False, service='stopped', preview='absent', rules=False)
         options.update(kwargs)
-        self.vps = Machine('justus@vps', self.log, **options); self.machines['justus@vps'] = self.vps
+        self.vps = Machine('alex@vps', self.log, **options); self.machines['alex@vps'] = self.vps
         return self.vps
 
     def test_add_runs_every_step_in_order_and_ends_with_a_health_report(self):
         self.fresh_vps(); self.runtime.chmod(0o700)
-        code, out, err = self.cli('add', 'justus@vps', '--name', 'vps', '--usage-owner')
+        code, out, err = self.cli('add', 'alex@vps', '--name', 'vps', '--usage-owner')
         self.assertEqual(code, 0, out + err); self.assertEqual(step_names(out), list(ADD_ORDER))
         value = registry.load(self.reg)
         self.assertEqual({d['name'] for d in value['devices']}, {'mac', 'vps'})
         self.assertEqual(registry.owner(value)['name'], 'vps')
         self.assertEqual(value['conductor']['device'], 'vps'); self.assertEqual(value['conductor']['email'], 'team@x.de')
-        # The Conductor's home (CLAUDE.md, bin/, board/, journal.md, state/ on personal-vps) is its working directory.
+        # The Conductor's home (CLAUDE.md, bin/, board/, journal.md, state/ on example-vps) is its working directory.
         self.assertEqual(value['conductor']['cwd'], '~/projects/conductor')
         self.assertEqual(self.vps.self_name, 'vps'); self.assertEqual(self.vps.accounts['team']['fingerprint'], self.team_fp)
         self.assertEqual(self.vps.registry['generation'], value['generation'])
         self.assertTrue(self.vps.shell); self.assertEqual(self.vps.linger, 'yes'); self.assertEqual(self.vps.service, 'running')
         self.assertTrue(self.vps.rules); self.assertEqual(self.vps.preview, 'ours')
-        self.assertEqual([r['target'] for r in self.local.herdr], ['justus@vps'])
+        self.assertEqual([r['target'] for r in self.local.herdr], ['alex@vps'])
         import conductor_board
         cached = json.loads((self.runtime / conductor_board.CHECK_FILE).read_text())['devices']
         self.assertEqual([step['name'] for step in cached['vps']['steps']], list(ADD_ORDER))
@@ -970,19 +970,19 @@ class AddTests(OrchestrationBase):
         # A fresh machine only stages long-lived tokens; as usage owner it could poll no usage and readings would stop.
         registry.update(lambda value: value['devices'].append(dict(SELF_ROW, roles=['usage'])), self.reg)
         self.fresh_vps(refreshable=())
-        code, out, err = self.cli('add', 'justus@vps', '--name', 'vps', '--usage-owner')
+        code, out, err = self.cli('add', 'alex@vps', '--name', 'vps', '--usage-owner')
         self.assertEqual(code, 2, out + err)
         self.assertEqual(registry.owner(registry.load(self.reg))['name'], 'mac')
         self.assertIsNone(registry.load(self.reg)['conductor'])
         self.assertRegex(out, r'failed +usage-owner +vps serves no refreshable login for team.*\n      fix: '
-                              r'ssh justus@vps \.local/bin/claude-pool account add team@x\.de --name team, then claude-pool device add justus@vps --usage-owner')
+                              r'ssh alex@vps \.local/bin/claude-pool account add team@x\.de --name team, then claude-pool device add alex@vps --usage-owner')
         self.fresh_vps()
-        code, out, err = self.cli('add', 'justus@vps', '--name', 'vps', '--usage-owner')
+        code, out, err = self.cli('add', 'alex@vps', '--name', 'vps', '--usage-owner')
         self.assertEqual(code, 0, out + err); self.assertEqual(registry.owner(registry.load(self.reg))['name'], 'vps')
 
     def test_add_checks_the_launcher_before_any_device_verb(self):
         self.fresh_vps()
-        self.cli('add', 'justus@vps', '--name', 'vps')
+        self.cli('add', 'alex@vps', '--name', 'vps')
         order = [argv for argv, _ in self.vps.calls]
         first_device = next(i for i, argv in enumerate(order) if argv[1:2] == ['device'])
         first_install = next(i for i, argv in enumerate(order) if device_install.INSTALL_SCRIPT in argv)
@@ -991,17 +991,17 @@ class AddTests(OrchestrationBase):
 
     def test_add_is_idempotent_and_resumes_a_half_finished_machine(self):
         self.fresh_vps().fail.add('shell add')
-        code, out1, err = self.cli('add', 'justus@vps', '--name', 'vps')
+        code, out1, err = self.cli('add', 'alex@vps', '--name', 'vps')
         self.assertEqual(code, 2, out1 + err); self.assertRegex(out1, r'shell .*\n      fix: \S')
         self.vps.fail.clear(); self.vps.calls.clear(); self.local.calls.clear()
-        code, out2, err = self.cli('add', 'justus@vps', '--name', 'vps')
+        code, out2, err = self.cli('add', 'alex@vps', '--name', 'vps')
         self.assertEqual(code, 0, out2 + err)
         for verb in ['install', 'shell add', 'receive-account', 'preview-rules add']:
             self.assertLessEqual(self.count(self.vps, verb), 1, verb)
         self.assertLessEqual(self.count(self.local, 'machine add'), 1)
         generation = registry.load(self.reg)['generation']
         self.vps.calls.clear(); self.local.calls.clear()
-        self.assertEqual(self.cli('add', 'justus@vps', '--name', 'vps')[0], 0)
+        self.assertEqual(self.cli('add', 'alex@vps', '--name', 'vps')[0], 0)
         self.assertEqual(registry.load(self.reg)['generation'], generation)
         for verb in ['install', 'shell add', 'receive-account', 'preview-rules add', 'receive-registry', '--start', 'enable-linger']:
             self.assertEqual(self.count(self.vps, verb), 0, verb)
@@ -1009,12 +1009,12 @@ class AddTests(OrchestrationBase):
 
     def test_manual_steps_do_not_block_and_are_listed_under_needs_you(self):
         (self.app / 'ssh_configs.json').unlink()
-        code, out, err = self.cli('add', 'justus@vps', '--name', 'vps')
+        code, out, err = self.cli('add', 'alex@vps', '--name', 'vps')
         self.assertEqual(code, 0, out + err); self.assertIn('\nNeeds you:\n  app: ', out)
 
     def test_add_never_leaks_a_token_anywhere(self):
         self.fresh_vps(cua=True, ip='100.64.0.2'); self.local.cua = True
-        code, out, err = self.cli('add', 'justus@vps', '--name', 'vps', '--cua', '--usage-owner')
+        code, out, err = self.cli('add', 'alex@vps', '--name', 'vps', '--cua', '--usage-owner')
         self.assertEqual(code, 0, out + err)
         self.assertIn('direct:100.64.0.2:3211', self.local.spaces); self.assertIn('direct:100.64.0.1:3211', self.vps.spaces)
         watch = SecretWatch(fixture_token(), CUA_FIXTURE_TOKEN)
@@ -1026,26 +1026,26 @@ class AddTests(OrchestrationBase):
     def test_a_blocked_cua_port_is_reached_through_an_ssh_tunnel_owned_by_claude_pool(self):
         self.fresh_vps(cua=True, ip='100.64.0.2'); self.local.cua = True
         self.local.blocked = {'100.64.0.2:3211'}
-        code, out, err = self.cli('add', 'justus@vps', '--name', 'vps', '--cua')
+        code, out, err = self.cli('add', 'alex@vps', '--name', 'vps', '--cua')
         self.assertEqual(code, 0, out + err)
         port = self.local.tunnels['vps']['port']
         self.assertIn(f'direct:127.0.0.1:{port}', self.local.spaces); self.assertIn('direct:100.64.0.1:3211', self.vps.spaces)
         self.assertEqual(registry.device(registry.load(self.reg), 'mac')['cuaTunnels'], {'vps': port})
         tunnel = [argv for argv, _ in self.local.calls if 'cua-tunnel' in argv]
-        self.assertEqual(tunnel[0][-5:], ['cua-tunnel', 'add', 'vps', '100.64.0.2', 'justus@vps'])
+        self.assertEqual(tunnel[0][-5:], ['cua-tunnel', 'add', 'vps', '100.64.0.2', 'alex@vps'])
         self.assertEqual([argv for argv, _ in self.vps.calls if 'cua-tunnel' in argv], [])
         self.assertRegex(out, r'\n  ok +cua +linked both ways \(vps through an SSH tunnel\)\n')
         SecretWatch(fixture_token(), CUA_FIXTURE_TOKEN).argv(self.all_calls())
         # a rerun keeps the tunnel and registers nothing again
         self.local.calls.clear()
-        code, out, err = self.cli('add', 'justus@vps', '--name', 'vps', '--cua')
+        code, out, err = self.cli('add', 'alex@vps', '--name', 'vps', '--cua')
         self.assertEqual(code, 0, out + err)
         self.assertEqual([argv for argv, _ in self.local.calls if argv[:3] == ['sh', '-c', device_cua.TOKEN_WRAPPER]], [])
 
     def test_an_auth_failure_on_the_cua_port_makes_no_tunnel(self):
         self.fresh_vps(cua=True, ip='100.64.0.2'); self.local.cua = True
         self.local.blocked = {'100.64.0.2:3211'}; self.local.add_error = answer(5, b'401 Unauthorized')
-        code, out, err = self.cli('add', 'justus@vps', '--name', 'vps', '--cua')
+        code, out, err = self.cli('add', 'alex@vps', '--name', 'vps', '--cua')
         self.assertEqual(code, 2, out + err)
         self.assertEqual([argv for argv, _ in self.local.calls if 'cua-tunnel' in argv], []); self.assertEqual(self.local.tunnels, {})
         self.assertNotIn('cuaTunnels', registry.device(registry.load(self.reg), 'mac'))
@@ -1058,29 +1058,29 @@ class AddTests(OrchestrationBase):
         (self.self_path).unlink()  # this device has no name yet either: still nothing is written
         self.vps.reachable = False
         before = self.snapshot()
-        code, out, err = self.cli('add', 'justus@vps', '--name', 'vps')
+        code, out, err = self.cli('add', 'alex@vps', '--name', 'vps')
         self.assertEqual(code, 2); self.assertEqual(self.snapshot(), before)
-        self.assertRegex(out, r'unreachable +reachable .*\n      fix: ssh justus@vps true must work without a password prompt \(BatchMode\)')
+        self.assertRegex(out, r'unreachable +reachable .*\n      fix: ssh alex@vps true must work without a password prompt \(BatchMode\)')
         self.assertEqual([argv for argv, _ in self.vps.calls], [['true']]); self.assertEqual(self.local.calls, [])
 
     def test_add_names_this_device_from_its_hostname_when_it_has_none(self):
         self.self_path.unlink()
-        with patch.object(devices_cli.socket, 'gethostname', return_value='Justus-MacBook.local'):
-            self.assertEqual(self.cli('add', 'justus@vps', '--name', 'vps')[0], 0)
-        self.assertEqual(registry.self_name(self.self_path), 'justus-macbook')
-        self.assertEqual({d['name'] for d in registry.load(self.reg)['devices']}, {'justus-macbook', 'vps'})
+        with patch.object(devices_cli.socket, 'gethostname', return_value='Alex-MacBook.local'):
+            self.assertEqual(self.cli('add', 'alex@vps', '--name', 'vps')[0], 0)
+        self.assertEqual(registry.self_name(self.self_path), 'alex-macbook')
+        self.assertEqual({d['name'] for d in registry.load(self.reg)['devices']}, {'alex-macbook', 'vps'})
 
     def test_add_skips_and_reports_steps_a_machine_cannot_do(self):
         self.local.herdr, self.local.ip, self.vps.ip = None, None, None
         with patch.object(devices_cli, 'local_platform', lambda: 'linux'):
-            code, out, err = self.cli('add', 'justus@vps', '--name', 'vps', '--cua')
+            code, out, err = self.cli('add', 'alex@vps', '--name', 'vps', '--cua')
         self.assertEqual(code, 0, out + err)
         for name in ['herdr', 'app', 'cua']:
             found = step_of(out, name)
             self.assertEqual(found.group(1), 'skipped', name); self.assertTrue(found.group(2).strip(), name)
 
     def test_existing_native_login_is_not_repeated(self):
-        self.assertEqual(self.cli('add', 'justus@vps', '--name', 'vps')[0], 0)
+        self.assertEqual(self.cli('add', 'alex@vps', '--name', 'vps')[0], 0)
         self.login.assert_not_called()
 
     def test_a_missing_native_login_runs_the_one_click_login_once(self):
@@ -1089,40 +1089,40 @@ class AddTests(OrchestrationBase):
             self.vps.login = TEAM_LOGIN
             return Step('native-login', 'ok', 'logged in on ' + target)
         self.login.side_effect = login
-        code, out, err = self.cli('add', 'justus@vps', '--name', 'vps')
-        self.assertEqual(code, 0, out + err); self.login.assert_called_once_with('justus@vps', NATIVE_PATH)
+        code, out, err = self.cli('add', 'alex@vps', '--name', 'vps')
+        self.assertEqual(code, 0, out + err); self.login.assert_called_once_with('alex@vps', NATIVE_PATH)
 
     def test_an_outdated_launcher_is_reinstalled_and_never_handed_device_words(self):
         self.vps.launcher = 'old'
-        code, out, err = self.cli('add', 'justus@vps', '--name', 'vps')
+        code, out, err = self.cli('add', 'alex@vps', '--name', 'vps')
         self.assertEqual(code, 0, out + err)
         installed = next(i for i, (argv, _) in enumerate(self.vps.calls) if device_install.INSTALL_SCRIPT in argv)
         self.assertFalse([argv for argv, _ in self.vps.calls[:installed] if argv[1:2] == ['device']])
 
     def test_add_tells_every_other_device_about_the_new_one(self):
-        registry.update(lambda value: value['devices'].append({'name': 'lap', 'ssh': 'justus@lap', 'platform': 'darwin', 'roles': []}), self.reg)
-        lap = Machine('justus@lap', self.log, platform='darwin', self_name='lap', registry_value=registry.load(self.reg))
-        self.machines['justus@lap'] = lap
-        self.assertEqual(self.cli('add', 'justus@vps', '--name', 'vps')[0], 0)
+        registry.update(lambda value: value['devices'].append({'name': 'lap', 'ssh': 'alex@lap', 'platform': 'darwin', 'roles': []}), self.reg)
+        lap = Machine('alex@lap', self.log, platform='darwin', self_name='lap', registry_value=registry.load(self.reg))
+        self.machines['alex@lap'] = lap
+        self.assertEqual(self.cli('add', 'alex@vps', '--name', 'vps')[0], 0)
         self.assertEqual({d['name'] for d in lap.registry['devices']}, {'mac', 'vps', 'lap'})
         self.assertFalse([argv for argv, _ in lap.calls if '--start' in argv or '--stop' in argv])
 
     def test_add_refuses_a_name_that_belongs_to_another_target(self):
-        registry.update(lambda value: value['devices'].append({'name': 'vps', 'ssh': 'justus@other', 'platform': 'linux', 'roles': []}), self.reg)
+        registry.update(lambda value: value['devices'].append({'name': 'vps', 'ssh': 'alex@other', 'platform': 'linux', 'roles': []}), self.reg)
         before = registry.load(self.reg)
-        code, out, err = self.cli('add', 'justus@vps', '--name', 'vps')
-        self.assertEqual(code, 2); self.assertIn('justus@other', out + err); self.assertEqual(registry.load(self.reg), before)
+        code, out, err = self.cli('add', 'alex@vps', '--name', 'vps')
+        self.assertEqual(code, 2); self.assertIn('alex@other', out + err); self.assertEqual(registry.load(self.reg), before)
         self.assertEqual(self.vps.calls, [])
 
 
 class CheckTests(OrchestrationBase):
     def setUp(self):
         super().setUp()
-        registry.update(lambda value: value['devices'].extend([dict(SELF_ROW), dict(VPS, ssh='justus@vps', roles=[])]), self.reg)
+        registry.update(lambda value: value['devices'].extend([dict(SELF_ROW), dict(VPS, ssh='alex@vps', roles=[])]), self.reg)
         known = registry.load(self.reg)
         self.vps.registry, self.vps.self_name = known, 'vps'
         self.vps.accounts = {'team': {'kind': 'long-lived', 'fingerprint': self.team_fp}}
-        self.local.herdr = [{'id': 'p1', 'label': 'vps', 'target': 'justus@vps'}]
+        self.local.herdr = [{'id': 'p1', 'label': 'vps', 'target': 'alex@vps'}]
         self.local.accounts = dict(self.vps.accounts); self.local.registry = known
 
     def test_a_healthy_device_is_ready(self):
@@ -1168,11 +1168,11 @@ class CheckTests(OrchestrationBase):
         self.tunnelled(running=False)
         code, out, err = self.cli('check', 'vps')
         self.assertEqual(code, 2, out + err)
-        self.assertRegex(out, r'\n  missing +cua +the SSH tunnel to vps does not run on this device\n      fix: claude-pool device add justus@vps --cua\n')
+        self.assertRegex(out, r'\n  missing +cua +the SSH tunnel to vps does not run on this device\n      fix: claude-pool device add alex@vps --cua\n')
         self.local.tunnels = {}
         code, out, err = self.cli('check', 'vps')
         self.assertEqual(code, 2, out + err)
-        self.assertRegex(out, r'\n  missing +cua +the SSH tunnel to vps is not loaded on this device\n      fix: claude-pool device add justus@vps --cua\n')
+        self.assertRegex(out, r'\n  missing +cua +the SSH tunnel to vps is not loaded on this device\n      fix: claude-pool device add alex@vps --cua\n')
 
     def test_a_tunnel_space_for_another_port_does_not_count(self):
         self.tunnelled(); self.local.spaces = ['direct:127.0.0.1:32399']
@@ -1212,7 +1212,7 @@ class CheckTests(OrchestrationBase):
             conductor={'device': 'vps', 'email': 'team@x.de', 'organization': 'Team A', 'cwd': '/srv/c'})), self.reg)
         code, out, err = self.cli('check', 'vps')
         self.assertEqual(code, 2)
-        self.assertRegex(out, r'\n  failed +install +outdated launcher.*\n      fix: claude-pool device add justus@vps')
+        self.assertRegex(out, r'\n  failed +install +outdated launcher.*\n      fix: claude-pool device add alex@vps')
         for name in CHECK_NAMES[1:]:
             self.assertRegex(out, r'\n  \S+ +' + re.escape(name) + r' .*\n      fix: \S', name)
         self.assertFalse([argv for argv, _ in self.vps.calls if argv[1:2] == ['device']])
@@ -1247,7 +1247,7 @@ class CheckTests(OrchestrationBase):
         self.vps.conductor = {'installed': True, 'running': True, 'ready': True, 'fresh': True, 'duplicates': []}
         code, out, err = self.cli('check', 'vps')
         self.assertEqual(code, 0, out + err)
-        self.assertRegex(out, r'\n  manual +accounts .*switch.*\n      fix: ssh justus@vps .local/bin/claude-pool device switch')
+        self.assertRegex(out, r'\n  manual +accounts .*switch.*\n      fix: ssh alex@vps .local/bin/claude-pool device switch')
         self.assertRegex(out, r'\n  manual +conductor ')
         self.vps.conductor = {'error': 'OSError'}
         code, out, _ = self.cli('check', 'vps')
@@ -1280,12 +1280,12 @@ class CheckTests(OrchestrationBase):
 
 
 class HerdrUnitsTests(OrchestrationBase):
-    MISSING = 'ssh justus@vps .local/bin/claude-pool device herdr-units'
+    MISSING = 'ssh alex@vps .local/bin/claude-pool device herdr-units'
 
     def setUp(self):
         super().setUp()
-        self.local.herdr = [{'id': 'p1', 'label': 'vps', 'target': 'justus@vps'}]
-        registry.update(lambda value: value['devices'].extend([dict(SELF_ROW, roles=['usage']), dict(VPS, ssh='justus@vps', roles=[])]), self.reg)
+        self.local.herdr = [{'id': 'p1', 'label': 'vps', 'target': 'alex@vps'}]
+        registry.update(lambda value: value['devices'].extend([dict(SELF_ROW, roles=['usage']), dict(VPS, ssh='alex@vps', roles=[])]), self.reg)
         self.vps.registry, self.vps.self_name = registry.load(self.reg), 'vps'
         self.vps.accounts = {'team': {'kind': 'long-lived', 'fingerprint': self.team_fp}}
 
@@ -1295,7 +1295,7 @@ class HerdrUnitsTests(OrchestrationBase):
     def test_add_enables_the_units_of_running_sessions_without_adopting_them(self):
         self.sessions({'name': 'dashboard', 'running': True, 'enabled': False, 'active': False},
                       {'name': 'trial', 'running': True, 'unit': 'herdr-trial.service'})
-        code, out, err = self.cli('add', 'justus@vps', '--name', 'vps')
+        code, out, err = self.cli('add', 'alex@vps', '--name', 'vps')
         self.assertEqual(code, 0, out + err)
         self.assertEqual([label for _, label in self.log if label.startswith('herdr-units')], ['herdr-units'])
         found = step_of(out, 'herdr-sessions')
@@ -1303,12 +1303,12 @@ class HerdrUnitsTests(OrchestrationBase):
 
     def test_add_records_the_herdr_session_in_the_registry_row(self):
         self.sessions({'name': 'objekt', 'running': False, 'enabled': False})
-        code, out, err = self.cli('add', 'justus@vps', '--name', 'vps', '--herdr-session', 'objekt')
+        code, out, err = self.cli('add', 'alex@vps', '--name', 'vps', '--herdr-session', 'objekt')
         self.assertEqual(code, 0, out + err)
         row = registry.device(registry.load(self.reg), 'vps')
         self.assertEqual((row['herdrSession'], row['herdrSessions']), ('objekt', ['objekt']))
         self.assertEqual([label for _, label in self.log if label.startswith('herdr-units')], ['herdr-units'])
-        self.cli('add', 'justus@vps', '--name', 'vps', '--herdr-session', 'dashboard')
+        self.cli('add', 'alex@vps', '--name', 'vps', '--herdr-session', 'dashboard')
         self.assertEqual(registry.device(registry.load(self.reg), 'vps')['herdrSessions'], ['objekt', 'dashboard'])
 
     def test_check_names_missing_sessions_and_the_internal_verb(self):
@@ -1330,7 +1330,7 @@ class HerdrUnitsTests(OrchestrationBase):
         self.vps.fail = {'herdr-units'}
         code, out, err = self.cli('remove', 'vps')
         self.assertEqual(code, 1)
-        self.assertRegex(out, r'failed +herdr-sessions .*\n      fix: ssh justus@vps \.local/bin/claude-pool device herdr-units --remove')
+        self.assertRegex(out, r'failed +herdr-sessions .*\n      fix: ssh alex@vps \.local/bin/claude-pool device herdr-units --remove')
         self.assertIsNotNone(registry.device(registry.load(self.reg), 'vps'))
         self.assertNotIn('--stop', [label for _, label in self.log])
 
@@ -1368,9 +1368,9 @@ class HerdrUnitsVerbTests(DeviceCliBase):
 class RemoveTests(OrchestrationBase):
     def setUp(self):
         super().setUp()
-        self.local.herdr = [{'id': 'p1', 'label': 'vps', 'target': 'justus@vps'}]
+        self.local.herdr = [{'id': 'p1', 'label': 'vps', 'target': 'alex@vps'}]
         registry.update(lambda value: value['devices'].extend([dict(SELF_ROW, roles=['usage']),
-                                                               dict(VPS, ssh='justus@vps', roles=[], cua=True)]), self.reg)
+                                                               dict(VPS, ssh='alex@vps', roles=[], cua=True)]), self.reg)
         self.vps.registry, self.vps.self_name = registry.load(self.reg), 'vps'
         self.vps.accounts = {'team': {'kind': 'long-lived', 'fingerprint': self.team_fp},
                              'personal': {'kind': 'refreshable', 'fingerprint': '1' * 12}}
@@ -1417,7 +1417,7 @@ class RemoveTests(OrchestrationBase):
         self.assertEqual(self.local.herdr, []); self.assertEqual(self.local.spaces, [])
         unit = [argv for argv, _ in self.vps.calls if 'systemctl' in ' '.join(argv)]
         self.assertEqual(unit, [['sh', '-c', service.unload_hint(service.DEFAULT_LABEL, 'linux')]])
-        self.assertIn('remove the justus@vps environment', out)
+        self.assertIn('remove the alex@vps environment', out)
         self.assertEqual(self.count(self.vps, 'uninstall'), 0)
 
     def test_remove_never_reports_the_claude_function_removed_while_it_is_still_there(self):
@@ -1480,7 +1480,7 @@ class LocalPoolTests(OrchestrationBase):
     def test_device_commands_never_start_or_stop_the_local_pool(self):
         registry.update(lambda value: value['devices'].append(dict(SELF_ROW)), self.reg)
         with patch.object(launch, 'managed_start') as start, patch.object(launch, 'service_command') as command:
-            self.assertEqual(self.cli('add', 'justus@vps', '--name', 'vps')[0], 0)
+            self.assertEqual(self.cli('add', 'alex@vps', '--name', 'vps')[0], 0)
             self.cli('check')
             self.assertEqual(self.cli('remove', 'vps')[0], 0)
         start.assert_not_called(); command.assert_not_called()
@@ -1490,7 +1490,7 @@ class LocalPoolTests(OrchestrationBase):
 
 SESSION_FIXTURE = 'cse_' + 'adopt123'
 ADOPT_FIX = ('stop the hand-started Conductor (herdr session conductor), then run: '
-             'ssh justus@vps .local/bin/claude-pool device conductor install --session-id ' + SESSION_FIXTURE)
+             'ssh alex@vps .local/bin/claude-pool device conductor install --session-id ' + SESSION_FIXTURE)
 HAND_STARTED = {'installed': False, 'running': False, 'ready': False, 'fresh': False, 'duplicates': [4242],
                 'adoptSessionId': SESSION_FIXTURE}
 IDLE_CONDUCTOR = {'installed': False, 'running': False, 'ready': False, 'fresh': False, 'duplicates': []}
@@ -1499,26 +1499,26 @@ IDLE_CONDUCTOR = {'installed': False, 'running': False, 'ready': False, 'fresh':
 class ConductorAddTests(OrchestrationBase):
     def test_a_hand_started_conductor_is_adopted_by_hand_then_the_rerun_installs(self):
         self.vps.conductor = dict(HAND_STARTED)
-        code, out, err = self.cli('add', 'justus@vps', '--name', 'vps', '--usage-owner')
+        code, out, err = self.cli('add', 'alex@vps', '--name', 'vps', '--usage-owner')
         self.assertEqual(getattr(self.vps, 'conductor_installs', 0), 0)  # never installs next to a running Conductor
         self.assertRegex(out, r'\n  manual +conductor .*\n      fix: ' + re.escape(ADOPT_FIX))
         self.assertIn('\nNeeds you:\n', out); self.assertIn('  conductor: ' + ADOPT_FIX, out)
         self.assertEqual(registry.load(self.reg)['conductor']['device'], 'vps')
-        self.vps.conductor = dict(IDLE_CONDUCTOR)  # Justus stops the hand-started one
-        code, out, err = self.cli('add', 'justus@vps', '--name', 'vps', '--usage-owner')
+        self.vps.conductor = dict(IDLE_CONDUCTOR)  # the user stops the hand-started one
+        code, out, err = self.cli('add', 'alex@vps', '--name', 'vps', '--usage-owner')
         self.assertEqual(code, 0, out + err); self.assertEqual(self.vps.conductor_installs, 1)
         self.assertRegex(out, r'\n  ok +conductor +ready on vps')
 
     def test_a_registered_conductor_that_is_not_running_is_installed_again(self):
-        registry.update(lambda value: (value['devices'].extend([dict(SELF_ROW), dict(VPS, ssh='justus@vps', roles=[])]), value.update(
+        registry.update(lambda value: (value['devices'].extend([dict(SELF_ROW), dict(VPS, ssh='alex@vps', roles=[])]), value.update(
             conductor={'device': 'vps', 'email': 'team@x.de', 'organization': 'Team A', 'cwd': '/srv/c'})), self.reg)
-        code, out, err = self.cli('add', 'justus@vps', '--name', 'vps')
+        code, out, err = self.cli('add', 'alex@vps', '--name', 'vps')
         self.assertEqual(code, 0, out + err); self.assertEqual(self.vps.conductor_installs, 1)
 
     def test_a_failed_install_reports_the_real_conductor_step_not_a_generic_one(self):
         self.vps.after_failed_install = dict(HAND_STARTED)  # someone started one by hand meanwhile
         self.vps.fail.add('conductor install')
-        code, out, err = self.cli('add', 'justus@vps', '--name', 'vps', '--usage-owner')
+        code, out, err = self.cli('add', 'alex@vps', '--name', 'vps', '--usage-owner')
         self.assertEqual(self.vps.conductor_installs, 1)
         self.assertRegex(out, r'\n  manual +conductor .*\n      fix: ' + re.escape(ADOPT_FIX))
         self.assertNotIn('install failed', out); self.assertNotIn('installing the Conductor', out)
@@ -1539,21 +1539,21 @@ class ConductorAdoptTests(unittest.TestCase):
         self.assertEqual(step.fix, ADOPT_FIX)
         with patch.object(registry, 'self_name', return_value='vps'):
             step = conductor.check({'vps': {'platform': 'linux', 'linger': True, 'conductor': dict(HAND_STARTED)}}, value)
-        self.assertEqual(step.fix, ADOPT_FIX.replace('ssh justus@vps .local/bin/', ''))
+        self.assertEqual(step.fix, ADOPT_FIX.replace('ssh alex@vps .local/bin/', ''))
 
 
 class FixRoundCheckTests(OrchestrationBase):
     def setUp(self):
         super().setUp()
-        registry.update(lambda value: value['devices'].extend([dict(SELF_ROW, roles=['usage']), dict(VPS, ssh='justus@vps', roles=[])]), self.reg)
+        registry.update(lambda value: value['devices'].extend([dict(SELF_ROW, roles=['usage']), dict(VPS, ssh='alex@vps', roles=[])]), self.reg)
         known = registry.load(self.reg)
         self.vps.registry, self.vps.self_name = known, 'vps'
         self.vps.accounts = {'team': {'kind': 'long-lived', 'fingerprint': self.team_fp}}
-        self.local.herdr = [{'id': 'p1', 'label': 'vps', 'target': 'justus@vps'}]
+        self.local.herdr = [{'id': 'p1', 'label': 'vps', 'target': 'alex@vps'}]
         self.local.registry = known
 
     def test_readings_not_yet_arrived_are_manual_and_stale_readings_are_missing(self):
-        fix = 'first readings arrive within 5 min; needs ssh from justus@vps to mac without a password prompt'
+        fix = 'first readings arrive within 5 min; needs ssh from alex@vps to mac without a password prompt'
         self.vps.shared_at = None
         code, out, _ = self.cli('check', 'vps')
         self.assertEqual(code, 0, out); self.assertRegex(out, r'\n  manual +readings .*\n      fix: ' + re.escape(fix))
@@ -1570,7 +1570,7 @@ class FixRoundCheckTests(OrchestrationBase):
     def test_doctor_fixes_are_run_on_the_device(self):
         self.vps.doctor = False
         code, out, _ = self.cli('check', 'vps')
-        self.assertRegex(out, r'\n  failed +doctor +fail tokens.*\n      fix: ssh justus@vps .local/bin/claude-pool account add x')
+        self.assertRegex(out, r'\n  failed +doctor +fail tokens.*\n      fix: ssh alex@vps .local/bin/claude-pool account add x')
 
     def test_a_peer_whose_registry_is_ahead_is_reported(self):
         ahead = json.loads(json.dumps(self.vps.registry)); ahead['generation'] += 3
@@ -1583,18 +1583,18 @@ class FixRoundAddTests(OrchestrationBase):
     def test_add_waits_for_readings_then_leaves_a_manual_step(self):
         registry.update(lambda value: value['devices'].append(dict(SELF_ROW, roles=['usage'])), self.reg)
         self.vps.shared_at = None
-        code, out, err = self.cli('add', 'justus@vps', '--name', 'vps')
+        code, out, err = self.cli('add', 'alex@vps', '--name', 'vps')
         self.assertEqual(code, 0, out + err)
-        self.assertIn('  readings: first readings arrive within 5 min; needs ssh from justus@vps to mac without a password prompt', out)
+        self.assertIn('  readings: first readings arrive within 5 min; needs ssh from alex@vps to mac without a password prompt', out)
 
     def test_add_updates_an_earlier_preview_tool_even_when_it_answers(self):
         self.vps.preview = 'previous'
-        code, out, err = self.cli('add', 'justus@vps', '--name', 'vps')
+        code, out, err = self.cli('add', 'alex@vps', '--name', 'vps')
         self.assertEqual(code, 0, out + err); self.assertEqual(self.vps.updates, 1); self.assertEqual(self.vps.preview, 'ours')
 
     def test_add_prints_each_devices_sync_result_and_records_the_tailscale_address(self):
         self.vps.cua, self.vps.ip, self.local.cua = True, '100.64.0.2', True
-        code, out, err = self.cli('add', 'justus@vps', '--name', 'vps', '--cua')
+        code, out, err = self.cli('add', 'alex@vps', '--name', 'vps', '--cua')
         self.assertEqual(code, 0, out + err); self.assertIn('sync vps: ok', out)
         value = registry.load(self.reg)
         self.assertEqual(registry.device(value, 'vps')['tailscaleIp'], '100.64.0.2')
@@ -1604,16 +1604,16 @@ class FixRoundAddTests(OrchestrationBase):
 class FixRoundRemoveTests(OrchestrationBase):
     def setUp(self):
         super().setUp()
-        self.local.herdr = [{'id': 'p1', 'label': 'vps', 'target': 'justus@vps'}, {'id': 'p2', 'label': 'vps', 'target': 'justus@other'}]
+        self.local.herdr = [{'id': 'p1', 'label': 'vps', 'target': 'alex@vps'}, {'id': 'p2', 'label': 'vps', 'target': 'alex@other'}]
         registry.update(lambda value: value['devices'].extend([dict(SELF_ROW, roles=['usage']),
-                                                               dict(VPS, ssh='justus@vps', roles=[], cua=True, tailscaleIp='100.64.0.2')]), self.reg)
+                                                               dict(VPS, ssh='alex@vps', roles=[], cua=True, tailscaleIp='100.64.0.2')]), self.reg)
         self.vps.registry, self.vps.self_name = registry.load(self.reg), 'vps'
         self.vps.accounts = {'team': {'kind': 'long-lived', 'fingerprint': self.team_fp}}
         self.vps.cua, self.vps.ip, self.vps.host, self.vps.mcp = True, '100.64.0.2', True, True
         self.local.cua, self.local.spaces = True, ['direct:100.64.0.2:3211', 'direct:100.64.0.9:3211']
 
     def test_a_failed_preview_or_shell_removal_stops_before_anything_irreversible_and_a_rerun_completes(self):
-        for part, fix in [('preview', 'claude-pool device remove vps'), ('shell remove', 'ssh justus@vps .local/bin/claude-pool device shell remove')]:
+        for part, fix in [('preview', 'claude-pool device remove vps'), ('shell remove', 'ssh alex@vps .local/bin/claude-pool device shell remove')]:
             with self.subTest(part=part):
                 self.vps.fail = {part}; self.vps.calls.clear()
                 code, out, err = self.cli('remove', 'vps')
@@ -1642,8 +1642,8 @@ class FixRoundRemoveTests(OrchestrationBase):
         self.assertEqual(code, 0, out + err)
 
     def test_remove_prints_each_devices_sync_result(self):
-        registry.update(lambda value: value['devices'].append({'name': 'lap', 'ssh': 'justus@lap', 'platform': 'darwin', 'roles': []}), self.reg)
-        self.machines['justus@lap'] = Machine('justus@lap', self.log, platform='darwin', self_name='lap', registry_value=registry.load(self.reg))
+        registry.update(lambda value: value['devices'].append({'name': 'lap', 'ssh': 'alex@lap', 'platform': 'darwin', 'roles': []}), self.reg)
+        self.machines['alex@lap'] = Machine('alex@lap', self.log, platform='darwin', self_name='lap', registry_value=registry.load(self.reg))
         code, out, err = self.cli('remove', 'vps')
         self.assertEqual(code, 0, out + err); self.assertIn('sync lap: ok', out)
 
@@ -1653,7 +1653,7 @@ class FixRoundRemoveTests(OrchestrationBase):
         self.assertEqual(code, 0, out + err)
         self.assertEqual(self.vps.calls, [])
         self.assertIsNone(registry.device(registry.load(self.reg), 'vps'))
-        self.assertEqual(self.local.herdr, [{'id': 'p2', 'label': 'vps', 'target': 'justus@other'}])
+        self.assertEqual(self.local.herdr, [{'id': 'p2', 'label': 'vps', 'target': 'alex@other'}])
         self.assertEqual(self.local.spaces, ['direct:100.64.0.9:3211'])
         self.assertIn('tokens copied to vps remain', out); self.assertIn('revoke', out)
         self.assertIn('--long-lived --replace --name <name> on the device that first enrolled it', out)
@@ -1696,7 +1696,7 @@ class StrayLongLivedTests(DeviceCliBase):
 
 class DoctorOutputTests(unittest.TestCase):
     def test_a_failing_first_line_keeps_its_fix(self):
-        fake = FakeRemote('justus@vps', lambda argv, data: answer(1, '  fail tokens · fix: claude-pool account add x\n'.encode()))
+        fake = FakeRemote('alex@vps', lambda argv, data: answer(1, '  fail tokens · fix: claude-pool account add x\n'.encode()))
         step = device_install.check_doctor(fake)
         self.assertEqual((step.status, step.fix), ('failed', 'claude-pool account add x'))
 
@@ -1715,7 +1715,7 @@ class FixRoundTwoTests(OrchestrationBase):
     def test_remove_disables_the_label_the_real_status_reports(self):
         (self.root / 'installation.json').write_text(json.dumps({'serviceLabel': 'io.example.pool'}))
         real = device_sync.status()
-        registry.update(lambda value: value['devices'].extend([dict(SELF_ROW, roles=['usage']), dict(VPS, ssh='justus@vps', roles=[])]), self.reg)
+        registry.update(lambda value: value['devices'].extend([dict(SELF_ROW, roles=['usage']), dict(VPS, ssh='alex@vps', roles=[])]), self.reg)
         self.vps.registry, self.vps.self_name = registry.load(self.reg), 'vps'
         self.vps.label = real['serviceLabel']
         code, out, err = self.cli('remove', 'vps')
@@ -1730,9 +1730,9 @@ class FixRoundTwoTests(OrchestrationBase):
             if text == device_preview._SHA_SCRIPT: return ok('link ' + old)
             return original(text, rest, data)
         self.vps.script = script
-        code, out, err = self.cli('add', 'justus@vps', '--name', 'vps')
+        code, out, err = self.cli('add', 'alex@vps', '--name', 'vps')
         self.assertEqual(code, 2)
-        self.assertRegex(out, r'\n  failed +preview .*\n      fix: remove or rename ~/.local/bin/preview on justus@vps')
+        self.assertRegex(out, r'\n  failed +preview .*\n      fix: remove or rename ~/.local/bin/preview on alex@vps')
         self.assertEqual(getattr(self.vps, 'updates', 0), 0)
         self.assertEqual(sum(1 for argv, _ in self.vps.calls if device_preview._SHA_SCRIPT in argv), 3)  # check, install, recheck
 
@@ -1743,7 +1743,7 @@ class FixRoundTwoTests(OrchestrationBase):
             if rest[2:4] == ['host', 'setup']: return answer(1)
             return original(script, rest, data)
         self.vps.cua_call = cua_call
-        code, out, err = self.cli('add', 'justus@vps', '--name', 'vps', '--cua')
+        code, out, err = self.cli('add', 'alex@vps', '--name', 'vps', '--cua')
         self.assertEqual(code, 2)
         value = registry.load(self.reg)
         self.assertNotIn('tailscaleIp', registry.device(value, 'vps')); self.assertNotIn('tailscaleIp', registry.device(value, 'mac'))

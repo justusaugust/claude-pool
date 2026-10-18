@@ -25,16 +25,16 @@ from remote import Completed
 
 SCRUBBED = ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'CLAUDE_CODE_USE_BEDROCK',
             'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY', 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC', 'DISABLE_GROWTHBOOK']
-ENV_WITH_ALL = {**{key: 'x' for key in SCRUBBED}, 'HOME': '/srv/justus', 'LANG': 'C.UTF-8', 'PATH': '/usr/bin:/bin'}
-MAC = {'name': 'mac', 'ssh': 'justus@mac', 'platform': 'darwin'}
-VPS = {'name': 'personal-vps', 'ssh': 'personal-vps', 'platform': 'linux', 'herdrSession': 'conductor'}
-IDENTITY = {'email': 'justus@ai-vaerk.de', 'organization': 'AI-Vaerk Team'}
+ENV_WITH_ALL = {**{key: 'x' for key in SCRUBBED}, 'HOME': '/srv/alex', 'LANG': 'C.UTF-8', 'PATH': '/usr/bin:/bin'}
+MAC = {'name': 'mac', 'ssh': 'alex@mac', 'platform': 'darwin'}
+VPS = {'name': 'example-vps', 'ssh': 'example-vps', 'platform': 'linux', 'herdrSession': 'conductor'}
+IDENTITY = {'email': 'owner@example.com', 'organization': 'AI-Vaerk Team'}
 SESSION = '01AbCdEf23'
 URL_LINE = b'View it at https://claude.ai/code/session_' + SESSION.encode() + b'\r\n'
 SERVER_ARGV = ['remote-control', '--name', 'Conductor Claude', '--spawn', 'same-dir', '--permission-mode', 'auto']
 
 
-def value_with(device='personal-vps', cwd='/srv/justus/projects/conductor', devices=(MAC, VPS), accounts=()):
+def value_with(device='example-vps', cwd='/srv/alex/projects/conductor', devices=(MAC, VPS), accounts=()):
     return {**registry.EMPTY(), 'devices': [dict(d) for d in devices], 'accounts': list(accounts),
             'conductor': {'device': device, 'cwd': cwd, **IDENTITY}}
 
@@ -218,7 +218,7 @@ class ServeTests(ServeBase):
 
 class DefinitionTests(unittest.TestCase):
     def test_unit_definition_restarts_on_failure_and_starts_at_login(self):
-        cwd = Path('/srv/justus/projects/conductor')
+        cwd = Path('/srv/alex/projects/conductor')
         d = conductor.definition(ROOT, cwd)
         self.assertTrue(d['RunAtLoad']); self.assertEqual(d['KeepAlive'], {'SuccessfulExit': False})
         self.assertEqual(d['ProgramArguments'][1:], [str(ROOT / 'run.py'), 'device', 'conductor', 'serve'])
@@ -252,7 +252,7 @@ class DefinitionTests(unittest.TestCase):
                 mock.patch.object(control_main.subprocess, 'call', side_effect=call), self.assertRaises(SystemExit):
             control_main.cli(['--chat'])
         self.assertEqual(seen, conductor.native_env(ENV_WITH_ALL))
-        self.assertEqual(seen, {'HOME': '/srv/justus', 'LANG': 'C.UTF-8', 'PATH': '/usr/bin:/bin'})
+        self.assertEqual(seen, {'HOME': '/srv/alex', 'LANG': 'C.UTF-8', 'PATH': '/usr/bin:/bin'})
 
 
 PS = '''    1     0 /sbin/init
@@ -295,11 +295,11 @@ class ServiceBase(unittest.TestCase):
                    mock.patch.object(settings, 'CONDUCTOR_STATE', self.runtime / 'conductor.json'),
                    mock.patch.object(accounts_cli, 'local_context',
                                      return_value=(self.config, self.bin / 'shunt', [self.toml], dict(os.environ))),
-                   mock.patch.object(registry, 'self_name', return_value='personal-vps'),
+                   mock.patch.object(registry, 'self_name', return_value='example-vps'),
                    mock.patch.object(settings, 'NATIVE_CLAUDE', '/opt/native/claude'),
                    mock.patch.object(conductor, 'PROC', self.root / 'no-proc')]
         for item in patches: item.start(); self.addCleanup(item.stop)
-        accounts = [{'name': 'team', 'email': 'Justus@AI-Vaerk.de', 'organization': 'AI-Vaerk Team'},
+        accounts = [{'name': 'team', 'email': 'Owner@Example.com', 'organization': 'AI-Vaerk Team'},
                     {'name': 'ops', 'email': 'ops@ai-vaerk.de', 'organization': 'AI-Vaerk Team'}]
         registry.update(lambda v: v.update(value_with(cwd=str(self.cwd), accounts=accounts), generation=v['generation']))
 
@@ -358,7 +358,7 @@ class InstallTests(ServiceBase):
         self.assertEqual(conductor.duplicates(ps, 10, native=native), [11, 12])
 
     def test_the_live_vps_conductor_is_found_through_proc_and_codex_is_not(self):
-        # Facts from personal-vps (2026-10-18): the hand-started Conductor is `~/.local/bin/claude remote-control --session-id
+        # Facts from example-vps (2026-10-18): the hand-started Conductor is `~/.local/bin/claude remote-control --session-id
         # cse_<id> --permission-mode auto` (no --name); codex app-server --remote-control runs on the same machine.
         root = Path(self.tmp.name)
         versions = root / 'home/.local/share/claude/versions'; versions.mkdir(parents=True)
@@ -462,36 +462,36 @@ IDLE = {'platform': 'darwin', 'linger': None, 'conductor': {'installed': False, 
 
 class CheckTests(unittest.TestCase):
     def test_not_connected_to_remote_control_has_a_fix(self):
-        step = conductor.check({'personal-vps': {**RUNNING, 'conductor': {**RUNNING['conductor'], 'ready': False}}, 'mac': IDLE}, value_with())
+        step = conductor.check({'example-vps': {**RUNNING, 'conductor': {**RUNNING['conductor'], 'ready': False}}, 'mac': IDLE}, value_with())
         self.assertEqual(step.status, 'failed')
         self.assertRegex(step.fix, r'^turn Remote Control on in the Claude app, wait two minutes, then run claude-pool device check \S+; '
                                             r'if it still says not connected: ssh \S+ \.local/bin/claude-pool device conductor install --restart$')
 
     def test_check_is_not_ready_without_linger_or_with_two_conductors(self):
         value = value_with()
-        self.assertEqual(conductor.check({'personal-vps': RUNNING, 'mac': IDLE}, value).status, 'ok')
-        self.assertEqual(conductor.check({'personal-vps': NO_LINGER}, value).status, 'failed')
-        self.assertEqual(conductor.check({'personal-vps': RUNNING, 'mac': {**RUNNING, 'platform': 'darwin'}}, value).status, 'failed')
+        self.assertEqual(conductor.check({'example-vps': RUNNING, 'mac': IDLE}, value).status, 'ok')
+        self.assertEqual(conductor.check({'example-vps': NO_LINGER}, value).status, 'failed')
+        self.assertEqual(conductor.check({'example-vps': RUNNING, 'mac': {**RUNNING, 'platform': 'darwin'}}, value).status, 'failed')
 
     def test_check_names_wrong_device_not_ready_duplicates_and_fresh_conversation(self):
         value = value_with()
-        wrong = conductor.check({'personal-vps': IDLE, 'mac': {**RUNNING, 'platform': 'darwin'}}, value)
-        self.assertEqual(wrong.status, 'failed'); self.assertIn('move personal-vps', wrong.fix)
+        wrong = conductor.check({'example-vps': IDLE, 'mac': {**RUNNING, 'platform': 'darwin'}}, value)
+        self.assertEqual(wrong.status, 'failed'); self.assertIn('move example-vps', wrong.fix)
         busy = {**RUNNING, 'conductor': {**RUNNING['conductor'], 'ready': False}}
-        self.assertEqual(conductor.check({'personal-vps': busy}, value).status, 'failed')
+        self.assertEqual(conductor.check({'example-vps': busy}, value).status, 'failed')
         dup = {**RUNNING, 'conductor': {**RUNNING['conductor'], 'duplicates': [77]}}
-        self.assertIn('herdr session', conductor.check({'personal-vps': dup}, value).fix)
+        self.assertIn('herdr session', conductor.check({'example-vps': dup}, value).fix)
         fresh = {**RUNNING, 'conductor': {**RUNNING['conductor'], 'fresh': True}}
-        self.assertEqual(conductor.check({'personal-vps': fresh}, value).status, 'manual')
+        self.assertEqual(conductor.check({'example-vps': fresh}, value).status, 'manual')
         self.assertEqual(conductor.check({'mac': IDLE}, value).status, 'unreachable')
         self.assertEqual(conductor.check({}, {**value, 'conductor': None}).status, 'skipped')
 
     def test_check_reports_a_status_error_instead_of_not_running(self):
         value = value_with()
         broken = {**RUNNING, 'conductor': {'error': 'RuntimeError'}}
-        step = conductor.check({'personal-vps': broken}, value)
+        step = conductor.check({'example-vps': broken}, value)
         self.assertEqual(step.status, 'failed')
-        self.assertEqual(step.detail, 'status error on personal-vps: RuntimeError')
+        self.assertEqual(step.detail, 'status error on example-vps: RuntimeError')
         self.assertNotIn('not running', step.detail)
 
 
@@ -516,7 +516,7 @@ class ContextTests(unittest.TestCase):
         self.assertTrue(text.startswith('# Conductor\n\nhand-written role\n'))
         self.assertIn('hand-written', text)
         block = text.split(conductor.START)[1].split(conductor.END)[0]
-        for word in ['mac', 'justus@mac', 'personal-vps', 'herdr machine list', 'herdr session', 'through the pool']:
+        for word in ['mac', 'alex@mac', 'example-vps', 'herdr machine list', 'herdr session', 'through the pool']:
             self.assertIn(word, block)
 
     def test_malformed_markers_leave_the_file_alone(self):
@@ -531,11 +531,11 @@ class ContextTests(unittest.TestCase):
         value = value_with(cwd=str(self.cwd))
         with mock.patch.object(registry, 'self_name', return_value='mac'): conductor.apply_hook(value)
         self.assertFalse((self.cwd / 'CLAUDE.md').exists())
-        with mock.patch.object(registry, 'self_name', return_value='personal-vps'): conductor.apply_hook(value)
+        with mock.patch.object(registry, 'self_name', return_value='example-vps'): conductor.apply_hook(value)
         self.assertIn(conductor.START, (self.cwd / 'CLAUDE.md').read_text())
         self.assertIn(conductor.apply_hook, device_sync.INTEGRATION_HOOKS)
         missing = Path(self.tmp.name) / 'gone'
-        with mock.patch.object(registry, 'self_name', return_value='personal-vps'): conductor.apply_hook(value_with(cwd=str(missing)))
+        with mock.patch.object(registry, 'self_name', return_value='example-vps'): conductor.apply_hook(value_with(cwd=str(missing)))
         self.assertFalse(missing.exists())
 
 
@@ -547,9 +547,9 @@ class MoveTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
         self.cfg = Path(self.tmp.name) / 'cfg'; self.cfg.mkdir(mode=0o700)
         self.order, self.requested, self.ready_after, self.install_code = [], [], 2, 0
-        self.native = {'personal-vps': {'email': ' justus@AI-Vaerk.de', 'organization': 'AI Vaerk Team'}, 'mac': dict(IDENTITY)}
-        self.linger = {'personal-vps': 'yes'}
-        self.service = {'personal-vps': 'running', 'mac': 'running'}
+        self.native = {'example-vps': {'email': ' owner@Example.com', 'organization': 'AI Vaerk Team'}, 'mac': dict(IDENTITY)}
+        self.linger = {'example-vps': 'yes'}
+        self.service = {'example-vps': 'running', 'mac': 'running'}
         patches = [mock.patch.object(settings, 'REGISTRY', self.cfg / 'devices.json'),
                    mock.patch.object(registry, 'self_name', return_value='mac'),
                    mock.patch.object(conductor.device_sync, 'sync_all', side_effect=lambda remotes: self.order.append(('sync',)))]
@@ -563,11 +563,11 @@ class MoveTests(unittest.TestCase):
                 polls = self.order.count((name, 'status'))
                 self.order.append((name, 'status'))
                 ready = state['installed'] and polls >= self.ready_after
-                return done({'platform': 'linux' if name == 'personal-vps' else 'darwin', 'service': self.service[name],
+                return done({'platform': 'linux' if name == 'example-vps' else 'darwin', 'service': self.service[name],
                              'nativeLogin': self.native[name], 'linger': self.linger.get(name) == 'yes',
                              'conductor': {'installed': state['installed'], 'running': state['installed'], 'ready': ready,
                                            'fresh': False, 'duplicates': []}})
-            if argv == ['uname', '-s']: return done(b'Linux\n' if name == 'personal-vps' else b'Darwin\n')
+            if argv == ['uname', '-s']: return done(b'Linux\n' if name == 'example-vps' else b'Darwin\n')
             if argv[:2] == ['sh', '-c'] and 'loginctl' in argv[2]: return done((self.linger.get(name, 'no') + '\n').encode())
             if argv[-5:] == ['device', 'conductor', 'install', '--move', '--fresh']:
                 state['installed'] = True; self.order.append((name, 'install'))
@@ -579,7 +579,7 @@ class MoveTests(unittest.TestCase):
 
     def remotes(self, ssh):
         self.requested.append(ssh)
-        return self.fake({'personal-vps': 'personal-vps', 'justus@mac': 'mac'}[ssh])
+        return self.fake({'example-vps': 'example-vps', 'alex@mac': 'mac'}[ssh])
 
     def move(self, target):
         with contextlib.redirect_stdout(io.StringIO()) as out:
@@ -589,44 +589,44 @@ class MoveTests(unittest.TestCase):
     def installs(self): return [item for item in self.order if item[1:] == ('install',)]
 
     def test_move_resolves_ssh_targets_and_installs_on_target_before_removing_from_source(self):
-        code, out = self.move('personal-vps')
+        code, out = self.move('example-vps')
         self.assertEqual(code, 0, out)
-        self.assertEqual(self.requested, ['personal-vps'])
-        self.assertLess(self.order.index(('personal-vps', 'install')), self.order.index(('mac', 'uninstall')))
+        self.assertEqual(self.requested, ['example-vps'])
+        self.assertLess(self.order.index(('example-vps', 'install')), self.order.index(('mac', 'uninstall')))
         self.assertLess(self.order.index(('mac', 'uninstall')), self.order.index(('sync',)))
-        self.assertEqual(registry.load()['conductor']['device'], 'personal-vps')
+        self.assertEqual(registry.load()['conductor']['device'], 'example-vps')
         self.assertIn('new conversation', out)
 
     def test_a_failed_install_on_the_target_is_removed_again(self):
         self.install_code = 1
-        code, _ = self.move('personal-vps')
+        code, _ = self.move('example-vps')
         self.assertNotEqual(code, 0)
-        self.assertEqual(self.order[-1], ('personal-vps', 'uninstall'))
+        self.assertEqual(self.order[-1], ('example-vps', 'uninstall'))
         self.assertNotIn(('mac', 'uninstall'), self.order)
         self.assertEqual(registry.load()['conductor']['device'], 'mac')
 
     def test_move_refuses_a_target_with_another_native_account(self):
-        self.native['personal-vps'] = {'email': 'other@ai-vaerk.de', 'organization': 'AI-Vaerk Team'}
-        code, out = self.move('personal-vps')
+        self.native['example-vps'] = {'email': 'other@ai-vaerk.de', 'organization': 'AI-Vaerk Team'}
+        code, out = self.move('example-vps')
         self.assertNotEqual(code, 0); self.assertEqual(self.installs(), []); self.assertIn('Native login', out)
-        self.native['personal-vps'] = {'email': 'justus@ai-vaerk.de', 'organization': 'Another Org'}
-        self.assertNotEqual(self.move('personal-vps')[0], 0); self.assertEqual(self.installs(), [])
-        self.native['personal-vps'] = None
-        self.assertNotEqual(self.move('personal-vps')[0], 0); self.assertEqual(self.installs(), [])
+        self.native['example-vps'] = {'email': 'owner@example.com', 'organization': 'Another Org'}
+        self.assertNotEqual(self.move('example-vps')[0], 0); self.assertEqual(self.installs(), [])
+        self.native['example-vps'] = None
+        self.assertNotEqual(self.move('example-vps')[0], 0); self.assertEqual(self.installs(), [])
         self.assertEqual(registry.load()['conductor']['device'], 'mac')
 
     def test_move_refuses_without_linger_or_a_running_pool(self):
-        self.linger['personal-vps'] = 'no'
-        self.assertNotEqual(self.move('personal-vps')[0], 0)
-        self.linger['personal-vps'] = 'yes'; self.service['personal-vps'] = 'stopped'
-        self.assertNotEqual(self.move('personal-vps')[0], 0)
+        self.linger['example-vps'] = 'no'
+        self.assertNotEqual(self.move('example-vps')[0], 0)
+        self.linger['example-vps'] = 'yes'; self.service['example-vps'] = 'stopped'
+        self.assertNotEqual(self.move('example-vps')[0], 0)
         self.assertEqual(self.installs(), [])
 
     def test_move_that_never_gets_ready_leaves_the_old_conductor_running(self):
         self.ready_after = 10 ** 6
-        code, _ = self.move('personal-vps')
+        code, _ = self.move('example-vps')
         self.assertNotEqual(code, 0)
-        self.assertIn(('personal-vps', 'uninstall'), self.order); self.assertNotIn(('mac', 'uninstall'), self.order)
+        self.assertIn(('example-vps', 'uninstall'), self.order); self.assertNotIn(('mac', 'uninstall'), self.order)
         self.assertEqual(registry.load()['conductor']['device'], 'mac')
 
 

@@ -128,7 +128,7 @@ class PullTests(unittest.TestCase):
             item = patch.object(settings, key, value); item.start(); self.addCleanup(item.stop)
         registry.set_self('mac', self.me)
         self.journal, self.reply, self.remotes = Journal(), None, {}
-        self.owner_row = {'name': 'vps', 'ssh': 'justus@vps', 'platform': 'linux', 'roles': ['usage'], 'addedAt': 1}
+        self.owner_row = {'name': 'vps', 'ssh': 'alex@vps', 'platform': 'linux', 'roles': ['usage'], 'addedAt': 1}
 
     def add(self, *rows): registry.update(lambda v: v['devices'].extend(rows), self.reg)
 
@@ -144,7 +144,7 @@ class PullTests(unittest.TestCase):
         puller = self.make()
         self.assertTrue(puller.run_once())
         self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
-        self.assertEqual(self.remotes['justus@vps'].calls[0][0], ['.local/bin/claude-pool', 'device', 'readings'])
+        self.assertEqual(self.remotes['alex@vps'].calls[0][0], ['.local/bin/claude-pool', 'device', 'readings'])
         self.assertEqual(readings.load_shared(self.path)['device'], 'vps')
 
     def test_pull_failure_records_an_incident_once_and_overview_still_answers(self):

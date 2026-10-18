@@ -26,8 +26,8 @@ from test_conductor_tools import ToolsBase, base_state
 NOW = 1_800_000_000.0
 WANTED = 'src-1'
 MAC = {'name': 'mac', 'platform': 'darwin', 'roles': [], 'addedAt': 1}
-VPS = {'name': 'vps', 'ssh': 'justus@vps', 'platform': 'linux', 'roles': ['usage'], 'addedAt': 2}
-PI = {'name': 'pi', 'ssh': 'justus@pi', 'platform': 'linux', 'roles': [], 'addedAt': 3}
+VPS = {'name': 'vps', 'ssh': 'alex@vps', 'platform': 'linux', 'roles': ['usage'], 'addedAt': 2}
+PI = {'name': 'pi', 'ssh': 'alex@pi', 'platform': 'linux', 'roles': [], 'addedAt': 3}
 MACHINE_KEYS = {'name', 'platform', 'self', 'reachable', 'poolRunning', 'versionMatches', 'light', 'code', 'reason', 'fix', 'checkedAt'}
 CODE = r'^(ok|unreachable|pool-stopped|version-mismatch|never-checked|not-checkable|(failed|missing|manual):[a-z-]+)$'
 ACCOUNT_KEYS = {'name', 'label', 'alias', 'registryName', 'fiveHourPct', 'weekPct', 'fableWeekPct', 'resetsAt', 'reserveAt', 'kind',
@@ -68,7 +68,7 @@ class BoardBase(ToolsBase):
         super().setUp()
         self.cfg.mkdir(mode=0o700, parents=True, exist_ok=True)
         settings.CONFIG.write_text(json.dumps(CONFIG))
-        self.peers = {'justus@vps': Peer(), 'justus@pi': Peer()}
+        self.peers = {'alex@vps': Peer(), 'alex@pi': Peer()}
         self.service = 'running'
 
     def devices(self, *rows, me='mac', accounts=(), conductor=None):
@@ -101,7 +101,7 @@ class ShapeTests(BoardBase):
         self.devices(MAC, VPS, conductor={'device': 'vps', 'email': 'c@x.de', 'organization': 'Team', 'cwd': '~/projects/conductor'})
         old = json.loads(ct.snapshot(ct.Tools(), as_json=True, now=NOW, queue_path=self.queue_path, board=self.board()))
         for key in ('sessions', 'previews', 'prs', 'orphaned'): self.assertIn(key, old)
-        self.assertEqual(old['previews'], [{'port': 5173, 'label': 'web', 'link': 'https://personal-vps.tail1.ts.net:8443/'}])
+        self.assertEqual(old['previews'], [{'port': 5173, 'label': 'web', 'link': 'https://example-vps.tail1.ts.net:8443/'}])
         value = self.snap()
         self.assertEqual(value['generatedAt'], int(NOW * 1000)); self.assertIsInstance(value['generatedAt'], int)
         self.assertEqual([row['name'] for row in value['machines']], ['mac', 'vps'])
@@ -137,7 +137,7 @@ class ShapeTests(BoardBase):
 
     def test_text_snapshot_names_machines_and_accounts_in_a_few_lines(self):
         self.devices(MAC, VPS)
-        self.peers['justus@vps'].code = 255
+        self.peers['alex@vps'].code = 255
         text = ct.snapshot(ct.Tools(), now=NOW, queue_path=self.queue_path, board=self.board())
         self.assertIn('machines:', text); self.assertIn('vps red', text); self.assertIn('accounts:', text)
         self.assertIn('AI Værk Team', text); self.assertLessEqual(len(text.splitlines()), 60)
@@ -159,18 +159,18 @@ class LightTests(BoardBase):
             self.assertEqual(row['checkedAt'], int(NOW * 1000))
 
     def test_unreachable_is_red_with_the_ssh_fix(self):
-        self.peers['justus@vps'].code = 255
+        self.peers['alex@vps'].code = 255
         row = self.machine(self.snap(NOW + 700), 'vps')
         self.assertEqual((row['light'], row['code'], row['reachable']), ('red', 'unreachable', False))
         self.assertIn('not reachable', row['reason'].lower())
-        self.assertEqual(row['fix'], 'ssh justus@vps true must work without a password prompt (BatchMode)')
+        self.assertEqual(row['fix'], 'ssh alex@vps true must work without a password prompt (BatchMode)')
 
     def test_pool_not_running_is_red(self):
-        self.peers['justus@vps'].service = 'stopped'
+        self.peers['alex@vps'].service = 'stopped'
         row = self.machine(self.snap(NOW + 700), 'vps')
         self.assertEqual((row['light'], row['code'], row['poolRunning']), ('red', 'pool-stopped', False))
         self.assertIn('pool is not running', row['reason'])
-        self.assertEqual(row['fix'], 'claude-pool device add justus@vps')
+        self.assertEqual(row['fix'], 'claude-pool device add alex@vps')
         self.service = 'stopped'
         row = self.machine(self.snap(NOW + 700), 'mac')
         self.assertEqual((row['light'], row['poolRunning'], row['fix']), ('red', False, 'claude-pool --start'))
@@ -191,18 +191,18 @@ class LightTests(BoardBase):
                 self.assertIn('app', row['reason'])
 
     def test_live_facts_win_over_an_older_cached_check(self):
-        self.checked('vps', ('reachable', 'unreachable', 'could not reach justus@vps over ssh', 'ssh justus@vps true'), at=NOW - 3600)
+        self.checked('vps', ('reachable', 'unreachable', 'could not reach alex@vps over ssh', 'ssh alex@vps true'), at=NOW - 3600)
         row = self.machine(self.snap(), 'vps')
         self.assertEqual((row['light'], row['reachable']), ('green', True))
 
     def test_another_version_is_amber(self):
-        self.peers['justus@vps'].version = 'src-0'
+        self.peers['alex@vps'].version = 'src-0'
         row = self.machine(self.snap(NOW + 700), 'vps')
         self.assertEqual((row['light'], row['code'], row['versionMatches'], row['fix']),
-                         ('amber', 'version-mismatch', False, 'claude-pool device add justus@vps'))
+                         ('amber', 'version-mismatch', False, 'claude-pool device add alex@vps'))
 
     def test_a_slow_answer_is_grey_not_unreachable(self):
-        self.peers['justus@vps'].code, self.peers['justus@vps'].stderr = 255, b'timed out'
+        self.peers['alex@vps'].code, self.peers['alex@vps'].stderr = 255, b'timed out'
         row = self.machine(self.snap(NOW + 700), 'vps')
         self.assertEqual((row['light'], row['code'], row['reachable']), ('grey', 'not-checkable', None))
         self.assertIn('did not answer', row['reason'])
@@ -211,7 +211,7 @@ class LightTests(BoardBase):
         self.devices(PI)
         row = self.machine(self.snap(), 'pi')
         self.assertEqual((row['light'], row['code'], row['checkedAt'], row['fix']), ('grey', 'never-checked', None, 'claude-pool device check pi'))
-        self.peers['justus@pi'].service = 'stopped'
+        self.peers['alex@pi'].service = 'stopped'
         row = self.machine(self.snap(NOW + 700), 'pi')  # a live problem still outranks never checked
         self.assertEqual((row['light'], row['code']), ('red', 'pool-stopped'))
 
@@ -252,13 +252,13 @@ class LightTests(BoardBase):
 class CacheTests(BoardBase):
     def test_at_most_one_ssh_per_ten_minutes_per_device_even_when_unreachable(self):
         self.devices(MAC, VPS, PI)
-        self.peers['justus@pi'].code = 255
+        self.peers['alex@pi'].code = 255
         for at in (NOW, NOW + 60, NOW + 300, NOW + 599):
             self.snap(at)
-        self.assertEqual([len(self.peers[t].calls) for t in ('justus@vps', 'justus@pi')], [1, 1])
+        self.assertEqual([len(self.peers[t].calls) for t in ('alex@vps', 'alex@pi')], [1, 1])
         self.snap(NOW + 600)
-        self.assertEqual([len(self.peers[t].calls) for t in ('justus@vps', 'justus@pi')], [2, 2])
-        args, timeout = self.peers['justus@vps'].calls[0]
+        self.assertEqual([len(self.peers[t].calls) for t in ('alex@vps', 'alex@pi')], [2, 2])
+        args, timeout = self.peers['alex@vps'].calls[0]
         self.assertEqual(args, ('status',)); self.assertLessEqual(timeout, cb.PROBE_TIMEOUT)
         path = settings.RUNTIME / cb.PROBE_FILE
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
@@ -305,13 +305,13 @@ class CacheTests(BoardBase):
         class Receiver(Peer):
             def device(peer, *args, stdin=None, timeout=120):
                 sent.append((args, json.loads(stdin), timeout)); return Completed(0, b'{}', b'')
-        self.peers = {'justus@vps': Receiver(), 'justus@pi': Receiver()}
+        self.peers = {'alex@vps': Receiver(), 'alex@pi': Receiver()}
         results = cb.share_checks(lambda target: self.peers[target], skip=('pi',))
         self.assertEqual(results, {'vps': 'ok'})
         (args, payload, timeout), = sent
         self.assertEqual(args, ('receive-checks',)); self.assertEqual(set(payload['devices']), {'mac', 'vps'})
         self.assertLessEqual(timeout, cb.PROBE_TIMEOUT)
-        self.peers['justus@vps'] = Peer(code=255)
+        self.peers['alex@vps'] = Peer(code=255)
         self.assertEqual(cb.share_checks(lambda target: self.peers[target]), {'vps': 'unreachable', 'pi': 'ok'})
 
     def test_budget_under_five_seconds_with_cached_machines(self):

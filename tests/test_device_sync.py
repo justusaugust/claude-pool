@@ -18,8 +18,8 @@ import settings
 from remote import Completed
 from fakes import FakeRemote, SecretWatch, fixture_token, long_lived_file, refreshable_file
 
-MAC = {'name': 'mac', 'ssh': 'justus@mac', 'platform': 'darwin', 'roles': [], 'addedAt': 1}
-VPS = {'name': 'vps', 'ssh': 'justus@vps', 'platform': 'linux', 'roles': ['usage'], 'addedAt': 2}
+MAC = {'name': 'mac', 'ssh': 'alex@mac', 'platform': 'darwin', 'roles': [], 'addedAt': 1}
+VPS = {'name': 'vps', 'ssh': 'alex@vps', 'platform': 'linux', 'roles': ['usage'], 'addedAt': 2}
 BASE = ('[providers.anthropic]\nkind = "anthropic"\nauth = "claude_oauth"\n\n'
         '[[providers.anthropic.accounts]]\nname = "personal"\n')
 ROW = {'name': 'team', 'label': 'Team', 'alias': 'team', 'plan': 'Team', 'email': 'team@x.de', 'organization': 'Team A',

@@ -358,5 +358,23 @@ class ReleaseTests(unittest.TestCase):
             if '__pycache__' in path.parts or '.scratch' in path.parts or '.claude-plugin/types' in str(path): continue
             for text in forbidden: self.assertNotIn(text, path.read_text(), str(path.relative_to(ROOT)))
 
+    def test_no_personal_identifiers_in_source(self):
+        """Tests and docs use neutral fixtures (100.64.0.x, example-vps, alex@vps), never a real machine or person.
+        The repository URL is the one allowed use of the owner's account name."""
+        forbidden = ['100.116.' + '84.79', '100.108.' + '161.69', 'personal' + '-vps', 'tail69' + 'b084', 'jus' + 'tus', 'aug' + 'ust']
+        allowed = ['github.com/' + 'jus' + 'tusau' + 'gust/claude-pool', 'github.com/' + 'jus' + 'tusau' + 'gust)',
+                   'raw.githubusercontent.com/' + 'jus' + 'tusau' + 'gust/claude-pool']
+        skip = {'.git', '.superpowers', '__pycache__', '.scratch', 'node_modules'}
+        hits = []
+        for path in ROOT.rglob('*'):
+            if not path.is_file() or skip & set(path.relative_to(ROOT).parts): continue
+            try: text = path.read_text()
+            except (UnicodeDecodeError, OSError): continue
+            for line_number, line in enumerate(text.splitlines(), 1):
+                low = line.lower()
+                for keep in allowed: low = low.replace(keep, '')
+                hits += [f'{path.relative_to(ROOT)}:{line_number}: {word}' for word in forbidden if word in low]
+        self.assertEqual(hits, [])
+
 
 if __name__ == '__main__': unittest.main()

@@ -4,7 +4,7 @@
 apiProvider, authMethod, configDirectory, email, loggedIn, orgId, orgName, projectsDirectory,
 subscriptionType. The account email is `email`, the organization name is `orgName`.
 
-How `claude-native auth login` hands out its authorize URL, probed 2026-10-17 on personal-vps (Native 2.x, a
+How `claude-native auth login` hands out its authorize URL, probed 2026-10-17 on example-vps (Native 2.x, a
 throwaway HOME, cancelled before anything was authorized): it PRINTS a manual-fallback URL whose `redirect_uri` is
 `https://platform.claude.com/oauth/code/callback` (the paste-a-code flow), and it hands the browser command
 (`$BROWSER`, and `xdg-open` when DISPLAY is set) a different URL whose `redirect_uri` is
@@ -218,7 +218,7 @@ def _session(target, native, opener, spawn, ssh, socket, timeout):
 
 
 def login(target: str, native: str, opener=webbrowser.open, spawn=pty.fork, ssh='ssh', timeout=900) -> Step:
-    """Log `target` into Native Claude with one Authorize click in this machine's browser, or say what Justus does by hand.
+    """Log `target` into Native Claude with one Authorize click in this machine's browser, or say what the user does by hand.
     It never reads, asks for or passes on a code, and never shows the child's output."""
     if not isinstance(target, str) or not _TARGET.fullmatch(target) or target.startswith('-'): raise ValueError('Invalid ssh target')
     if not isinstance(native, str) or not native or '\0' in native: raise ValueError('Invalid Native path')

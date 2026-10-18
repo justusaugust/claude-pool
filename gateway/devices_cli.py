@@ -936,7 +936,7 @@ def ensure_cua(t):
 
 
 def _adopt(step):
-    """A hand-started Conductor is running; handing it to the service is Justus's step, so it is listed under Needs you."""
+    """A hand-started Conductor is running; handing it to the service is the user's step, so it is listed under Needs you."""
     if step.status == 'failed' and (step.fix or '').startswith('stop the hand-started Conductor'): return step._replace(status='manual')
     return step
 
@@ -1118,7 +1118,7 @@ def _desired(value, me, name, target, platform, args):
 
 def prefer_ensured(done, step, retry):
     """The final report shows the recheck, which names the current fix, unless it says nothing better than the ensure did:
-    the ensure step stays when it is manual (Justus's part) or when the recheck has no fix or only the generic rerun."""
+    the ensure step stays when it is manual (the user's part) or when the recheck has no fix or only the generic rerun."""
     if done is None or step.status == 'ok' or done.status == 'ok': return False
     return done.status == 'manual' or not step.fix or step.fix == retry
 

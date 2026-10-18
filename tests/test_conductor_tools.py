@@ -93,7 +93,7 @@ sys.exit(2)
 ESC = '\x1b'
 
 
-def agent(pane, status, cwd='/srv/justus/dev/website', name=None):
+def agent(pane, status, cwd='/srv/alex/dev/website', name=None):
     row = {'agent': 'claude', 'agent_status': status, 'cwd': cwd, 'pane_id': pane, 'workspace_id': pane.split(':')[0],
            'tab_id': pane.split(':')[0] + ':t1', 'state_change_seq': 1, 'terminal_title_stripped': 'claude'}
     if name: row['name'] = name
@@ -105,19 +105,19 @@ def base_state():
         'sessions': [{'name': 'dashboard', 'running': True, 'default': True, 'session_dir': '/x', 'socket_path': '/x/s'},
                      {'name': 'old', 'running': False, 'default': False, 'session_dir': '/y', 'socket_path': '/y/s'}],
         'agents': {'dashboard': [agent('w1:p1', 'working', name='reviewer'),
-                                 agent('w2:p1', 'idle', cwd='/srv/justus/dev/claude-pool', name='pooler')]},
+                                 agent('w2:p1', 'idle', cwd='/srv/alex/dev/claude-pool', name='pooler')]},
         'workspaces': {'dashboard': [{'workspace_id': 'w1', 'label': 'api'}, {'workspace_id': 'w2', 'label': 'pool'}]},
         'reads': {'w1:p1': ESC + '[32mRunning tests 3/9' + ESC + '[0m\n\n? for shortcuts\n',
                   'w2:p1': 'Committed. token ' + fixture_token() + '\n> \n'},
-        'previews': [{'port': 5173, 'label': 'web', 'link': 'https://personal-vps.tail1.ts.net:8443/'}],
+        'previews': [{'port': 5173, 'label': 'web', 'link': 'https://example-vps.tail1.ts.net:8443/'}],
         'prs': {'ai-vaerk/website': [{'number': 12, 'title': 'Über uns: neu', 'state': 'OPEN', 'url': 'https://github.com/ai-vaerk/website/pull/12',
                                       'headRefName': 'about'}]},
-        'git': {'/srv/justus/dev/website': {'top': '/srv/justus/dev/website', 'origin': 'git@github.com:ai-vaerk/website.git'},
-                '/srv/justus/dev/claude-pool': {'top': '/srv/justus/dev/claude-pool',
+        'git': {'/srv/alex/dev/website': {'top': '/srv/alex/dev/website', 'origin': 'git@github.com:ai-vaerk/website.git'},
+                '/srv/alex/dev/claude-pool': {'top': '/srv/alex/dev/claude-pool',
                                                 'origin': 'https://user:' + fixture_token('g') + '@example.com/pool.git'}},
-        'processes': [{'pid': 10, 'name': 'python3', 'argv': ['/usr/bin/python3', '/srv/justus/.local/share/claude-pool/current/gateway/launch.py', 'exec'],
-                       'cmdline': 'python3 /srv/justus/.local/share/claude-pool/current/gateway/launch.py exec'},
-                      {'pid': 11, 'name': 'claude', 'argv': ['/srv/justus/.local/bin/claude']}],
+        'processes': [{'pid': 10, 'name': 'python3', 'argv': ['/usr/bin/python3', '/srv/alex/.local/share/claude-pool/current/gateway/launch.py', 'exec'],
+                       'cmdline': 'python3 /srv/alex/.local/share/claude-pool/current/gateway/launch.py exec'},
+                      {'pid': 11, 'name': 'claude', 'argv': ['/srv/alex/.local/bin/claude']}],
     }
 
 
@@ -186,7 +186,7 @@ class CleanTests(unittest.TestCase):
         self.assertNotIn(ESC, cleaned); self.assertNotIn(token, cleaned); self.assertNotIn('abc.def', cleaned)
         self.assertNotIn('a1' * 25, cleaned); self.assertNotIn('f' * 40, cleaned)
         self.assertIn('bold', cleaned); self.assertIn('<redacted>', cleaned)
-        keep = '/srv/justus/dev/claude-pool-devices/gateway/conductor_tools.py test_no_machine_home_paths_or_private_keys_in_source'
+        keep = '/srv/alex/dev/claude-pool-devices/gateway/conductor_tools.py test_no_machine_home_paths_or_private_keys_in_source'
         self.assertEqual(ct.clean(keep), keep)
         self.assertEqual(ct.clean('a\tb\x07c\rd'), 'a b c d')
         self.assertEqual(len(ct.clean('x' * 500, limit=160)), 160)
@@ -198,7 +198,7 @@ class CleanTests(unittest.TestCase):
         run = 'aB3/' * 15
         self.assertEqual(ct.clean('secret ' + aws), 'secret <redacted>')
         self.assertEqual(ct.clean('key ' + run + '=='), 'key <redacted>')
-        path = '/srv/justus/dev/claude-pool-devices/gateway/Conductor2Tools/Module3'
+        path = '/srv/alex/dev/claude-pool-devices/gateway/Conductor2Tools/Module3'
         self.assertEqual(ct.clean('open ' + path), 'open ' + path)
 
     def test_last_line_skips_chrome_and_blank_lines(self):
@@ -226,7 +226,7 @@ class SnapshotTests(ToolsBase):
         self.assertIn('Running tests 3/9', text); self.assertIn('ai-vaerk/website', text)
         self.assertIn('Committed. token <redacted>', text); self.assertNotIn(fixture_token(), text)
         self.assertNotIn(fixture_token('g'), text); self.assertNotIn('example.com', text)
-        self.assertIn('https://personal-vps.tail1.ts.net:8443/', text)
+        self.assertIn('https://example-vps.tail1.ts.net:8443/', text)
         self.assertIn('#12', text); self.assertIn('https://github.com/ai-vaerk/website/pull/12', text)
         self.assertNotIn(ESC, text); self.assertNotIn('? for shortcuts', text)
         value = json.loads(ct.snapshot(ct.Tools(), as_json=True))
@@ -235,7 +235,7 @@ class SnapshotTests(ToolsBase):
         rows = [a for w in dashboard['workspaces'] for a in w['agents']]
         reviewer = next(a for a in rows if a['name'] == 'reviewer')
         self.assertEqual((reviewer['status'], reviewer['repo'], reviewer['last']), ('working', 'ai-vaerk/website', 'Running tests 3/9'))
-        self.assertEqual(value['previews'][0], {'port': 5173, 'label': 'web', 'link': 'https://personal-vps.tail1.ts.net:8443/'})
+        self.assertEqual(value['previews'][0], {'port': 5173, 'label': 'web', 'link': 'https://example-vps.tail1.ts.net:8443/'})
         self.assertEqual(value['prs']['ai-vaerk/website'][0]['number'], 12)
         stopped = next(s for s in value['sessions'] if s['name'] == 'old')
         self.assertEqual(stopped['workspaces'], [])
@@ -289,11 +289,11 @@ class EventsTests(ToolsBase):
     def test_important_changes_print_at_once_one_line_each(self):
         self.tick(1000, first=True)
         value = base_state()
-        value['agents']['dashboard'] = [agent('w1:p1', 'idle', name='reviewer'), agent('w2:p1', 'blocked', cwd='/srv/justus/dev/claude-pool', name='pooler'),
+        value['agents']['dashboard'] = [agent('w1:p1', 'idle', name='reviewer'), agent('w2:p1', 'blocked', cwd='/srv/alex/dev/claude-pool', name='pooler'),
                                         agent('w3:p1', 'done', name='writer')]
         value['agents']['old'] = []; value['sessions'][1]['running'] = True
         value['reads']['w1:p1'] = 'Ready for review\n'
-        value['previews'] = [{'port': 3000, 'label': 'docs', 'link': 'https://personal-vps.tail1.ts.net:9443/'}]
+        value['previews'] = [{'port': 3000, 'label': 'docs', 'link': 'https://example-vps.tail1.ts.net:9443/'}]
         value['prs']['ai-vaerk/website'] = [{'number': 12, 'title': 'Über uns: neu', 'state': 'MERGED', 'url': 'u12', 'headRefName': 'about'},
                                             {'number': 13, 'title': 'Kontakt', 'state': 'OPEN', 'url': 'u13', 'headRefName': 'k'}]
         self.set_state(value)
@@ -307,8 +307,8 @@ class EventsTests(ToolsBase):
         self.assertIn('conductor-event session-started old', lines)
         self.assertIn('conductor-event pr-merged ai-vaerk/website#12 Über uns: neu u12', lines)
         self.assertIn('conductor-event pr-opened ai-vaerk/website#13 Kontakt u13', lines)
-        self.assertIn('conductor-event preview-started 3000 docs https://personal-vps.tail1.ts.net:9443/', lines)
-        self.assertIn('conductor-event preview-stopped 5173 web https://personal-vps.tail1.ts.net:8443/', lines)
+        self.assertIn('conductor-event preview-started 3000 docs https://example-vps.tail1.ts.net:9443/', lines)
+        self.assertIn('conductor-event preview-stopped 5173 web https://example-vps.tail1.ts.net:8443/', lines)
         # A new agent appearing as done is important; nothing unimportant prints before the batch window.
         self.assertIn('agent-done dashboard/writer', '\n'.join(lines))
         self.assertFalse([line for line in lines if ' batch ' in line])
@@ -531,7 +531,7 @@ class TellTests(ToolsBase):
         code, line = ct.tell('reviewer', 'Write the docs', parallel=True, tools=ct.Tools(), queue_path=self.queue_path, sleep=lambda s: None)
         self.assertEqual(code, 0); self.assertEqual(line, 'started dashboard/reviewer-2 in a new workspace through the pool and prompted it')
         calls = self.herdr_calls()
-        self.assertIn(['herdr', '--session', 'dashboard', 'workspace', 'create', '--cwd', '/srv/justus/dev/website', '--label', 'reviewer-2',
+        self.assertIn(['herdr', '--session', 'dashboard', 'workspace', 'create', '--cwd', '/srv/alex/dev/website', '--label', 'reviewer-2',
                        '--no-focus'], calls)
         self.assertIn(['herdr', '--session', 'dashboard', 'agent', 'start', 'reviewer-2', '--kind', 'claude', '--pane', 'w9:p1'], calls)
         self.assertIn(['herdr', '--session', 'dashboard', 'pane', 'process-info', '--pane', 'w9:p1'], calls)
@@ -540,7 +540,7 @@ class TellTests(ToolsBase):
         self.assert_never_creates_sessions()
 
     def test_parallel_agent_outside_the_pool_is_stopped_and_reported(self):
-        value = base_state(); value['processes'] = [{'pid': 11, 'name': 'claude', 'argv': ['/srv/justus/.local/bin/claude']}]
+        value = base_state(); value['processes'] = [{'pid': 11, 'name': 'claude', 'argv': ['/srv/alex/.local/bin/claude']}]
         self.set_state(value)
         code, line = ct.tell('reviewer', 'Write the docs', parallel=True, tools=ct.Tools(), queue_path=self.queue_path, sleep=lambda s: None)
         self.assertEqual(code, 1); self.assertIn('launch.py exec', line); self.assertIn('stopped', line)

@@ -1,9 +1,9 @@
 """Cheap tools for Conductor Claude: `claude-pool conductor snapshot | events | tell | journal`.
 
-Conductor Claude keeps the Conductor Board and hands work to the agents in Justus's herdr sessions. These commands give it
+Conductor Claude keeps the Conductor Board and hands work to the agents in the user's herdr sessions. These commands give it
 one bounded, ANSI-free, redacted view instead of raw tool output. Every herdr call goes through `Tools`, so tests fake it.
 
-Tool shapes (personal-vps 2026-10-17, controller-verified; herdr 0.9.5 usage strings and `herdr api schema --json`):
+Tool shapes (example-vps 2026-10-17, controller-verified; herdr 0.9.5 usage strings and `herdr api schema --json`):
 - `herdr session list --json` -> {"sessions":[{"name","running","default","session_dir","socket_path"}]}
 - `herdr --session S agent list` -> {"result":{"agents":[{"agent","agent_status","cwd","name"?,"pane_id","workspace_id",...}]}}
 - `herdr --session S workspace list` -> {"result":{"workspaces":[{"workspace_id","label",...}]}}

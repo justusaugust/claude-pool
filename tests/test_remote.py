@@ -20,8 +20,8 @@ class RemoteTests(unittest.TestCase):
     def setUp(self): self.run = mock.Mock(side_effect=ok)
 
     def test_ssh_argv_is_batch_mode_and_command_is_one_quoted_word(self):
-        Remote('personal-vps', run=self.run).call(['echo', 'a b'])
-        self.assertEqual(self.run.call_args.args[0], ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', '-T', 'personal-vps', "echo 'a b'"])
+        Remote('example-vps', run=self.run).call(['echo', 'a b'])
+        self.assertEqual(self.run.call_args.args[0], ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', '-T', 'example-vps', "echo 'a b'"])
 
     def test_without_stdin_the_child_reads_devnull_not_the_parents_stdin(self):
         Remote('vps', run=self.run).call(['true'])

@@ -30,8 +30,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 VERSION = "1.1"
-FALLBACK_TS_IP = "100.108.161.69"
-FALLBACK_TS_NAME = "personal-vps.tail69b084.ts.net"
 UNIT_PREFIX = "preview-"
 RESERVED_PORTS = {22, 80, 443}
 TAILNET_NETS = (ipaddress.ip_network("100.64.0.0/10"), ipaddress.ip_network("fd7a:115c:a1e0::/48"))
@@ -42,11 +40,11 @@ CUA_SPACE_PORTS = range(18501, 18600)  # one share per Cua desktop (Space)
 CUA_LABEL = "Cua desktops"
 
 HELP = """\
-Open a web server that runs on this VPS (localhost) on Justus' Mac and iPhone with one link.
+Open a web server that runs on this VPS (localhost) on the user's Mac and iPhone with one link.
 
 WHEN TO USE
   Every time you start or change a web frontend or any HTTP server a human should look at
-  (Vite, Next.js, Astro, php -S, python -m http.server, Storybook, ...). Give Justus the
+  (Vite, Next.js, Astro, php -S, python -m http.server, Storybook, ...). Give the user the
   printed link instead of screenshots. The link only works on devices in the Tailscale tailnet.
 
 HOW
@@ -55,7 +53,7 @@ HOW
        php -S 127.0.0.1:8000 router.php
        python3 -m http.server 8080 --bind 127.0.0.1
   2. preview 5173 --name "landing page"
-     It prints one line with the link, plus a short note. Send that link to Justus.
+     It prints one line with the link, plus a short note. Send that link to the user.
   3. When the work is done: preview stop 5173
 
   To share a file or folder instead (a Markdown report, screenshots, a PDF):
@@ -1455,6 +1453,10 @@ def unit_file_text(description, argv):
 # System access (tailscale, systemd --user, ss). Tests replace this class.
 # ---------------------------------------------------------------------------
 
+class TailnetUnknown(RuntimeError):
+    """Tailscale did not report this machine's tailnet name and IP."""
+
+
 class System:
     def __init__(self):
         self._ts = None
@@ -1468,16 +1470,20 @@ class System:
             return subprocess.CompletedProcess(argv, 124, "", f"{argv[0]}: timed out")
 
     def tailnet(self):
+        """(tailnet IPv4, MagicDNS name) of this machine; TailnetUnknown when Tailscale cannot say (never a guess)."""
         if self._ts is None:
-            ip, name = FALLBACK_TS_IP, FALLBACK_TS_NAME
             r = self.run(["tailscale", "status", "--self", "--peers=false", "--json"], timeout=10)
+            ip = name = None
             if r.returncode == 0:
                 try:
                     me = json.loads(r.stdout)["Self"]
-                    name = me.get("DNSName", "").rstrip(".") or name
-                    ip = next((a for a in me.get("TailscaleIPs", []) if "." in a), ip)
-                except (ValueError, KeyError, TypeError):
+                    name = me.get("DNSName", "").rstrip(".") or None
+                    ip = next((a for a in me.get("TailscaleIPs", []) if "." in a), None)
+                except (ValueError, KeyError, TypeError, AttributeError):
                     pass
+            if not (ip and name):
+                raise TailnetUnknown("tailscale status gave no tailnet name and IP for this machine "
+                                     "(is Tailscale running and logged in? check: tailscale status)")
             self._ts = (ip, name)
         return self._ts
 
@@ -2078,7 +2084,10 @@ def cmd_list(sysm, as_json=False, out=None):
 
 def cmd_doctor(sysm, out=None):
     out = out or sys.stdout
-    ts_ip, name = sysm.tailnet()
+    try:
+        ts_ip, name = sysm.tailnet()
+    except TailnetUnknown as e:
+        ts_ip, name = "unknown", f"unknown ({e})"
     operator = sysm.operator_ok()
     user = current_user()
     print(f"tailnet name   {name}", file=out)
@@ -2405,6 +2414,14 @@ def main(argv=None, sysm=None):
     if cmd == "_cua-index":
         return cmd_cua_index(a)
     sysm = sysm or System()
+    try:
+        return run_command(cmd, a, sysm)
+    except TailnetUnknown as e:
+        print(f"preview: {e}", file=sys.stderr)
+        return 1
+
+
+def run_command(cmd, a, sysm):
     if cmd == "list":
         return cmd_list(sysm, a.json)
     if cmd == "stop":

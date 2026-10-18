@@ -16,7 +16,7 @@ Tailscale is the only network path between machines. Nothing listens on a public
 claude-pool device add <ssh-target> [--name <name>] [--cua] [--usage-owner] [--herdr-session <session>]
 ```
 
-`<ssh-target>` is anything `ssh` accepts, for example `user@host` or an alias. The device name must match `[a-z0-9-]{1,40}`; by default it is the host part of the target, lowercased (`justus@personal-vps.example` becomes `personal-vps`). Pass `--name` to choose another.
+`<ssh-target>` is anything `ssh` accepts, for example `user@host` or an alias. The device name must match `[a-z0-9-]{1,40}`; by default it is the host part of the target, lowercased (`alex@example-vps.example` becomes `example-vps`). Pass `--name` to choose another.
 
 Run the same command again to repair a half-finished machine: every step finishes only what is missing, and a step a machine cannot do is `skipped` with the reason. In order, `add` checks and fixes `reachable`, `native-claude`, `install`, `version`, `linger`, `shell`, `accounts`, `service`, `doctor`, `native-login`, `herdr`, `herdr-sessions`, `app`, `cua`, `conductor`, `readings`, `preview`. It prints one line per step, a `fix:` line under anything that needs work, and a "Needs you" list of manual steps.
 

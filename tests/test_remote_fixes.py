@@ -19,8 +19,8 @@ from remote import Completed
 from fakes import FakeRemote
 
 BARE = re.compile(r'ssh +(?:-o +\S+ +)*[^\s;,]+ +(claude-pool|preview)\b')
-VPS = {'name': 'vps', 'ssh': 'justus@vps', 'platform': 'linux', 'roles': [], 'addedAt': 1}
-MAC = {'name': 'mac', 'ssh': 'justus@mac', 'platform': 'darwin', 'roles': [], 'addedAt': 1}
+VPS = {'name': 'vps', 'ssh': 'alex@vps', 'platform': 'linux', 'roles': [], 'addedAt': 1}
+MAC = {'name': 'mac', 'ssh': 'alex@mac', 'platform': 'darwin', 'roles': [], 'addedAt': 1}
 ENTRY = {'device': 'vps', 'email': 'team@x.de', 'organization': 'Team A', 'cwd': '/srv/c'}
 PART = {'installed': True, 'running': True, 'ready': True, 'fresh': False, 'duplicates': []}
 
@@ -33,10 +33,10 @@ class RemoteFixTests(unittest.TestCase):
         self.assertIsNone(BARE.search(text), where + ': ' + text)
 
     def test_the_helper_names_the_launcher_by_its_home_relative_path(self):
-        self.assertEqual(remote.remote_command('justus@vps', 'claude-pool device conductor install'),
-                         'ssh justus@vps .local/bin/claude-pool device conductor install')
+        self.assertEqual(remote.remote_command('alex@vps', 'claude-pool device conductor install'),
+                         'ssh alex@vps .local/bin/claude-pool device conductor install')
         self.assertEqual(remote.remote_command('vps', 'preview doctor'), 'ssh vps .local/bin/preview doctor')
-        self.assertEqual(remote.remote_command('vps', 'sudo loginctl enable-linger justus'), 'ssh vps sudo loginctl enable-linger justus')
+        self.assertEqual(remote.remote_command('vps', 'sudo loginctl enable-linger alex'), 'ssh vps sudo loginctl enable-linger alex')
 
     def test_help_and_docs(self):
         self.assert_relative(devices_cli.DEVICE_HELP, 'DEVICE_HELP')
@@ -60,22 +60,22 @@ class RemoteFixTests(unittest.TestCase):
                     step = conductor.check(statuses, value())
                     self.assertIn('.local/bin/claude-pool', step.fix)
                     self.assert_relative(step.fix, name)
-        self.assertEqual(conductor.adopt_fix('cse_01Ab', 'justus@vps'),
+        self.assertEqual(conductor.adopt_fix('cse_01Ab', 'alex@vps'),
                          'stop the hand-started Conductor (herdr session conductor), then run: '
-                         'ssh justus@vps .local/bin/claude-pool device conductor install --session-id cse_01Ab')
+                         'ssh alex@vps .local/bin/claude-pool device conductor install --session-id cse_01Ab')
 
     def test_service_and_preview_fixes(self):
-        failing = FakeRemote('justus@vps', lambda argv, stdin: Completed(1, b'', b''))
-        step = device_install.start_service(failing, 'justus@vps')
+        failing = FakeRemote('alex@vps', lambda argv, stdin: Completed(1, b'', b''))
+        step = device_install.start_service(failing, 'alex@vps')
         self.assertIn('.local/bin/claude-pool --start', step.fix); self.assert_relative(step.fix, 'start_service')
-        step = device_preview.check(FakeRemote('justus@vps', lambda argv, stdin: Completed(2, b'', b'')), 'justus')
+        step = device_preview.check(FakeRemote('alex@vps', lambda argv, stdin: Completed(2, b'', b'')), 'alex')
         self.assertIn('.local/bin/preview doctor', step.fix); self.assert_relative(step.fix, 'preview check')
 
     def test_target_on_and_check_help(self):
         session = devices_cli.Session(lambda target: FakeRemote(target, lambda argv, stdin: Completed(0, b'', b'')), None)
         session.me = 'mac'
-        t = devices_cli.Target(session, VPS, FakeRemote('justus@vps', None), False, None)
-        self.assertEqual(t.on('claude-pool device switch'), 'ssh justus@vps .local/bin/claude-pool device switch')
+        t = devices_cli.Target(session, VPS, FakeRemote('alex@vps', None), False, None)
+        self.assertEqual(t.on('claude-pool device switch'), 'ssh alex@vps .local/bin/claude-pool device switch')
         for name, (_proves, fix) in devices_cli.CHECK_HELP.items(): self.assert_relative(fix, 'CHECK_HELP ' + name)
 
     def test_source_has_no_bare_remote_launcher_literal(self):

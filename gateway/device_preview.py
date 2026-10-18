@@ -19,17 +19,19 @@ TARGET = '.local/bin/preview'
 RULES_START = '<!-- claude-pool:previews start -->'
 RULES_END = '<!-- claude-pool:previews end -->'
 LINUX_ONLY = 'preview runs its proxy as a systemd user unit; Linux only for now'
-# Earlier releases of gateway/preview that install() may replace: the copy live on personal-vps, the first release with
+# Earlier releases of gateway/preview that install() may replace: the copy live on the VPS, the first release with
 # file shares, the release before the Host header check, the release before `preview cua`, the first `preview cua` (viewer
-# key as a query parameter), then `preview cua` on `cua viewer` with its cookie (both installed on personal-vps), then the
-# one-link `preview cua` whose units were transient (systemd-run), so a reboot dropped every preview.
+# key as a query parameter), then `preview cua` on `cua viewer` with its cookie (both installed on the VPS), then the
+# one-link `preview cua` whose units were transient (systemd-run), so a reboot dropped every preview, then the first
+# release with persistent units (fell back to a fixed machine name when `tailscale status` failed).
 KNOWN_PREVIOUS = {'b3e645e7ba9750057b68c12f7dd518d19ff792a98062eeea857115b194358d94',
                   '89c880b1411939c7996239273e28aa51399a1dca1cd56e387754e82e235faabe',
                   '7894d83a893ab63cc07ec07244b910ae8fce1949b080ba355a3b08f6e3903efd',
                   'fc7f0f3162eadf48ca4f1b942aef8b25f6446fba8fdc1e64bafc959c718a5a11',
                   'ce9f107b5620bea133df4972781e0630bc880b2b2d933f6761e3d84f855bd90b',
                   '27adcbcf4e189571c911730040e606e5a961a81debe3080d62bf9d8551b489aa',
-                  'c4aaac57cf0bb23e4a64d91e2435d638d87bab1dfb66f14e2102a51a079198f5'}
+                  'c4aaac57cf0bb23e4a64d91e2435d638d87bab1dfb66f14e2102a51a079198f5',
+                  '8cba203c1f2566ec033d47dc39189c7dbf0643fc68fd619720f8a19c1bc4c0d0'}
 # Run on the device when `preview doctor` says previews would not come back after a reboot (made by an older release).
 RESTORE = 'preview restore'
 

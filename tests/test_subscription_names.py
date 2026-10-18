@@ -22,7 +22,7 @@ from fakes import FakeRemote, fixture_token, long_lived_file, refreshable_file
 import test_devices_cli as cli_base
 
 # The six subscriptions as the two machines were enrolled by hand before the devices feature existed.
-MAC_NAMES = ['ai-vaerk-team-premium', 'intern', 'justus-ai-vaerk', 'justus-gmail', 'operations', 'sofi']
+MAC_NAMES = ['ai-vaerk-team-premium', 'intern', 'jamie-ai-vaerk', 'jamie-gmail', 'operations', 'sofi']
 VPS_NAMES = ['team', 'intern', 'max', 'gmail', 'operations', 'sofi']
 IDS = [('user-' + str(i), 'org-' + str(i)) for i in range(6)]
 MAC_IDS, VPS_IDS = dict(zip(MAC_NAMES, IDS)), dict(zip(VPS_NAMES, IDS))
@@ -42,7 +42,7 @@ class MatchTests(unittest.TestCase):
     def test_a_registry_row_finds_the_local_account_with_its_uuids(self):
         rows = [local(name, VPS_IDS[name]) for name in VPS_NAMES]
         self.assertEqual(registry.local_name(TEAM_ROW, rows), 'team')
-        self.assertEqual(registry.local_name({'name': 'justus-gmail', 'userId': 'user-3', 'organizationId': 'org-3'}, rows), 'gmail')
+        self.assertEqual(registry.local_name({'name': 'jamie-gmail', 'userId': 'user-3', 'organizationId': 'org-3'}, rows), 'gmail')
 
     def test_the_name_counts_only_when_a_side_has_no_uuids(self):
         self.assertEqual(registry.local_name({'name': 'team'}, [local('team', ('x', 'y'))]), 'team')
@@ -90,8 +90,8 @@ class FileDevice(unittest.TestCase):
         for item in patches: item.start(); self.addCleanup(item.stop)
         registry.set_self('vps', self.self_path)
         refreshable_file(self.stores, 'team', *IDS[0])
-        mac = {'name': 'mac', 'ssh': 'justus@mac', 'platform': 'darwin', 'roles': [], 'addedAt': 1}
-        vps = {'name': 'vps', 'ssh': 'justus@vps', 'platform': 'linux', 'roles': [], 'addedAt': 2}
+        mac = {'name': 'mac', 'ssh': 'alex@mac', 'platform': 'darwin', 'roles': [], 'addedAt': 1}
+        vps = {'name': 'vps', 'ssh': 'alex@vps', 'platform': 'linux', 'roles': [], 'addedAt': 2}
         self.blob = long_lived_file(self.root / 'src', 'ai-vaerk-team-premium', *IDS[0]).read_bytes()
         self.fp = long_lived.fingerprint(json.loads(self.blob))
         registry.update(lambda value: (value['devices'].extend([mac, vps]), value['accounts'].append({**TEAM_ROW, 'fingerprint': self.fp})), self.reg)
@@ -165,7 +165,7 @@ class ReceiveTests(FileDevice):
             if argv[2] == 'registry': return Completed(0, json.dumps(registry.load(self.reg)).encode(), b'')
             if argv[2:4] == ['send-account', 'ai-vaerk-team-premium']: return Completed(0, self.blob, b'')
             return Completed(1, b'', b'')
-        fake = FakeRemote('justus@mac', handler)
+        fake = FakeRemote('alex@mac', handler)
         self.assertEqual(device_sync.pull(fake), 'ok')
         self.assertEqual(long_lived.fingerprint(json.loads((self.directory / 'team.json').read_bytes())), self.fp)
         self.assertFalse((self.directory / 'ai-vaerk-team-premium.json').exists())
@@ -177,14 +177,14 @@ class ReceiveTests(FileDevice):
         status = {'accounts': [{'name': 'ai-vaerk-team-premium', 'kind': 'long-lived', 'fingerprint': self.fp, 'active': False,
                                 'userId': IDS[0][0], 'organizationId': IDS[0][1]}],
                   'registryHash': registry.digest(registry.load(self.reg))}
-        fake = FakeRemote('justus@mac', lambda argv, stdin: Completed(0, json.dumps(status).encode(), b''))
+        fake = FakeRemote('alex@mac', lambda argv, stdin: Completed(0, json.dumps(status).encode(), b''))
         self.assertEqual(device_sync.push(fake), 'ok')
         self.assertEqual([argv[2] for argv, _ in fake.calls], ['status'])
 
     def test_push_sends_the_local_copy_under_the_registry_name(self):
         long_lived_file(self.directory, 'team', *IDS[0], token=fixture_token())
         status = {'accounts': [], 'registryHash': registry.digest(registry.load(self.reg))}
-        fake = FakeRemote('justus@mac', lambda argv, stdin: Completed(0, json.dumps(status).encode(), b''))
+        fake = FakeRemote('alex@mac', lambda argv, stdin: Completed(0, json.dumps(status).encode(), b''))
         self.assertEqual(device_sync.push(fake), 'ok')
         sent = [(argv[2:], stdin) for argv, stdin in fake.calls if argv[2] == 'receive-account']
         self.assertEqual([(args, long_lived.fingerprint(json.loads(data))) for args, data in sent],
@@ -272,7 +272,7 @@ class ReadingsTests(unittest.TestCase):
         mine = readings.localize(shared, [local(name, MAC_IDS[name]) for name in MAC_NAMES])
         self.assertEqual(sorted(mine['accounts']), sorted(MAC_NAMES))
         self.assertEqual(mine['accounts']['ai-vaerk-team-premium']['fiveHour']['pct'], 10)
-        self.assertEqual(mine['accounts']['justus-gmail']['fiveHour']['pct'], 13)
+        self.assertEqual(mine['accounts']['jamie-gmail']['fiveHour']['pct'], 13)
         rows = [{'name': 'ai-vaerk-team-premium', 'seenAt': 0}]
         readings.merge(rows, mine, self.NOW)
         self.assertEqual(rows[0]['fiveHour']['pct'], 10)
@@ -288,7 +288,7 @@ class ReadingsTests(unittest.TestCase):
             item = patch.object(settings, key, value); item.start(); self.addCleanup(item.stop)
         registry.set_self('mac')
         registry.update(lambda v: v['devices'].extend([{'name': 'mac', 'platform': 'darwin', 'roles': []},
-                                                       {'name': 'vps', 'ssh': 'justus@vps', 'platform': 'linux', 'roles': ['usage']}]))
+                                                       {'name': 'vps', 'ssh': 'alex@vps', 'platform': 'linux', 'roles': ['usage']}]))
         overview = {'accounts': [{'name': 'team', 'fiveHour': {'pct': 40, 'resetsAt': None}, 'seenAt': int(time_ms()) - 10}]}
         reply = json.dumps(readings.export(overview, 'vps', int(time_ms()), ids={'team': IDS[0]})).encode()
         puller = readings.Puller(root / 'shared.json', quiet_journal(), lambda target: FakeRemote(target, lambda a, s: Completed(0, reply, b'')),
@@ -338,12 +338,12 @@ class TwoDeviceTests(cli_base.OrchestrationBase):
         self.fp = long_lived.fingerprint(json.loads(self.token.read_bytes()))
         registry.update(lambda value: (value['devices'].append(dict(cli_base.SELF_ROW)),
                                        value['accounts'].append({**TEAM_ROW, 'fingerprint': self.fp})), self.reg)
-        self.vps = cli_base.Machine('justus@vps', self.log, refreshable=VPS_NAMES, uuids=VPS_IDS, shared_accounts=VPS_NAMES)
-        self.machines['justus@vps'] = self.vps
+        self.vps = cli_base.Machine('alex@vps', self.log, refreshable=VPS_NAMES, uuids=VPS_IDS, shared_accounts=VPS_NAMES)
+        self.machines['alex@vps'] = self.vps
         self.local.uuids, self.local.refreshable = dict(MAC_IDS), set(MAC_NAMES[1:])
 
     def test_add_usage_owner_succeeds_and_the_token_lands_under_team(self):
-        code, out, err = self.cli('add', 'justus@vps', '--name', 'vps', '--usage-owner')
+        code, out, err = self.cli('add', 'alex@vps', '--name', 'vps', '--usage-owner')
         self.assertEqual(code, 0, out + err)
         self.assertNotIn('serves no refreshable login', out)
         self.assertEqual(registry.owner(registry.load(self.reg))['name'], 'vps')
@@ -354,23 +354,23 @@ class TwoDeviceTests(cli_base.OrchestrationBase):
         self.assertRegex(out, r'\n  ok +accounts ')
 
     def test_check_names_the_rename_when_a_device_holds_the_subscription_under_another_name(self):
-        self.assertEqual(self.cli('add', 'justus@vps', '--name', 'vps', '--usage-owner')[0], 0)
+        self.assertEqual(self.cli('add', 'alex@vps', '--name', 'vps', '--usage-owner')[0], 0)
         code, out, err = self.cli('check', 'vps')
         line = next(l for l in out.splitlines() if l.strip().startswith('ok') and ' accounts ' in l)
         self.assertIn('team (registry: ai-vaerk-team-premium)', line)
-        self.assertIn('fix: ssh justus@vps .local/bin/claude-pool account rename team ai-vaerk-team-premium --wait', out)
+        self.assertIn('fix: ssh alex@vps .local/bin/claude-pool account rename team ai-vaerk-team-premium --wait', out)
 
     def test_a_refused_usage_owner_names_both_names(self):
         self.vps.refreshable = set(VPS_NAMES[1:])  # `team` only long-lived there
         self.vps.accounts['team'] = {'kind': 'long-lived', 'fingerprint': self.fp}
         registry.update(lambda value: registry.device(value, 'mac').update(roles=['usage']), self.reg)
-        code, out, err = self.cli('add', 'justus@vps', '--name', 'vps', '--usage-owner')
+        code, out, err = self.cli('add', 'alex@vps', '--name', 'vps', '--usage-owner')
         self.assertIn('serves no refreshable login for team (AI Værk Team, registry: ai-vaerk-team-premium)', out)
         self.assertIn('account add team@x.de --name team,', out)
 
     def test_check_matches_readings_by_subscription(self):
         # The registry names the subscription as the VPS does; the Mac's readings carry its own name for it.
-        registry.update(lambda value: (value['devices'].append({'name': 'vps', 'ssh': 'justus@vps', 'platform': 'linux', 'roles': ['usage']}),
+        registry.update(lambda value: (value['devices'].append({'name': 'vps', 'ssh': 'alex@vps', 'platform': 'linux', 'roles': ['usage']}),
                                        value.update(accounts=[{**TEAM_ROW, 'name': 'team', 'fingerprint': self.fp}])), self.reg)
         self.local.shared_accounts, self.local.refreshable = list(MAC_NAMES), set(MAC_NAMES)
         self.local.registry = registry.load(self.reg)

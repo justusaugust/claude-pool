@@ -224,12 +224,12 @@ class RenameTests(RenameBase):
 
 
     def test_a_new_name_with_a_removal_marker_refuses(self):
-        registry.update(lambda value: value['accounts'].append({'name': 'justus-gmail', 'userId': 'user-g', 'organizationId': 'org-g',
+        registry.update(lambda value: value['accounts'].append({'name': 'jamie-gmail', 'userId': 'user-g', 'organizationId': 'org-g',
                                                                'fingerprint': 'f00d00000000'}), self.reg)
-        registry.update(lambda value: value.update(accounts=[r for r in value['accounts'] if r['name'] != 'justus-gmail']), self.reg)
+        registry.update(lambda value: value.update(accounts=[r for r in value['accounts'] if r['name'] != 'jamie-gmail']), self.reg)
         before = self.snapshot()
-        with self.assertRaises(RuntimeError) as caught: self.rename(new='justus-gmail')
-        self.assertIn('removal marker for justus-gmail', str(caught.exception)); self.assertIn('f00d00000000', str(caught.exception))
+        with self.assertRaises(RuntimeError) as caught: self.rename(new='jamie-gmail')
+        self.assertIn('removal marker for jamie-gmail', str(caught.exception)); self.assertIn('f00d00000000', str(caught.exception))
         self.assertEqual(self.snapshot(), before)
 
     def test_an_interrupt_inside_the_rename_puts_everything_back_and_restarts_the_pool(self):

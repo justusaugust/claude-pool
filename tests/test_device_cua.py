@@ -215,8 +215,8 @@ class CuaTests(unittest.TestCase):
 
 # SSH tunnel when the peer's Cua port is blocked ----------------------------------------------------------------------------
 
-SSH = 'justus@vps'
-PEER = '100.108.161.69'
+SSH = 'alex@vps'
+PEER = '100.64.0.20'
 CONNECT_ERROR = Completed(5, b'', b'Error: tcp connect error (deadline has elapsed)\n')
 AUTH_ERROR = Completed(5, b'', b'Error: 401 Unauthorized: invalid token\n')
 
@@ -451,17 +451,17 @@ class TunnelTests(unittest.TestCase):
         value = device_cua.tunnel_add('vps', PEER, SSH, run=manager, system='darwin', home=self.home, listening=self.up(manager),
                                       sleep=lambda s: None)
         agents = self.agent().parent
-        hand_made = agents / 'de.cua.personal-vps-tunnel.plist'; hand_made.write_bytes(b'theirs')
+        hand_made = agents / 'de.cua.example-vps-tunnel.plist'; hand_made.write_bytes(b'theirs')
         pool = agents / 'io.github.claude-pool.plist'; pool.write_bytes(b'pool')
-        manager.loaded |= {'de.cua.personal-vps-tunnel', 'io.github.claude-pool'}
+        manager.loaded |= {'de.cua.example-vps-tunnel', 'io.github.claude-pool'}
         self.assertEqual(device_cua.tunnels(run=manager, system='darwin', home=self.home, listening=lambda port: True),
                          {'vps': {'port': value['port'], 'running': True}})
         for _ in range(2): self.assertTrue(device_cua.tunnel_remove('vps', run=manager, system='darwin', home=self.home))
         self.assertFalse(self.agent().exists())
         self.assertEqual(hand_made.read_bytes(), b'theirs'); self.assertEqual(pool.read_bytes(), b'pool')
-        self.assertEqual({'de.cua.personal-vps-tunnel', 'io.github.claude-pool'}, manager.loaded)
+        self.assertEqual({'de.cua.example-vps-tunnel', 'io.github.claude-pool'}, manager.loaded)
         self.assertTrue(all(a[-1].endswith('io.github.claude-pool.cua-tunnel.vps') for a in manager.managed('bootout')))
-        for bad in ('personal-vps-tunnel.x', '../vps', '', 'VPS'):
+        for bad in ('example-vps-tunnel.x', '../vps', '', 'VPS'):
             with self.assertRaises(ValueError): device_cua.tunnel_remove(bad, run=manager, system='darwin', home=self.home)
 
     def test_a_stopped_tunnel_reports_not_running(self):

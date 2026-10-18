@@ -13,7 +13,7 @@ import device_integrations
 import device_sync
 from remote import Local
 
-VPS = {'name': 'personal-vps', 'ssh': 'personal-vps', 'platform': 'linux', 'herdrSession': 'dashboard'}
+VPS = {'name': 'example-vps', 'ssh': 'example-vps', 'platform': 'linux', 'herdrSession': 'dashboard'}
 VPS_ID = 'prof-vps-1'
 SCRIPT = '''#!/bin/sh
 printf '%s\\n' "$*" >> "$HERDR_LOG"
@@ -49,10 +49,10 @@ class HerdrTests(Base):
     def test_herdr_profile_added_once_with_label_and_remote_session(self):
         self.herdr()
         self.assertEqual(device_integrations.ensure_herdr(VPS, self.local, always).status, 'ok')
-        self.assertEqual(self.calls('machine add'), [['machine', 'add', 'personal-vps', '--label', 'personal-vps', '--remote-session', 'dashboard']])
+        self.assertEqual(self.calls('machine add'), [['machine', 'add', 'example-vps', '--label', 'example-vps', '--remote-session', 'dashboard']])
 
     def test_existing_herdr_profile_is_kept(self):
-        self.herdr([profile('x', 'VPS Conductor', 'personal-vps')])
+        self.herdr([profile('x', 'VPS Conductor', 'example-vps')])
         self.assertEqual(device_integrations.ensure_herdr(VPS, self.local, always).status, 'ok')
         self.assertEqual(self.calls('machine add'), [])
 
@@ -63,19 +63,19 @@ class HerdrTests(Base):
         self.assertEqual(device_integrations.ensure_herdr(dict(VPS, name='mac'), self.local, always).status, 'skipped')
 
     def test_remove_uses_the_profile_id_of_the_exact_label(self):
-        self.herdr([profile('other', 'personal-vps2', 'personal-vps'), profile(VPS_ID, 'personal-vps', 'personal-vps'),
-                    profile('mine', 'VPS Conductor', 'personal-vps')])
+        self.herdr([profile('other', 'example-vps2', 'example-vps'), profile(VPS_ID, 'example-vps', 'example-vps'),
+                    profile('mine', 'VPS Conductor', 'example-vps')])
         self.assertEqual(device_integrations.remove_herdr(VPS, self.local).status, 'ok')
         self.assertEqual(self.calls('machine remove'), [['machine', 'remove', VPS_ID]])
 
     def test_remove_never_touches_profiles_the_user_named(self):
-        self.herdr([profile('mine', 'VPS Conductor', 'personal-vps')])
+        self.herdr([profile('mine', 'VPS Conductor', 'example-vps')])
         step = device_integrations.remove_herdr(VPS, self.local)
         self.assertEqual((step.status, step.detail), ('skipped', 'no profile created by claude-pool'))
         self.assertEqual(self.calls('machine remove'), [])
 
     def test_hook_adds_only_missing_profiles_and_status_lists_labels(self):
-        self.herdr([profile('a', 'VPS dashboard', 'personal-vps')])
+        self.herdr([profile('a', 'VPS dashboard', 'example-vps')])
         with mock.patch('device_integrations.Remote') as remote:
             remote.return_value.reachable.return_value = True
             device_integrations.apply_hook({'devices': [VPS, {'name': 'two', 'ssh': 'two', 'platform': 'linux'}, {'name': 'mac', 'ssh': 'mac', 'platform': 'darwin'}]})
@@ -92,13 +92,13 @@ class AppTests(Base):
         self.store = self.app_dir / 'ssh_configs.json'
 
     def write(self, trusted):
-        self.store.write_text(json.dumps({'configs': [{'name': 'vps', 'sshHost': 'personal-vps', 'id': '1'}], 'trustedHosts': trusted}))
+        self.store.write_text(json.dumps({'configs': [{'name': 'vps', 'sshHost': 'example-vps', 'id': '1'}], 'trustedHosts': trusted}))
 
     def test_app_environment_found_reads_without_writing(self):
-        self.write(['personal-vps'])
+        self.write(['example-vps'])
         before = (self.store.read_bytes(), self.store.stat().st_mtime_ns)
         self.assertEqual(device_integrations.check_app(VPS, self.app_dir, 'darwin').status, 'ok')
-        self.assertEqual(device_integrations.app_environments(self.app_dir), {'personal-vps'})
+        self.assertEqual(device_integrations.app_environments(self.app_dir), {'example-vps'})
         self.assertEqual(before, (self.store.read_bytes(), self.store.stat().st_mtime_ns))
 
     def test_listed_but_untrusted_asks_to_trust(self):
@@ -108,8 +108,8 @@ class AppTests(Base):
 
     def test_a_missing_or_unreadable_environment_list_never_says_not_found(self):
         unreadable = 'could not read the Claude app\'s environment list'
-        expected_fix = ('In the Claude app: Code tab, New: personal-vps should be listed under Recent environments; if not, add it '
-                        '(Code tab, environment menu, Add environment, SSH, choose personal-vps, pick the folder, trust it).')
+        expected_fix = ('In the Claude app: Code tab, New: example-vps should be listed under Recent environments; if not, add it '
+                        '(Code tab, environment menu, Add environment, SSH, choose example-vps, pick the folder, trust it).')
         cases = {'absent': None, 'broken': '{nope', 'not an object': '[1]', 'no configs list': '{"trustedHosts": []}'}
         for label, content in cases.items():
             with self.subTest(label):
@@ -130,13 +130,13 @@ class AppTests(Base):
 
     def test_a_user_prefix_on_either_side_still_matches(self):
         def put(host, trusted): self.store.write_text(json.dumps({'configs': [{'name': 'vps', 'sshHost': host, 'id': '1'}], 'trustedHosts': trusted}))
-        put('justus@personal-vps', ['justus@personal-vps'])
+        put('alex@example-vps', ['alex@example-vps'])
         self.assertEqual(device_integrations.check_app(VPS, self.app_dir, 'darwin').status, 'ok')
-        put('personal-vps', ['personal-vps'])
-        self.assertEqual(device_integrations.check_app(dict(VPS, ssh='justus@personal-vps'), self.app_dir, 'darwin').status, 'ok')
-        put('justus@personal-vps', [])
+        put('example-vps', ['example-vps'])
+        self.assertEqual(device_integrations.check_app(dict(VPS, ssh='alex@example-vps'), self.app_dir, 'darwin').status, 'ok')
+        put('alex@example-vps', [])
         self.assertIn('trust it', device_integrations.check_app(VPS, self.app_dir, 'darwin').fix)
-        put('justus@other-vps', ['justus@other-vps'])
+        put('alex@other-vps', ['alex@other-vps'])
         self.assertEqual(device_integrations.check_app(VPS, self.app_dir, 'darwin').detail, 'environment not found in the Claude app')
 
     def test_not_macos_is_skipped(self):

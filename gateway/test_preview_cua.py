@@ -21,12 +21,12 @@ from unittest import mock
 import test_preview_files as tpf
 
 pv = tpf.pv
-OWNER = "justus@example.com"
+OWNER = "owner@example.com"
 TS_NAME = tpf.TS_NAME
 CUA = "/opt/cua/bin/cua"
 TICKET = "T1ck3tSecretValue_0123456789abcdef"
 VPS_DESKTOP = {"id": "direct:127.0.0.1:32191", "name": "Personal VPS Desktop", "kind": "container", "os": "linux"}
-MAC = {"id": "direct:100.116.84.79:3211", "name": "Justus Mac", "kind": "host", "os": "macos"}
+MAC = {"id": "direct:100.64.0.10:3211", "name": "Laptop", "kind": "host", "os": "macos"}
 
 
 def spaces_json(*spaces):
@@ -105,7 +105,7 @@ class CuaCommandTests(unittest.TestCase):
         self.assertEqual(opt(plan["argv"], "--public-host"), TS_NAME)
         self.assertEqual([(s["id"], s["name"], s["host"], s["upstream_port"], s["port"]) for s in plan["spaces"]],
                          [(VPS_DESKTOP["id"], "Personal VPS Desktop", "127.0.0.1", 32191, 18501),
-                          (MAC["id"], "Justus Mac", "100.116.84.79", 3211, 18502)])
+                          (MAC["id"], "Laptop", "100.64.0.10", 3211, 18502)])
         self.assertEqual(plan["skipped"], ["direct:8.8.8.8:3211"])
         self.assertFalse([a for a in fake.argvs() if a[0] == "systemctl"])
         self.assertEqual(fake.started, [])
@@ -127,10 +127,10 @@ class CuaCommandTests(unittest.TestCase):
             self.assertEqual(opt(cmd, "--public-url"), f"https://{TS_NAME}:{port}")
         self.assertEqual((opt(proxies[18500], "--upstream-host"), opt(proxies[18500], "--upstream-port")), ("127.0.0.1", "18500"))
         self.assertEqual((opt(proxies[18501], "--upstream-host"), opt(proxies[18501], "--upstream-port")), ("127.0.0.1", "32191"))
-        self.assertEqual((opt(proxies[18502], "--upstream-host"), opt(proxies[18502], "--upstream-port")), ("100.116.84.79", "3211"))
+        self.assertEqual((opt(proxies[18502], "--upstream-host"), opt(proxies[18502], "--upstream-port")), ("100.64.0.10", "3211"))
         self.assertEqual(self.space_ports(), {VPS_DESKTOP["id"]: 18501, MAC["id"]: 18502})
         self.assertIn("Personal VPS Desktop", err)
-        self.assertIn("Justus Mac", err)
+        self.assertIn("Laptop", err)
         self.assertIn("preview stop cua", err)
         self.assertFalse([a for a in fake.argvs() if "sandbox" in a])  # tickets are minted only when a desktop is tapped
         index = pv.load_state(18500)
@@ -228,13 +228,13 @@ class CuaCommandTests(unittest.TestCase):
         fake = self.https()
         _, out, _ = self.main(["cua"], fake)
         _, table, _ = self.main(["list"], fake)
-        for words in ("Cua desktops", out.strip(), "index active", "Personal VPS Desktop", "Justus Mac", MAC["id"]):
+        for words in ("Cua desktops", out.strip(), "index active", "Personal VPS Desktop", "Laptop", MAC["id"]):
             self.assertIn(words, table)
         _, js, _ = self.main(["list", "--json"], fake)
         rows = {r["port"]: r for r in json.loads(js)}
         self.assertEqual((rows[18500]["kind"], rows[18500]["index"]), ("cua", "active"))
         self.assertEqual((rows[18502]["kind"], rows[18502]["space_id"], rows[18502]["label"], rows[18502]["upstream"]),
-                         ("cua-space", MAC["id"], "Justus Mac", "100.116.84.79:3211"))
+                         ("cua-space", MAC["id"], "Laptop", "100.64.0.10:3211"))
         for row in rows.values():
             for key in ("port", "label", "link", "backend", "unit", "listen", "target_listening", "proxy"):
                 self.assertIn(key, row)
@@ -248,7 +248,7 @@ class CuaCommandTests(unittest.TestCase):
                 code, out, _ = self.main(argv, fake)
                 self.assertEqual(code, 0)
                 self.assertIn("Cua desktops", out)
-                self.assertIn("Justus Mac", out)
+                self.assertIn("Laptop", out)
                 self.assertIn(["systemctl", "--user", "stop", "preview-cua-index.service"], fake.argvs())
                 if argv[1] == "cua":
                     self.assertEqual(set(fake.serve), {5173})

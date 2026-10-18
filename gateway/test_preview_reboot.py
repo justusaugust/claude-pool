@@ -141,7 +141,7 @@ class UnitFileTests(Base):
             cmd = tpf.exec_start(unit_text(fake, f"preview-{port}.service"))
             self.assertEqual(opt(cmd, "--owner-login"), tpc.OWNER)
             self.assertTrue(opt(cmd, "--listen").startswith("127.0.0.1:"))
-        self.assertEqual(opt(tpf.exec_start(unit_text(fake, "preview-18502.service")), "--upstream-host"), "100.116.84.79")
+        self.assertEqual(opt(tpf.exec_start(unit_text(fake, "preview-18502.service")), "--upstream-host"), "100.64.0.10")
         self.assertEqual(fake.enabled, {"preview-18500", "preview-18501", "preview-18502", "preview-cua-index.service"})
 
     def test_a_label_cannot_add_lines_or_specifiers_to_the_unit(self):

@@ -145,12 +145,12 @@ class InstallTests(unittest.TestCase):
     def test_linger_failure_reports_the_one_root_command_without_running_sudo(self):
         def denied(argv, stdin):
             if argv.startswith('uname'): return answer(0, 'Linux')
-            if argv.startswith('id'): return answer(0, 'justus')
+            if argv.startswith('id'): return answer(0, 'alex')
             if argv.startswith('loginctl enable-linger'): return answer(1, err='denied')
             return answer(0, 'no')
         fake = remote(denied)
         step = device_install.enable_linger(fake)
-        self.assertEqual(step.status, 'failed'); self.assertIn('sudo loginctl enable-linger justus', step.fix)
+        self.assertEqual(step.status, 'failed'); self.assertIn('sudo loginctl enable-linger alex', step.fix)
         self.assertFalse([a for a, _ in fake.calls if 'sudo' in ' '.join(a)])
 
     def test_missing_logind_skips_linger_with_the_reason(self):

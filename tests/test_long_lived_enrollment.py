@@ -17,8 +17,8 @@ import settings
 from remote import Completed
 from fakes import FakeRemote, SecretWatch, fixture_token, long_lived_file, refreshable_file
 
-SELF = {'name': 'mac', 'ssh': 'justus@mac', 'platform': 'darwin', 'roles': [], 'addedAt': 1}
-OWNER = {'name': 'personal-vps', 'ssh': 'justus@vps', 'platform': 'linux', 'roles': ['usage'], 'addedAt': 2}
+SELF = {'name': 'mac', 'ssh': 'alex@mac', 'platform': 'darwin', 'roles': [], 'addedAt': 1}
+OWNER = {'name': 'example-vps', 'ssh': 'alex@vps', 'platform': 'linux', 'roles': ['usage'], 'addedAt': 2}
 
 
 def mode(path): return path.stat().st_mode & 0o777
@@ -151,7 +151,7 @@ class LongLivedEnrollmentTests(unittest.TestCase):
         with patch.object(settings, 'REGISTRY', self.reg), patch.object(settings, 'SELF', self.self_path):
             got = setup.owner_lookup('user-a', 'team-a', remotes=lambda target: targets.append(target) or owner)
         self.assertEqual(got, self.info())
-        self.assertEqual(targets, ['justus@vps'])
+        self.assertEqual(targets, ['alex@vps'])
         self.assertEqual(owner.calls[-1][0], ['.local/bin/claude-pool', 'device', 'identity', 'user-a', 'team-a'])
 
     def test_owner_lookup_is_none_without_an_owner_on_self_or_on_failure(self):
@@ -166,10 +166,10 @@ class LongLivedEnrollmentTests(unittest.TestCase):
             self.assertEqual(calls, [])
             registry.update(lambda value: value['devices'].append(OWNER), self.reg)
             self.assertIsNone(setup.owner_lookup('user-a', 'team-a', remotes=factory))  # unreachable owner
-            self.assertEqual(calls, ['justus@vps'])
-            registry.set_self('personal-vps', self.self_path)
+            self.assertEqual(calls, ['alex@vps'])
+            registry.set_self('example-vps', self.self_path)
             self.assertIsNone(setup.owner_lookup('user-a', 'team-a', remotes=factory))  # the owner is this machine
-            self.assertEqual(calls, ['justus@vps'])
+            self.assertEqual(calls, ['alex@vps'])
         owner = FakeRemote('vps', lambda argv, stdin: Completed(0, b'not json', b''))
         registry.set_self('mac', self.self_path)
         with patch.object(settings, 'REGISTRY', self.reg), patch.object(settings, 'SELF', self.self_path):
@@ -262,7 +262,7 @@ class LongLivedEnrollmentTests(unittest.TestCase):
         self.assertFalse((self.stores / 'operations.json').exists())
 
     def test_usage_owner_never_gets_a_long_lived_store_copy(self):
-        self.devices(SELF, OWNER, me='personal-vps')
+        self.devices(SELF, OWNER, me='example-vps')
         staged = self.staged()
         code, out = self.run_cli('--long-lived', '--from-file', str(staged), lookup=Mock(return_value=self.info()))
         self.assertEqual(code, 0)

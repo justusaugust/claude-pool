@@ -293,7 +293,7 @@ def adoptable(ps_output, pids):
 
 
 def adopt_fix(session_id, target=None):
-    """How Justus hands a hand-started Conductor to the service; `target` is its ssh target when shown from another device."""
+    """How the user hands a hand-started Conductor to the service; `target` is its ssh target when shown from another device."""
     if not session_id: return HERDR_FIX
     command = 'claude-pool device conductor install --session-id ' + session_id
     return 'stop the hand-started Conductor (herdr session conductor), then run: ' + (remote_command(target, command) if target else command)
@@ -330,7 +330,7 @@ def _identity_accounts(entry):
 
 
 def reserve_default(entry):
-    """Reserve the Conductor's pool account from 85 % unless Justus set a reserve (any `reserveAt`, even 0)."""
+    """Reserve the Conductor's pool account from 85 % unless the user set a reserve (any `reserveAt`, even 0)."""
     done, failed = [], []
     for row in _identity_accounts(entry):
         if 'reserveAt' in row: continue
@@ -391,7 +391,7 @@ def install(session_id=None, fresh=False, moving=False, restart=False):
     detail = 'installed in ' + str(cwd)
     if reserved: detail += '; reserved ' + ', '.join(reserved) + ' from ' + str(RESERVE_DEFAULT) + ' %'
     if failed:
-        # The service runs; only the reserve is missing, and Justus can apply it himself.
+        # The service runs; only the reserve is missing, and the user can apply it.
         return Step(STEP, 'manual', detail + '; reserve not applied for ' + ', '.join(failed),
                     'claude-pool account reserve ' + failed[0] + ' ' + str(RESERVE_DEFAULT))
     return Step(STEP, 'ok', detail)

@@ -27,8 +27,8 @@ _spec = importlib.util.spec_from_loader("preview_tool", _loader)
 pv = importlib.util.module_from_spec(_spec)
 _loader.exec_module(pv)
 
-TS_IP = "100.108.161.69"
-TS_NAME = "personal-vps.tail69b084.ts.net"
+TS_IP = "100.64.0.20"
+TS_NAME = "example-vps.tail0000.ts.net"
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +86,7 @@ class BindAddressTests(unittest.TestCase):
 
     def test_refused(self):
         for bad in ("0.0.0.0", "::", "[::]", "136.148.219.14", "192.168.1.5", "172.17.0.1", "localhost",
-                    "personal-vps", ""):
+                    "example-vps", ""):
             with self.assertRaises(pv.UnsafeListenAddress, msg=bad):
                 pv.check_listen_host(bad)
 
@@ -264,7 +264,7 @@ class ProxyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_tailnet_names_addresses_and_localhost_with_the_share_port_are_accepted(self):
         proxy = pv.Proxy(self.port, self.public, tailnet_ip=TS_IP)
-        for host in (f"{TS_NAME}:{self.port}", f"{TS_NAME.upper()}.:{self.port}", f"personal-vps:{self.port}",
+        for host in (f"{TS_NAME}:{self.port}", f"{TS_NAME.upper()}.:{self.port}", f"example-vps:{self.port}",
                      f"{TS_IP}:{self.port}", f"127.0.0.1:{self.port}", f"localhost:{self.port}"):
             with self.subTest(host=host):
                 self.assertEqual(await self.status_for(host.encode(), proxy), b"200")
@@ -590,6 +590,21 @@ class LifecycleTests(unittest.TestCase):
         out = io.StringIO()
         pv.cmd_doctor(s, out=out)
         self.assertIn(f"sudo tailscale set --operator={pv.current_user()}", out.getvalue())
+
+    def test_unknown_tailnet_refuses_instead_of_guessing_a_machine(self):
+        """Without `tailscale status` the tool has no name to link to; it never falls back to a fixed machine."""
+        s = pv.System()
+        s.run = lambda argv, timeout=30: subprocess.CompletedProcess(argv, 1, "", "not logged in")
+        with self.assertRaises(pv.TailnetUnknown):
+            s.tailnet()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(pv.main(["5173"], sysm=s), 1)
+        self.assertIn("tailscale status", err.getvalue())
+        self.assertIsNone(pv.load_state(5173))
+        out = io.StringIO()
+        pv.cmd_doctor(s, out=out)
+        self.assertIn("tailnet name   unknown", out.getvalue())
 
 
 # ---------------------------------------------------------------------------

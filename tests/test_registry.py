@@ -11,8 +11,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'gateway'))
 import registry
 from fakes import fixture_token
 
-MAC = {'name': 'mac', 'ssh': 'justus@mac', 'platform': 'darwin', 'roles': ['usage'], 'tailscaleIp': '100.64.0.1', 'cua': True, 'herdrSession': None, 'addedAt': 1}
-VPS = {'name': 'personal-vps', 'ssh': 'justus@vps', 'platform': 'linux', 'roles': [], 'tailscaleIp': None, 'cua': False, 'herdrSession': 'main', 'addedAt': 2}
+MAC = {'name': 'mac', 'ssh': 'alex@mac', 'platform': 'darwin', 'roles': ['usage'], 'tailscaleIp': '100.64.0.1', 'cua': True, 'herdrSession': None, 'addedAt': 1}
+VPS = {'name': 'example-vps', 'ssh': 'alex@vps', 'platform': 'linux', 'roles': [], 'tailscaleIp': None, 'cua': False, 'herdrSession': 'main', 'addedAt': 2}
 ENTRY = {'name': 'team', 'label': 'Team', 'alias': 'team', 'plan': 'max', 'email': 'a@example.com', 'organization': 'AI Værk Team',
          'userId': 'user-a', 'organizationId': 'org-a', 'fingerprint': '0123456789ab', 'expiresAt': 4_000_000_000_000}
 
@@ -69,10 +69,10 @@ class RegistryTests(unittest.TestCase):
         other = self.dir / 'other.json'
         registry.write(b, other)
         a = registry.update(lambda v: registry.account(v, 'team').update(reserveAt=85), self.path)
-        b = registry.update(lambda v: registry.device(v, 'personal-vps').update(cua=True), other)
+        b = registry.update(lambda v: registry.device(v, 'example-vps').update(cua=True), other)
         merged = registry.merge(a, b)
         self.assertEqual(registry.account(merged, 'team')['reserveAt'], 85)
-        self.assertTrue(registry.device(merged, 'personal-vps')['cua'])
+        self.assertTrue(registry.device(merged, 'example-vps')['cua'])
         self.assertEqual(merged, registry.merge(b, a))
         self.assertEqual(registry.merge(merged, a), merged); self.assertEqual(registry.merge(merged, merged), merged)
 
@@ -83,7 +83,7 @@ class RegistryTests(unittest.TestCase):
             def change(v):
                 for row in v['devices']: row['roles'] = ['usage'] if row['name'] == name else []
             return change
-        a = registry.update(move('personal-vps'), self.path)
+        a = registry.update(move('example-vps'), self.path)
         b = registry.update(move('third'), other)
         merged = registry.merge(a, b)
         self.assertEqual(merged, registry.merge(b, a))
@@ -99,7 +99,7 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(self.path.read_bytes(), before)
         previous, merged = registry.receive(gen(5, devices=[VPS]), self.path)
         self.assertEqual(previous, current)
-        self.assertEqual([r['name'] for r in merged['devices']], ['mac', 'personal-vps'])
+        self.assertEqual([r['name'] for r in merged['devices']], ['example-vps', 'mac'])
         self.assertEqual(registry.load(self.path), merged)
 
     def test_receive_rejects_invalid_values(self):
@@ -192,7 +192,7 @@ class RegistryTests(unittest.TestCase):
         value = {**gen(1, devices=[MAC, VPS], accounts=[ENTRY])}
         self.assertEqual(registry.owner(value)['name'], 'mac')
         self.assertIsNone(registry.owner(gen(1, devices=[VPS])))
-        self.assertEqual(registry.device(value, 'personal-vps'), VPS)
+        self.assertEqual(registry.device(value, 'example-vps'), VPS)
         self.assertIsNone(registry.device(value, 'nope'))
         self.assertEqual(registry.account(value, 'team'), ENTRY)
         self.assertIsNone(registry.account(value, 'nope'))
