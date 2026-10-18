@@ -3,7 +3,8 @@
 herdr: `herdr machine list --json` is a list of {id, label, target, session, enabled, selected}. A device counts as set up when
 any profile (enabled or not, whoever named it) has `target` equal to the device's ssh target; existing profiles are never touched.
 App (macOS): `~/Library/Application Support/Claude/ssh_configs.json` is {"configs": [{"name", "sshHost", "id"}], "trustedHosts": [...]}.
-Only that file is read, never written. Its neighbour holding tokens is never opened."""
+Only that file is read, never written. Its neighbours (tokens, remote-server state) are never opened. Newer app versions may
+not keep the list there, so an absent or unreadable file means "cannot tell", never "not found"."""
 import json
 from pathlib import Path
 import sys
@@ -18,8 +19,17 @@ APP_FILE = 'ssh_configs.json'
 HERDR_TIMEOUT = 120
 
 
+def _add_clicks(ssh):
+    return f'Code tab, environment menu, Add environment, SSH, choose {ssh}, pick the folder, trust it'
+
+
 def APP_CLICKS_FOR(ssh):
-    return f'In the Claude app: Code tab, environment menu, Add environment, SSH, choose {ssh}, pick the folder, trust it.'
+    return 'In the Claude app: ' + _add_clicks(ssh) + '.'
+
+
+def APP_LOOK_FOR(ssh):
+    """For when the environment list cannot be read: look in the app, add only if absent."""
+    return f'In the Claude app: Code tab, New: {ssh} should be listed under Recent environments; if not, add it ({_add_clicks(ssh)}).'
 
 
 def _list(local):
@@ -74,11 +84,14 @@ def remove_herdr(device, local):
 
 
 def _app(app_dir):
+    """(hosts, trusted) from the app's environment list, or None when it is absent, unparsable or not that shape:
+    newer app versions may keep environments elsewhere, and no other file in that folder is ever opened."""
     try: value = json.loads((Path(app_dir) / APP_FILE).read_text())
     except (OSError, ValueError): return None
     if not isinstance(value, dict): return None
     configs = value.get('configs'); trusted = value.get('trustedHosts')
-    hosts = {c['sshHost'] for c in configs if isinstance(c, dict) and isinstance(c.get('sshHost'), str)} if isinstance(configs, list) else set()
+    if not isinstance(configs, list): return None
+    hosts = {c['sshHost'] for c in configs if isinstance(c, dict) and isinstance(c.get('sshHost'), str)}
     return hosts, {t for t in trusted if isinstance(t, str)} if isinstance(trusted, list) else set()
 
 
@@ -90,9 +103,9 @@ def app_environments(app_dir):
 def check_app(device, app_dir, platform):
     ssh = device.get('ssh')
     if platform != 'darwin' or not ssh: return Step('app', 'skipped', 'the Claude app environment is for macOS only')
-    clicks = APP_CLICKS_FOR(ssh)
     parsed = _app(app_dir)
-    if parsed is None or ssh not in parsed[0]: return Step('app', 'manual', 'environment not found in the Claude app', clicks)
+    if parsed is None: return Step('app', 'manual', "could not read the Claude app's environment list", APP_LOOK_FOR(ssh))
+    if ssh not in parsed[0]: return Step('app', 'manual', 'environment not found in the Claude app', APP_CLICKS_FOR(ssh))
     if ssh not in parsed[1]:
         return Step('app', 'manual', 'environment listed but not trusted', f'In the Claude app: open the {ssh} environment once and trust it.')
     return Step('app', 'ok', 'environment listed and trusted')

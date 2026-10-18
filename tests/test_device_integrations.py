@@ -106,12 +106,27 @@ class AppTests(Base):
         step = device_integrations.check_app(VPS, self.app_dir, 'darwin')
         self.assertEqual(step.status, 'manual'); self.assertIn('trust it', step.fix)
 
-    def test_missing_or_broken_app_store_reports_the_clicks(self):
-        step = device_integrations.check_app(VPS, self.root / 'nothing', 'darwin')
-        self.assertEqual(step.status, 'manual'); self.assertIn('Add environment', step.fix)
-        self.assertIsNone(device_integrations.app_environments(self.root / 'nothing'))
-        self.store.write_text('{nope')
-        self.assertEqual(device_integrations.check_app(VPS, self.app_dir, 'darwin').status, 'manual')
+    def test_a_missing_or_unreadable_environment_list_never_says_not_found(self):
+        unreadable = 'could not read the Claude app\'s environment list'
+        expected_fix = ('In the Claude app: Code tab, New: personal-vps should be listed under Recent environments; if not, add it '
+                        '(Code tab, environment menu, Add environment, SSH, choose personal-vps, pick the folder, trust it).')
+        cases = {'absent': None, 'broken': '{nope', 'not an object': '[1]', 'no configs list': '{"trustedHosts": []}'}
+        for label, content in cases.items():
+            with self.subTest(label):
+                if content is None: app_dir = self.root / 'nothing'
+                else: self.store.write_text(content); app_dir = self.app_dir
+                step = device_integrations.check_app(VPS, app_dir, 'darwin')
+                self.assertEqual((step.status, step.detail, step.fix), ('manual', unreadable, expected_fix))
+                self.assertNotIn('not found', step.detail)
+                self.assertIsNone(device_integrations.app_environments(app_dir))
+
+    def test_a_parsed_list_without_the_host_says_not_found(self):
+        self.store.write_text(json.dumps({'configs': [{'name': 'other', 'sshHost': 'other-host', 'id': '1'}], 'trustedHosts': ['other-host']}))
+        step = device_integrations.check_app(VPS, self.app_dir, 'darwin')
+        self.assertEqual((step.status, step.detail), ('manual', 'environment not found in the Claude app'))
+        self.assertIn('Add environment', step.fix)
+        self.store.write_text(json.dumps({'configs': [], 'trustedHosts': []}))
+        self.assertEqual(device_integrations.check_app(VPS, self.app_dir, 'darwin').detail, 'environment not found in the Claude app')
 
     def test_not_macos_is_skipped(self):
         self.assertEqual(device_integrations.check_app(VPS, self.app_dir, 'linux').status, 'skipped')

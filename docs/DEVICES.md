@@ -89,7 +89,7 @@ On a Mac, also remove the SSH environment in the Claude app by hand: Code tab, e
 - **macOS Accessibility for `cua-spacesd`.** System Settings, Privacy & Security, Accessibility: switch on `cua-spacesd`, then run `claude-pool device add <ssh-target> --cua` again.
 - **Linux linger.** Services stop at logout unless linger is on. `add` tries `loginctl enable-linger` as your user; if the system refuses, a root user runs `sudo loginctl enable-linger <user>` once. `add` prints it and never runs it.
 - **Tailscale operator for HTTPS preview links.** A root user runs `sudo tailscale set --operator=<user>` once. Without it, previews work over HTTP.
-- **The Claude app on the Mac.** The `app` check is about the Mac that runs the Claude app: Code tab, environment menu, add the SSH environment, open it once and trust it. The check lists these clicks.
+- **The Claude app on the Mac.** The `app` check is about the Mac that runs the Claude app: Code tab, environment menu, add the SSH environment, open it once and trust it. The check lists these clicks. It reads only the app's `ssh_configs.json`. When that file is absent or unreadable (newer app versions keep the list elsewhere), the check says `could not read the Claude app's environment list` instead of claiming the environment is missing: look under Recent environments after Code tab, New, and add it only if it is not there.
 
 There is no sudo and no root step anywhere in `add`.
 
