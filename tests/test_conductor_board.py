@@ -230,13 +230,13 @@ class LightTests(BoardBase):
                  {'name': 'version', 'status': 'ok', 'detail': WANTED, 'fix': ''},
                  {'name': 'service', 'status': 'ok', 'detail': 'running', 'fix': ''},
                  {'name': 'app', 'status': 'manual', 'detail': 'add the SSH environment', 'fix': 'open the Claude app'}]
-        self.assertEqual(cb.merge_checks({'devices': {'mac': {'checkedAt': int(NOW * 1000) - 5000, 'steps': steps}}}), ['mac'])
+        self.assertEqual(cb.merge_checks({'devices': {'mac': {'checkedAt': int(NOW * 1000) - 5000, 'steps': steps}}}, now=NOW), ['mac'])
         row = self.machine(self.snap(), 'mac')
         self.assertEqual((row['light'], row['code'], row['reachable'], row['poolRunning'], row['versionMatches']),
                          ('amber', 'manual:app', True, True, True))
         self.assertEqual(row['checkedAt'], int(NOW * 1000) - 5000)
         steps[3]['status'] = 'ok'
-        cb.merge_checks({'devices': {'mac': {'checkedAt': int(NOW * 1000), 'steps': steps}}})
+        cb.merge_checks({'devices': {'mac': {'checkedAt': int(NOW * 1000), 'steps': steps}}}, now=NOW)
         row = self.machine(self.snap(), 'mac')
         self.assertEqual((row['light'], row['code']), ('green', 'ok'))
         self.assertEqual(self.ssh_count(), 0)
@@ -244,7 +244,7 @@ class LightTests(BoardBase):
     def test_this_machines_own_row_stays_live_after_a_shared_result(self):
         steps = [{'name': 'reachable', 'status': 'ok', 'detail': 'ssh works', 'fix': ''},
                  {'name': 'service', 'status': 'missing', 'detail': 'service is stopped', 'fix': 'claude-pool device add mac'}]
-        cb.merge_checks({'devices': {'mac': {'checkedAt': int(NOW * 1000) + 1000, 'steps': steps}}})
+        cb.merge_checks({'devices': {'mac': {'checkedAt': int(NOW * 1000) + 1000, 'steps': steps}}}, now=NOW)
         row = self.machine(self.snap(), 'mac')
         self.assertEqual((row['light'], row['code'], row['poolRunning']), ('green', 'ok', True))
 
@@ -281,6 +281,7 @@ class CacheTests(BoardBase):
         self.assertEqual(entry['checkedAt'], int(NOW * 1000)); self.assertEqual(entry['steps'][0]['status'], 'failed')
 
     def test_merge_keeps_the_newest_result_per_device_and_refuses_bad_input(self):
+        self.devices(MAC, VPS)
         token = fixture_token()
         old = {'checkedAt': 1000, 'steps': [{'name': 'doctor', 'status': 'failed', 'detail': 'x', 'fix': 'y'}]}
         new = {'checkedAt': 2000, 'steps': [{'name': 'doctor', 'status': 'ok', 'detail': 'no findings ' + token, 'fix': ''}]}
@@ -449,6 +450,99 @@ class QueueTests(BoardBase):
                       '`queued for <session>/<agent> (id <id>)`', '`grey`', '`never-checked`', '`not-checkable`', '`manual:<step>`',
                       '`device receive-checks`'):
             self.assertIn(words, docs)
+
+
+class HardeningTests(BoardBase):
+    """Review of 8c748c5: shared check results cannot poison the board, and one broken part never blanks the others."""
+    DAY_MS = 86_400_000
+
+    def entry(self, at, status='ok'):
+        return {'checkedAt': at, 'steps': [{'name': 'doctor', 'status': status, 'detail': 'd', 'fix': ''}]}
+
+    def test_checked_at_is_capped_to_one_day_ahead_and_absurd_values_are_refused(self):
+        self.devices(MAC, VPS)
+        now_ms = int(NOW * 1000)
+        path = settings.RUNTIME / cb.CHECK_FILE
+        for absurd in (10 ** 330, 2 ** 63, 4 * 10 ** 18):
+            with self.subTest(absurd=absurd), self.assertRaises(ValueError): cb.merge_checks({'devices': {'vps': self.entry(absurd)}}, now=NOW)
+        self.assertFalse(path.exists(), 'nothing is written for refused input')
+        for raw in (b'{"devices": {"vps": {"checkedAt": Infinity, "steps": []}}}', b'{"devices": {"vps": {"checkedAt": NaN, "steps": []}}}'):
+            with self.subTest(raw=raw), self.assertRaises(ValueError): cb.merge_checks(json.loads(raw), now=NOW)
+        # A far-future but finite value is kept at most one day ahead, so a later genuine result still replaces it.
+        self.assertEqual(cb.merge_checks({'devices': {'vps': self.entry(now_ms + 30 * self.DAY_MS, 'failed')}}, now=NOW), ['vps'])
+        self.assertEqual(json.loads(path.read_text())['devices']['vps']['checkedAt'], now_ms + self.DAY_MS)
+        self.assertEqual(cb.merge_checks({'devices': {'vps': self.entry(now_ms + 2 * self.DAY_MS)}}, now=NOW + 2 * 86400), ['vps'])
+        value = self.snap(NOW + 2 * 86400)
+        self.assertEqual([row['name'] for row in value['machines']], ['mac', 'vps'])
+        self.assertEqual(len(value['accounts']), 2)
+
+    def test_an_oversized_checked_at_already_in_the_cache_never_blanks_the_board(self):
+        self.devices(MAC, VPS)
+        self.runtime.mkdir(mode=0o700, parents=True, exist_ok=True)
+        steps = [{'name': name, 'status': 'ok', 'detail': '', 'fix': ''} for name in ('reachable', 'service', 'version')]
+        (settings.RUNTIME / cb.CHECK_FILE).write_text(json.dumps({'devices': {'vps': {'checkedAt': 10 ** 330, 'steps': steps}}}))
+        (settings.RUNTIME / cb.CHECK_FILE).chmod(0o600)
+        value = self.snap()
+        self.assertEqual(len(value['accounts']), 2, 'accounts survive a broken machines part')
+        self.assertIsInstance(value['quickAccess'], list)
+
+    def test_one_failing_part_does_not_blank_the_others(self):
+        self.devices(MAC, VPS, conductor={'device': 'vps', 'email': 'c@x.de', 'organization': 'Team', 'cwd': '~/projects/conductor'})
+        board = self.board()
+        board.machines = mock.Mock(side_effect=RuntimeError('probe thread died'))
+        value = self.snap(board=board)
+        self.assertEqual(value['machines'], [])
+        self.assertEqual(len(value['accounts']), 2)
+        self.assertIn('app', [row['kind'] for row in value['quickAccess']])
+        board = self.board()
+        board.accounts = mock.Mock(side_effect=RuntimeError('overview broke'))
+        value = self.snap(board=board)
+        self.assertEqual(value['accounts'], []); self.assertEqual([row['name'] for row in value['machines']], ['mac', 'vps'])
+        with mock.patch.object(cb, 'quick_access', side_effect=RuntimeError('preview list broke')):
+            value = self.snap()
+        self.assertEqual(value['quickAccess'], []); self.assertEqual(len(value['accounts']), 2)
+        self.runtime.mkdir(mode=0o700, parents=True, exist_ok=True)
+        ct._write(self.queue_path, {'items': [{'id': 'aaa111', 'session': 'dashboard', 'pane': 'w1:p1', 'agent': 'reviewer', 'task': 'Good', 'at': NOW},
+                                              {'id': 'bbb222', 'session': 'dashboard', 'pane': 'w1:p1', 'task': 'Bad', 'at': 'yesterday'}]})
+        value = self.snap()
+        self.assertEqual([row['id'] for row in value['queue']], ['aaa111'], 'one bad queue item drops only itself')
+        self.assertEqual([row['name'] for row in value['machines']], ['mac', 'vps']); self.assertEqual(len(value['accounts']), 2)
+
+    def test_receive_checks_takes_only_registered_devices_and_prunes_the_rest(self):
+        self.devices(MAC, VPS)
+        cb.record_checks({'gone': [Step('doctor', 'ok', 'fine')]}, now=NOW)  # a device removed from the registry since
+        merged = cb.merge_checks({'devices': {'vps': self.entry(int(NOW * 1000)), 'ghost': self.entry(int(NOW * 1000))}}, now=NOW)
+        self.assertEqual(merged, ['vps'])
+        self.assertEqual(set(json.loads((settings.RUNTIME / cb.CHECK_FILE).read_text())['devices']), {'vps'})
+        # Many unknown names never grow the cache.
+        flood = {'devices': {'ghost-' + str(n): self.entry(int(NOW * 1000)) for n in range(64)}}
+        self.assertEqual(cb.merge_checks(flood, now=NOW), [])
+        self.assertEqual(set(json.loads((settings.RUNTIME / cb.CHECK_FILE).read_text())['devices']), {'vps'})
+
+    def test_a_failing_service_state_for_this_machine_is_grey_never_green(self):
+        self.devices(MAC, VPS)
+        def broken(): raise RuntimeError('launchctl unavailable')
+        board = cb.Board(remotes=lambda target: self.peers[target], service_state=broken, version=lambda: WANTED,
+                         overview=lambda: json.loads(json.dumps(OVERVIEW)), account_rows=lambda: [dict(row) for row in ROWS])
+        row = self.machine(self.snap(board=board), 'mac')
+        self.assertEqual((row['light'], row['code'], row['poolRunning']), ('grey', 'never-checked', None))
+        self.checked('mac', ('reachable', 'ok', 'this device'), ('service', 'ok', 'running'))
+        row = self.machine(self.snap(board=board), 'mac')
+        self.assertEqual((row['light'], row['code'], row['poolRunning']), ('grey', 'pool-stopped', None))
+        self.assertTrue(row['reason']); self.assertTrue(row['fix'])
+
+    def test_tell_list_survives_a_corrupt_or_oversized_queue_file(self):
+        self.runtime.mkdir(mode=0o700, parents=True, exist_ok=True)
+        for content in ('{not json', '[1, 2]', json.dumps({'items': [{'id': 'x' * 10, 'task': 'y' * 100}] * 20000})):
+            with self.subTest(size=len(content)):
+                self.queue_path.write_text(content); self.queue_path.chmod(0o600)
+                text = ct.tell_list(self.queue_path)
+                self.assertIn('could not be read', text)
+                self.assertEqual(json.loads(ct.tell_list(self.queue_path, as_json=True)), [])
+                out, err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err): code = ct.cli(['tell', '--list'])
+                self.assertEqual(code, 0, err.getvalue()); self.assertIn('could not be read', out.getvalue())
+                self.assertEqual(self.queue_path.read_text(), content, 'an unreadable queue is never rewritten by a read')
 
 
 if __name__ == '__main__': unittest.main()

@@ -251,7 +251,8 @@ def _bounded(lines):
 # --- snapshot -----------------------------------------------------------------------------------------------------
 
 def _board(board, now, previews):
-    """The Conductor Board keys (machines, accounts, quickAccess); a part that cannot be read is empty, never an error."""
+    """The Conductor Board keys (machines, accounts, quickAccess); each part fails alone (conductor_board.facts), this
+    guard only covers a board that cannot be built at all."""
     import conductor_board
     try: return conductor_board.facts(board or conductor_board.Board(), now, previews)
     except Exception: return {'machines': [], 'accounts': [], 'quickAccess': []}
@@ -649,13 +650,23 @@ def queue_items(queue_path=None):
 
 
 def _queue_view(items):
-    return [{'id': item['id'], 'target': clean(item.get('session', '') + '/' + (item.get('agent') or item.get('pane', '')), 80),
-             'text': clean(item.get('task', ''), 200), 'queuedAt': int(float(item.get('at') or 0) * 1000),
-             'attempts': int(item.get('attempts') or 0)} for item in items]
+    """The queue as shown; an item that cannot be shown (a hand-edited time, a non-text field) drops only itself."""
+    rows = []
+    for item in items:
+        try:
+            rows.append({'id': item['id'], 'target': clean(item.get('session', '') + '/' + (item.get('agent') or item.get('pane', '')), 80),
+                         'text': clean(item.get('task', ''), 200), 'queuedAt': int(float(item.get('at') or 0) * 1000),
+                         'attempts': int(item.get('attempts') or 0)})
+        except (KeyError, TypeError, ValueError, OverflowError): continue
+    return rows
 
 
 def tell_list(queue_path=None, as_json=False, now=None):
-    rows, now = _queue_view(queue_items(queue_path)), time.time() if now is None else now
+    """Like snapshot, a corrupt or oversized queue file reads as empty (and is left as it is)."""
+    now = time.time() if now is None else now
+    try: rows = _queue_view(queue_items(queue_path))
+    except (OSError, RuntimeError, ValueError):
+        return '[]' if as_json else 'no queued tasks shown: the queue file could not be read'
     if as_json: return json.dumps(rows, ensure_ascii=False)
     if not rows: return 'no queued tasks'
     return _bounded([row['id'] + '  ' + row['target'] + '  queued ' + _ago(now - row['queuedAt'] / 1000) + ' ago'

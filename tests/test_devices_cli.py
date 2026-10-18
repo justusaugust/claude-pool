@@ -229,6 +229,7 @@ class InternalVerbTests(DeviceCliBase):
     def test_receive_checks_merges_newest_first_and_refuses_bad_input(self):
         import conductor_board
         self.runtime.chmod(0o700)
+        self.devices(MAC)
         steps = [{'name': 'reachable', 'status': 'ok', 'detail': 'this device', 'fix': ''}]
         code, out, err = self.run_cli(['receive-checks'], stdin=json.dumps({'devices': {'mac': {'checkedAt': 2000, 'steps': steps}}}).encode())
         self.assertEqual((code, json.loads(out)), (0, {'merged': ['mac']}), err)
@@ -238,6 +239,9 @@ class InternalVerbTests(DeviceCliBase):
         for data in (b'not json', b'{"devices": {"mac": {"checkedAt": 5, "steps": [{"name": "x", "status": "boom"}]}}}'):
             code, out, err = self.run_cli(['receive-checks'], stdin=data)
             self.assertEqual(code, 2, data)
+        code, out, err = self.run_cli(['receive-checks'], stdin=json.dumps({'devices': {'ghost': {'checkedAt': 3000, 'steps': steps}}}).encode())
+        self.assertEqual((code, json.loads(out)), (0, {'merged': []}), err)
+        self.assertEqual(set(json.loads((self.runtime / conductor_board.CHECK_FILE).read_text())['devices']), {'mac'})
 
     def test_sync_shares_the_check_results_with_every_peer_it_reached(self):
         import conductor_board

@@ -25,6 +25,8 @@ PROBE_FILE = 'device-probe-cache.json'   # 0600, in settings.RUNTIME: the last c
 PROBE_EVERY = 600                         # seconds between two probes of one device
 PROBE_TIMEOUT = 20                        # seconds one `device status` over ssh may take
 LIMIT = 256 * 1024
+DAY_MS = 86_400_000                       # a shared checkedAt counts as at most one day ahead of this clock
+MAX_CHECKED_AT = 2 ** 53 - 1              # larger is no time at all: refused (it would overflow checkedAt / 1000)
 LIVE_STEPS = ('reachable', 'service', 'version')  # what a probe measures again; a newer probe replaces these cached steps
 RANK = {'red': 0, 'amber': 1, 'grey': 2}
 STEP_NAME = re.compile(r'[a-z][a-z-]{0,39}')
@@ -43,14 +45,23 @@ def _load(path):
     return {name: entry for name, entry in devices.items() if isinstance(entry, dict)} if isinstance(devices, dict) else {}
 
 
-def _store(path, entries, newer=False):
-    """Write `entries` into the cache under its lock; with `newer`, only a device whose entry is newer than the kept one.
-    Returns the names written."""
+def _checked_at(entry, cap=MAX_CHECKED_AT):
+    """The entry's checkedAt when it is a sane integer time (ms) no later than `cap`, else None."""
+    value = entry.get('checkedAt') if isinstance(entry, dict) else None
+    return value if type(value) is int and 0 <= value <= cap else None
+
+
+def _store(path, entries, newer=False, keep=None, cap=MAX_CHECKED_AT):
+    """Write `entries` into the cache under its lock; with `newer`, only a device whose entry is newer than the kept one
+    (a kept checkedAt beyond `cap` counts as none, so an old poisoned entry cannot win forever). With `keep`, entries of
+    any other device are dropped from the cache. Returns the names written."""
     with _locked(path):
         current = _load(path)
+        stale = [name for name in current if keep is not None and name not in keep]
+        for name in stale: del current[name]
         written = sorted(name for name, entry in entries.items()
-                         if not newer or entry['checkedAt'] > (current.get(name) or {}).get('checkedAt', -1))
-        if written:
+                         if not newer or entry['checkedAt'] > (_checked_at(current.get(name), cap) or -1))
+        if written or stale:
             current.update({name: entries[name] for name in written})
             write_private(path, json.dumps({'devices': current}, ensure_ascii=False, sort_keys=True))
     return written
@@ -74,15 +85,16 @@ def record_checks(results, now=None):
     except (OSError, ValueError, RuntimeError): pass
 
 
-def checked_entries(value):
-    """The `{devices: {name: {checkedAt, steps}}}` another device shares, validated and redacted; ValueError otherwise."""
+def checked_entries(value, now=None):
+    """The `{devices: {name: {checkedAt, steps}}}` another device shares, validated and redacted; ValueError otherwise.
+    checkedAt must be an integer from 0 to MAX_CHECKED_AT and is kept at most one day ahead of `now`."""
+    ceiling = int((time.time() if now is None else now) * 1000) + DAY_MS
     devices = value.get('devices') if isinstance(value, dict) else None
     if not isinstance(devices, dict) or len(devices) > 64: raise ValueError('checks must be {"devices": {name: entry}}')
     out = {}
     for name, entry in devices.items():
         if not isinstance(name, str) or not registry.NAME.fullmatch(name): raise ValueError('invalid device name in checks')
-        if not isinstance(entry, dict) or type(entry.get('checkedAt')) is not int or entry['checkedAt'] < 0:
-            raise ValueError('checks need an integer checkedAt per device')
+        if _checked_at(entry) is None: raise ValueError('checks need an integer checkedAt (ms) per device')
         steps = entry.get('steps')
         if not isinstance(steps, list) or len(steps) > 64: raise ValueError('checks need a list of steps per device')
         rows = []
@@ -92,14 +104,19 @@ def checked_entries(value):
                     or not all(isinstance(step.get(key, ''), str) for key in ('detail', 'fix'))):
                 raise ValueError('invalid step in checks')
             rows.append(_step(step['name'], step['status'], step.get('detail'), step.get('fix')))
-        out[name] = {'checkedAt': entry['checkedAt'], 'steps': rows}
+        out[name] = {'checkedAt': min(entry['checkedAt'], ceiling), 'steps': rows}
     return out
 
 
-def merge_checks(value):
-    """`device receive-checks`: merge the results another device shares; per device the newest checkedAt wins. Returns
-    the names that changed; raises ValueError on input that is not a check result (nothing is written then)."""
-    return _store(_path(CHECK_FILE), checked_entries(value), newer=True)
+def merge_checks(value, now=None):
+    """`device receive-checks`: merge the results another device shares; per device the newest checkedAt wins. Only devices
+    in this registry are taken, and the cache is pruned to them, so it cannot grow past the registry. Returns the names that
+    changed; raises ValueError on input that is not a check result (nothing is written then)."""
+    entries = checked_entries(value, now)
+    devices = {row['name'] for row in registry.load()['devices']}
+    ceiling = int((time.time() if now is None else now) * 1000) + DAY_MS
+    return _store(_path(CHECK_FILE), {name: entry for name, entry in entries.items() if name in devices},
+                  newer=True, keep=devices, cap=ceiling)
 
 
 def share_checks(remotes, skip=()):
@@ -180,15 +197,15 @@ class Board:
             name = row['name']
             check = checks.get(name) or {}
             if name == me:
-                try: running = self.service_state() == 'running'
-                except Exception: running = None
-                live[name] = {'reachable': True, 'poolRunning': running, 'versionMatches': True, 'at': now}
+                try: running, unknown = self.service_state() == 'running', False
+                except Exception: running, unknown = None, True
+                live[name] = {'reachable': True, 'poolRunning': running, 'versionMatches': True, 'at': now, 'serviceUnknown': unknown}
                 continue
             if not row.get('ssh'): continue
             candidates = []
             probe = probes.get(name)
             if probe and isinstance(probe.get('at'), (int, float)): candidates.append(probe)
-            measured = _from_steps(check.get('steps') or []) if isinstance(check.get('checkedAt'), int) else None
+            measured = _from_steps(check.get('steps') or []) if _checked_at(check) is not None else None
             if measured: candidates.append({**measured, 'at': check['checkedAt'] / 1000})
             fresh = max(candidates, key=lambda entry: entry['at'], default=None)
             if fresh and now - fresh['at'] < PROBE_EVERY: live[name] = fresh
@@ -204,7 +221,7 @@ class Board:
 
     def _machine(self, row, mine, live, check):
         name, ssh = row['name'], row.get('ssh')
-        checked = check.get('checkedAt') if isinstance(check.get('checkedAt'), int) else None
+        checked = _checked_at(check)
         steps = [step for step in check.get('steps') or [] if isinstance(step, dict)]
         if live is None and checked is not None:
             live = _facts(steps)  # no ssh from here: the result the device itself (or another peer) shared is all there is
@@ -221,6 +238,8 @@ class Board:
             issues.append(('grey', 'not-checkable', 'Not checked from here: this machine has no ssh to it and it shared no result yet.',
                            'claude-pool device check ' + name + ' on that machine'))
         if live.get('poolRunning') is False: issues.append(('red', 'pool-stopped', 'The pool is not running.', start_fix))
+        if mine and live.get('serviceUnknown') and checked is not None:  # unchecked: never-checked below says enough
+            issues.append(('grey', 'pool-stopped', 'Could not read whether the pool runs on this machine.', 'claude-pool device check ' + name))
         if live.get('versionMatches') is False:
             issues.append(('amber', 'version-mismatch', 'It runs another claude-pool version.', 'claude-pool device add ' + str(ssh)))
         for step in steps:
@@ -301,7 +320,11 @@ def quick_access(previews, value):
 
 
 def facts(board, now, previews):
-    """The board keys of the snapshot (without the queue)."""
+    """The board keys of the snapshot (without the queue); a part that fails is empty and never blanks the others."""
+    def part(read):
+        try: return read()
+        except Exception: return []
     try: value = registry.load()
-    except ValueError: value = None
-    return {'machines': board.machines(now), 'accounts': board.accounts(now), 'quickAccess': quick_access(previews, value)}
+    except Exception: value = None
+    return {'machines': part(lambda: board.machines(now)), 'accounts': part(lambda: board.accounts(now)),
+            'quickAccess': part(lambda: quick_access(previews, value))}
