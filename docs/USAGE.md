@@ -27,6 +27,7 @@ After shell setup, `claude` starts pooled sessions and preserves Native administ
 | `claude-pool help device` | Everything an agent needs to manage machines |
 | `claude-pool account add <email> --long-lived` | Enroll a one-year token that every device can use |
 | `claude-pool account remove <name> [--wait]` | Disconnect a subscription without interrupting requests |
+| `claude-pool account rename <old> <new> [--wait]` | Rename an account on this machine (label and shortcut stay); `claude-pool help account` |
 | `claude-pool account reserve <name> --at <pct>` / `--off` | Make an account the last choice from a percent of its limit |
 | `claude-pool conductor snapshot` / `events` / `tell` / `journal` | Tools Conductor Claude uses for herdr agents |
 | `preview file <path>` | Share one file or folder read-only over Tailscale |

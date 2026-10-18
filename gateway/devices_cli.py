@@ -44,7 +44,7 @@ CHECK_HELP = {
     'version': ('the device runs the same claude-pool sources as this one (each platform builds its own backend)', 'claude-pool device add <ssh-target>'),
     'linger': ('Linux services survive logout (macOS: skipped)', 'claude-pool device add <ssh-target> tries it without root; if it stays failed, a root user runs sudo loginctl enable-linger <user> on the device'),
     'shell': ('the claude shell function sends claude through the pool', 'claude-pool device add <ssh-target>'),
-    'accounts': ('registry, token fingerprints, reserve settings and account health match', 'claude-pool device sync; claude-pool device sync --force-registry on the device whose list is right; claude-pool account add <email> --long-lived --replace --name <name> on the device that first enrolled it, then device sync; claude-pool account reserve <name> --at <pct>; claude-pool device switch'),
+    'accounts': ('registry, token fingerprints, reserve settings and account health match', 'claude-pool device sync; claude-pool device sync --force-registry on the device whose list is right; claude-pool account add <email> --long-lived --replace --name <name> on the device that first enrolled it, then device sync; claude-pool account reserve <name> --at <pct>; claude-pool device switch; ok with a name hint: claude-pool account rename <local-name> <registry-name> on that device'),
     'service': ('the pool service is running', 'claude-pool device add <ssh-target>; or ssh <ssh-target> .local/bin/claude-pool --start'),
     'doctor': ('claude-pool doctor on the device reports nothing', 'run ssh <device> .local/bin/claude-pool doctor and apply the fix it prints'),
     'native-login': ('Native Claude is logged in to an account the pool serves', 'claude-pool device add <ssh-target> and click Authorize; claude-native auth status if it cannot be read'),
@@ -650,6 +650,10 @@ def check_accounts(t):
                        'claude-pool device sync'))
     theirs = st.get('accounts') or {}
     here = device_sync.account_rows()
+    renames = []  # (local name there, registry name): not a failure, but one name everywhere is easier to read
+    for row in value['accounts']:
+        there = registry.local_name(row, theirs)
+        if there is not None and there != row['name'] and (theirs.get(there) or {}).get('active', True): renames.append((there, row['name']))
     for row in value['accounts']:
         # Each device holds the subscription under its own name: matched by UUIDs, by name only without them.
         want = row.get('fingerprint') or _local_fingerprint(device_sync.local_name(row, here) or row['name'])
@@ -687,8 +691,12 @@ def check_accounts(t):
     pending = st.get('switchPending') or []
     if pending:
         issues.append(('manual', 'switch pending for ' + ', '.join(pending), t.on('claude-pool device switch')))
-    return issues_step('accounts', issues, str(len(theirs)) + ' account' + ('' if len(theirs) == 1 else 's') +
-                       ', registry generation ' + str(generation))
+    fine = str(len(theirs)) + ' account' + ('' if len(theirs) == 1 else 's') + ', registry generation ' + str(generation)
+    if renames:
+        fine += '; ' + ', '.join(local + ' (registry: ' + name + ')' for local, name in renames)
+        if not issues:
+            return Step('accounts', 'ok', fine, '; '.join(t.on('claude-pool account rename ' + local + ' ' + name) for local, name in renames))
+    return issues_step('accounts', issues, fine)
 
 
 def ensure_accounts(t):

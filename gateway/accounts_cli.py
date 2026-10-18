@@ -188,6 +188,31 @@ def refuse_duplicate(rows, stores, name, info):
             raise RuntimeError('This subscription is already connected as ' + row.get('label', row['name']) + '; a second alias adds no quota.')
 
 
+def refuse_other_name(rows, stores, name, info, known):
+    """A long-lived enrollment under a name that differs from the registry's name for the subscription, or from this
+    machine's own name for it, is refused with the one command that makes the names agree: account rename."""
+    mine = (info['userId'], info['organizationId'])
+    entry = next((row for row in known['accounts'] if (row.get('userId'), row.get('organizationId')) == mine), None)
+    here = None
+    for row in rows:
+        path = stores / (row['name'] + '.json')
+        if path.exists() and not path.is_symlink():
+            try:
+                if ids(credential(path)) == mine: here = row; break
+            except (OSError, ValueError, RuntimeError): continue
+    if entry is not None and entry['name'] != name:
+        what = entry.get('label') or entry['name']
+        lead = 'This subscription is already connected as ' + what + ' (registry name ' + entry['name']
+        if here is not None and here['name'] != entry['name']:
+            raise RuntimeError(lead + ', on this machine ' + here['name'] + '). Give it the registry name here first: claude-pool account rename '
+                               + here['name'] + ' ' + entry['name'] + ', then rerun with --name ' + entry['name'] + '. Nothing was enrolled.')
+        raise RuntimeError(lead + '); a second alias adds no quota. Rerun with --name ' + entry['name'] + '. Nothing was enrolled.')
+    if here is not None and here['name'] != name:
+        raise RuntimeError('This subscription is already connected as ' + (here.get('label') or here['name']) + ' (name ' + here['name']
+                           + ' on this machine); a second alias adds no quota. To use the name ' + name + ' instead, run: claude-pool account rename '
+                           + here['name'] + ' ' + name + ', then rerun this command. Nothing was enrolled.')
+
+
 def apply_change(config, binary, paths, env, change_value, change_toml,
                  rejected='Backend rejected the change; live membership is unchanged'):
     """The one validated write path for membership: candidates are checked before anything is written."""
@@ -451,6 +476,7 @@ def enroll_steps(args, email, name, entry, *, config, stores, binary, runtime, b
     def upsert(current):
         current['accounts'] = [r for r in current['accounts'] if r['name'] != name] + [wanted(current)]
     known = registry.load(registry_path)
+    refuse_other_name(load(config).get('accounts', []), stores, name, info, known)
     # Refuse a second name for this subscription before anything is written (register() checks again under its lock).
     refuse_duplicate(load(config).get('accounts', []), stores, name, info)
     for row in known['accounts']:
@@ -590,6 +616,272 @@ def remove_account(name, wait, *, config, stores, binary, runtime, backend_sourc
     return 0
 
 
+ACCOUNT_HELP = '\n'.join([
+    'claude-pool account <verb>: the subscriptions this machine serves.', '',
+    '  claude-pool account list                               names, labels and shortcuts',
+    '  claude-pool account add <email> [--name N] [--label L] [--alias A]   browser login, verified identity, joins the pool',
+    '  claude-pool account add <email> --long-lived [--replace] [--from-file F] [--name N]   a one-year token every device can use',
+    '  claude-pool account remove <name> [--wait]             disconnect without interrupting running requests',
+    '  claude-pool account rename <old> <new> [--wait]        rename the account on this machine; label and shortcut stay',
+    '  claude-pool account reserve <name> --at <pct> | --off  last choice from a percent of its 5-hour or weekly limit', '',
+    'rename moves the login, the long-lived token, the config row, the runtime config, the reserve and the local state',
+    '(probe results, pulled readings, session pins) to the new name. It refuses a name that is already connected, that is not',
+    'lowercase a-z, 0-9 and -, or under which a token of another subscription is saved. A second copy of the same token under',
+    'the new name is removed only when another copy of it stays; anything else is moved into the credential folder\'s .retired.',
+    'A running pool is restarted to take the new name, once the account (and then the pool) serves no request; --wait waits up',
+    'to 30 minutes. When this machine enrolled the subscription, the registry row is renamed too; other devices keep their own',
+    'names. Use it so a subscription carries the same name on every machine: device check prints the exact command.',
+])
+NAME = re.compile('[a-z0-9-]{1,80}')
+RENAME_USAGE = 'Usage: claude-pool account rename <old> <new> [--wait]'
+STATE_LIMIT = 4 * 1024 * 1024
+
+
+def rename_membership(text, old, new):
+    """Rename the [[providers.anthropic.accounts]] table `old` to `new`; every other line stays byte-identical and the
+    result must parse to the old document with only that name changed."""
+    before = tomllib.loads(text)
+    rows = before.get('providers', {}).get('anthropic', {}).get('accounts', [])
+    if not any(row.get('name') == old for row in rows): return text
+    if any(row.get('name') == new for row in rows): raise RuntimeError('The runtime configuration already lists ' + new + '; nothing was renamed')
+    lines = text.splitlines(keepends=True)
+    header = '[[providers.anthropic.accounts]]'
+    start = end = None
+    for index, line in enumerate(lines):
+        if line.strip() != header: continue
+        stop = index + 1
+        while stop < len(lines) and not lines[stop].strip().startswith('['): stop += 1
+        block = tomllib.loads(''.join(lines[index:stop]))['providers']['anthropic']['accounts']
+        if block and block[0].get('name') == old: start, end = index, stop; break
+    if start is None: raise RuntimeError('The runtime configuration lists ' + old + ' in a form this command cannot edit')
+    own = re.compile(r'(\s*)(?:name|"name"|\'name\')\s*=')
+    at = next((i for i in range(start + 1, end) if own.match(lines[i])), None)
+    if at is None: raise RuntimeError('The runtime configuration lists ' + old + ' in a form this command cannot edit')
+    lines[at] = own.match(lines[at]).group(1) + 'name = ' + json.dumps(new) + '\n'
+    candidate = ''.join(lines)
+    expected = copy.deepcopy(before)
+    next(r for r in expected['providers']['anthropic']['accounts'] if r.get('name') == old)['name'] = new
+    if tomllib.loads(candidate) != expected: raise RuntimeError('Renaming ' + old + ' would change other runtime settings; nothing was renamed')
+    return candidate
+
+
+def rename_in_sessions(value, old, new):
+    """The pool bridge's saved state (sessions.json) with every reference to account `old` renamed: pins, the serving
+    account, routing, switch history, paused accounts, observations and traffic. Returns (value, changed)."""
+    changed = []
+    def swap(holder, key):
+        if isinstance(holder, dict) and holder.get(key) == old: holder[key] = new; changed.append(key)
+    if not isinstance(value, dict): return value, False
+    versioned = value.get('version') == 1
+    sessions = value.get('sessions') if versioned else value
+    for state in (sessions.values() if isinstance(sessions, dict) else []):
+        if not isinstance(state, dict): continue
+        for key in ('active', 'pin', 'reserved'): swap(state, key)
+        swap(state.get('routing'), 'account')
+        for item in (state.get('history') if isinstance(state.get('history'), list) else []) + [state.get('switch')]:
+            swap(item, 'from'); swap(item, 'to')
+    if versioned:
+        observations = value.get('observations')
+        if isinstance(observations, dict) and old in observations:
+            observations[new] = observations.pop(old); changed.append('observations')
+        if isinstance(value.get('paused'), list) and old in value['paused']:
+            value['paused'] = sorted({new if name == old else name for name in value['paused']}); changed.append('paused')
+        for row in value.get('traffic') if isinstance(value.get('traffic'), list) else []: swap(row, 'account')
+    return value, bool(changed)
+
+
+class _Undo:
+    """Every step of a rename registers how to put it back; rollback runs them in reverse and names what it could not."""
+    def __init__(self): self.steps = []
+    def add(self, what, undo): self.steps.append((what, undo))
+    def rollback(self):
+        failed = []
+        for what, undo in reversed(self.steps):
+            try: undo()
+            except Exception: failed.append(what)
+        return failed
+
+
+def _move(source, target, undo):
+    if target.exists() or target.is_symlink(): raise RuntimeError(target.name + ' appeared in ' + str(target.parent) + ' during the rename')
+    os.rename(source, target)
+    undo.add(str(source) + ' (now ' + str(target) + ')', lambda: os.rename(target, source))
+
+
+def _aside(path, folder, undo):
+    """Move `path` into `folder` under a unique name (the folder is private, the file is never unlinked here)."""
+    private_directory(folder)
+    stamp, n = str(int(time.time())), 0
+    while True:
+        target = folder / (path.stem + '-' + stamp + ('-' + str(n) if n else '') + path.suffix)
+        if not (target.exists() or target.is_symlink()): break
+        n += 1
+    _move(path, target, undo)
+    return target
+
+
+def _rewrite(path, data, undo):
+    original = path.read_bytes()
+    atomic_write(path, data)
+    undo.add(str(path), lambda: atomic_write(path, original))
+
+
+def _rename_state(runtime, old, new, undo):
+    """Local state keyed by the account name: the long-lived probe results, the readings pulled from the usage owner and
+    the bridge's sessions (pins, paused accounts, observations). Files that are absent or unreadable stay as they are."""
+    renamed = []
+    for name in ('long-lived-probes.json', 'shared-readings.json', 'sessions.json', 'sessions.bak'):
+        path = Path(runtime) / name
+        try:
+            if path.is_symlink() or not path.is_file() or path.stat().st_size > STATE_LIMIT: continue
+            value = json.loads(path.read_bytes())
+        except (OSError, ValueError): continue
+        if name.startswith('sessions'): value, changed = rename_in_sessions(value, old, new)
+        else:
+            table = value.get('accounts') if name == 'shared-readings.json' and isinstance(value, dict) else value
+            changed = isinstance(table, dict) and old in table
+            if changed: table[new] = table.pop(old)
+        if changed:
+            _rewrite(path, json.dumps(value, sort_keys=name == 'long-lived-probes.json'), undo); renamed.append(name)
+    return renamed
+
+
+def _rename_files(old, new, stores, directory, undo):
+    """Move the account's files to `new`. The account's own store file stays its store file; one long-lived token ends up
+    in the long-lived folder under `new`; any other copy found under either name is removed only when a kept file holds
+    the identical token, otherwise moved into stores/.retired (never the only copy of a token). Returns report lines."""
+    s_old, l_old, s_new, l_new = (stores / (old + '.json'), directory / (old + '.json'), stores / (new + '.json'), directory / (new + '.json'))
+    present = {path: credential(path) for path in (s_old, l_old, s_new, l_new) if path.exists()}
+    store = s_old if s_old in present else s_new if s_new in present else None
+    replica = next((path for path in (l_old, l_new, s_new) if path in present and path != store and kind(present[path]) == 'long-lived'), None)
+    kept = {fingerprint(present[path]) for path in (store, replica) if path is not None}
+    lines, staged = [], []
+    for path in [p for p in present if p not in (store, replica)]:
+        if fingerprint(present[path]) in kept:
+            staging = path.parent / ('.rename-' + new)
+            private_directory(staging)
+            undo.add(str(staging), lambda folder=staging: folder.rmdir() if folder.exists() and not any(folder.iterdir()) else None)
+            target = staging / path.name
+            _move(path, target, undo); staged.append(target)
+            lines.append('Removed a second copy of the same token: ' + str(path))
+        else:
+            target = _aside(path, stores / '.retired', undo)
+            lines.append('Moved ' + str(path) + ' aside to ' + str(target) + ' (the only copy of that token; never deleted)')
+    if replica is not None and replica != l_new: _move(replica, l_new, undo)
+    if store is not None and store != s_new: _move(store, s_new, undo)
+    for path in (s_old, l_old):
+        if path.exists() or path.is_symlink(): raise RuntimeError(str(path) + ' is still there after the move')
+    return lines, staged
+
+
+def _account_ids(stores, directory, name):
+    for path in (stores / (name + '.json'), directory / (name + '.json')):
+        if path.exists():
+            user, org = ids(credential(path))
+            if user and org: return {'userId': user, 'organizationId': org}
+    return {}
+
+
+def rename_account(old, new, wait, *, config, stores, binary, runtime, backend_source, backend_env, overview,
+                   directory, registry_path, pool):
+    if not NAME.fullmatch(old or ''): raise RuntimeError(RENAME_USAGE)
+    rows = load(config).get('accounts', [])
+    row = next((r for r in rows if r['name'] == old), None)
+    if row is None: raise RuntimeError('No account named ' + old + ' is connected (see claude-pool account list)')
+    label = row.get('label') or old
+    if not NAME.fullmatch(new or ''): raise RuntimeError('Choose a lowercase account name (a-z, 0-9 and -, up to 80 characters)')
+    if new == old: raise RuntimeError(label + ' is already named ' + old + '; nothing was renamed')
+    if any(r['name'] == new for r in rows): raise RuntimeError(new + ' is already a connected account; nothing was renamed')
+    for path in (stores / (old + '.json'), directory / (old + '.json'), stores / (new + '.json'), directory / (new + '.json')):
+        if path.is_symlink(): raise RuntimeError('Credential file must not be a symlink: ' + str(path))
+        if path.exists():
+            try: credential(path)
+            except (OSError, ValueError, RuntimeError):
+                raise RuntimeError(str(path) + ' cannot be read (it must be a private 0600 credential file); nothing was renamed') from None
+    mine = _account_ids(stores, directory, old)
+    for path in (stores / (new + '.json'), directory / (new + '.json')):
+        if path.exists() and (not mine or ids(credential(path)) != (mine['userId'], mine['organizationId'])):
+            raise RuntimeError(str(path) + ' holds a token of another subscription; nothing was renamed')
+    known = registry.load(registry_path)
+    member = {'name': old, **mine}
+    entry = registry.entry_for(known, member)
+    clash = registry.account(known, new)
+    if clash is not None and not registry.same_subscription(clash, member):
+        raise RuntimeError('The registry uses ' + new + ' for another subscription; nothing was renamed')
+    follow = entry is not None and entry['name'] == old and clash is None
+    if follow and not registry.NAME.fullmatch(new):
+        raise RuntimeError('The registry names this account too, and registry names have at most 40 characters; nothing was renamed')
+    private_directory(stores)
+    with (stores / ('.' + old + '.add.lock')).open('a') as lock_old, (stores / ('.' + new + '.add.lock')).open('a') as lock_new:
+        for lock in (lock_old, lock_new):
+            try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError: raise RuntimeError('This account has a connection in progress; nothing was renamed') from None
+        stopped = False
+        if overview is not None:
+            if wait: print('Waiting for ' + label + ' to finish its running requests…', flush=True)
+            if not routing.wait_idle(overview, old, wait):
+                raise RuntimeError(label + ' is still serving a request' + (' after 30 minutes' if wait else '')
+                                   + ' (or the pool did not answer); nothing was renamed. '
+                                   + ('Rerun when it is idle.' if wait else 'Rerun with --wait to rename it once idle.'))
+            # The running pool takes the new name only through a restart, which would cut every other running request.
+            if not routing.wait_idle(overview, None, wait):
+                raise RuntimeError('Other Claude tasks are running; renaming restarts the pool and would interrupt them. Nothing was renamed. '
+                                   + ('Rerun when they are done.' if wait else 'Rerun with --wait to rename once the pool is idle.'))
+            if pool is None: raise RuntimeError('The pool is running and cannot be restarted from here; stop it with claude-pool --stop, then rerun.')
+            if pool('--stop'):
+                print('The pool service did not stop; nothing was changed. Rerun claude-pool account rename ' + old + ' ' + new + '.')
+                return 1
+            stopped = True
+        try:
+            lines = _rename(old, new, label, follow, config=config, stores=stores, binary=binary, runtime=runtime,
+                            backend_source=backend_source, backend_env=backend_env, directory=directory, registry_path=registry_path)
+        except Exception:
+            if stopped and pool('--start'): print('The pool service did not restart. Run: claude-pool --start')
+            raise
+    started = stopped and pool('--start')
+    print('Renamed ' + old + ' to ' + new + ' (' + label + '; the shortcut claude ' + (row.get('alias') or old) + ' stays).')
+    for line in lines: print(line)
+    if entry is None: print('The registry does not list this subscription; other devices are unchanged.')
+    elif follow: print('The registry now names it ' + new + '; other devices keep their own names after claude-pool device sync.')
+    elif entry['name'] == new: print('The registry already names it ' + new + '.')
+    else: print('The registry names it ' + entry['name'] + ' (another device enrolled it); the registry is unchanged.')
+    if stopped:
+        if started:
+            print('The pool service did not restart. Run: claude-pool --start')
+            return 1
+        print('Stopped the pool for the rename and started it again with the new name.')
+    else: print('The pool was not running; it uses the new name when it starts.')
+    return 0
+
+
+def _rename(old, new, label, follow, *, config, stores, binary, runtime, backend_source, backend_env, directory, registry_path):
+    """The rename itself, all or nothing: any failure after the first move puts every step back and says what remains."""
+    undo = _Undo()
+    try:
+        lines, staged = _rename_files(old, new, stores, directory, undo)
+        paths, env = local_paths_env(runtime, stores, backend_source, backend_env)
+        for path in [config, *(p for p in paths if p.exists())]:
+            undo.add(str(path), lambda path=path, data=path.read_bytes(): atomic_write(path, data))
+        def change(value):
+            next(r for r in value['accounts'] if r['name'] == old)['name'] = new
+        apply_change(config, binary, paths, env, change, lambda text: rename_membership(text, old, new),
+                     rejected='Backend rejected the new name; nothing was renamed')
+        _rename_state(runtime, old, new, undo)
+        if follow:
+            def note(value): registry.account(value, old)['name'] = new
+            registry.update(note, registry_path)
+    except Exception as error:
+        failed = undo.rollback()
+        reason = type(error).__name__ + ': ' + str(error)
+        if not failed: raise RuntimeError('Renaming ' + label + ' failed (' + reason + '); everything was put back, it is still named ' + old + '.') from None
+        raise RuntimeError('Renaming ' + label + ' failed (' + reason + ') and these could not be put back: ' + ', '.join(failed)
+                           + '. Check them by hand; the config still names it ' + old + ' unless listed.') from None
+    for path in staged:
+        try: path.unlink(); path.parent.rmdir()
+        except OSError: pass
+    return lines
+
+
 def percent(text):
     if not re.fullmatch('[0-9]{1,3}', text) or not 1 <= int(text) <= 99: raise argparse.ArgumentTypeError('--at must be a whole number from 1 to 99')
     return int(text)
@@ -599,7 +891,7 @@ def cli(argv, *, on_change=None, **options):
     """Run an account command. After a successful add or remove, `on_change()` (a device sync) reports one line per
     device; a failing sync never changes the exit code of a change that already succeeded."""
     code = run_cli(argv, **options)
-    if code == 0 and on_change is not None and argv[:1] in (['add'], ['remove'], ['reserve']):
+    if code == 0 and on_change is not None and argv[:1] in (['add'], ['remove'], ['reserve'], ['rename']):
         try: results = on_change()
         except Exception as error: print('Device sync failed (' + type(error).__name__ + '); run claude-pool device sync later.')
         else:
@@ -608,7 +900,7 @@ def cli(argv, *, on_change=None, **options):
 
 
 def run_cli(argv, *, config, stores, binary, runtime, backend_source=None, backend_env=None, overview=None,
-            long_lived=None, registry_path=None, self_path=None, lookup=None, native_identity=None):
+            long_lived=None, registry_path=None, self_path=None, lookup=None, native_identity=None, pool=None):
     parser = argparse.ArgumentParser(prog='claude account')
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('list', help='Show connected names and shortcuts')
@@ -620,6 +912,9 @@ def run_cli(argv, *, config, stores, binary, runtime, backend_source=None, backe
     add.add_argument('--replace', action='store_true', help='With --long-lived: install a new token for this account; the old one is kept aside')
     remove = sub.add_parser('remove', help='Disconnect a subscription without interrupting running requests')
     remove.add_argument('name'); remove.add_argument('--wait', action='store_true', help='Wait (up to 30 minutes) until the account serves no request')
+    renamed = sub.add_parser('rename', help='Rename an account on this machine (label and shortcut stay)')
+    renamed.add_argument('old'); renamed.add_argument('new')
+    renamed.add_argument('--wait', action='store_true', help='Wait (up to 30 minutes) until the pool is idle, then restart it with the new name')
     reserved = sub.add_parser('reserve', help='Make an account the pool\'s last choice, with no new pool work near its limits')
     reserved.add_argument('name')
     mode = reserved.add_mutually_exclusive_group(required=True)
@@ -632,6 +927,10 @@ def run_cli(argv, *, config, stores, binary, runtime, backend_source=None, backe
         return remove_account(args.name, args.wait, config=config, stores=stores, binary=binary, runtime=runtime,
                               backend_source=backend_source, backend_env=backend_env, overview=overview, directory=directory,
                               registry_path=registry_path, native_identity=native_identity)
+    if args.command == 'rename':
+        return rename_account(args.old, args.new, args.wait, config=config, stores=stores, binary=binary, runtime=runtime,
+                              backend_source=backend_source, backend_env=backend_env, overview=overview, directory=directory,
+                              registry_path=registry_path, pool=pool)
     if args.command == 'reserve':
         row = next((r for r in load(config).get('accounts', []) if r['name'] == args.name), None)
         if row is None: raise RuntimeError('No account named ' + args.name + ' is connected (see claude-pool account list)')

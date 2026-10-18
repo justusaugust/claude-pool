@@ -51,7 +51,7 @@ claude-pool device switch [--wait]
 | `version` | the device runs the same claude-pool sources as this one (each platform builds its own backend) | claude-pool device add <ssh-target> |
 | `linger` | Linux services survive logout (macOS: skipped) | claude-pool device add <ssh-target> tries it without root; if it stays failed, a root user runs sudo loginctl enable-linger <user> on the device |
 | `shell` | the claude shell function sends claude through the pool | claude-pool device add <ssh-target> |
-| `accounts` | registry, token fingerprints, reserve settings and account health match | claude-pool device sync; claude-pool device sync --force-registry on the device whose list is right; claude-pool account add <email> --long-lived --replace --name <name> on the device that first enrolled it, then device sync; claude-pool account reserve <name> --at <pct>; claude-pool device switch |
+| `accounts` | registry, token fingerprints, reserve settings and account health match | claude-pool device sync; claude-pool device sync --force-registry on the device whose list is right; claude-pool account add <email> --long-lived --replace --name <name> on the device that first enrolled it, then device sync; claude-pool account reserve <name> --at <pct>; claude-pool device switch; ok with a name hint: claude-pool account rename <local-name> <registry-name> on that device |
 | `service` | the pool service is running | claude-pool device add <ssh-target>; or ssh <ssh-target> .local/bin/claude-pool --start |
 | `doctor` | claude-pool doctor on the device reports nothing | run ssh <device> .local/bin/claude-pool doctor and apply the fix it prints |
 | `native-login` | Native Claude is logged in to an account the pool serves | claude-pool device add <ssh-target> and click Authorize; claude-native auth status if it cannot be read |
@@ -99,10 +99,13 @@ Refreshable accounts stay on the one machine that logged in; they are never copi
 
 An account is identified by its subscription (account and organization UUIDs), not by its name. Each machine may hold the same subscription under its own name, for example `team` on the VPS and `ai-vaerk-team-premium` on the Mac. Every device command matches accounts across machines by subscription and falls back to the name only when one side has no UUIDs; messages name both, as in `team (AI Værk Team, registry: ai-vaerk-team-premium)`. A synced long-lived token is kept under the local name of the subscription, so `device switch` replaces that machine's own login in place (alias and sessions stay) and never adds a second account. A copy that arrived under the registry name before this matching existed moves to the local name on the next sync, unless that name already holds a long-lived token; then `check` lists it and it stays (it is never deleted).
 
+To give a subscription the same name on every machine, rename it where it differs: `claude-pool account rename <old> <new> [--wait]` on that machine. `device check` prints the exact command as a hint on its `accounts` line, for example `team (registry: ai-vaerk-team-premium)` with `ssh <target> .local/bin/claude-pool account rename team ai-vaerk-team-premium`. Rename moves the login, the long-lived token, the config row, the runtime config, the reserve and local state (probe results, pulled readings, session pins); label and shortcut stay. It refuses a name that is already connected, that is not lowercase, or under which a token of another subscription is saved. A copy of the same token already under the new name (the stray copy from before) is removed only when another copy of that token stays; anything else is moved into the credential folder's `.retired`. A running pool is restarted to take the new name once the account and then the pool serve no request (`--wait` waits up to 30 minutes). If anything fails, everything is put back. When this machine enrolled the subscription, the registry row is renamed too; the other devices keep their own names. `account add <email> --long-lived --name <name>` refuses a name that differs from the registry's and prints the rename command; after the rename, `--name <registry-name>` works on that machine.
+
 ```sh
 claude-pool account add <email> --long-lived --name <name>
 claude-pool account add <email> --long-lived --replace --name <name>
 claude-pool account remove <name> [--wait]
+claude-pool account rename <old> <new> [--wait]
 claude-pool account reserve <name> --at <pct>
 claude-pool account reserve <name> --off
 ```

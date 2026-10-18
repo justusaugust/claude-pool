@@ -293,6 +293,9 @@ def receive_registry(data, overview=None, native_identity=None, elsewhere=()):
             if held is not None and held != tomb.get('fingerprint') and held not in set(elsewhere):
                 report['kept'].append(name)  # another token than the one removed, and maybe its only copy
                 continue
+            if renamed_elsewhere(name, tomb, now):
+                report['kept'].append(name)  # renamed on the device that enrolled it; this device keeps its own name
+                continue
             if not routing.wait_idle(local_overview(overview), name, False):
                 report['kept_busy'].append(name); continue
             if not native['done']:
@@ -317,6 +320,25 @@ def receive_registry(data, overview=None, native_identity=None, elsewhere=()):
             try: hook(now); report['hooks'][label] = 'ok'
             except Exception as error: report['hooks'][label] = 'failed: ' + type(error).__name__
     return report
+
+
+def _uuids_of(name):
+    """(userId, organizationId) of this device's copy of `name` (pool store first), or None."""
+    for path in (settings.STORES / (name + '.json'), settings.LONG_LIVED / (name + '.json')):
+        if path.is_symlink() or not path.exists(): continue
+        try: found = registry.ids({'userId': (value := read_private(path)).get('shuntAccountUuid'), 'organizationId': value.get('shuntOrganizationUuid')})
+        except (OSError, ValueError, RuntimeError): continue
+        if found: return found
+    return None
+
+
+def renamed_elsewhere(name, tomb, value):
+    """A tombstone whose subscription the registry still lists under another name is a rename (`account rename` on the
+    device that enrolled it), not a removal: the same token or the same subscription is still a registry row."""
+    fp = tomb.get('fingerprint')
+    if fp and any(row.get('fingerprint') == fp for row in value['accounts']): return True
+    mine = _uuids_of(name)
+    return mine is not None and any(registry.ids(row) == mine for row in value['accounts'])
 
 
 def retire_renamed(name, fp, value):

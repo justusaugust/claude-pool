@@ -471,6 +471,10 @@ def main():
         from devices_cli import DEVICE_HELP
         print(DEVICE_HELP)
         return
+    if sys.argv[1:] == ['help', 'account']:
+        from accounts_cli import ACCOUNT_HELP
+        print(ACCOUNT_HELP)
+        return
     if len(sys.argv) > 1 and sys.argv[1] in {'account', 'login'}:
         from accounts_cli import cli
         argv = sys.argv[2:]
@@ -479,13 +483,17 @@ def main():
             argv = ['add', '--name', argv[0]]
         def overview():
             return json.loads(request(token('.pool-client-token'), path='/pool/overview'))
-        live = bool(argv) and argv[0] in ('add', 'remove') and '--help' not in argv and '-h' not in argv and (STORES / '.pool-client-token').is_file()
+        live = bool(argv) and argv[0] in ('add', 'remove', 'rename') and '--help' not in argv and '-h' not in argv and (STORES / '.pool-client-token').is_file()
         try:
             if not live: raise OSError('No live readiness check needed')
             overview(); available = True
         except (OSError, RuntimeError, ValueError):
-            # remove never skips its in-flight check while the service runs: an unanswered overview counts as busy.
-            available = live and argv[0] == 'remove' and service.loaded(SERVICE_LABEL)
+            # remove and rename never skip their in-flight check while the service runs: an unanswered overview counts as busy.
+            available = live and argv[0] in ('remove', 'rename') and service.loaded(SERVICE_LABEL)
+        def pool(flag):
+            # The same stop/start device switch uses: --stop lets running responses finish first.
+            from remote import Local
+            return Local().pool(flag, timeout=600).returncode
         on_change = None
         try:
             import registry
@@ -496,7 +504,7 @@ def main():
         except ValueError: pass  # an unreadable registry never blocks adding or removing an account
         raise SystemExit(cli(argv, config=CONFIG, stores=STORES, binary=HERE/'bin/shunt', runtime=RUNTIME,
                              overview=overview if available else None, long_lived=LONG_LIVED, native_identity=native_identity,
-                             on_change=on_change))
+                             on_change=on_change, pool=pool))
     if len(sys.argv) > 1 and sys.argv[1] == 'conductor':
         from conductor_tools import cli
         raise SystemExit(cli(sys.argv[2:]))
@@ -504,7 +512,7 @@ def main():
     if sys.argv[1:] == ['--version']:
         raise SystemExit(subprocess.call([NATIVE_CLAUDE, *sys.argv[1:]]))
     if sys.argv[1:] == ['help']:
-        print('claude-pool [account-alias] [Claude arguments]\nCommands: update, usage [--once], history, forecast-check, doctor, account add <email>, account list, account remove <name> [--wait], account reserve <name> --at <pct>|--off, login <name>, device add|check|remove|list|sync|switch|conductor (details: claude-pool help device), phone, respawn <id>, conductor snapshot|events|tell|journal\nUpdates: claude update = Claude Code; claude-pool update or claude pool update = Claude Pool\nService: --start, --stop\nSetup: ' + str(ROOT / 'docs/SETUP.md'))
+        print('claude-pool [account-alias] [Claude arguments]\nCommands: update, usage [--once], history, forecast-check, doctor, account add <email>, account list, account remove <name> [--wait], account rename <old> <new> [--wait], account reserve <name> --at <pct>|--off, login <name>, device add|check|remove|list|sync|switch|conductor (details: claude-pool help device, claude-pool help account), phone, respawn <id>, conductor snapshot|events|tell|journal\nUpdates: claude update = Claude Code; claude-pool update or claude pool update = Claude Pool\nService: --start, --stop\nSetup: ' + str(ROOT / 'docs/SETUP.md'))
         return
     if len(sys.argv) > 1 and sys.argv[1] == 'phone':
         from control_main import cli
