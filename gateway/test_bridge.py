@@ -66,6 +66,16 @@ class BridgeTests(unittest.TestCase):
         try:
             response=conn.getresponse();data=response.read();return response.status,data
         finally:conn.close()
+    def test_every_upstream_answer_is_kept_with_its_status_and_answering_account(self):
+        import time
+        start = int(time.time() * 1000)
+        self.http_status = 401
+        self.call('/v1/messages', b'{"model":"claude-opus-5-5","messages":[]}')
+        self.http_status = 200
+        self.call('/v1/messages', b'{"model":"claude-opus-5-5","messages":[]}')
+        self.assertEqual([(row['status'], row['account']) for row in self.bridge.outcomes_since(start)], [(401, 'gmail'), (200, 'gmail')])
+        self.assertEqual(self.bridge.outcomes_since(int(time.time() * 1000) + 1000), [])
+
     def test_quota_rejection_waits_before_resending_identical_request(self):
         self.http_status = 429
         request = b'{"model":"claude-opus-5-5","output_config":{"effort":"high"},"thinking":{"type":"adaptive"},"stream":true,"messages":[]}'

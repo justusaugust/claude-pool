@@ -58,6 +58,7 @@ class PoolBridge(ThreadingHTTPServer):
         self.lock = threading.RLock()
         self.sessions, self.observations, self.paused_names = {}, {}, set()
         self.traffic = []
+        self.outcomes = []  # recent upstream answers: status and answering account (x-shunt-account), in memory only
         self.recovery = {"restarts": 0, "state": "ready"}
         self.persistence_error = False
         self._last_saved = None
@@ -227,6 +228,15 @@ class PoolBridge(ThreadingHTTPServer):
             return data
         finally:
             conn.close()
+
+    def note_outcome(self, status, account):
+        """Keep the last 200 upstream answers (time, status, x-shunt-account) for the long-lived probe; no body, no token."""
+        with self.lock:
+            self.outcomes.append({'at': int(time.time() * 1000), 'status': status, 'account': account})
+            del self.outcomes[:-200]
+
+    def outcomes_since(self, at_ms):
+        with self.lock: return [dict(row) for row in self.outcomes if row['at'] >= at_ms]
 
     def accounts(self):
         rows = []
@@ -594,6 +604,7 @@ class Handler(BaseHTTPRequestHandler):
             response = conn.getresponse()
             lease['progress'] = time.monotonic()
             account = response.getheader('x-shunt-account')
+            self.server.note_outcome(response.status, account)
             if response.status >= 400: self.server.journal.record('upstream_http_error', status=response.status, account=account)
             while response.status == 429 and path == '/v1/messages' and request.get('stream') is True and isinstance(request.get('model'), str):
                 quota = capacity(self.server.accounts(), request.get('model', ''), int(time.time() * 1000))
@@ -635,6 +646,7 @@ class Handler(BaseHTTPRequestHandler):
                 response = conn.getresponse()
                 lease['progress'] = time.monotonic()
                 account = response.getheader('x-shunt-account')
+                self.server.note_outcome(response.status, account)
             if committed and (response.status != 200 or 'text/event-stream' not in response.getheader('Content-Type', '')):
                 raise ConnectionError()
             if not committed:

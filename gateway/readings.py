@@ -75,7 +75,7 @@ def load_shared(path):
 
 PROBE_EVERY_MS = 900_000
 PROBE = ['-p', 'Reply with OK.', '--model', 'haiku']
-PROBE_RESULTS = ('ok', 'rejected')
+PROBE_RESULTS = ('ok', 'rejected', 'unknown')
 
 
 def _store_fingerprint(name):
@@ -101,19 +101,30 @@ def load_probes(path):
 
 
 def reauthenticate(path):
-    """Accounts whose served long-lived token the last probe found rejected (a replaced token clears the mark)."""
+    """Accounts whose served long-lived token the probe found rejected (a replaced token clears the mark)."""
     return {name for name, entry in load_probes(path).items()
             if entry['result'] == 'rejected' and _store_fingerprint(name) == entry['fingerprint']}
 
 
+def verdict(name, outcomes):
+    """'ok' when the probed account itself answered with success, 'rejected' when it answered 401 itself, else None.
+    Shunt answers a 401 on a setup token by cooling the account and rotating to the next one, so a success from another
+    account, a 5xx or 529, a network error or no answer at all says nothing about this token."""
+    own = [row for row in outcomes if row.get('account') == name and isinstance(row.get('status'), int)]
+    if any(200 <= row['status'] < 300 for row in own): return 'ok'
+    if any(row['status'] == 401 for row in own): return 'rejected'
+    return None
+
+
 class AuthProbe:
-    """Shunt answers a 401 on a setup-token account by cooling it for five minutes and rotating, so a revoked long-lived
-    token only ever shows as cooling. On the device that serves it, a long-lived account that is cooling gets the cheap
-    probe (one real Claude Code request through the pool, `claude-pool <alias> -p 'Reply with OK.' --model haiku`) at most
-    every 15 minutes; a failed probe marks it `reauthenticate` for device check and doctor. A served (ready) account
-    clears its mark. The result file holds names, times, fingerprints and the result, never a token."""
-    def __init__(self, path, overview=None, run=None, clock=None):
-        self.path, self.overview, self.run = path, overview, run
+    """On the device that serves it, a long-lived account the overview shows cooling gets the cheap probe (one real Claude
+    Code request through the pool, `claude-pool <alias> -p 'Reply with OK.' --model haiku`) at most every 15 minutes,
+    however its status changes in between. The bridge reports which account answered each upstream request
+    (`outcomes(since_ms)`, from x-shunt-account). Only a 401 answered by the probed account marks it `rejected`
+    (reauthenticate); only a later success answered by that account, or a new token fingerprint, clears the mark; every
+    other outcome keeps the previous state. The result file holds names, times, fingerprints and results, never a token."""
+    def __init__(self, path, overview=None, run=None, clock=None, outcomes=None):
+        self.path, self.overview, self.run, self.outcomes = path, overview, run, outcomes
         self.clock = clock or (lambda: int(time.time() * 1000))
 
     def default_run(self, alias):
@@ -128,7 +139,7 @@ class AuthProbe:
         try: value = (self.overview or self.default_overview)()
         except Exception: return {}
         rows = [row for row in value.get('accounts') or [] if isinstance(row, dict) and isinstance(row.get('name'), str)]
-        state, changed, now = load_probes(self.path), False, self.clock()
+        state, changed = load_probes(self.path), False
         try:
             from account_metadata import load
             import settings
@@ -136,16 +147,18 @@ class AuthProbe:
         except Exception: aliases = {}
         for row in rows:
             name = row['name']
-            if row.get('status') in ('ready', 'limited') and name in state:
-                del state[name]; changed = True; continue
-            if row.get('status') != 'cooling': continue
             fp = _store_fingerprint(name)
             if fp is None: continue
             last = state.get(name)
-            if last and last['fingerprint'] == fp and now - last['at'] < PROBE_EVERY_MS: continue
-            done = (self.run or self.default_run)(aliases.get(name, name))
-            passed = done is not None and done.returncode == 0 and b'OK' in (done.stdout or b'')
-            state[name] = {'at': now, 'fingerprint': fp, 'result': 'ok' if passed else 'rejected'}
+            if last and last['fingerprint'] != fp: last = None  # a new token: the old verdict does not apply
+            if row.get('status') != 'cooling' or self.outcomes is None: continue
+            started = self.clock()
+            if last and started - last['at'] < PROBE_EVERY_MS: continue
+            try: (self.run or self.default_run)(aliases.get(name, name))
+            except Exception: pass
+            try: found = verdict(name, self.outcomes(started))
+            except Exception: found = None
+            state[name] = {'at': started, 'fingerprint': fp, 'result': found or (last or {}).get('result', 'unknown')}
             changed = True
         if changed: write_private(self.path, json.dumps(state, sort_keys=True))
         return state

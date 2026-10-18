@@ -155,7 +155,7 @@ def daemon(client, admin):
     try:
         names = [a['name'] for a in tomllib.loads(config).get('providers', {}).get('anthropic', {}).get('accounts', [])]
         server = PoolBridge(("127.0.0.1", GATEWAY_PORT), BACKEND_PORT, client, admin, RUNTIME / "sessions.json", native_auth=NativeAuth(STORES, names), shared_readings=SHARED_READINGS)
-        readings.Puller(SHARED_READINGS, server.journal).start(stop, probe=readings.AuthProbe(LONG_LIVED_PROBES))
+        readings.Puller(SHARED_READINGS, server.journal).start(stop, probe=readings.AuthProbe(LONG_LIVED_PROBES, outcomes=server.outcomes_since))
         def drain(signum, frame):
             server.draining = True
             server.journal.record('service_draining', requests=len(server.requests))
