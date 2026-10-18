@@ -22,13 +22,13 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 import signal
 import subprocess
 import tempfile
 import threading
 import time
-import uuid
 
 from private_files import private_directory, read_private, write_private
 import settings
@@ -150,19 +150,24 @@ class Tools:
     def close_workspace(self, session, workspace):
         return self.herdr(session, 'workspace', 'close', workspace) is not None
 
-    def previews(self):
+    def preview_list(self):
+        """[{port, label, link, kind}] as `preview list --json` reports them (kind '' for a plain preview), None on failure."""
         done = self.run(['preview', 'list', '--json'], 15)
         data = _json(done.stdout) if done.returncode == 0 else None
         if isinstance(data, dict): data = data.get('previews')
         if not isinstance(data, list): return None
-        rows = {}
-        for row in data:
-            if not isinstance(row, dict): continue
-            link = clean(row.get('link') or row.get('url') or row.get('proxy') or '', 200)
-            label = clean(row.get('label') or '', 60)
-            key = clean(row['port'] if row.get('port') is not None else label or link, 60)
-            if key: rows[key] = {'port': row.get('port'), 'label': label, 'link': link}
-        return rows
+        return [{'port': row.get('port') if isinstance(row.get('port'), int) else None,
+                 'label': clean(row.get('label') or '', 60), 'kind': clean(row.get('kind') or '', 20),
+                 'link': clean(row.get('link') or row.get('url') or row.get('proxy') or '', 200)} for row in data if isinstance(row, dict)]
+
+    def previews(self, rows=None):
+        rows = self.preview_list() if rows is None else rows
+        if rows is None: return None
+        found = {}
+        for row in rows:
+            key = clean(row['port'] if row.get('port') is not None else row['label'] or row['link'], 60)
+            if key: found[key] = {'port': row.get('port'), 'label': row['label'], 'link': row['link']}
+        return found
 
     def repo(self, cwd):
         """{'name': repo directory name, 'slug': owner/repo on GitHub or ''}; the remote URL itself never leaves here."""
@@ -245,14 +250,36 @@ def _bounded(lines):
 
 # --- snapshot -----------------------------------------------------------------------------------------------------
 
-def snapshot(tools=None, as_json=False, now=None, state_path=None, queue_path=None):
+def _board(board, now, previews):
+    """The Conductor Board keys (machines, accounts, quickAccess); a part that cannot be read is empty, never an error."""
+    import conductor_board
+    try: return conductor_board.facts(board or conductor_board.Board(), now, previews)
+    except Exception: return {'machines': [], 'accounts': [], 'quickAccess': []}
+
+
+def _light_lines(value):
+    lines = []
+    if value.get('machines'):
+        lines.append('machines: ' + ' · '.join(row['name'] + ' ' + row['light'] + (': ' + row['reason'][:80] if row['reason'] else '')
+                                               for row in value['machines']))
+    if value.get('accounts'):
+        def pct(label, number): return label + ' ' + str(round(number)) + '%' if number is not None else ''
+        lines.append('accounts: ' + ' · '.join(' '.join(part for part in (row['label'], row['status'], pct('5h', row['fiveHourPct']),
+                                                                          pct('week', row['weekPct'])) if part)
+                                               for row in value['accounts']))
+    return lines
+
+
+def snapshot(tools=None, as_json=False, now=None, state_path=None, queue_path=None, board=None):
     tools, now = tools or Tools(), time.time() if now is None else now
     seen, queued = {}, []
     with contextlib.suppress(OSError, RuntimeError, ValueError): seen = _read(state_path or EVENTS).get('agents') or {}
-    with contextlib.suppress(OSError, RuntimeError, ValueError): queued = _read(queue_path or QUEUE).get('items') or []
+    with contextlib.suppress(OSError, RuntimeError, ValueError): queued = queue_items(queue_path or QUEUE)
     sessions = tools.sessions()
     if sessions is None:
-        return json.dumps({'error': 'herdr is not available'}) if as_json else 'herdr is not available on this machine'
+        if not as_json: return 'herdr is not available on this machine'
+        return json.dumps({'error': 'herdr is not available', 'generatedAt': int(now * 1000),
+                           **_board(board, now, tools.preview_list()), 'queue': _queue_view(queued)}, ensure_ascii=False)
     repos, value, shown, present, unknown = {}, {'sessions': [], 'previews': [], 'prs': {}}, 0, set(), set()
     for session in sessions[:MAX_SESSIONS]:
         entry = {'name': clean(session['name'], 60), 'running': bool(session.get('running')), 'workspaces': []}
@@ -279,7 +306,8 @@ def snapshot(tools=None, as_json=False, now=None, state_path=None, queue_path=No
                 'last': last_line(tools.read(session['name'], agent['pane_id'])),
                 'queued': sum(1 for item in queued if item.get('session') == session['name'] and item.get('pane') == agent['pane_id'])})
         entry['workspaces'] = list(groups.values())
-    value['previews'] = [dict(row) for row in list((tools.previews() or {}).values())[:MAX_PREVIEWS]]
+    listed = tools.preview_list()
+    value['previews'] = [dict(row) for row in list((tools.previews(listed) or {}).values())[:MAX_PREVIEWS]]
     value['orphaned'] = [{'agent': item.get('session', '') + '/' + (item.get('agent') or item.get('pane', '')), 'task': clean(item.get('task', ''), 100)}
                          for item in queued if item.get('session') not in unknown
                          and item.get('session', '') + '/' + item.get('pane', '') not in present][:MAX_PREVIEWS]
@@ -287,9 +315,12 @@ def snapshot(tools=None, as_json=False, now=None, state_path=None, queue_path=No
         rows = tools.prs(slug)
         if rows: value['prs'][slug] = [{'number': int(n), **row} for n, row in list(rows.items())[:MAX_PRS] if row['state'] in ('', 'OPEN')]
     value['prs'] = {slug: rows for slug, rows in value['prs'].items() if rows}
+    value['generatedAt'] = int(now * 1000)
+    value.update(_board(board, now, listed))
+    value['queue'] = _queue_view(queued)
     if as_json: return json.dumps(value, ensure_ascii=False)
     running = sum(1 for s in value['sessions'] if s['running'])
-    lines = ['herdr sessions: ' + str(len(value['sessions'])) + ' (' + str(running) + ' running)']
+    lines = ['herdr sessions: ' + str(len(value['sessions'])) + ' (' + str(running) + ' running)'] + _light_lines(value)
     for entry in value['sessions']:
         lines.append(entry['name'] + (' running' if entry['running'] else ' stopped'))
         for group in entry['workspaces']:
@@ -408,8 +439,7 @@ def _deliver(tools, agents, queue_path, now):
     """Prompt idle agents with their oldest queued task (one per agent per poll); a task gets ATTEMPTS failed prompts.
     A task whose agent is gone is reported once as orphaned, delivered if the agent comes back, and dropped as
     undeliverable ORPHAN_KEEP after it was queued; polls without the agent are not attempts."""
-    with _locked(queue_path):
-        items = _read(queue_path).get('items') or []
+    items = queue_items(queue_path)
     lines, busy, changes = [], set(), {}
     for item in items:
         key = item.get('session', '') + '/' + item.get('pane', '')
@@ -586,10 +616,71 @@ def _tell(target, task, parallel, tools, queue_path, now, sleep):
     if parallel: return _parallel(row, task, rows, tools, sleep)
     with _locked(queue_path):
         value = _read(queue_path)
-        value.setdefault('items', []).append({'id': uuid.uuid4().hex[:12], 'session': row['session'], 'pane': row['pane'],
-                                              'agent': row['name'], 'task': task, 'at': now})
+        items = value.setdefault('items', [])
+        items.append({'id': _new_id(items), 'session': row['session'], 'pane': row['pane'], 'agent': row['name'], 'task': task, 'at': now})
         _write(queue_path, value)
-    return 0, 'queued for ' + agent_label(row)
+    return 0, 'queued for ' + agent_label(row) + ' (id ' + items[-1]['id'] + ')'
+
+
+# --- the queue: ids, list and cancel ---------------------------------------------------------------------------------
+
+def _new_id(items):
+    """A short id no other queued task has; it never changes once given."""
+    taken = {item.get('id') for item in items}
+    while True:
+        candidate = secrets.token_hex(3)
+        if candidate not in taken: return candidate
+
+
+def queue_items(queue_path=None):
+    """The queued tasks; an item without an id (queued before ids existed) gets one now, under the queue lock, and keeps it.
+    A missing queue file reads as empty and is not created."""
+    queue_path = queue_path or QUEUE
+    if not queue_path.exists(): return []
+    with _locked(queue_path):
+        value = _read(queue_path)
+        items = [item for item in value.get('items') or [] if isinstance(item, dict)]
+        missing = [item for item in items if not isinstance(item.get('id'), str) or not item['id']]
+        for item in missing: item['id'] = _new_id(items)
+        if missing:
+            value['items'] = items
+            _write(queue_path, value)
+    return items
+
+
+def _queue_view(items):
+    return [{'id': item['id'], 'target': clean(item.get('session', '') + '/' + (item.get('agent') or item.get('pane', '')), 80),
+             'text': clean(item.get('task', ''), 200), 'queuedAt': int(float(item.get('at') or 0) * 1000),
+             'attempts': int(item.get('attempts') or 0)} for item in items]
+
+
+def tell_list(queue_path=None, as_json=False, now=None):
+    rows, now = _queue_view(queue_items(queue_path)), time.time() if now is None else now
+    if as_json: return json.dumps(rows, ensure_ascii=False)
+    if not rows: return 'no queued tasks'
+    return _bounded([row['id'] + '  ' + row['target'] + '  queued ' + _ago(now - row['queuedAt'] / 1000) + ' ago'
+                     + ('  ' + str(row['attempts']) + ' failed attempts' if row['attempts'] else '') + '  ' + row['text'][:120]
+                     for row in rows])
+
+
+def tell_cancel(item_id, queue_path=None):
+    """(exit code, one line): removes the queued task with this id under the queue lock."""
+    queue_path = queue_path or QUEUE
+    queue_items(queue_path)  # gives ids to old items first, so the id printed by --list always matches
+    removed = None
+    if queue_path.exists():
+        with _locked(queue_path):
+            value = _read(queue_path)
+            kept = []
+            for item in value.get('items') or []:
+                if removed is None and isinstance(item, dict) and item.get('id') == item_id: removed = item
+                else: kept.append(item)
+            if removed is not None:
+                value['items'] = kept
+                _write(queue_path, value)
+    if removed is None: return 1, clean('no queued task with id ' + str(item_id) + ' (see claude-pool conductor tell --list)', 200)
+    row = _queue_view([removed])[0]
+    return 0, clean('cancelled ' + row['id'] + ' for ' + row['target'] + ': ' + row['text'], 300)
 
 
 # --- journal ------------------------------------------------------------------------------------------------------
@@ -668,10 +759,14 @@ def cli(argv):
     shot.add_argument('--json', action='store_true')
     watch = commands.add_parser('events', help='watcher for the Monitor tool: one `conductor-event` line per important change')
     watch.add_argument('--interval', type=float, default=POLL, help=argparse.SUPPRESS)
-    told = commands.add_parser('tell', help='prompt the right agent, or queue the task until it is idle')
-    told.add_argument('target', help='agent name, session, session/agent or project')
-    told.add_argument('task', nargs='+')
+    told = commands.add_parser('tell', help='prompt the right agent, or queue the task until it is idle; --list, --cancel <id>',
+                               usage='claude-pool conductor tell <target> <task> [--parallel] | tell --list [--json] | tell --cancel <id>')
+    told.add_argument('target', nargs='?', help='agent name, session, session/agent or project')
+    told.add_argument('task', nargs='*')
     told.add_argument('--parallel', action='store_true', help='busy agent: start a second pool agent in a new workspace of its session')
+    told.add_argument('--list', action='store_true', help='show the queued tasks: id, agent, age, failed attempts, text')
+    told.add_argument('--json', action='store_true', help='with --list: the queue as JSON')
+    told.add_argument('--cancel', metavar='ID', help='remove one queued task by the id --list shows')
     journal = commands.add_parser('journal', help='append-only journal (default ' + str(JOURNAL).replace(str(Path.home()), '~') + ')')
     verbs = journal.add_subparsers(dest='verb', required=True)
     add = verbs.add_parser('add'); add.add_argument('line', nargs='+')
@@ -682,6 +777,15 @@ def cli(argv):
     if args.command == 'snapshot': print(snapshot(as_json=args.json)); return 0
     if args.command == 'events': return events(interval=args.interval)
     if args.command == 'tell':
+        if args.list or args.cancel is not None:
+            if args.list and args.cancel is not None: told.error('--list and --cancel go alone')
+            if args.target or args.task or args.parallel: told.error('--list and --cancel take no target, task or --parallel')
+            if args.json and not args.list: told.error('--json goes with --list')
+            if args.list: print(tell_list(as_json=args.json)); return 0
+            code, line = tell_cancel(args.cancel)
+            print(line); return code
+        if args.json: told.error('--json goes with --list')
+        if not args.target or not args.task: told.error('give an agent and a task, or --list, or --cancel <id>')
         code, line = tell(args.target, ' '.join(args.task), parallel=args.parallel)
         print(line); return code
     if args.verb == 'add': journal_add(args.file, ' '.join(args.line)); return 0

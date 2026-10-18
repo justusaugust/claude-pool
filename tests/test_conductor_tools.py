@@ -137,9 +137,24 @@ class ToolsBase(unittest.TestCase):
         self.log.write_text('')
         self.set_state(base_state())
         self.env = {'PATH': str(self.bin) + ':/usr/bin:/bin', 'FAKE_STATE': str(self.state_file), 'FAKE_LOG': str(self.log)}
+        # The board facts (machines, accounts) read the registry, the pool and the service manager: point every path at the
+        # temp dir and shadow ssh and the service managers, so a snapshot can never reach a real device, pool or service.
+        for name in ('ssh', 'launchctl', 'systemctl', 'tailscale', 'cua', 'claude-pool'):
+            path = self.bin / name
+            path.write_text('#!' + sys.executable + '\nimport json, os, sys\nopen(os.environ["FAKE_LOG"], "a").write(json.dumps(['
+                            + repr(name) + '] + sys.argv[1:]) + "\\n")\nsys.exit(97)\n'); path.chmod(0o755)
         patcher = mock.patch.dict(os.environ, self.env); patcher.start(); self.addCleanup(patcher.stop)
         self.runtime = self.dir / 'state'
+        self.cfg = self.dir / 'cfg'
+        import settings
+        for key, value in [('RUNTIME', self.runtime), ('REGISTRY', self.cfg / 'devices.json'), ('SELF', self.cfg / 'device.json'),
+                           ('CONFIG', self.cfg / 'config.json'), ('STORES', self.dir / 'credentials'), ('LONG_LIVED', self.dir / 'long-lived'),
+                           ('LONG_LIVED_PROBES', self.runtime / 'long-lived-probes.json'),
+                           ('SHARED_READINGS', self.runtime / 'shared-readings.json'), ('HERE', self.dir / 'release' / 'gateway')]:
+            patcher = mock.patch.object(settings, key, value); patcher.start(); self.addCleanup(patcher.stop)
         self.events_path, self.queue_path = self.runtime / 'conductor-events.json', self.runtime / 'conductor-queue.json'
+        for key, value in [('EVENTS', self.events_path), ('QUEUE', self.queue_path)]:  # the real queue is never read or rewritten
+            patcher = mock.patch.object(ct, key, value); patcher.start(); self.addCleanup(patcher.stop)
 
     def set_state(self, value):
         self.value = value
@@ -158,7 +173,7 @@ class GuardTests(unittest.TestCase):
         try:
             parts = os.environ['PATH'].split(':')
             self.assertEqual(parts[1:], ['/usr/bin', '/bin'])
-            for name in ('herdr', 'gh', 'preview', 'git'):
+            for name in ('herdr', 'gh', 'preview', 'git', 'ssh', 'launchctl', 'systemctl', 'claude-pool'):
                 self.assertTrue(str(ct.shutil.which(name)).startswith(str(base.bin)), name)
         finally: base.doCleanups()
 
@@ -447,7 +462,8 @@ class TellTests(ToolsBase):
     def test_busy_agent_is_queued_and_events_deliver_it_when_idle(self):
         self.tick(1000, first=True)
         code, line = ct.tell('reviewer', 'Review PR 12', tools=ct.Tools(), queue_path=self.queue_path, now=1010)
-        self.assertEqual((code, line), (0, 'queued for dashboard/reviewer'))
+        self.assertEqual(code, 0); self.assertRegex(line, r'^queued for dashboard/reviewer \(id [0-9a-f]{6}\)$')
+        self.assertIn(json.loads(self.queue_path.read_text())['items'][0]['id'], line)  # the id `tell --cancel` takes
         self.assertEqual(stat.S_IMODE(self.queue_path.stat().st_mode), 0o600)
         self.assertFalse([c for c in self.herdr_calls() if 'prompt' in c])
         self.assertEqual(self.tick(1020), [])  # still working: nothing delivered

@@ -18,6 +18,7 @@ import tomllib
 import accounts_cli
 # Every module that contributes a STATUS_PARTS or INTEGRATION_HOOKS entry, imported here so registration never depends on call order.
 import conductor
+import conductor_board
 import device_cua
 import device_herdr  # noqa: F401  (registers herdrUnits)
 import device_install
@@ -111,7 +112,8 @@ DEVICE_HELP = '\n'.join([
     '  claude-pool account add <email> --long-lived --replace --name <name> (needs a browser), then claude-pool device sync.',
     '  If that device is gone (--replace says no token is saved), run the same command without --replace on any machine with a browser.', '',
     'RELATED TOOLS',
-    '  claude-pool conductor snapshot|events|tell|journal   what Conductor Claude uses to watch and prompt herdr agents',
+    '  claude-pool conductor snapshot|events|tell|journal   what Conductor Claude uses to watch and prompt herdr agents;',
+    '                                                      tell --list shows the queued tasks, tell --cancel <id> removes one',
     '  preview <port> | preview file <path>                 share a dev server or one file or folder over Tailscale (Linux devices)',
     '  device herdr-units [--adopt] [--session S]          on a Linux device: a unit per herdr session, so it comes back after a reboot.',
     '                                                       A running session stays as it is until the next boot; --adopt hands it to its',
@@ -1163,6 +1165,7 @@ def add(argv, out, remotes, local, **_):
         done = ensured.get(step.name)
         final.append(done if prefer_ensured(done, step, t.retry) else step)
     if refused is not None: final.append(refused)
+    conductor_board.record_checks({name: final})  # the Conductor Board reads the last result instead of checking again
     print(render(name + ' (' + target + ')', final))
     print_sync(synced)
     return 0 if ready(final) else 2
@@ -1189,6 +1192,7 @@ def check(argv, out, remotes, local, **_):
             continue
         results[row['name']] = check_all(t)
     good = all(ready(steps) for steps in results.values())
+    conductor_board.record_checks(results)  # the Conductor Board reads the last result instead of checking again
     if args.json:
         print_json({'ready': good, 'devices': {name: [step._asdict() for step in steps] for name, steps in results.items()}})
     else:

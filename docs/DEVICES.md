@@ -144,11 +144,21 @@ If `check` says `running on <device> but not connected to Remote Control`, turn 
 What Conductor Claude calls to see and act (bounded, redacted output):
 
 ```sh
-claude-pool conductor snapshot [--json]       # sessions, agents, last line, previews, open PRs
+claude-pool conductor snapshot [--json]       # sessions, agents, last line, previews, open PRs, machines, accounts, quick links, queue
 claude-pool conductor events                  # watcher: one line per important change
-claude-pool conductor tell <target> <task>    # prompt an agent, or queue the task until it is idle
+claude-pool conductor tell <target> <task>    # prompt an agent, or queue the task until it is idle (prints the task's id)
+claude-pool conductor tell --list [--json]    # the queued tasks: id, agent, age, failed attempts, text
+claude-pool conductor tell --cancel <id>      # remove one queued task; an unknown id exits 1
 claude-pool conductor journal add|show|prune  # append-only journal
 ```
+
+`snapshot --json` also carries what the Conductor Board shows at a glance, so the board never works these facts out itself:
+
+- `generatedAt`: when the snapshot was taken (ms).
+- `machines`: one row per registry device with `name`, `platform`, `self`, `reachable`, `poolRunning`, `versionMatches` (`null` = not known), `light` (`green`, `amber` or `red`), `reason` (one short sentence, empty when green), `fix` (the fix of the worst step) and `checkedAt` (ms of the last `device check`, `null` if never). Red: not reachable, pool not running, or a failed step. Amber: a step that is missing or needs you, another claude-pool version, no answer within 20 s, never checked, or no ssh from this machine to it. The snapshot never runs `device check`: it reads the last result that `device check` and `device add` keep in `device-check-cache.json` (0600, state folder), checks this machine's pool locally and asks another device for `claude-pool device status` over ssh at most once per 10 minutes (cached in `device-probe-cache.json`, whether or not it answered; a `device check` from the last 10 minutes counts as one).
+- `accounts`: one row per account the local pool knows, from the same overview as `claude-pool usage --once` (no call per account): `name`, `label`, `alias`, `registryName` (`null` when the registry uses the same name), `fiveHourPct`, `weekPct`, `fableWeekPct` (`null` when not reported), `resetsAt` (`fiveHour`, `week`, `fableWeek` in ms or `null`), `reserveAt`, `kind` (`long-lived` or `refreshable`), `expiresAt` (long-lived only), `status` and `agents` (Claude sessions this machine's pool serves on it; left out when the pool does not answer).
+- `quickAccess`: `{label, link, kind}`: the Cua desktops index first (`kind` `cua`), then every other preview as `preview list --json` reports it (`preview`), then `Conductor in der Claude-App` (`app`, https://claude.ai/code) when a Conductor is configured. The per-desktop shares on port 18501 and up are never listed: they open through the index.
+- `queue`: the queued `tell` tasks: `id`, `target`, `text` (first 200 characters), `queuedAt` (ms), `attempts`.
 
 ## herdr sessions after a reboot
 

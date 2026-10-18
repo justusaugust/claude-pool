@@ -896,7 +896,7 @@ class AddTests(OrchestrationBase):
         return self.vps
 
     def test_add_runs_every_step_in_order_and_ends_with_a_health_report(self):
-        self.fresh_vps()
+        self.fresh_vps(); self.runtime.chmod(0o700)
         code, out, err = self.cli('add', 'justus@vps', '--name', 'vps', '--usage-owner')
         self.assertEqual(code, 0, out + err); self.assertEqual(step_names(out), list(ADD_ORDER))
         value = registry.load(self.reg)
@@ -910,6 +910,9 @@ class AddTests(OrchestrationBase):
         self.assertTrue(self.vps.shell); self.assertEqual(self.vps.linger, 'yes'); self.assertEqual(self.vps.service, 'running')
         self.assertTrue(self.vps.rules); self.assertEqual(self.vps.preview, 'ours')
         self.assertEqual([r['target'] for r in self.local.herdr], ['justus@vps'])
+        import conductor_board
+        cached = json.loads((self.runtime / conductor_board.CHECK_FILE).read_text())['devices']
+        self.assertEqual([step['name'] for step in cached['vps']['steps']], list(ADD_ORDER))
 
     def test_usage_owner_is_refused_on_a_device_that_serves_no_refreshable_login_for_the_accounts(self):
         # A fresh machine only stages long-lived tokens; as usage owner it could poll no usage and readings would stop.
@@ -1074,6 +1077,17 @@ class CheckTests(OrchestrationBase):
         code, out, err = self.cli('check', 'vps')
         self.assertEqual(code, 0, out + err); self.assertEqual(step_names(out), list(CHECK_NAMES))
         self.assertEqual(self.count(self.vps, '-p'), 0)
+
+    def test_check_caches_each_result_for_the_conductor_board(self):
+        import conductor_board
+        self.runtime.chmod(0o700)
+        self.cli('check')
+        path = self.runtime / conductor_board.CHECK_FILE
+        self.assertEqual(oct(path.stat().st_mode & 0o777), oct(0o600))
+        cached = json.loads(path.read_text())['devices']
+        self.assertEqual([step['name'] for step in cached['vps']['steps']], list(CHECK_NAMES))
+        self.assertIsInstance(cached['vps']['checkedAt'], int)
+        self.assertEqual([step['name'] for step in cached['mac']['steps']], list(CHECK_NAMES))
 
     def tunnelled(self, running=True):
         registry.update(lambda value: (registry.device(value, 'vps').update(cua=True, tailscaleIp='100.64.0.2'),
