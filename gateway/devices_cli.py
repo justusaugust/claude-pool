@@ -51,7 +51,7 @@ CHECK_HELP = {
     'herdr': ('this machine has a herdr profile for the device', 'herdr machine add <ssh-target> --label <name>'),
     'app': ('the Mac that runs the Claude app lists and trusts the SSH environment', 'the Claude app clicks printed under Needs you'),
     'cua': ('the device shares its desktop through Cua and the machines can reach each other', 'see docs/DEVICES.md, Cua; macOS: switch on cua-spacesd in Accessibility, then claude-pool device add <ssh-target> --cua'),
-    'conductor': ('exactly one Conductor runs, on the registry device, connected to Remote Control', 'ssh <device> claude-pool device conductor install; claude-pool device conductor move <device>; stop the hand-started Conductor (herdr session conductor)'),
+    'conductor': ('exactly one Conductor runs, on the registry device, connected to Remote Control', 'not connected: turn Remote Control on in the Claude app, wait two minutes, run claude-pool device check <device>, then ssh <device> claude-pool device conductor install --restart; not running: ssh <device> claude-pool device conductor install; claude-pool device conductor move <device>; stop the hand-started Conductor (herdr session conductor)'),
     'readings': ('usage readings from the usage owner are fresh', 'ssh -o BatchMode=yes <owner> true must work from the device'),
     'preview': ('the preview tool is installed and links are HTTPS (Linux devices only)', 'claude-pool device add <ssh-target>; a root user runs sudo tailscale set --operator=<user> for HTTPS'),
 }
@@ -80,7 +80,7 @@ DEVICE_HELP = '\n'.join([
     '  device conductor move <device>           Moves the one Conductor to a device whose Native login is the Conductor account, linger is on and the pool runs.',
     '                                           It starts a new conversation: open "Conductor Claude" in the Claude app.',
     '  device conductor status                  Shows where the Conductor runs and whether it is connected',
-    '  (on the Conductor device: claude-pool device conductor install [--session-id ID] [--fresh] | uninstall)', '',
+    '  (on the Conductor device: claude-pool device conductor install [--session-id ID] [--fresh] [--restart] | uninstall)', '',
     'EXIT CODES: 0 nothing is missing, failed or unreachable (manual steps do not block); 2 a step needs work, read its fix line; 3 remove: tasks running.',
     'A failed linger step (root needed) also gives exit 2 until the root command ran.',
     'A device that prints "outdated launcher (no device support)" needs claude-pool device add <ssh-target> from this machine;',
@@ -100,7 +100,8 @@ DEVICE_HELP = '\n'.join([
     '  account reserve <name> --at <pct>|--off keeps an account as the last choice (the Conductor account is reserved from 85%).',
     '  A long-lived token lasts one year; doctor warns 30 days before and fails 7 days before. Revoking is manual in claude.ai settings.',
     '  Status reauthenticate means the token is revoked or expired: on the device that first enrolled the account run',
-    '  claude-pool account add <email> --long-lived --replace --name <name> (needs a browser), then claude-pool device sync.', '',
+    '  claude-pool account add <email> --long-lived --replace --name <name> (needs a browser), then claude-pool device sync.',
+    '  If that device is gone (--replace says no token is saved), run the same command without --replace on any machine with a browser.', '',
     'RELATED TOOLS',
     '  claude-pool conductor snapshot|events|tell|journal   what Conductor Claude uses to watch and prompt herdr agents',
     '  preview <port> | preview file <path>                 share a dev server or one file or folder over Tailscale (Linux devices)',
@@ -343,8 +344,8 @@ def conductor_internal(action, argv):
         return conductor.serve_service()
     if action == 'install':
         args = parse('conductor install', argv, (['--session-id'], {}), (['--fresh'], {'action': 'store_true'}),
-                     (['--move'], {'action': 'store_true'}))
-        step = conductor.install(args.session_id, args.fresh, args.move)
+                     (['--move'], {'action': 'store_true'}), (['--restart'], {'action': 'store_true'}))
+        step = conductor.install(args.session_id, args.fresh, args.move, args.restart)
     else:
         parse('conductor uninstall', argv)
         step = conductor.uninstall()

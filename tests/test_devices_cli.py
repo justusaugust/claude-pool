@@ -365,9 +365,11 @@ class InternalVerbTests(DeviceCliBase):
         with patch.object(conductor, 'install', return_value=Step('conductor', 'ok', 'installed')) as install:
             code, out, _ = self.run_cli(['conductor', 'install', '--session-id', session, '--fresh', '--move'])
             self.assertEqual(code, 0); self.assertIn('installed', out)
-            install.assert_called_once_with(session, True, True)
+            install.assert_called_once_with(session, True, True, False)
             self.run_cli(['conductor', 'install'])
-            install.assert_called_with(None, False, False)
+            install.assert_called_with(None, False, False, False)
+            self.run_cli(['conductor', 'install', '--restart'])
+            install.assert_called_with(None, False, False, True)
         with patch.object(conductor, 'uninstall', return_value=Step('conductor', 'failed', 'still loaded', 'launchctl bootout x')) as gone:
             code, out, _ = self.run_cli(['conductor', 'uninstall'])
         self.assertEqual(code, 1); self.assertIn('fix: launchctl bootout x', out); gone.assert_called_once_with()

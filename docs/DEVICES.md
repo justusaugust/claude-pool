@@ -71,7 +71,7 @@ claude-pool device remove <name> [--wait] [--uninstall]
 claude-pool device remove <name> --forget
 ```
 
-Removal stops the pool on the device, removes the long-lived token copies and the herdr profile, forgets the Cua Space and syncs the new registry to the other devices. The refreshable grant stays on its own machine, byte for byte. `--uninstall` also removes claude-pool from the device.
+Removal stops the pool on the device, removes the long-lived token copies and the herdr profile, forgets the Cua Space and syncs the new registry to the other devices. The refreshable grant stays on its own machine, byte for byte. `--uninstall` also removes claude-pool from the device. A partly failed removal exits 1 and the device stays registered: fix what it prints and rerun `claude-pool device remove <name>`, which completes it.
 
 It refuses, changing nothing, when:
 
@@ -105,7 +105,7 @@ claude-pool account reserve <name> --at <pct>
 claude-pool account reserve <name> --off
 ```
 
-A long-lived token lasts one year and is inference only. `doctor` warns 30 days before it expires and fails 7 days before. Revoking a token is manual, in claude.ai settings. After a revoke or an expiry, devices report `reauthenticate`. Fix it on the device that first enrolled the account (it holds the old token and has a browser): `claude-pool account add <email> --long-lived --replace --name <name>`, then `claude-pool device sync`.
+A long-lived token lasts one year and is inference only. `doctor` warns 30 days before it expires and fails 7 days before. Revoking a token is manual, in claude.ai settings. After a revoke or an expiry, devices report `reauthenticate`. Fix it on the device that first enrolled the account (it holds the old token and has a browser): `claude-pool account add <email> --long-lived --replace --name <name>`, then `claude-pool device sync`. If that device is gone and `--replace` fails with "No long-lived token is saved", enroll again without `--replace` on any machine with a browser, then `claude-pool device sync`.
 
 `account reserve` makes an account the pool's last choice: it takes no new pool work from the given percent of its limit. `--off` returns it to normal. A missing all-model weekly window is normal for Team accounts.
 
@@ -122,18 +122,18 @@ claude-pool device conductor status
 claude-pool device conductor move <device>
 ```
 
-`move` needs: the target is in the registry (`device list`), its Native login is the Conductor account, linger is on, and its pool service is running. Otherwise it refuses and changes nothing. A move starts a new conversation, so open the new "Conductor Claude" conversation in the Claude app (Code, environment of the device). `check` then says `ready on <device> in a new conversation; the old one could not be reattached` until you have.
+`move` refusals exit 1 and change nothing. `move` needs: the target is in the registry (`device list`), its Native login is the Conductor account, linger is on, and its pool service is running. Otherwise it refuses and changes nothing. If the old device is unreachable at the end, its Conductor is removed later and `check` reports it until then. A move starts a new conversation, so open the new "Conductor Claude" conversation in the Claude app (Code, environment of the device). `check` then says `ready on <device> in a new conversation; the old one could not be reattached` until you have.
 
 On the Conductor device itself the service is managed with:
 
 ```sh
-ssh <ssh-target> claude-pool device conductor install [--session-id <ID>] [--fresh]
+ssh <ssh-target> claude-pool device conductor install [--session-id <ID>] [--fresh] [--restart]
 ssh <ssh-target> claude-pool device conductor uninstall
 ```
 
-`install` is safe to rerun and reattaches the one conversation with `--session-id`; after three quick failures it starts a fresh conversation. `--session-id` adopts a Conductor you started by hand in herdr session `conductor`: stop that one first, then run the install line `check` prints. `--fresh` starts a new conversation.
+`install` is safe to rerun and reattaches the one conversation with `--session-id`; after three quick failures it starts a fresh conversation. `--session-id` adopts a Conductor you started by hand in herdr session `conductor`: stop that one first, then run the install line `check` prints. `--fresh` starts a new conversation. `--restart` restarts only the Conductor service, never the pool.
 
-If `check` says `running on <device> but not connected to Remote Control`, make sure Remote Control is on in the Claude app settings, then run `ssh <ssh-target> claude-pool device conductor install`.
+If `check` says `running on <device> but not connected to Remote Control`, turn Remote Control on in the Claude app, wait two minutes (the service retries by itself), then run `claude-pool device check <name>`. If it still says not connected, run `ssh <ssh-target> claude-pool device conductor install --restart`.
 
 What Conductor Claude calls to see and act (bounded, redacted output):
 

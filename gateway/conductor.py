@@ -314,9 +314,9 @@ def reserve_default(entry):
     return done, failed
 
 
-def install(session_id=None, fresh=False, moving=False):
+def install(session_id=None, fresh=False, moving=False, restart=False):
     """Install and start the Conductor service on this device. `session_id` adopts a conversation started by hand; `fresh`
-    starts a new conversation (move); `moving` (internal, from move) allows a device the registry does not name yet."""
+    starts a new conversation (move); `restart` restarts the Conductor unit even when nothing changed; `moving` (internal, from move) allows a device the registry does not name yet."""
     if session_id is not None and not SESSION_ID.fullmatch(session_id): raise ValueError('Invalid Conductor session id')
     entry = registry.load().get('conductor')
     if not entry: return Step(STEP, 'failed', 'the registry names no Conductor', 'claude-pool device add <ssh-target> --usage-owner')
@@ -351,14 +351,14 @@ def install(session_id=None, fresh=False, moving=False):
         if changed: service.write(unit, service.render(wanted))
         if not loaded:
             if _manager('bootstrap', 'gui/' + str(os.getuid()), str(unit)): return Step(STEP, 'failed', 'launchd did not load the Conductor', fix)
-        elif changes: _manager('kickstart', '-k', target)  # reattach the newly recorded conversation now
+        elif changes or restart: _manager('kickstart', '-k', target)  # reattach the newly recorded conversation now
     else:
         active = _manager('is-active', '--quiet', LABEL + '.service') == 0
         if changed:
             service.write(unit, service.render(wanted))
             _manager('daemon-reload')
         if _manager('enable', '--now', LABEL + '.service'): return Step(STEP, 'failed', 'systemd did not start the Conductor', fix)
-        if active and (changed or changes): _manager('restart', LABEL + '.service')
+        if active and (changed or changes or restart): _manager('restart', LABEL + '.service')
     reserved, failed = reserve_default(entry)
     detail = 'installed in ' + str(cwd)
     if reserved: detail += '; reserved ' + ', '.join(reserved) + ' from ' + str(RESERVE_DEFAULT) + ' %'
@@ -432,8 +432,9 @@ def check(statuses, value):
     here = statuses[device]
     if not parts[device].get('ready'):
         return Step(STEP, 'failed', 'running on ' + device + ' but not connected to Remote Control',
-                    'ssh ' + str(_target(value, device) or device) + ' claude-pool device conductor install'
-                    ' (first check that Remote Control is on in the Claude app settings)')
+                    'turn Remote Control on in the Claude app, wait two minutes, then run claude-pool device check ' + device +
+                    '; if it still says not connected: ssh ' + str(_target(value, device) or device) +
+                    ' claude-pool device conductor install --restart')
     if here.get('platform') == 'linux' and here.get('linger') is False:
         return Step(STEP, 'failed', 'stops when ' + device + ' logs out (linger is off)', 'claude-pool device add ' + str(_target(value, device) or device))
     if parts[device].get('fresh'):

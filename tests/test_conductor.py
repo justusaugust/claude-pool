@@ -365,6 +365,14 @@ class InstallTests(ServiceBase):
         restarts = [argv for argv in self.calls() if 'restart' in argv or 'kickstart' in argv]
         self.assertEqual(len(restarts), 1); self.assertTrue(any(conductor.LABEL in word for word in restarts[0]))
 
+    def test_install_restart_restarts_only_the_conductor_unit_once(self):
+        self.assertEqual(conductor.install().status, 'ok')
+        self.loaded.write_text(''); self.log.write_text('')
+        self.assertEqual(conductor.install(restart=True).status, 'ok')
+        restarts = [argv for argv in self.calls() if 'restart' in argv or 'kickstart' in argv]
+        self.assertEqual(len(restarts), 1); self.assertTrue(any(conductor.LABEL in word for word in restarts[0]))
+        self.assert_own_unit_only()
+
     def test_a_reserve_that_fails_leaves_the_service_installed_and_asks_for_the_reserve(self):
         (self.bin / 'shunt').write_text('#!/bin/sh\nexit 1\n')
         step = conductor.install()
@@ -421,7 +429,8 @@ class CheckTests(unittest.TestCase):
     def test_not_connected_to_remote_control_has_a_fix(self):
         step = conductor.check({'personal-vps': {**RUNNING, 'conductor': {**RUNNING['conductor'], 'ready': False}}, 'mac': IDLE}, value_with())
         self.assertEqual(step.status, 'failed')
-        self.assertRegex(step.fix, r'^ssh \S+ claude-pool device conductor install .*Remote Control')
+        self.assertRegex(step.fix, r'^turn Remote Control on in the Claude app, wait two minutes, then run claude-pool device check \S+; '
+                                            r'if it still says not connected: ssh \S+ claude-pool device conductor install --restart$')
 
     def test_check_is_not_ready_without_linger_or_with_two_conductors(self):
         value = value_with()
