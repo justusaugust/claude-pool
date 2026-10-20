@@ -146,16 +146,18 @@ What Conductor Claude calls to see and act (bounded, redacted output):
 
 ```sh
 claude-pool conductor snapshot [--json]       # sessions, agents, last line, previews, open PRs, machines, accounts, quick links, queue
-claude-pool conductor events                  # watcher: one line per important change
-claude-pool conductor tell <target> <task>    # prompt an agent, or queue the task until it is idle
+claude-pool conductor events                  # watcher: one line per important change; delivers the queue while it runs
+claude-pool conductor tell <target> <task>    # prompt an agent, or queue the task until it is idle (the Conductor service delivers it)
 claude-pool conductor tell --list [--json]    # the queued tasks: id, agent, age, failed attempts, text
 claude-pool conductor tell --cancel <id>      # remove one queued task; an unknown id exits 1
 claude-pool conductor journal add|show|prune  # append-only journal
 ```
 
-`snapshot --json` also carries what the Conductor Board shows at a glance, so the board never works these facts out itself:
-
 `tell` prints one line: `prompted <session>/<agent>` for an idle agent, or `queued for <session>/<agent> (id <id>)` for a busy one; `<id>` is the six-character id `tell --list` shows and `tell --cancel` takes. A queue file that cannot be read shows as empty, as in the snapshot.
+
+The Conductor service delivers queued tasks: every 20 s it prompts each idle or done agent with its oldest queued task and adds a `conductor-event delivered|orphaned|undeliverable <session>/<agent> <task>` line to the journal. While a `claude-pool conductor events` watcher runs, the watcher delivers instead and prints those lines. A task whose prompt fails three times is dropped as `undeliverable`; a task whose agent is gone is reported once as `orphaned`, delivered if the agent comes back, and dropped a day after it was queued. While herdr cannot list the agents, a task stays as it is.
+
+`snapshot --json` also carries what the Conductor Board shows at a glance, so the board never works these facts out itself:
 
 - `generatedAt`: when the snapshot was taken (ms).
 - `machines`: one row per registry device with `name`, `platform`, `self`, `reachable`, `poolRunning`, `versionMatches` (`null` = not known), `light` (`green`, `amber`, `red` or `grey`), `code`, `reason` (one short English sentence, empty when green), `fix` (the fix of the worst finding) and `checkedAt` (ms of the last `device check`, `null` if never). Red: not reachable, pool not running, or a failed step. Amber: a step that is missing or needs you, or another claude-pool version. Grey: never checked, no answer within 20 s, no ssh from this machine and no result shared yet, or (code `pool-stopped`) this machine's own service state could not be read. `code` is stable for a board to translate: `ok`, `unreachable`, `pool-stopped`, `version-mismatch`, `never-checked`, `not-checkable`, `failed:<step>`, `missing:<step>` or `manual:<step>`. The snapshot never runs `device check`: it reads the last result that `device check` and `device add` keep in `device-check-cache.json` (0600, state folder), checks this machine's pool locally and asks another device for `claude-pool device status` over ssh at most once per 10 minutes (cached in `device-probe-cache.json`, whether or not it answered; a `device check` from the last 10 minutes counts as one). `device check`, `device add` and `device sync` also send the whole check cache to every other device they reach (internal verb `device receive-checks`, JSON on stdin, no secrets; per device the newest result wins; only devices in the receiving registry are kept, and a `checkedAt` counts as at most one day ahead of the receiver's clock), so a device with no ssh back to your Mac still shows the Mac's own last check. A device's own row stays live: its reachability, pool and version are read on the spot.

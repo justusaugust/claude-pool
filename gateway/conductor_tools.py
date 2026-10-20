@@ -36,7 +36,7 @@ import settings
 EVENTS = settings.RUNTIME / 'conductor-events.json'  # 0600 last seen state of sessions, agents, previews and PRs
 QUEUE = settings.RUNTIME / 'conductor-queue.json'    # 0600 tasks waiting for a busy agent
 JOURNAL = Path(settings.CONDUCTOR_HOME).expanduser() / 'journal.md'
-POLL = 20               # seconds between `events` polls
+POLL = 20               # seconds between `events` polls and between the Conductor service's queue passes
 PR_EVERY = 3            # ask gh every third poll (about once a minute)
 BATCH = 600             # at most one batch line per ten minutes
 KEEP_DAYS = 14
@@ -219,13 +219,16 @@ def agent_label(row):
     return row['session'] + '/' + (row.get('name') or row['pane'])
 
 
+def _agent_row(session, agent):
+    return {'session': session, 'pane': agent['pane_id'], 'name': agent.get('name') or '', 'cwd': agent.get('cwd') or '',
+            'status': agent.get('agent_status') or 'unknown'}
+
+
 def _agent_rows(tools, sessions):
     rows = []
     for session in sessions:
         if not session.get('running'): continue
-        for agent in tools.agents(session['name']) or []:
-            rows.append({'session': session['name'], 'pane': agent['pane_id'], 'name': agent.get('name') or '',
-                         'status': agent.get('agent_status') or 'unknown', 'cwd': agent.get('cwd') or ''})
+        for agent in tools.agents(session['name']) or []: rows.append(_agent_row(session['name'], agent))
     return rows
 
 
@@ -359,10 +362,7 @@ def _observe(tools, previous, with_prs, now):
         agents = tools.agents(name)
         if agents is None:
             value['agents'].update({key: dict(row) for key, row in old_agents.items() if row.get('session') == name}); continue
-        for agent in agents:
-            value['agents'][name + '/' + agent['pane_id']] = {
-                'session': name, 'pane': agent['pane_id'], 'name': agent.get('name') or '', 'cwd': agent.get('cwd') or '',
-                'status': agent.get('agent_status') or 'unknown'}
+        for agent in agents: value['agents'][name + '/' + agent['pane_id']] = _agent_row(name, agent)
     previews = tools.previews()
     if previews is not None: value['previews'] = previews
     if with_prs:
@@ -501,15 +501,17 @@ def _tick(state_path, queue_path, tools, now, first, with_prs):
         lines.append('conductor-event batch ' + str(new['pending']) + ' changes')
         new['pending'], new['batchAt'] = 0, now
     _write(state_path, new)
-    if not (first or not old) and queue_path.exists(): lines += _deliver(tools, new['agents'], queue_path, now)
+    if not (first or not old) and queue_path.exists():
+        with _delivery_lock(queue_path) as held:
+            if held: lines += _deliver(tools, new['agents'], queue_path, now)  # not held: a service pass delivers right now
     return lines, True
 
 
 @contextlib.contextmanager
-def _watcher_lock(state_path):
-    """Held for a watcher's lifetime; yields False when another watcher holds it."""
-    private_directory(state_path.parent)
-    fd = os.open(str(state_path) + '.watch.lock', os.O_RDWR | os.O_CREAT, 0o600)
+def _try_lock(path):
+    """Takes the 0600 lock file `path` without waiting; yields False when another holder has it."""
+    private_directory(path.parent)
+    fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
     try:
         try: fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -518,8 +520,19 @@ def _watcher_lock(state_path):
     finally: os.close(fd)
 
 
+def _watcher_lock(state_path):
+    """Held for a watcher's lifetime; yields False when another watcher holds it."""
+    return _try_lock(Path(str(state_path) + '.watch.lock'))
+
+
+def _delivery_lock(queue_path):
+    """Held while one deliverer (a watcher's tick or a service pass) prompts from the queue; the other skips that poll."""
+    return _try_lock(Path(str(queue_path) + '.deliver.lock'))
+
+
 def events(state_path=None, queue_path=None, interval=POLL, tools=None, stop=None, clock=time.time, write=None):
-    """The Monitor watcher: polls until SIGTERM/SIGINT (or `stop`), one line per important event. One per machine."""
+    """The Monitor watcher: polls until SIGTERM/SIGINT (or `stop`), one line per important event. One per machine.
+    While it runs it delivers the queue, and the Conductor service leaves the queue to it."""
     write = write or (lambda line: print(line, flush=True))
     with _watcher_lock(state_path or EVENTS) as held:
         if not held:
@@ -542,6 +555,50 @@ def _watch(state_path, queue_path, interval, tools, stop, clock, write):
         count += 1
         stop.wait(interval)
     return 0
+
+
+# --- queue delivery by the Conductor service ----------------------------------------------------------------------
+
+def _all_agents(tools):
+    """{session/pane: row} of every agent in a running session, as `_observe` keeps them; None when herdr could not list
+    them all."""
+    sessions = tools.sessions()
+    if sessions is None: return None
+    found = {}
+    for session in sessions:
+        if not session.get('running'): continue
+        agents = tools.agents(session['name'])
+        if agents is None: return None
+        for agent in agents: found[session['name'] + '/' + agent['pane_id']] = _agent_row(session['name'], agent)
+    return found
+
+
+def deliver(queue_path=None, tools=None, now=None, state_path=None):
+    """One queue pass of the Conductor service, so a queued task never waits for an `events` watcher: prompts idle agents
+    as `_deliver` does and adds each line to the journal, since no Monitor reads it. A missing or empty queue costs no
+    herdr call. Changes nothing while a watcher runs (it delivers), while the other deliverer holds the delivery lock, or
+    when herdr cannot list every running session's agents (no attempt is counted and no task is orphaned)."""
+    queue_path, state_path = queue_path or QUEUE, state_path or EVENTS
+    tools, now = tools or Tools(), time.time() if now is None else now
+    if not queue_items(queue_path): return []
+    with _watcher_lock(state_path) as free:
+        if not free: return []  # released at once: a watcher started a moment later still gets its lock
+    with _delivery_lock(queue_path) as held:
+        if not held: return []
+        agents = _all_agents(tools)
+        if agents is None: return []
+        lines = _deliver(tools, agents, queue_path, now)
+    for line in lines: journal_add(JOURNAL, line)
+    return lines
+
+
+def deliver_until(stop, interval=POLL):
+    """The Conductor service's queue thread: one `deliver` pass at once, then one every `interval` seconds until `stop`."""
+    while not stop.is_set():
+        try: deliver()
+        except Exception:
+            pass  # one bad pass never ends delivery; the next pass reads the queue afresh
+        stop.wait(interval)
 
 
 # --- tell ---------------------------------------------------------------------------------------------------------
@@ -596,8 +653,8 @@ def _parallel(row, task, rows, tools, sleep):
 
 def tell(target, task, parallel=False, tools=None, queue_path=None, now=None, sleep=time.sleep):
     """(exit code, one line). Idle agent: prompt it. Busy: start a second pool agent in a new workspace of the same session
-    with `parallel`, otherwise queue for `events` to deliver. Several matches fail with the candidates. Never creates
-    herdr sessions or projects."""
+    with `parallel`, otherwise queue it; the Conductor service delivers it once the agent is idle (a running `events`
+    watcher does instead). Several matches fail with the candidates. Never creates herdr sessions or projects."""
     code, line = _tell(target, task, parallel, tools, queue_path, now, sleep)
     return code, clean(line, 600)
 
