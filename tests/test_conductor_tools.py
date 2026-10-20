@@ -560,6 +560,39 @@ class TellTests(ToolsBase):
         self.assertFalse([c for c in self.herdr_calls() if 'create' in c or 'start' in c])
 
 
+class ServiceDeliveryTests(ToolsBase):
+    """The queue must not depend on the optional `conductor events` watcher: a task queued for a busy agent sat for 13 hours
+    with 0 attempts while its agent was done several times, because no watcher ran (example-vps, 2026-10-19)."""
+
+    def test_the_conductor_service_delivers_a_queued_task_once_the_agent_is_done_without_an_events_watcher(self):
+        code, line = ct.tell('reviewer', 'Review PR 12', tools=ct.Tools(), queue_path=self.queue_path)
+        self.assertEqual(code, 0); self.assertTrue(line.startswith('queued for dashboard/reviewer'))
+        value = base_state(); value['agents']['dashboard'][0]['agent_status'] = 'done'
+        self.set_state(value)
+        native = self.dir / 'native-claude'
+        native.write_text('#!/bin/sh\nexec sleep 60\n'); native.chmod(0o755)
+        config = self.dir / 'config.json'
+        config.write_text(json.dumps({'state_dir': str(self.runtime), 'credential_dir': str(self.dir / 'credentials'),
+                                      'native_claude': str(native)}))
+        home = self.dir / 'conductor'; home.mkdir()
+        env = {**self.env, 'HOME': str(self.dir), 'CLAUDE_POOL_CONFIG': str(config), 'PYTHONDONTWRITEBYTECODE': '1'}
+        # The unit's command (`run.py device conductor serve`), started the way the service manager starts it.
+        child = subprocess.Popen([sys.executable, str(ROOT / 'gateway/launch.py'), 'device', 'conductor', 'serve'], cwd=home,
+                                 env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        prompt = ['herdr', '--session', 'dashboard', 'agent', 'prompt', 'w1:p1', 'Review PR 12']
+        try:
+            deadline = time.time() + 20
+            while prompt not in self.calls() and time.time() < deadline: time.sleep(0.1)
+            child.send_signal(signal.SIGTERM)
+            out, err = child.communicate(timeout=30)
+        finally:
+            if child.poll() is None: child.kill(); child.wait()
+        self.assertEqual((child.returncode, err), (0, ''))
+        self.assertIn('startedAt', json.loads((self.runtime / 'conductor.json').read_text()))  # the service really supervised
+        self.assertIn(prompt, self.calls())
+        self.assertEqual(json.loads(self.queue_path.read_text())['items'], [])
+
+
 class JournalTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
