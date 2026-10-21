@@ -622,7 +622,8 @@ class Handler(BaseHTTPRequestHandler):
             with self.server.lock: project = (self.server.sessions.get(session_id) or {}).get('project', '')
         original, braked, sent_model = body, None, request.get('model')
         if self.command == 'POST' and path == '/v1/messages' and cls in BRAKE_CLASSES:
-            new, decision = self.server.brake.decide(headers, request, self.server.brake_info(), project, self.server.urgent())
+            info, urgent = self.server.brake_info(), self.server.urgent()
+            with self.server.lock: new, decision = self.server.brake.decide(headers, request, info, project, urgent)
             if new is not None: body, braked, sent_model = json.dumps(new).encode(), decision, new['model']
         context = None
         if tracked:
