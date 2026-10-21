@@ -10,6 +10,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -558,6 +559,165 @@ class TellTests(ToolsBase):
     def test_busy_agent_without_parallel_never_creates_a_workspace(self):
         ct.tell('reviewer', 'x', tools=ct.Tools(), queue_path=self.queue_path)
         self.assertFalse([c for c in self.herdr_calls() if 'create' in c or 'start' in c])
+
+
+class ServiceDeliveryTests(ToolsBase):
+    """The queue must not depend on the optional `conductor events` watcher: a task queued for a busy agent sat for 13 hours
+    with 0 attempts while its agent was done several times, because no watcher ran (example-vps, 2026-10-19)."""
+
+    def test_the_conductor_service_delivers_a_queued_task_once_the_agent_is_done_without_an_events_watcher(self):
+        code, line = ct.tell('reviewer', 'Review PR 12', tools=ct.Tools(), queue_path=self.queue_path)
+        self.assertEqual(code, 0); self.assertTrue(line.startswith('queued for dashboard/reviewer'))
+        value = base_state(); value['agents']['dashboard'][0]['agent_status'] = 'done'
+        self.set_state(value)
+        native = self.dir / 'native-claude'
+        native.write_text('#!/bin/sh\nexec sleep 60\n'); native.chmod(0o755)
+        config = self.dir / 'config.json'
+        config.write_text(json.dumps({'state_dir': str(self.runtime), 'credential_dir': str(self.dir / 'credentials'),
+                                      'native_claude': str(native)}))
+        home = self.dir / 'conductor'; home.mkdir()
+        env = {**self.env, 'HOME': str(self.dir), 'CLAUDE_POOL_CONFIG': str(config), 'PYTHONDONTWRITEBYTECODE': '1'}
+        # The unit's command (`run.py device conductor serve`), started the way the service manager starts it.
+        child = subprocess.Popen([sys.executable, str(ROOT / 'gateway/launch.py'), 'device', 'conductor', 'serve'], cwd=home,
+                                 env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        prompt = ['herdr', '--session', 'dashboard', 'agent', 'prompt', 'w1:p1', 'Review PR 12']
+        try:
+            deadline = time.time() + 20
+            while prompt not in self.calls() and time.time() < deadline: time.sleep(0.1)
+            child.send_signal(signal.SIGTERM)
+            out, err = child.communicate(timeout=30)
+        finally:
+            if child.poll() is None: child.kill(); child.wait()
+        self.assertEqual((child.returncode, err), (0, ''))
+        self.assertIn('startedAt', json.loads((self.runtime / 'conductor.json').read_text()))  # the service really supervised
+        self.assertIn(prompt, self.calls())
+        self.assertEqual(json.loads(self.queue_path.read_text())['items'], [])
+
+
+class DeliveryPassTests(ToolsBase):
+    """One queue pass of the Conductor service, called directly (the service makes one every POLL seconds)."""
+    DELIVERED = 'conductor-event delivered dashboard/reviewer Review PR 12'
+    PROMPT = ['herdr', '--session', 'dashboard', 'agent', 'prompt', 'w1:p1', 'Review PR 12']
+
+    def setUp(self):
+        super().setUp()
+        self.journal = self.dir / 'conductor' / 'journal.md'
+        patcher = mock.patch.object(ct, 'JOURNAL', self.journal); patcher.start(); self.addCleanup(patcher.stop)
+
+    def queue(self, status):
+        """Queue a task for the busy reviewer, then set its status; the call log starts empty."""
+        ct.tell('reviewer', 'Review PR 12', tools=ct.Tools(), queue_path=self.queue_path, now=1010)
+        value = base_state(); value['agents']['dashboard'][0]['agent_status'] = status
+        self.set_state(value); self.log.write_text('')
+        return value
+
+    def deliver(self, now=1020, tools=None):
+        return ct.deliver(self.queue_path, tools or ct.Tools(), now, self.events_path)
+
+    def items(self): return json.loads(self.queue_path.read_text())['items']
+
+    def herdr_calls(self): return [c for c in self.calls() if c[0] == 'herdr']
+
+    def journal_lines(self): return [line.split(' ', 3)[3] for line in self.journal.read_text().splitlines()]
+
+    def test_a_missing_or_empty_queue_costs_no_herdr_call(self):
+        self.assertEqual(self.deliver(), [])
+        self.assertFalse(self.queue_path.exists())
+        ct._write(self.queue_path, {'items': []})
+        self.assertEqual(self.deliver(), [])
+        self.assertEqual(self.calls(), [])
+        self.assertFalse(self.journal.exists())
+
+    def test_a_task_waits_while_its_agent_works_and_is_delivered_and_journaled_once_it_is_done(self):
+        value = self.queue('working')
+        self.assertEqual(self.deliver(), [])
+        self.assertNotIn('attempts', self.items()[0])
+        value['agents']['dashboard'][0]['agent_status'] = 'done'; self.set_state(value)
+        self.assertEqual(self.deliver(1040), [self.DELIVERED])
+        self.assertEqual([c for c in self.herdr_calls() if c[4:5] == ['prompt']], [self.PROMPT])
+        self.assertEqual(self.items(), [])
+        self.assertRegex(self.journal.read_text(), r'^- \d{4}-\d{2}-\d{2} \d{2}:\d{2} ' + self.DELIVERED + '\n$')
+        self.assertEqual(self.deliver(1060), [])
+
+    def test_orphaned_and_undeliverable_lines_land_in_the_journal(self):
+        value = self.queue('working')
+        del value['agents']['dashboard'][0]; self.set_state(value)
+        self.assertEqual(self.deliver(1020), ['conductor-event orphaned dashboard/reviewer Review PR 12'])
+        self.assertEqual(self.deliver(1040), [])  # reported once
+        self.assertEqual(self.deliver(1010 + ct.ORPHAN_KEEP), ['conductor-event undeliverable dashboard/reviewer Review PR 12'])
+        self.assertEqual(self.items(), [])
+        self.assertEqual(self.journal_lines(), ['conductor-event orphaned dashboard/reviewer Review PR 12',
+                                                'conductor-event undeliverable dashboard/reviewer Review PR 12'])
+
+    def test_a_herdr_read_failure_leaves_the_task_untouched(self):
+        value = self.queue('done')
+        before = self.items()
+        for broken in ({'herdr_down': True}, {'agent_list_fails': ['dashboard']}):
+            with self.subTest(broken=broken):
+                self.set_state({**value, **broken})
+                # A day after queueing, a pass that took "could not tell" for "gone" would drop the task as undeliverable.
+                self.assertEqual(self.deliver(1010 + ct.ORPHAN_KEEP), [])
+                self.assertEqual(self.items(), before)
+        self.assertFalse([c for c in self.herdr_calls() if c[4:5] == ['prompt']])
+        self.assertFalse(self.journal.exists())
+
+    def test_a_running_watcher_delivers_instead_and_a_pass_never_keeps_the_watcher_lock(self):
+        self.queue('done')
+        with ct._watcher_lock(self.events_path) as held:
+            self.assertTrue(held)
+            self.assertEqual(self.deliver(), [])
+        self.assertEqual(self.herdr_calls(), [])
+        self.assertEqual(len(self.items()), 1)
+        seen, case = [], self
+        class WatcherStartsMidPass(ct.Tools):
+            def prompt(self, *args):
+                with ct._watcher_lock(case.events_path) as held: seen.append(held)
+                return super().prompt(*args)
+        self.assertEqual(self.deliver(tools=WatcherStartsMidPass()), [self.DELIVERED])
+        self.assertEqual(seen, [True])
+        with ct._watcher_lock(self.events_path) as held: self.assertTrue(held)
+
+    def test_a_pass_skips_while_another_deliverer_holds_the_delivery_lock(self):
+        self.queue('done')
+        lock = Path(str(self.queue_path) + '.deliver.lock')
+        with ct._delivery_lock(self.queue_path) as held:
+            self.assertTrue(held)
+            self.assertEqual(self.deliver(), [])
+        self.assertEqual(self.herdr_calls(), [])
+        self.assertEqual(stat.S_IMODE(lock.stat().st_mode), 0o600)
+        self.assertEqual(self.deliver(), [self.DELIVERED])
+
+    def test_a_watcher_tick_skips_delivery_while_a_service_pass_holds_the_delivery_lock(self):
+        self.tick(1000, first=True)
+        self.queue('idle')
+        with ct._delivery_lock(self.queue_path) as held:
+            self.assertTrue(held)
+            self.assertEqual([line.split()[1] for line in self.tick(1020)], ['agent-waiting'])
+        self.assertFalse([c for c in self.herdr_calls() if c[4:5] == ['prompt']])
+        self.assertEqual(len(self.items()), 1)
+        self.assertIn(self.DELIVERED, self.tick(1040))
+
+    def run_loop(self, one_pass, interval, passes, wanted):
+        stop = threading.Event(); self.addCleanup(stop.set)
+        with mock.patch.object(ct, 'deliver', one_pass):
+            thread = threading.Thread(target=ct.deliver_until, args=(stop,), kwargs={'interval': interval}); thread.start()
+            deadline = time.time() + 5
+            while len(passes) < wanted and time.time() < deadline: time.sleep(0.01)
+            stop.set(); thread.join(5)
+        self.assertFalse(thread.is_alive())
+
+    def test_the_queue_thread_passes_at_once_and_ends_when_the_service_stops(self):
+        passes = []
+        self.run_loop(lambda: passes.append(1), 3600, passes, 1)
+        self.assertEqual(passes, [1])
+
+    def test_the_queue_thread_survives_a_failing_pass(self):
+        passes = []
+        def one_pass():
+            passes.append(1)
+            if len(passes) == 1: raise RuntimeError('a bad pass')
+        self.run_loop(one_pass, 0.01, passes, 3)
+        self.assertGreaterEqual(len(passes), 3)
 
 
 class JournalTests(unittest.TestCase):
