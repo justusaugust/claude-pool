@@ -30,6 +30,8 @@ After shell setup, `claude` starts pooled sessions and preserves Native administ
 | `claude-pool account rename <old> <new> [--wait]` | Rename an account on this machine (label and shortcut stay); `claude-pool help account` |
 | `claude-pool account reserve <name> --at <pct>` / `--off` | Make an account the last choice from a percent of its limit |
 | `claude-pool conductor snapshot` / `events` / `tell` / `journal` | Tools Conductor Claude uses for herdr agents |
+| `claude-pool conductor usage [--json]` | Today's usage by project and request class (API price equivalent) and the brake stage |
+| `claude-pool conductor urgent <project> [--hours N]` / `--off <project>` / `--list` | The owner waits on a project: the brake leaves its subagents alone for some hours |
 | `preview file <path>` | Share one file or folder read-only over Tailscale |
 | `claude-native update` | Update Native Claude itself through its own updater |
 | `claude-native agents --json` | Native worker inventory |
@@ -49,6 +51,12 @@ Call the explicit `claude-pool` executable. Shell functions named `claude` are u
 Five-hour and weekly bars show percent **used**. The optional phone UI explicitly shows capacity **remaining**. A panel refresh is not a new provider observation: check the observation age. Cached provider polling and response headers update readings independently.
 
 Forecasts use recent observed quota burn, not a sum of percentages across different plans. They need enough fresh observations and measured burn. Missing weekly windows, stale readings or insufficient signal remain visible; the displayed range is observed variability, not guaranteed runtime.
+
+## Forecast and brake
+
+The pool forecast is the time until every ready account reaches its limit at the current combined pace: the rest of all ready accounts (to the reserve limit of reserved accounts, idle accounts included) divided by their summed burn. Accounts burn in parallel, so their own times do not add up.
+
+When that forecast does not reach the next five-hour reset of an account that can serve again, the brake starts new subagent and workflow conversations on Sonnet 5.5 instead of Opus or Fable (stage 1). Below half that time their effort is also capped at high (stage 2). The model is chosen at an agent's first request and kept for its lifetime, because caches and thinking blocks belong to one model; an agent first seen mid-conversation keeps its model. Main sessions, compaction, Conductor (`conductor-wecker`) and projects marked with `claude-pool conductor urgent` are never braked. If the API refuses a braked request, it is sent once more with the model the agent asked for. Every answered request is logged without content in `usage-ledger/<date>.jsonl` under the state directory (31 days).
 
 ## Quota exhaustion and recovery
 

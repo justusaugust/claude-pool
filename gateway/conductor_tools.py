@@ -820,6 +820,44 @@ def journal_prune(path, now=None, keep_days=KEEP_DAYS):
 
 # --- command line -------------------------------------------------------------------------------------------------
 
+def urgent_projects():
+    try: value = json.loads((settings.RUNTIME / 'brake.json').read_text())
+    except (OSError, ValueError): value = {}
+    rows = value.get('urgent') if isinstance(value, dict) else None
+    return {p: u for p, u in rows.items() if isinstance(u, (int, float)) and u > time.time()} if isinstance(rows, dict) else {}
+
+
+def urgent_set(project, hours=None):
+    """The owner waits on a project: the pool brake leaves its subagents alone for some hours (hours None lifts it)."""
+    rows = urgent_projects()
+    if hours is None: rows.pop(project, None)
+    else: rows[project] = time.time() + hours * 3600
+    path = settings.RUNTIME / 'brake.json'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix('.tmp'); tmp.write_text(json.dumps({'urgent': rows})); os.chmod(tmp, 0o600); tmp.replace(path)
+    return rows
+
+
+def usage_today(as_json=False):
+    """Today's usage from the pool ledger by project and request class, API-price equivalent, plus the brake stage."""
+    from brake import today_summary
+    summary = today_summary(settings.RUNTIME / 'usage-ledger' / (time.strftime('%Y-%m-%d') + '.jsonl'))
+    summary['brake'] = None
+    try:
+        lines = (settings.RUNTIME / 'usage-history' / (time.strftime('%Y-%m') + '.jsonl')).read_text().splitlines()
+        summary['brake'] = next((json.loads(l).get('forecast', {}).get('brake') for l in reversed(lines) if '"brake"' in l), None)
+    except (OSError, ValueError): pass
+    if as_json: return json.dumps(summary)
+    stage = (summary['brake'] or {}).get('stage') or 0
+    text = ['Usage today · ~$' + format(round(summary['usd']), ',') + ' API price equivalent',
+            'Brake · ' + ('off' if not stage else f'stage {stage}: new subagents on Sonnet 5.5' + (', effort high' if stage >= 2 else ''))
+            + (f" · {summary['braked']} braked answers" if summary['braked'] else '')]
+    for row in summary['projects'][:12]:
+        text.append(f"  {row['project'][:28]:<28} ~${row['usd']:>7.0f}  {row['usd'] / summary['usd']:>4.0%}" if summary['usd'] else '')
+    text.append('  ' + ' · '.join(f"{k} {v / summary['usd']:.0%}" for k, v in sorted(summary['classes'].items(), key=lambda kv: -kv[1])) if summary['usd'] else '  no answers logged today')
+    return '\n'.join(text)
+
+
 def cli(argv):
     parser = argparse.ArgumentParser(prog='claude-pool conductor', description='Cheap tools for Conductor Claude.')
     commands = parser.add_subparsers(dest='command', required=True)
@@ -835,6 +873,12 @@ def cli(argv):
     told.add_argument('--list', action='store_true', help='show the queued tasks: id, agent, age, failed attempts, text')
     told.add_argument('--json', action='store_true', help='with --list: the queue as JSON')
     told.add_argument('--cancel', metavar='ID', help='remove one queued task by the id --list shows')
+    urgent = commands.add_parser('urgent', help='the owner waits on a project: the brake leaves its subagents alone for some hours',
+                                 usage='claude-pool conductor urgent <project> [--hours N] | urgent --off <project> | urgent --list')
+    urgent.add_argument('project', nargs='?', help='COCKPIT_PROJECT, the folder name the agent works in')
+    urgent.add_argument('--hours', type=float, default=3); urgent.add_argument('--off', action='store_true'); urgent.add_argument('--list', action='store_true')
+    spend = commands.add_parser('usage', help="today's usage by project and class from the pool ledger, and the brake stage")
+    spend.add_argument('--json', action='store_true')
     journal = commands.add_parser('journal', help='append-only journal (default ' + str(JOURNAL).replace(str(Path.home()), '~') + ')')
     verbs = journal.add_subparsers(dest='verb', required=True)
     add = verbs.add_parser('add'); add.add_argument('line', nargs='+')
@@ -843,6 +887,14 @@ def cli(argv):
     for sub in (add, show, prune): sub.add_argument('--file', type=Path, default=JOURNAL)
     args = parser.parse_args(argv)
     if args.command == 'snapshot': print(snapshot(as_json=args.json)); return 0
+    if args.command == 'usage': print(usage_today(as_json=args.json)); return 0
+    if args.command == 'urgent':
+        if args.list:
+            rows = urgent_projects()
+            print('\n'.join(f"{p} until {time.strftime('%H:%M', time.localtime(u))}" for p, u in sorted(rows.items())) or 'no urgent projects'); return 0
+        if not args.project or not re.fullmatch(r'[\w .-]{1,60}', args.project): urgent.error('give a project folder name')
+        rows = urgent_set(args.project, None if args.off else args.hours)
+        print(f"{args.project}: " + (f"urgent until {time.strftime('%H:%M', time.localtime(rows[args.project]))}" if args.project in rows else 'braked like the others again')); return 0
     if args.command == 'events': return events(interval=args.interval)
     if args.command == 'tell':
         if args.list or args.cancel is not None:
