@@ -1,4 +1,5 @@
-"""Quota pace uses fresh same-window observations, not sums of plan percentages."""
+"""Quota pace uses fresh same-window observations. The pool forecast pools rest and pace of accounts that burn at the
+same time; summing each account's own time assumed they run one after another (21.10.2026: 248 min forecast, 70 real)."""
 from statistics import median
 from telemetry import missing_windows
 
@@ -38,6 +39,8 @@ def pace(points, key, now):
 def estimate(accounts, observations, now, threshold=95):
     estimates, resets = [], []
     for account in accounts:
+        # A reserved account takes no new pool work from its reserve limit on (routing.reserve_blocked).
+        limit = min(threshold, account['reserveAt']) if account.get('reserveAt') else threshold
         row = {'name': account['name'], 'label': account['label'], 'status': account['status'],
                'seconds': None, 'basis': [], 'windows': {}, 'reason': 'collecting pace'}
         times = []
@@ -64,9 +67,14 @@ def estimate(accounts, observations, now, threshold=95):
             row['windows'][key] = speed
             if speed['ratePerHour'] is None or speed['ratePerHour'] <= 0:
                 if row['reason'] != 'reading stale': row['reason'] = speed['reason']
+                if speed['ratePerHour'] == 0:
+                    rest = max(0, limit - window['pct'])
+                    row['idleRestPct'] = rest if row.get('idleRestPct') is None else min(row['idleRestPct'], rest)
                 continue
-            remaining = max(0, threshold - window['pct']) * 3600
+            rest = max(0, limit - window['pct'])
+            remaining = rest * 3600
             seconds = remaining / speed['ratePerHour']
+            speed['restPct'] = rest
             speed.update(seconds=seconds, secondsLow=remaining / speed['rateHigh'],
                          secondsHigh=remaining / speed['rateLow'] if speed['rateLow'] > 0 else None)
             times.append((seconds, key, window, speed))
@@ -74,22 +82,36 @@ def estimate(accounts, observations, now, threshold=95):
         if times and account['status'] == 'ready':
             seconds, key, window, speed = min(times, key=lambda t: t[0])
             upper = [t[3]['secondsHigh'] for t in times if t[3]['secondsHigh'] is not None]
+            row.update(restPct=speed['restPct'], ratePerHour=speed['ratePerHour'], rateLow=speed['rateLow'], rateHigh=speed['rateHigh'])
             row.update(seconds=int(seconds), secondsLow=int(min(t[3]['secondsLow'] for t in times)),
                        secondsHigh=int(min(upper)) if upper else None, reason='recent burn',
                        paceQuality=speed['reason'], resetBeforeLimit=seconds * 1000 > window['resetsAt'] - now)
         estimates.append(row)
     eligible = [a for a in estimates if a['status'] == 'ready']
     known = [a for a in eligible if a['seconds'] is not None]
-    return {'seconds': sum(a['seconds'] for a in known) if known else None,
-            'secondsLow': sum(a['secondsLow'] for a in known) if known else None,
-            'secondsHigh': sum(a['secondsHigh'] for a in known) if known and all(a['secondsHigh'] is not None for a in known) else None,
+    pooled = pool_seconds(known, [a for a in eligible if a['seconds'] is None and a.get('idleRestPct') is not None])
+    plans = {a.get('plan') for a in accounts if a['status'] == 'ready'}
+    return {**pooled, 'mixedPlans': len(plans) > 1,
             'paceQuality': 'changing' if any(a['paceQuality'] == 'changing' for a in known) else 'low signal' if any(a['paceQuality'] == 'low signal' for a in known) else 'steady' if known else 'collecting',
             'resetBeforeLimit': any(a['resetBeforeLimit'] for a in known),
             'estimatedAccounts': len(known), 'eligibleAccounts': len(eligible),
-            'partial': len(known) != len(eligible) or any(len(a['basis']) < 2 for a in known),
+            'partial': len(known) != len(eligible) or any(len(a['basis']) < 2 for a in known) or len(plans) > 1,
             'threshold': threshold, 'accounts': estimates,
             'missingWindows': missing_windows(accounts),
             'nextReset': min(resets, key=lambda r: r['at']) if resets else None}
+
+
+def pool_seconds(burning, idle):
+    """Time until every eligible account reaches its limit at the current combined pace.
+
+    Load moves to the accounts that still have room, so rest and pace add up across accounts: rest of the burning and the
+    idle accounts over the summed pace. Percentages of one plan are comparable; mixed plans are flagged by the caller."""
+    if not burning: return {'seconds': None, 'secondsLow': None, 'secondsHigh': None}
+    rest = sum(a['restPct'] for a in burning) + sum(a['idleRestPct'] for a in idle)
+    rate, high = sum(a['ratePerHour'] for a in burning), sum(a['rateHigh'] for a in burning)
+    low = sum(a['rateLow'] for a in burning)
+    return {'seconds': round(rest * 3600 / rate), 'secondsLow': round(rest * 3600 / high),
+            'secondsHigh': round(rest * 3600 / low) if low > 0 else None}
 
 
 def renewal_scenario(accounts, forecast, now, hours=24):
