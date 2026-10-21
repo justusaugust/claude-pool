@@ -30,6 +30,8 @@ def archive(folder, accounts, forecast, now, source='live'):
     saved_forecast['accounts'] = [{'name': a['name'], 'windows': {
         key: {'ratePerHour': a['windows'][key].get('ratePerHour')} for key in WINDOWS if key in a.get('windows', {})}}
         for a in forecast.get('accounts', [])]
+    if forecast.get('brake'):
+        saved_forecast['brake'] = {k: forecast['brake'].get(k) for k in ('stage', 'ratio', 'resetAt')}
     if forecast.get('renewals'):
         saved_forecast['renewals'] = {'segments': [{k: s[k] for k in ('at', 'until', 'available', 'uncertain')}
                                                    for s in forecast['renewals']['segments']]}

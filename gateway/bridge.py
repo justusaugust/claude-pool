@@ -18,6 +18,7 @@ from forecast import estimate, renewal_scenario, workload_estimates
 from routing import choose, profile, session_rows, unavailable, REASONS
 from validation import archive, HistoryIndex
 from diagnostics import Journal
+from brake import Brake, CLASSES as BRAKE_CLASSES, ledger_line, stage as brake_stage
 import readings
 from native_auth import NativeAuthUnavailable
 from telemetry import fable_windows, capacity
@@ -68,6 +69,8 @@ class PoolBridge(ThreadingHTTPServer):
         self.journal = Journal(self.state_path.parent / 'incidents.json' if self.state_path else None, atomic_write)
         self.health = {"backend": "starting", "failures": 0, "checkedAt": None, "supervisor": ("systemd" if sys.platform.startswith("linux") else "launchd") if os.environ.get("POOL_MANAGED") == "1" else "standalone"}
         self.last_accounts = []
+        self.brake, self._brake_cache = Brake(), (-60.0, {'stage': 0, 'ratio': None, 'resetAt': None})
+        self.ledger_dir, self.ledger_lock, self._ledger_day = (self.state_path.parent / 'usage-ledger' if self.state_path else None), threading.Lock(), None
         self.draining = False
         self.connections = threading.BoundedSemaphore(64)
         self.requests = {}
@@ -338,8 +341,42 @@ class PoolBridge(ThreadingHTTPServer):
     def forecast(self, accounts, now):
         result = estimate(accounts, self.observations, now)
         result["renewals"] = renewal_scenario(accounts, result, now)
+        result["brake"] = brake_stage(result, accounts, now)
         result["workloads"] = workload_estimates(accounts, self.observations, self.traffic, now)
         return result
+
+    def brake_info(self):
+        """Brake stage at most once a minute: the pooled forecast against the next usable five-hour reset."""
+        at, info = self._brake_cache
+        if time.monotonic() - at < 60: return info
+        try:
+            accounts, now = self.accounts(), int(time.time() * 1000)
+            with self.lock: info = brake_stage(estimate(accounts, self.observations, now), accounts, now)
+        except (OSError, ValueError, RuntimeError, KeyError, TypeError): info = {'stage': 0, 'ratio': None, 'resetAt': None}
+        self._brake_cache = (time.monotonic(), info)
+        return info
+
+    def urgent(self):
+        """Projects Conductor marked urgent (claude-pool conductor urgent): never braked while their time runs."""
+        try: value = json.loads((self.state_path.parent / 'brake.json').read_text()) if self.state_path else {}
+        except (OSError, ValueError): return set()
+        rows = value.get('urgent') if isinstance(value, dict) else None
+        return {p for p, until in rows.items() if isinstance(until, (int, float)) and until > time.time()} if isinstance(rows, dict) else set()
+
+    def record_usage(self, row):
+        """Appends one answered request to today's ledger; ledgers older than 31 days are removed."""
+        if not self.ledger_dir: return
+        day = time.strftime('%Y-%m-%d')
+        try:
+            with self.ledger_lock:
+                self.ledger_dir.mkdir(parents=True, exist_ok=True)
+                if day != self._ledger_day:
+                    self._ledger_day = day
+                    limit = time.time() - 31 * 86400
+                    for old in self.ledger_dir.glob('*.jsonl'):
+                        if old.stat().st_mtime < limit: old.unlink()
+                with open(self.ledger_dir / (day + '.jsonl'), 'a') as f: f.write(json.dumps(row) + '\n')
+        except OSError: self.journal.record('storage_failed')
 
     def reserve(self, session_id, request):
         accounts = self.accounts()
@@ -580,6 +617,14 @@ class Handler(BaseHTTPRequestHandler):
                 return
         main = lease['main']
         tracked = main and bool(session_id)
+        cls, project = headers.get('x-claude-code-request-class', 'main'), ''
+        if session_id:
+            with self.server.lock: project = (self.server.sessions.get(session_id) or {}).get('project', '')
+        original, braked, sent_model = body, None, request.get('model')
+        if self.command == 'POST' and path == '/v1/messages' and cls in BRAKE_CLASSES:
+            info, urgent = self.server.brake_info(), self.server.urgent()
+            with self.server.lock: new, decision = self.server.brake.decide(headers, request, info, project, urgent)
+            if new is not None: body, braked, sent_model = json.dumps(new).encode(), decision, new['model']
         context = None
         if tracked:
             try: context = self.server.reserve(session_id, request or {})
@@ -605,6 +650,17 @@ class Handler(BaseHTTPRequestHandler):
             lease['progress'] = time.monotonic()
             account = response.getheader('x-shunt-account')
             self.server.note_outcome(response.status, account)
+            if braked and response.status == 400:
+                # The braked model refused this request before any output: send it once more as the agent asked, keep it there.
+                response.read(); response.close(); conn.close()
+                braked['model'], braked, body, sent_model = None, None, original, request.get('model')
+                self.server.journal.record('brake_fallback', account=account)
+                conn.connect(); lease['upstream'] = conn.sock
+                conn.request(self.command, self.path, body, headers)
+                response = conn.getresponse()
+                lease['progress'] = time.monotonic()
+                account = response.getheader('x-shunt-account')
+                self.server.note_outcome(response.status, account)
             if response.status >= 400: self.server.journal.record('upstream_http_error', status=response.status, account=account)
             while response.status == 429 and path == '/v1/messages' and request.get('stream') is True and isinstance(request.get('model'), str):
                 quota = capacity(self.server.accounts(), request.get('model', ''), int(time.time() * 1000))
@@ -666,7 +722,7 @@ class Handler(BaseHTTPRequestHandler):
                         state["routing"].update(account=actual, reason="upstream failover")
                     self.server.save()
             sse = "text/event-stream" in response.getheader("Content-Type", "") and response.status == 200
-            pending, usage, transformations, complete = b"", {}, [], False
+            pending, usage, transformations, complete, logged, served_model = b"", {}, [], False, False, None
             while chunk := response.read1(65536):
                 lease['progress'] = time.monotonic()
                 if not sse:
@@ -691,12 +747,16 @@ class Handler(BaseHTTPRequestHandler):
                             message = event.get("message", {})
                             usage.update(message.get("usage", {}))
                             transformations = message.get("input_transformations", [])
+                            if isinstance(message.get("model"), str): served_model = message["model"]
                         if event.get("type") == "message_delta":
                             usage.update(event.get("usage", {}))
                             transformations += event.get("input_transformations", [])
                         if event.get("type") == "message_stop": complete = True
                     self.wfile.write(frame)
                     self.wfile.flush()
+                    if complete and not stream_error and session_id and not logged and path == '/v1/messages':
+                        logged = True
+                        self.server.record_usage(ledger_line(int(time.time() * 1000), session_id, project, cls, served_model or sent_model, account, usage, braked=bool(braked)))
                     if main and complete and not stream_error and session_id:
                         self.server.served(session_id, account, usage, transformations, context)
                         main = False

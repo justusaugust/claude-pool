@@ -109,6 +109,9 @@ def usage(data, *, width=80, color=False):
             add('Allowance range · ~' + duration(round(low / 300) * 300) + '–' + duration(round(high / 300) * 300), '90')
         elif low is not None and high is None:
             add('Allowance range not settled yet.', '90')
+    brake = forecast.get('brake') or {}
+    if brake.get('stage'):
+        add('Brake · stage ' + str(brake['stage']) + ': new subagents on Sonnet 5.5' + (', effort high' if brake['stage'] >= 2 else ''), '33')
     if forecast['partial']:
         add('Unmeasured accounts/windows excluded.', '90')
     note = coverage_note(data['accounts'])

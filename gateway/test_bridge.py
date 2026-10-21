@@ -20,6 +20,7 @@ class BridgeTests(unittest.TestCase):
         self.event_interval = 0
         self.keep_open = False
         self.http_status = 200
+        self.statuses = []
         self.hold = False
         self.entered, self.release = threading.Event(), threading.Event()
         owner = self
@@ -40,7 +41,7 @@ class BridgeTests(unittest.TestCase):
                 if owner.hold:
                     owner.entered.set()
                     owner.release.wait(5)
-                self.send_response(owner.http_status); self.send_header('Content-Type', 'text/event-stream'); self.send_header('x-shunt-account', account); self.end_headers()
+                self.send_response(owner.statuses.pop(0) if owner.statuses else owner.http_status); self.send_header('Content-Type', 'text/event-stream'); self.send_header('x-shunt-account', account); self.end_headers()
                 events = [{'type': 'message_start', 'message': {'usage': {'input_tokens': 2}, 'input_transformations': []}}, {'type': 'message_delta', 'usage': {'output_tokens': 4}}]
                 if owner.complete: events.append({'type': 'message_stop'})
                 if owner.stream_events is not None: events = owner.stream_events
@@ -66,6 +67,36 @@ class BridgeTests(unittest.TestCase):
         try:
             response=conn.getresponse();data=response.read();return response.status,data
         finally:conn.close()
+    def subagent(self, model='claude-opus-5-5', agent='fixture-agent'):
+        body = {'model': model, 'messages': [{'role': 'user', 'content': 'x'}], 'stream': True, 'output_config': {'effort': 'xhigh'}}
+        return self.call('/v1/messages', body, extra_headers={'x-claude-code-request-class': 'subagent', 'x-claude-code-agent-id': agent})
+    def ledger(self):
+        import time
+        path = Path(self.temp.name) / 'usage-ledger' / (time.strftime('%Y-%m-%d') + '.jsonl')
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+    def test_a_new_subagent_starts_on_sonnet_while_the_brake_is_on_and_is_logged(self):
+        with self.bridge.lock: self.bridge.session('test-session')['project'] = 'pitch-riot'
+        with patch.object(self.bridge, 'brake_info', return_value={'stage': 1}):
+            status, _ = self.subagent()
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(self.inputs[-1])['model'], 'claude-sonnet-5-5')
+        row = self.ledger()[-1]
+        self.assertEqual((row['project'], row['class'], row['model'], row['braked']), ('pitch-riot', 'subagent', 'claude-sonnet-5-5', True))
+        self.assertEqual((row['input_tokens'], row['output_tokens']), (2, 4))
+    def test_a_rejected_braked_request_is_sent_once_more_as_asked(self):
+        self.statuses = [400]
+        with patch.object(self.bridge, 'brake_info', return_value={'stage': 1}):
+            status, _ = self.subagent(agent='rejected-agent')
+            self.assertEqual(status, 200)
+            self.assertEqual([json.loads(b)['model'] for b in self.inputs[-2:]], ['claude-sonnet-5-5', 'claude-opus-5-5'])
+            self.subagent(agent='rejected-agent')
+        self.assertEqual(json.loads(self.inputs[-1])['model'], 'claude-opus-5-5', 'that agent stays on its model')
+    def test_without_brake_subagents_pass_unchanged_and_every_answer_is_logged(self):
+        status, _ = self.subagent()
+        self.assertEqual((status, json.loads(self.inputs[-1])['model']), (200, 'claude-opus-5-5'))
+        self.call('/v1/messages', {'model': 'claude-opus-5-5', 'messages': [], 'stream': True})
+        self.assertEqual([r['class'] for r in self.ledger()], ['subagent', 'main'])
+        self.assertFalse(any(r['braked'] for r in self.ledger()))
     def test_every_upstream_answer_is_kept_with_its_status_and_answering_account(self):
         import time
         start = int(time.time() * 1000)

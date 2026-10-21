@@ -10,9 +10,24 @@ class ForecastTests(unittest.TestCase):
     def test_pool_uses_separate_burn_rates_and_excludes_unmeasured_windows(self):
         a=self.account('gmail',30);b=self.account('team',50)
         result=estimate([a,b],{'gmail':self.points(a,[10,20,30]),'team':self.points(b,[40,45,50])},NOW)
-        self.assertEqual(result['seconds'],3900+5400)
+        # Both burn at once: the pool lasts while their combined rest covers their combined pace, not one after the other.
+        self.assertEqual([r['seconds'] for r in result['accounts']],[3900,5400])
+        self.assertEqual(result['seconds'],round((65+45)*3600/(60+30)))
         self.assertEqual(result['estimatedAccounts'],2);self.assertTrue(result['partial'])
         self.assertEqual(result['nextReset']['account'],'gmail')
+    def test_pool_forecast_on_21_october_counts_parallel_burn_reserve_and_idle_accounts(self):
+        # 21.10.2026 21:00: three Team accounts burned in parallel; the summed per-account times said 248 min,
+        # all accounts were exhausted 70 min later. The team account stops new work at its 85 % reserve.
+        team=self.account('team',59);team['reserveAt']=85;sofi=self.account('sofi',55);ops=self.account('ops',42)
+        idle=self.account('idle',20);gone=self.account('intern',96,status='limited')
+        obs={'team':self.points(team,[55,57,59]),'sofi':self.points(sofi,[45,50,55]),'ops':self.points(ops,[36,39,42]),
+             'idle':self.points(idle,[20,20,20]),'intern':self.points(gone,[90,93,96])}
+        result=estimate([team,sofi,ops,idle,gone],obs,NOW)
+        rows={r['name']:r for r in result['accounts']}
+        self.assertEqual(rows['team']['seconds'],round((85-59)*3600/12))
+        # rest (85-59)+(95-55)+(95-42)+(95-20) over the pace 12+30+18 %/h; the idle account takes load once others fill
+        self.assertEqual(result['seconds'],round((26+40+53+75)*3600/60))
+        self.assertLess(result['seconds'],sum(r['seconds'] for r in rows.values() if r['seconds']))
     def test_stale_reset_changed_zero_burn_and_paused_stay_unknown(self):
         a=self.account('gmail',30);points=self.points(a,[30,30,30])
         self.assertIsNone(estimate([a],{'gmail':points},NOW)['seconds'])
@@ -94,4 +109,9 @@ class ForecastTests(unittest.TestCase):
         data={'ready':1,'accounts':[a],'updatedAt':NOW,'forecast':estimate([a],{},NOW),'history':[]}
         text=usage(data);self.assertIn('Collecting pace',text);self.assertIn('not reported',text)
         self.assertIn('No account switches',history(data))
+    def test_usage_names_an_active_brake_and_stays_quiet_without_one(self):
+        a=self.account('gmail',30);forecast=estimate([a],{},NOW)
+        self.assertNotIn('Brake',usage({'ready':1,'accounts':[a],'updatedAt':NOW,'forecast':forecast,'history':[]}))
+        forecast['brake']={'stage':2,'ratio':.4,'resetAt':NOW+3600000}
+        self.assertIn('Brake · stage 2: new subagents on Sonnet 5.5, effort high',usage({'ready':1,'accounts':[a],'updatedAt':NOW,'forecast':forecast,'history':[]}))
 if __name__=='__main__':unittest.main()
