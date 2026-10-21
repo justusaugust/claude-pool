@@ -24,6 +24,7 @@ import threading
 import time
 
 import accounts_cli
+import conductor_tools
 import device_sync
 import managed_block
 from private_files import read_private, write_private
@@ -48,6 +49,7 @@ PROMPT_WINDOW = 4096
 BACKOFF_START, BACKOFF_MAX, BACKOFF_RESET = 10, 300, 600
 REATTACH_GRACE = 30
 MOVE_WAIT, MOVE_POLL = 120, 2
+QUEUE_JOIN = 5  # seconds the stopping service waits for a queue pass in flight (a herdr prompt may take up to 30)
 RESERVE_DEFAULT = 85
 HERDR_FIX = 'stop the Conductor in herdr session conductor first'
 START, END = '<!-- claude-pool:devices start -->', '<!-- claude-pool:devices end -->'
@@ -202,10 +204,15 @@ def serve(native, cwd, state=None, spawn=PtyChild, sleep=None, stop=None, clock=
 
 
 def serve_service():
-    """The unit's entry point: supervise in the unit's working directory until the service manager stops it."""
+    """The unit's entry point: supervise in the unit's working directory until the service manager stops it. Meanwhile a
+    thread delivers queued `conductor tell` tasks every POLL seconds; it ends with the service."""
     stop = threading.Event()
     for number in (signal.SIGTERM, signal.SIGINT): signal.signal(number, lambda *_: stop.set())
-    serve(settings.NATIVE_CLAUDE, Path.cwd(), stop=stop)
+    queue = threading.Thread(target=conductor_tools.deliver_until, args=(stop,), name='conductor-queue', daemon=True)
+    queue.start()
+    try: serve(settings.NATIVE_CLAUDE, Path.cwd(), stop=stop)
+    finally:
+        stop.set(); queue.join(QUEUE_JOIN)
     return 0
 
 
