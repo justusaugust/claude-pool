@@ -24,6 +24,14 @@ class StageTests(unittest.TestCase):
         info = stage({'seconds': 2 * 3600}, accounts, NOW)
         self.assertEqual((info['stage'], info['resetAt']), (1, NOW + 4 * H))
 
+    def test_an_account_whose_week_resets_soon_counts_as_returning_capacity(self):
+        # 22.10. 00:20: The second Max account had a full week, an empty five-hour window and its week reset in 40 min.
+        accounts = [acct('max', 0, 3 * H, status='limited', week={'pct': 100, 'resetsAt': NOW + 40 * 60000}), acct('team', 61, 4 * H)]
+        info = stage({'seconds': 2.5 * 3600}, accounts, NOW)
+        self.assertEqual((info['stage'], info['resetAt']), (0, NOW + 40 * 60000))
+        accounts[0]['fiveHour']['pct'] = 100   # a full five-hour window returns only when both have reset
+        self.assertEqual(stage({'seconds': 2.5 * 3600}, accounts, NOW)['resetAt'], NOW + 3 * H)
+
 
 class BrakeTests(unittest.TestCase):
     def setUp(self):

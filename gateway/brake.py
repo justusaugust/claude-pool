@@ -1,6 +1,6 @@
 """Brake for background model work when the pooled forecast does not reach the next reset, and a per-day usage ledger.
 
-Stage 1 (forecast below the time to the next usable five-hour reset): new subagent and workflow conversations start on
+Stage 1 (forecast below the time until an account next gains capacity): new subagent and workflow conversations start on
 Sonnet 5.5. Stage 2 (below half that time): their effort is also capped at high. The model is chosen once, at the first
 request of an agent, and kept for its lifetime: caches and thinking blocks belong to one model. Main sessions, the
 Conductor, compaction and projects marked urgent are never braked. Replayed on 21.10.2026 this removed a 65-minute stall.
@@ -19,12 +19,21 @@ PRICES = [('fable', (10, 50, .25)), ('mythos', (10, 50, .25)), ('opus-5-5', (4, 
           ('sonnet-5', (2, 10, .2)), ('sonnet', (3, 15, .3)), ('haiku-5-5', (.1, .5, .01)), ('haiku', (1, 5, .1))]
 
 
+def returns_at(account, now):
+    """When an account next gains capacity: its five-hour reset, or for a full week the weekly reset
+    (and the five-hour reset too, if that window is also full)."""
+    if account.get('status') not in {'ready', 'limited'}: return None
+    five, week = account.get('fiveHour') or {}, account.get('sevenDay') or {}
+    at = five.get('resetsAt') or 0
+    if week.get('pct', 0) >= 100:
+        at = max(week.get('resetsAt') or 0, at) if five.get('pct', 0) >= 100 else (week.get('resetsAt') or 0)
+    return at if at > now else None
+
+
 def stage(forecast, accounts, now):
-    """Brake stage from the pooled forecast and the next five-hour reset of an account that can serve again."""
+    """Brake stage from the pooled forecast and the next moment an account gains capacity."""
     seconds = (forecast or {}).get('seconds')
-    resets = [a['fiveHour']['resetsAt'] for a in accounts
-              if a.get('status') in {'ready', 'limited'} and a.get('fiveHour') and (a['fiveHour'].get('resetsAt') or 0) > now
-              and not (a.get('sevenDay') and a['sevenDay'].get('pct', 0) >= 100)]
+    resets = [at for a in accounts if (at := returns_at(a, now))]
     if seconds is None or not resets: return {'stage': 0, 'ratio': None, 'resetAt': min(resets) if resets else None}
     reset = min(resets)
     ratio = seconds * 1000 / (reset - now)
