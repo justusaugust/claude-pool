@@ -1,7 +1,10 @@
 name: Tests
 
 on:
+  # Feature branches are tested by their pull_request run; push runs only on main,
+  # so each PR runs once instead of twice.
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
