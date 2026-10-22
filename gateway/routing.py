@@ -40,6 +40,12 @@ def reserve_blocked(account):
     return limit > 0 and any(account.get(k) and account[k]['pct'] >= limit for k in ('fiveHour', 'sevenDay', 'fableWeekly'))
 
 
+def backend_priority(reserve_at):
+    """Shunt's per-account priority (lower is preferred, default 100): a reserved account comes after every other,
+    and the larger its reserve the later (99 -> 101, 85 -> 115)."""
+    return 200 - reserve_at if reserve_at else 100
+
+
 def session_rows(sessions, now):
     rows = []
     for key, s in sessions.items():
@@ -92,7 +98,7 @@ def choose(accounts, sessions, session_id, forecast, now):
     # Remaining time is comparable across plans; percentages are not.
     def score(a):
         name = a['name']; capacity = seconds.get(name)
-        return (bool(a.get('reserveAt')), busy[name], loads[name], -(capacity or 0), name)
+        return (backend_priority(a.get('reserveAt')), busy[name], loads[name], -(capacity or 0), name)
     best = min(ready, key=score)['name']
     held = bool(by_name.get(previous, {}).get('reserveAt')) and not by_name[best].get('reserveAt')
     reason = unavailable(by_name.get(pin or previous)) if pin or previous else 'new session'

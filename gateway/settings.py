@@ -51,14 +51,18 @@ ALIASES = {a.get('alias', a['name']): a['name'] for a in ACCOUNTS}
 
 def backend_config(state=RUNTIME):
     if not ACCOUNTS: raise RuntimeError('No accounts configured. Read docs/SETUP.md before starting the pool.')
+    from routing import backend_priority  # not at import: the control hook loads settings without routing
     lines = [f'[server]\nbind = "127.0.0.1:{BACKEND_PORT}"\ndefault_provider = "anthropic"',
              '[server.auth]\ntokens_env = "POOL_CLIENT_TOKENS"',
              '[server.admin]\ntokens_env = "POOL_ADMIN_TOKENS"\nhide_observed = true',
              '[server.pool]\ndefault_threshold = 0.95\nusage_refresh_seconds = 300\nramp_initial_concurrency = 2\nstate_path = ' + json.dumps(str(state / 'quota.json')),
              '[providers.anthropic]\nkind = "anthropic"\nbase_url = "https://api.anthropic.com"\nauth = "claude_oauth"']
-    # A reserved account gets Shunt's hard cap too (backstop for requests without a session); resolved for the 5h, weekly and Fable windows.
+    # Shunt picks the account for every request the pool does not steer (subagents, auxiliary, failover after the preferred
+    # account): a reserved account gets its hard cap (resolved for the 5h, weekly and Fable windows) and a priority after
+    # every unreserved account, so it is Shunt's last choice too. Unreserved accounts keep Shunt's defaults.
     lines.extend('[[providers.anthropic.accounts]]\nname = ' + json.dumps(a['name'])
-                 + ('\nmax_utilization = ' + repr(a['reserveAt'] / 100) if a.get('reserveAt', 0) > 0 else '') for a in ACCOUNTS)
+                 + ('\nmax_utilization = ' + repr(a['reserveAt'] / 100) + '\npriority = ' + str(backend_priority(a['reserveAt']))
+                    if a.get('reserveAt', 0) > 0 else '') for a in ACCOUNTS)
     return '\n\n'.join(lines) + '\n'
 
 
