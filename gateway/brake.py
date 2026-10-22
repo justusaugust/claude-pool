@@ -81,14 +81,23 @@ def ledger_line(at, session, project, cls, model, account, usage, braked=False):
 
 
 def today_summary(path):
+    """Today's ledger by project, request class and Claude session id (subagents count under their main session); a
+    session's project is the one it spent most on."""
     projects, classes, braked, total = defaultdict(float), defaultdict(float), 0, 0.0
+    sessions = defaultdict(lambda: {'usd': 0.0, 'classes': defaultdict(float), 'projects': defaultdict(float)})
     try: lines = path.read_text().splitlines()
     except OSError: lines = []
     for line in lines:
         try: row = json.loads(line)
         except ValueError: continue
         if not isinstance(row, dict) or not isinstance(row.get('usd'), (int, float)): continue
-        projects[row.get('project') or '-'] += row['usd']; classes[row.get('class') or 'main'] += row['usd']
+        project, cls = row.get('project') or '-', row.get('class') or 'main'
+        projects[project] += row['usd']; classes[cls] += row['usd']
         total += row['usd']; braked += bool(row.get('braked'))
+        if isinstance(row.get('session'), str) and row['session']:
+            one = sessions[row['session']]
+            one['usd'] += row['usd']; one['classes'][cls] += row['usd']; one['projects'][project] += row['usd']
     return {'usd': total, 'braked': braked, 'classes': dict(classes),
-            'projects': [{'project': p, 'usd': v} for p, v in sorted(projects.items(), key=lambda kv: -kv[1])]}
+            'projects': [{'project': p, 'usd': v} for p, v in sorted(projects.items(), key=lambda kv: -kv[1])],
+            'sessions': [{'session': k, 'project': max(v['projects'], key=v['projects'].get), 'usd': v['usd'], 'classes': dict(v['classes'])}
+                         for k, v in sorted(sessions.items(), key=lambda kv: -kv[1]['usd'])]}

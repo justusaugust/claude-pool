@@ -858,6 +858,26 @@ def usage_today(as_json=False):
     return '\n'.join(text)
 
 
+def inbox_cli(args):
+    import conductor_inbox
+    if args.verb == 'add':
+        print('queued for the Conductor' if conductor_inbox.add(' '.join(args.text), key=args.key) else 'already queued in the last ten minutes')
+        return 0
+    if args.verb == 'wait': return conductor_inbox.wait()
+    if args.verb == 'install':
+        entry = shutil.which('claude-pool') or str(Path.home() / '.local/bin/claude-pool')
+        print('hooks in ' + str(conductor_inbox.install(Path(settings.CONDUCTOR_HOME).expanduser(), entry))); return 0
+    if args.verb == 'waker':
+        conductor_inbox.set_waker(args.state == 'on')
+        print('the Conductor service runs the event watcher' if args.state == 'on' else 'the service leaves the event watcher to the Conductor')
+        return 0
+    value = conductor_inbox.status()
+    if args.json: print(json.dumps(value, ensure_ascii=False)); return 0
+    print(f"{value['pending']} waiting · waker {'on' if value['waker'] else 'off'} · waiter generation {value['generation']}")
+    for line in value['last']: print('  ' + line)
+    return 0
+
+
 def cli(argv):
     parser = argparse.ArgumentParser(prog='claude-pool conductor', description='Cheap tools for Conductor Claude.')
     commands = parser.add_subparsers(dest='command', required=True)
@@ -879,6 +899,15 @@ def cli(argv):
     urgent.add_argument('--hours', type=float, default=3); urgent.add_argument('--off', action='store_true'); urgent.add_argument('--list', action='store_true')
     spend = commands.add_parser('usage', help="today's usage by project and class from the pool ledger, and the brake stage")
     spend.add_argument('--json', action='store_true')
+    box = commands.add_parser('inbox', help="the Conductor's inbox: queue an event for it, or the hook that delivers them")
+    boxes = box.add_subparsers(dest='verb', required=True)
+    put = boxes.add_parser('add', help='queue one event; the Conductor gets it at its next wake'); put.add_argument('text', nargs='+')
+    put.add_argument('--key', help='the same key wakes only once in ten minutes')
+    boxes.add_parser('wait', help="hook command in the Conductor's session (asyncRewake): delivers queued events and wakes it")
+    state = boxes.add_parser('status'); state.add_argument('--json', action='store_true')
+    boxes.add_parser('install', help="add the waiting hooks to the Conductor folder's .claude/settings.local.json")
+    switch = boxes.add_parser('waker', help="run the Conductor's event watcher in the service (on) or leave it to the Conductor (off)")
+    switch.add_argument('state', choices=['on', 'off'])
     journal = commands.add_parser('journal', help='append-only journal (default ' + str(JOURNAL).replace(str(Path.home()), '~') + ')')
     verbs = journal.add_subparsers(dest='verb', required=True)
     add = verbs.add_parser('add'); add.add_argument('line', nargs='+')
@@ -896,6 +925,7 @@ def cli(argv):
         rows = urgent_set(args.project, None if args.off else args.hours)
         print(f"{args.project}: " + (f"urgent until {time.strftime('%H:%M', time.localtime(rows[args.project]))}" if args.project in rows else 'braked like the others again')); return 0
     if args.command == 'events': return events(interval=args.interval)
+    if args.command == 'inbox': return inbox_cli(args)
     if args.command == 'tell':
         if args.list or args.cancel is not None:
             if args.list and args.cancel is not None: told.error('--list and --cancel go alone')
