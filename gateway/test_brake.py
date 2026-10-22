@@ -90,6 +90,9 @@ class LedgerTests(unittest.TestCase):
             self.assertAlmostEqual(s['projects'][0]['usd'], 10 + 2, places=3)
             self.assertEqual(s['braked'], 1)
             self.assertAlmostEqual(s['classes']['subagent'], 10, places=3)
+            self.assertEqual([(r['session'], r['project']) for r in s['sessions']], [('s1', 'pitch-riot'), ('s2', 'conductor-wecker')])
+            self.assertAlmostEqual(s['sessions'][0]['usd'], 12, places=3)
+            self.assertAlmostEqual(s['sessions'][0]['classes']['main'], 2, places=3)
             self.assertNotIn('content', json.dumps(rows), 'no prompt content in the ledger')
 
 

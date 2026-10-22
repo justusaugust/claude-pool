@@ -49,6 +49,8 @@ class ConductorBrakeTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual([p['project'] for p in value['projects']], ['pitch-riot', 'website'])
         self.assertEqual((value['brake']['stage'], value['braked']), (1, 1))
+        self.assertEqual([(r['session'], r['project'], round(r['usd'], 3)) for r in value['sessions']], [('s', 'pitch-riot', 12.0)])
+        self.assertEqual(set(value['sessions'][0]['classes']), {'subagent', 'main'})
         text = self.run_cli('usage')[1]
         self.assertIn('pitch-riot', text); self.assertIn('Sonnet', text)
 
