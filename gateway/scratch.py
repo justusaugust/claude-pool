@@ -36,7 +36,8 @@ def agent_tmpdir(environ, home=None, tempdir=None, mounts=False):
     """The folder for CLAUDE_CODE_TMPDIR, or None when the system temp folder is not a tmpfs or the user chose one."""
     if environ.get('CLAUDE_CODE_TMPDIR'): return None
     mounts = _mounts() if mounts is False else mounts
-    if not mounts or _mount_type(os.path.realpath(tempdir or tempfile.gettempdir()), mounts) != 'tmpfs': return None
+    tempdir = tempdir or tempfile.gettempdir()
+    if not mounts or 'tmpfs' not in {_mount_type(tempdir, mounts), _mount_type(os.path.realpath(tempdir), mounts)}: return None
     home = Path(home or Path.home())
     path = Path(environ.get('XDG_CACHE_HOME') or home / '.cache') / 'claude-pool' / 'tmp'
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
