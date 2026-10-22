@@ -298,7 +298,7 @@ index 5e38f2b..fd51452 100644
 +
 +本地请求头 `x-shunt-session-account` 为 Claude OAuth Messages 请求优先选择已配置的账号名。它只调整可用账号的顺序；暂停、硬上限、配额阈值和故障转移仍然生效。Shunt 消费该请求头，不会发送给上游。
 diff --git a/src/accounts.rs b/src/accounts.rs
-index 51a67a2..ffc831f 100644
+index 51a67a2..7441333 100644
 --- a/src/accounts.rs
 +++ b/src/accounts.rs
 @@ -231,6 +231,8 @@ pub struct QuotaState {
@@ -347,7 +347,46 @@ index 51a67a2..ffc831f 100644
              quota_buckets: Vec::new(),
              needs_relogin,
              requests_attempted: requests.attempted(),
-@@ -1293,6 +1304,40 @@ impl AccountPool {
+@@ -1180,20 +1191,33 @@ impl AccountPool {
+             order
+         };
+ 
++        let is_available =
++            |index: usize| snapshots[index].0.is_none_or(|until: Instant| until <= now);
++
+         let sticky = ident_reps[start_slot];
+         let (sticky_cooldown, ref sticky_quota, _, _) = snapshots[sticky];
+         // `rotation` already excludes a disabled or paused sticky account, so
+-        // membership in it covers both checks the fast path needs.
++        // membership in it covers both checks the fast path needs. Priority
++        // still beats the sticky slot: an available account under its
++        // threshold with an earlier priority sends the request to the sorted
++        // path below. Equal priorities (the default) never do.
+         if rotation.contains(&sticky)
+             && sticky_cooldown.is_none_or(|until| until <= now)
+             && !sticky_quota.near
++            && !rotation.iter().any(|&index| {
++                accounts[index].priority < accounts[sticky].priority
++                    && is_available(index)
++                    && !snapshots[index].1.near
++            })
+         {
+-            return (promote(rotation), pending_reprobe, cap_verdict);
++            // The rotation starts at the sticky account. Behind it, a stable
++            // sort keeps rotation order within each priority tier so a later
++            // tier is the last fallback; a no-op when priorities are equal.
++            let mut order = rotation;
++            order[1..].sort_by_key(|&index| accounts[index].priority);
++            return (promote(order), pending_reprobe, cap_verdict);
+         }
+ 
+-        let is_available =
+-            |index: usize| snapshots[index].0.is_none_or(|until: Instant| until <= now);
+-
+         let mut available_under = rotation
+             .iter()
+             .copied()
+@@ -1293,6 +1317,40 @@ impl AccountPool {
      }
  
      pub fn note_quota(&self, provider: &str, account: &AccountConfig, headers: &HeaderMap) {
@@ -388,7 +427,7 @@ index 51a67a2..ffc831f 100644
          {
              let mut entries = self.entries.lock().expect("account health lock poisoned");
              let health = self.health_entry(&mut entries, account_key(provider, account));
-@@ -1377,6 +1422,8 @@ impl AccountPool {
+@@ -1377,6 +1435,8 @@ impl AccountPool {
              }
              if wrote_status {
                  quota.observed_at_status = Some(now);
@@ -397,7 +436,7 @@ index 51a67a2..ffc831f 100644
              }
  
              // The post-lock dirty mark below covers both this observation and
-@@ -1623,15 +1670,19 @@ impl AccountPool {
+@@ -1623,15 +1683,19 @@ impl AccountPool {
              expire_stale_quota(quota, now);
              if clear_five_hour {
                  quota.utilization_5h = None;
@@ -421,7 +460,7 @@ index 51a67a2..ffc831f 100644
              }
              if let Some(window) = &usage.five_hour {
                  quota.utilization_5h = Some(window.utilization);
-@@ -2395,10 +2446,12 @@ impl AccountPool {
+@@ -2395,10 +2459,12 @@ impl AccountPool {
                      // `store_marked` short-circuits first, so the steady state
                      // (an empty side table) scans nothing.
                      let store_backed = account.credentials.is_none() && account.token_env.is_none();
@@ -435,7 +474,7 @@ index 51a67a2..ffc831f 100644
                      let store_condemned = store_marked
                          && store_backed
                          && store_relogin.iter().any(|marked| {
-@@ -2455,12 +2508,12 @@ impl AccountPool {
+@@ -2455,12 +2521,12 @@ impl AccountPool {
                      AccountSnapshot {
                          name: account.name.clone(),
                          has_state: true,
@@ -454,7 +493,7 @@ index 51a67a2..ffc831f 100644
                          near_quota: quota.near,
                          capped,
                          capped_fable,
-@@ -2475,6 +2528,7 @@ impl AccountPool {
+@@ -2475,6 +2541,7 @@ impl AccountPool {
                          paused: health.paused_providers.contains(provider),
                          headroom_secs: (pool.is_some() && quota.headroom.is_finite())
                              .then_some(quota.headroom as i64),
@@ -462,7 +501,7 @@ index 51a67a2..ffc831f 100644
                          utilization_5h: health.quota.utilization_5h,
                          reset_5h: health.quota.reset_5h,
                          utilization_7d: health.quota.utilization_7d,
-@@ -2485,6 +2539,9 @@ impl AccountPool {
+@@ -2485,6 +2552,9 @@ impl AccountPool {
                          max_utilization_7d,
                          max_utilization_fable,
                          status: health.quota.status.clone(),
@@ -472,7 +511,7 @@ index 51a67a2..ffc831f 100644
                          quota_buckets: health.quota_buckets.clone(),
                          // The entry's own mark *or* the side table's, because
                          // the set cannot always reach the entry: a verdict
-@@ -2773,10 +2830,19 @@ impl Drop for AdmissionGuard {
+@@ -2773,10 +2843,19 @@ impl Drop for AdmissionGuard {
  /// A blank (empty or all-whitespace) `uuid` is treated the same as a missing
  /// one — otherwise every account configured with `uuid = ""` would coalesce
  /// into a single shared identity instead of falling back to its own name.
@@ -496,7 +535,7 @@ index 51a67a2..ffc831f 100644
      }
  }
  
-@@ -2814,10 +2880,9 @@ fn backed_by_same_store_account(
+@@ -2814,10 +2893,9 @@ fn backed_by_same_store_account(
      }
      sibling.store_family == key.store_family
          && match &sibling.identity {
@@ -510,7 +549,7 @@ index 51a67a2..ffc831f 100644
              AccountStateIdentity::StoreEntry { name }
              | AccountStateIdentity::UpstreamInline { name, .. } => *name == account.name,
          }
-@@ -2855,7 +2920,9 @@ fn purge_store_relogin(
+@@ -2855,7 +2933,9 @@ fn purge_store_relogin(
          account
              .uuid
              .as_deref()
@@ -521,7 +560,7 @@ index 51a67a2..ffc831f 100644
      );
  }
  
-@@ -2957,7 +3024,9 @@ pub(crate) fn account_key(upstream: &str, account: &AccountConfig) -> AccountKey
+@@ -2957,7 +3037,9 @@ pub(crate) fn account_key(upstream: &str, account: &AccountConfig) -> AccountKey
          }
      });
      let identity = match account.uuid.as_deref().filter(|id| !id.trim().is_empty()) {
@@ -532,7 +571,7 @@ index 51a67a2..ffc831f 100644
          None if account.store_entry => AccountStateIdentity::StoreEntry {
              name: account.name.clone(),
          },
-@@ -3554,6 +3623,7 @@ fn expire_stale_quota(quota: &mut QuotaState, now: u64) -> bool {
+@@ -3554,6 +3636,7 @@ fn expire_stale_quota(quota: &mut QuotaState, now: u64) -> bool {
          let had_signal = quota.status.is_some() || quota.observed_at_status.is_some();
          quota.status = None;
          quota.observed_at_status = None;
@@ -540,7 +579,7 @@ index 51a67a2..ffc831f 100644
          expired |= had_signal;
      }
      // Unconditional aggregate cap, independent of the per-window sweep above.
-@@ -3565,13 +3635,15 @@ fn expire_stale_quota(quota: &mut QuotaState, now: u64) -> bool {
+@@ -3565,13 +3648,15 @@ fn expire_stale_quota(quota: &mut QuotaState, now: u64) -> bool {
      // would leave a stale aggregate rejection with no expiry path at all —
      // the poller writes utilization/reset every cycle, so the per-window
      // sweep above never fires, and `status` would never clear on its own.
@@ -559,7 +598,7 @@ index 51a67a2..ffc831f 100644
          expired |= had_signal;
      }
      expired
-@@ -3694,8 +3766,9 @@ fn normalize_signal_metadata(quota: &mut QuotaState) -> bool {
+@@ -3694,8 +3779,9 @@ fn normalize_signal_metadata(quota: &mut QuotaState) -> bool {
          corrected |= quota.observed_at_status_7d_oi.take().is_some();
          corrected |= quota.reset_at_status_7d_oi.take().is_some();
      }
@@ -571,7 +610,7 @@ index 51a67a2..ffc831f 100644
      }
      corrected
  }
-@@ -3728,13 +3801,23 @@ const QUOTA_STATUS_HEADERS: [&str; 3] = [
+@@ -3728,13 +3814,23 @@ const QUOTA_STATUS_HEADERS: [&str; 3] = [
      "anthropic-ratelimit-unified-7d_oi-status",
  ];
  
@@ -596,7 +635,7 @@ index 51a67a2..ffc831f 100644
  }
  
  /// Low-cardinality pool-rotation reason for an upstream response that moves off
-@@ -3746,10 +3829,7 @@ pub fn is_fable_scoped_rejection(headers: &HeaderMap) -> bool {
+@@ -3746,10 +3842,7 @@ pub fn is_fable_scoped_rejection(headers: &HeaderMap) -> bool {
  /// separately from transient ones.
  pub fn rotation_reason(status: StatusCode, headers: &HeaderMap) -> &'static str {
      if status == StatusCode::TOO_MANY_REQUESTS {
@@ -608,7 +647,7 @@ index 51a67a2..ffc831f 100644
              "quota"
          } else {
              "rate_limit"
-@@ -3770,10 +3850,7 @@ pub fn classify(status: StatusCode, headers: &HeaderMap) -> FailoverAction {
+@@ -3770,10 +3863,7 @@ pub fn classify(status: StatusCode, headers: &HeaderMap) -> FailoverAction {
          return FailoverAction::Relay;
      }
      if status == StatusCode::TOO_MANY_REQUESTS {
@@ -620,7 +659,7 @@ index 51a67a2..ffc831f 100644
              return FailoverAction::Rotate;
          }
          return FailoverAction::PauseSame;
-@@ -3981,6 +4058,50 @@ mod tests {
+@@ -3981,6 +4071,50 @@ mod tests {
      /// not rewrite it. Otherwise a terminal admin probe on an account the proxy
      /// had already condemned would downgrade the verdict, and the next grant
      /// that happened to succeed would clear a mark nothing had disproved.
@@ -671,7 +710,7 @@ index 51a67a2..ffc831f 100644
      #[test]
      fn a_grant_failure_never_downgrades_a_served_request_verdict() {
          let pool = AccountPool::new();
-@@ -6944,6 +7065,7 @@ mod tests {
+@@ -6944,6 +7078,7 @@ mod tests {
              reset_at_status_7d: Some(now + 60),
              reset_at_status_7d_oi: Some(now + 120),
              observed_at_status: None,
@@ -679,7 +718,7 @@ index 51a67a2..ffc831f 100644
          };
          expire_stale_quota(&mut quota, now);
          assert_eq!(quota.status_5h, None);
-@@ -8021,6 +8143,125 @@ mod tests {
+@@ -8021,6 +8156,125 @@ mod tests {
          );
      }
  
@@ -805,7 +844,7 @@ index 51a67a2..ffc831f 100644
      #[test]
      fn note_quota_records_each_window_status_when_present() {
          let pool = AccountPool::new();
-@@ -8595,6 +8836,7 @@ mod tests {
+@@ -8595,6 +8849,7 @@ mod tests {
              reset_at_status_7d: Some(future + 3_600),
              reset_at_status_7d_oi: Some(future + 7_200),
              observed_at_status: Some(now),
@@ -813,7 +852,7 @@ index 51a67a2..ffc831f 100644
          };
          let sibling_quota = QuotaState {
              utilization_5h: Some(0.44),
-@@ -8755,6 +8997,7 @@ mod tests {
+@@ -8755,6 +9010,7 @@ mod tests {
              reset_at_status_7d: Some(future + 3_600),
              reset_at_status_7d_oi: Some(future + 7_200),
              observed_at_status: Some(now.saturating_sub(30)),
@@ -821,6 +860,47 @@ index 51a67a2..ffc831f 100644
          };
          let sibling_quota = QuotaState {
              utilization_7d_oi: Some(0.55),
+@@ -9927,6 +10183,40 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn priority_outranks_the_sticky_and_round_robin_slot() {
++        // claude-pool reserves an account by giving it a later priority. A
++        // session that hashes to it, and a session-less request whose
++        // round-robin slot it is, must still try every earlier-priority
++        // account first while one is available under its threshold.
++        for cfg in [None, Some(PoolConfig::default())] {
++            let pool = AccountPool::new();
++            let mut accounts = accounts();
++            let session = "priority-sticky";
++            let sticky =
++                pool.select_order("anthropic", &accounts, Some(session), None, cfg.as_ref())[0];
++            accounts[sticky].priority = 115;
++            let order =
++                pool.select_order("anthropic", &accounts, Some(session), None, cfg.as_ref());
++            assert_ne!(order[0], sticky, "pool config: {cfg:?}");
++            assert_eq!(order.last(), Some(&sticky), "pool config: {cfg:?}");
++            for _ in 0..accounts.len() {
++                let order = pool.select_order("anthropic", &accounts, None, None, cfg.as_ref());
++                assert_eq!(order.last(), Some(&sticky), "round robin, pool config: {cfg:?}");
++            }
++            // Within the earliest tier the sticky slot still decides.
++            let others: Vec<usize> = (0..accounts.len()).filter(|&i| i != sticky).collect();
++            let other_session = (0..64)
++                .map(|n| format!("tier-{n}"))
++                .find(|s| others.contains(&super::stable_session_index(s, accounts.len())))
++                .unwrap();
++            let slot = super::stable_session_index(&other_session, accounts.len());
++            let order =
++                pool.select_order("anthropic", &accounts, Some(&other_session), None, cfg.as_ref());
++            assert_eq!(order[0], slot, "pool config: {cfg:?}");
++        }
++    }
++
+     #[test]
+     fn all_near_accounts_fall_back_to_headroom_order() {
+         // Every account trips burn-rate avoidance: instead of emptying the
 diff --git a/src/adapters/anthropic/mod.rs b/src/adapters/anthropic/mod.rs
 index b21bbb0..a95a9c6 100644
 --- a/src/adapters/anthropic/mod.rs

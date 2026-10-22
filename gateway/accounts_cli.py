@@ -262,8 +262,9 @@ def unregister(config, stores, binary, paths, name, env):
 
 
 def set_account_option(text, name, key, value):
-    """Set (float) or remove (None) `key` inside the [[providers.anthropic.accounts]] table named `name`.
-    Every other table stays byte-identical; the result must parse to the old document with only that key changed."""
+    """Set (int stays int, anything else float) or remove (None) `key` inside the [[providers.anthropic.accounts]] table named
+    `name`. Every other table stays byte-identical; the result must parse to the old document with only that key changed."""
+    if value is not None and type(value) is not int: value = float(value)  # a bool is no int here
     before = tomllib.loads(text)
     rows = before.get('providers', {}).get('anthropic', {}).get('accounts', [])
     if not any(row.get('name') == name for row in rows): return text
@@ -282,7 +283,7 @@ def set_account_option(text, name, key, value):
     if value is None:
         if at is not None: del lines[at]  # no matching line: the verification below refuses a key it could not find
     else:
-        line = key + ' = ' + repr(float(value)) + '\n'
+        line = key + ' = ' + repr(value) + '\n'
         if at is not None: lines[at] = line
         else:
             last = max(i for i in range(start, end) if lines[i].strip())
@@ -292,7 +293,7 @@ def set_account_option(text, name, key, value):
     expected = copy.deepcopy(before)
     row = next(r for r in expected['providers']['anthropic']['accounts'] if r.get('name') == name)
     if value is None: row.pop(key, None)
-    else: row[key] = float(value)
+    else: row[key] = value
     if tomllib.loads(candidate) != expected: raise RuntimeError('Editing ' + name + ' would change other runtime settings; nothing was changed')
     return candidate
 
@@ -301,15 +302,18 @@ def reserve(config, binary, paths, env, name, pct, *, registry_path=None):
     """Make `name` the pool's last choice from `pct` percent (None = off). Same validated write path as membership.
     Shunt (pinned e147f9b9, src/accounts.rs resolved_max_utilization): an account-level `max_utilization` caps every
     quota window (5h, weekly and Fable 7d_oi) and excludes the account from selection at or above it, with or without
-    [server.pool]; no per-window key is needed. The pool layer (routing.choose) enforces the same limit on merged readings.
+    [server.pool]; no per-window key is needed. Below it, `priority` (routing.backend_priority, ordered before headroom)
+    makes it Shunt's last choice for the requests the pool does not steer (subagents, auxiliary, failover); one write sets
+    or removes both. The pool layer (routing.choose) applies the same order and limit on merged readings.
     The registry entry (when there is one) follows so other devices apply it; the hook passes no registry_path."""
     if not any(r['name'] == name for r in load(config).get('accounts', [])):
         raise RuntimeError('No account named ' + name + ' is connected (see claude-pool account list)')
     def change(value):
         next(r for r in value['accounts'] if r['name'] == name)['reserveAt'] = pct or 0
-    apply_change(config, binary, paths, env, change,
-                 lambda text: set_account_option(text, name, 'max_utilization', pct / 100 if pct else None),
-                 rejected='Backend rejected the reserve; live routing is unchanged')
+    def change_toml(text):
+        text = set_account_option(text, name, 'max_utilization', pct / 100 if pct else None)
+        return set_account_option(text, name, 'priority', routing.backend_priority(pct) if pct else None)
+    apply_change(config, binary, paths, env, change, change_toml, rejected='Backend rejected the reserve; live routing is unchanged')
     if registry_path is not False:
         try:
             # The registry row of this subscription, which may carry another name (the one of the device that enrolled it).

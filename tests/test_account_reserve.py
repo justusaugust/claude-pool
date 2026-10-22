@@ -69,6 +69,16 @@ class RoutingTests(unittest.TestCase):
                 self.assertEqual((decision['account'], decision['reason']), (None, 'no eligible account'))
         self.assertEqual(decide([account('team', five=10, reserve=85), account('other', five=97)], previous='team')['account'], 'team')
 
+    def test_the_larger_reserve_is_the_later_choice(self):
+        # 22.10.: the Conductor account (85) comes after every other account, also after Gmail (99).
+        rows = [account('team', five=1, reserve=85), account('gmail', five=50, reserve=99), account('other', five=97)]
+        self.assertEqual(decide(rows, seconds={'team': 99999, 'gmail': 10, 'other': 10})['account'], 'gmail')
+        self.assertEqual([routing.backend_priority(n) for n in (None, 0, 99, 85, 1)], [100, 100, 101, 115, 199])
+        # A session already on the Conductor account moves to Gmail at its next request: no cache affinity there.
+        moved = decide(rows, previous='team', seconds={'team': 99999, 'gmail': 10, 'other': 10})
+        self.assertEqual(moved['account'], 'gmail')
+        self.assertNotEqual(moved['reason'], 'cache affinity')
+
     def test_a_blocked_previous_account_names_its_reserve_as_the_reason(self):
         self.assertIn('reserved account', routing.REASONS)
         self.assertEqual(routing.unavailable(account('team', five=86, reserve=85)), 'reserved account')
@@ -142,9 +152,18 @@ class BackendConfigTests(unittest.TestCase):
         self.assertNotIn('max_utilization', plain)
         self.assertEqual(self.config([{'name': 'ops', 'reserveAt': 0}, {'name': 'team'}]), plain)
         capped = self.config([{'name': 'ops'}, {'name': 'team', 'reserveAt': 85}])
-        self.assertIn('name = "team"\nmax_utilization = 0.85', capped)
-        self.assertEqual(capped.replace('\nmax_utilization = 0.85', ''), plain)
+        self.assertIn('name = "team"\nmax_utilization = 0.85\npriority = 115', capped)
+        self.assertEqual(capped.replace('\nmax_utilization = 0.85\npriority = 115', ''), plain)
         self.assertEqual(settings.backend_config.__defaults__, (settings.RUNTIME,))
+
+
+    def test_reserved_accounts_are_shunts_last_choice(self):
+        # Shunt orders every request (subagents, auxiliary, failover after the preferred account) by priority first.
+        value = setup.tomllib.loads(self.config([{'name': 'gmail', 'reserveAt': 99}, {'name': 'team', 'reserveAt': 85}, {'name': 'ops'}]))
+        rows = {r['name']: r for r in value['providers']['anthropic']['accounts']}
+        self.assertEqual((rows['gmail']['priority'], rows['team']['priority']), (101, 115))
+        self.assertIs(type(rows['team']['priority']), int)
+        self.assertNotIn('priority', rows['ops'])
 
 
 class TomlEditTests(unittest.TestCase):
@@ -160,6 +179,12 @@ class TomlEditTests(unittest.TestCase):
         self.assertEqual(self.table(again, 'team')['max_utilization'], 0.5)
         self.assertEqual(setup.set_account_option(again, 'team', 'max_utilization', None), BASE)
         self.assertEqual(setup.set_account_option(BASE, 'team', 'max_utilization', None), BASE)
+
+    def test_an_integer_stays_an_integer(self):
+        out = setup.set_account_option(BASE, 'team', 'priority', 115)
+        self.assertIn('priority = 115\n', out)
+        self.assertIs(type(self.table(out, 'team')['priority']), int)
+        self.assertEqual(setup.set_account_option(out, 'team', 'priority', None), BASE)
 
     def test_sub_tables_and_other_settings_stay_byte_identical(self):
         text = BASE.replace('[server]', '[providers.anthropic.accounts.limits]\nweekly = 1\n\n[server]')
@@ -200,6 +225,7 @@ class ReserveTests(unittest.TestCase):
         self.reserve()
         self.assertIn('max_utilization = 0.85', self.toml.read_text())
         self.assertEqual(self.block('team')['max_utilization'], 0.85)
+        self.assertEqual(self.block('team')['priority'], 115)
         self.assertEqual(self.block('ops'), {'name': 'ops'})
         self.assertEqual(self.row('team')['reserveAt'], 85)
         self.assertNotIn('reserveAt', self.row('ops'))
@@ -213,6 +239,7 @@ class ReserveTests(unittest.TestCase):
     def test_off_removes_the_cap_and_records_explicit_off(self):
         self.reserve(); self.reserve(pct=None)
         self.assertNotIn('max_utilization', self.block('team'))
+        self.assertNotIn('priority', self.block('team'))
         self.assertEqual(self.toml.read_text(), BASE)
         self.assertEqual(self.row('team')['reserveAt'], 0)
 
