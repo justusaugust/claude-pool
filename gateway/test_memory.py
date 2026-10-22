@@ -1,5 +1,6 @@
 """Memory that large requests leave behind goes back to the system; checks run on loopback with synthetic bodies."""
 import json
+import sys
 import threading
 import time
 import unittest
@@ -12,8 +13,9 @@ import test_bridge
 
 class AllocatorTests(unittest.TestCase):
     def test_arena_limit_and_trim_work_on_glibc_and_are_harmless_elsewhere(self):
-        self.assertTrue(memory.limit_arenas(2))
-        self.assertTrue(memory.trim())
+        glibc = sys.platform.startswith('linux')
+        self.assertEqual(memory.limit_arenas(2), glibc)
+        self.assertEqual(memory.trim(), glibc)
         with patch.object(memory, 'LIBC', None):
             self.assertFalse(memory.limit_arenas(2))
             self.assertFalse(memory.trim())
