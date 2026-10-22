@@ -24,6 +24,7 @@ from views import usage, history
 from bridge import PoolBridge, atomic_write
 import memory
 import readings
+import scratch
 from native_auth import NativeAuth
 import service
 from validation import render as validation_view
@@ -664,6 +665,9 @@ def main():
     env.update(ANTHROPIC_BASE_URL=BASE_URL,
                COCKPIT_BASE_URL=BASE_URL, COCKPIT_TOKEN_FILE=str(STORES / '.pool-client-token'),
                COCKPIT_PROJECT=Path.cwd().name, CLAUDE_CODE_GATEWAY_HINT_HEADERS="1")
+    # Scratchpads, task output and edit diffs go to disk when /tmp is a tmpfs: in RAM they took 11 GB of 32 on 22.10.2026.
+    folder = scratch.agent_tmpdir(env)
+    if folder: env['CLAUDE_CODE_TMPDIR'] = str(folder)
     # Native inherits model choices from this environment when handing off or respawning.
     env.setdefault('ANTHROPIC_DEFAULT_OPUS_MODEL', 'claude-opus-5-5')
     # Native keeps signed prefixes stable only when discovery survives resume.

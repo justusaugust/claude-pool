@@ -107,6 +107,15 @@ class LauncherTests(unittest.TestCase):
                     self.assertEqual({key:env[key] for key in defaults},{**defaults,**overrides})
                     self.assertEqual(dict(launch.os.environ),overrides)
 
+    def test_agents_write_scratch_to_the_disk_folder_when_tmp_lives_in_memory(self):
+        for chosen in [Path('/srv/cache/claude-pool/tmp'), None]:
+            with self.subTest(chosen=chosen), tempfile.TemporaryDirectory() as folder, patch.object(launch,'RUNTIME',Path(folder)), \
+                 patch.dict(launch.os.environ,{},clear=True), patch.object(launch,'token',return_value='fixture'), patch.object(launch,'ensure_pool'), \
+                 patch.object(launch.scratch,'agent_tmpdir',return_value=chosen), \
+                 patch.object(launch.subprocess,'call',return_value=0) as native, patch.object(launch.sys,'argv',['claude']):
+                with self.assertRaises(SystemExit): launch.main()
+                self.assertEqual(native.call_args.kwargs['env'].get('CLAUDE_CODE_TMPDIR'), str(chosen) if chosen else None)
+
     def test_foreground_origins_are_unique_and_headless_calls_keep_their_arguments(self):
         paths=[]
         with tempfile.TemporaryDirectory() as folder, patch.object(launch,'RUNTIME',Path(folder)), \

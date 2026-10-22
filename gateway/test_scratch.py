@@ -10,6 +10,7 @@ import scratch
 
 MOUNTS = 'tmpfs /tmp tmpfs rw,nosuid,nodev,size=16G 0 0\n/dev/sda1 / ext4 rw,relatime 0 0\n'
 DAY = 86400
+ENDED, LIVE, FRESH = 'aaaaaaaa-1111-4111-8111-111111111111', 'bbbbbbbb-2222-4222-8222-222222222222', 'cccccccc-3333-4333-8333-333333333333'
 
 
 class TmpdirTests(unittest.TestCase):
@@ -48,15 +49,17 @@ class PruneTests(unittest.TestCase):
         return path.parent
 
     def test_only_stale_folders_of_ended_sessions_go(self):
-        ended = self.session('-home-a-projects-x', 'aaaa-ended', 5)
-        live = self.session('-home-a-projects-x', 'bbbb-live', 5)
-        fresh = self.session('-home-a-projects-y', 'cccc-fresh', 1)
-        removed = scratch.prune([self.root], live={'bbbb-live'}, now=self.now)
+        ended = self.session('-home-a-projects-x', ENDED, 5)
+        live = self.session('-home-a-projects-x', LIVE, 5)
+        fresh = self.session('-home-a-projects-y', FRESH, 1)
+        skills = self.session('bundled-skills', '2.1.306', 5)
+        removed = scratch.prune([self.root], live={LIVE}, now=self.now)
+        self.assertTrue(skills.exists(), 'bundled skills of running versions stay')
         self.assertFalse(ended.exists()); self.assertTrue(live.exists()); self.assertTrue(fresh.exists())
         self.assertEqual(removed['folders'], 1); self.assertEqual(removed['bytes'], 1000)
 
     def test_a_recent_file_deep_inside_keeps_the_folder(self):
-        folder = self.session('-home-a-projects-x', 'dddd', 5)
+        folder = self.session('-home-a-projects-x', ENDED, 5)
         (folder / 'scratchpad' / 'new.txt').write_text('heute')
         scratch.prune([self.root], live=set(), now=self.now)
         self.assertTrue(folder.exists())
