@@ -19,6 +19,7 @@ from routing import choose, profile, session_rows, unavailable, REASONS
 from validation import archive, HistoryIndex
 from diagnostics import Journal
 from brake import Brake, CLASSES as BRAKE_CLASSES, ledger_line, stage as brake_stage
+import memory
 import readings
 from native_auth import NativeAuthUnavailable
 from telemetry import fable_windows, capacity
@@ -77,6 +78,7 @@ class PoolBridge(ThreadingHTTPServer):
         self.body_bytes = 0
         self.max_requests, self.main_reserve = 32, 4
         self.max_body_bytes, self.idle_timeout = 256 * 1024 * 1024, 300
+        self.trim_interval, self.trimmed_at = 10, -math.inf
         self.history_index = HistoryIndex(self.history_path) if self.history_path else None
         self.monitor_stop = threading.Event()
         self.monitor = threading.Thread(target=self.monitor_requests, daemon=True)
@@ -194,6 +196,10 @@ class PoolBridge(ThreadingHTTPServer):
         with self.lock:
             row = self.requests.pop(id(handler), None)
             if row: self.body_bytes -= row['bytes']
+            # A large body's freed memory stays resident in its thread's malloc arena; return it at most every trim_interval.
+            trim = bool(row) and row['bytes'] >= 1024 * 1024 and time.monotonic() - self.trimmed_at >= self.trim_interval
+            if trim: self.trimmed_at = time.monotonic()
+        if trim: memory.trim()
 
     def check_backend(self):
         try:
