@@ -24,6 +24,7 @@ import threading
 import time
 
 import accounts_cli
+import conductor_inbox
 import conductor_tools
 import device_sync
 import managed_block
@@ -161,7 +162,7 @@ def serve(native, cwd, state=None, spawn=PtyChild, sleep=None, stop=None, clock=
     backoff, failures, restarts, last = BACKOFF_START, 0, 0, read_state(state).get('lastExit')
     while not stop.is_set():
         session = read_state(state).get('sessionId')
-        child = spawn(_command(native, session), native_env(os.environ), cwd)
+        child = spawn(_command(native, session), {**native_env(os.environ), conductor_inbox.MARK: '1'}, cwd)
         started, ready, known = clock(), False, session
         _update(state, pid=child.pid, startedAt=int(time.time()), ready=False, restarts=restarts, lastExit=last)
         ring, prompt = Ring(), ''
@@ -209,10 +210,11 @@ def serve_service():
     stop = threading.Event()
     for number in (signal.SIGTERM, signal.SIGINT): signal.signal(number, lambda *_: stop.set())
     queue = threading.Thread(target=conductor_tools.deliver_until, args=(stop,), name='conductor-queue', daemon=True)
-    queue.start()
+    waker = threading.Thread(target=conductor_inbox.waker_until, args=(stop,), name='conductor-waker', daemon=True)
+    queue.start(); waker.start()
     try: serve(settings.NATIVE_CLAUDE, Path.cwd(), stop=stop)
     finally:
-        stop.set(); queue.join(QUEUE_JOIN)
+        stop.set(); queue.join(QUEUE_JOIN); waker.join(QUEUE_JOIN)
     return 0
 
 

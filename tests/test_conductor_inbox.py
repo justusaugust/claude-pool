@@ -94,8 +94,8 @@ class InboxTests(InboxBase):
         inbox.add('x' * 5000)
         thread, result = self.waiter(); thread.join(3)
         lines = [l for l in result['text'].splitlines() if l.startswith('- ')]
-        self.assertEqual(lines[0], '- zeile eins zeile zwei')
-        self.assertLessEqual(len(lines[1]), inbox.LINE_LIMIT + 2)
+        self.assertRegex(lines[0], r'^- \d\d:\d\d zeile eins zeile zwei$')
+        self.assertLessEqual(len(lines[1]), inbox.LINE_LIMIT + len('- 16:40 '))
 
 
 class InstallTests(InboxBase):
@@ -111,7 +111,7 @@ class InstallTests(InboxBase):
             ours = [h for group in value['hooks'][event] for h in group['hooks'] if 'conductor inbox wait' in h['command']]
             self.assertEqual(len(ours), 1, event)
             self.assertTrue(ours[0]['asyncRewake']); self.assertGreaterEqual(ours[0]['timeout'], 86400)
-            self.assertTrue(ours[0]['command'].startswith('/usr/local/bin/claude-pool '))
+            self.assertEqual(ours[0]['command'], 'exec /usr/local/bin/claude-pool conductor inbox wait')
         self.assertIn({'type': 'command', 'command': 'say done'}, [h for g in value['hooks']['Stop'] for h in g['hooks']])
 
 
