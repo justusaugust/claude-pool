@@ -22,6 +22,7 @@ import tempfile
 from views import usage, history
 
 from bridge import PoolBridge, atomic_write
+import memory
 import readings
 from native_auth import NativeAuth
 import service
@@ -137,15 +138,21 @@ def request(client, method="GET", path="/health", body=None):
         conn.close()
 
 
+def backend_env(environ, client, admin):
+    # Shunt also frees large request bodies on many threads; two arenas keep that memory reusable.
+    return {'MALLOC_ARENA_MAX': '2', **environ, 'POOL_CLIENT_TOKENS': 'cockpit:' + client, 'POOL_ADMIN_TOKENS': 'cockpit:' + admin,
+            'SHUNT_CLAUDE_ACCOUNTS_DIR': str(STORES), 'RUST_LOG': 'error'}
+
+
 def daemon(client, admin):
     if (RUNTIME / 'maintenance').exists(): return
+    # Before any thread starts: each request thread could otherwise keep its own 64 MB malloc arena.
+    if 'MALLOC_ARENA_MAX' not in os.environ: memory.limit_arenas(2)
     private_directory(RUNTIME)
     config = backend_config(RUNTIME)
     cfg = RUNTIME / "shunt.toml"
     cfg.write_text(config)
-    env = os.environ.copy()
-    env.update(POOL_CLIENT_TOKENS="cockpit:" + client, POOL_ADMIN_TOKENS="cockpit:" + admin,
-               SHUNT_CLAUDE_ACCOUNTS_DIR=str(STORES), RUST_LOG="error")
+    env = backend_env(os.environ, client, admin)
     binary = HERE / "bin/shunt"
     if not binary.exists():
         raise RuntimeError("The packaged Shunt binary is missing")
