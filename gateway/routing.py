@@ -100,9 +100,9 @@ def choose(accounts, sessions, session_id, forecast, now):
         name = a['name']; capacity = seconds.get(name)
         return (backend_priority(a.get('reserveAt')), busy[name], loads[name], -(capacity or 0), name)
     best = min(ready, key=score)['name']
-    held = bool(by_name.get(previous, {}).get('reserveAt')) and not by_name[best].get('reserveAt')
+    held = previous in by_name and backend_priority(by_name[previous].get('reserveAt')) > backend_priority(by_name[best].get('reserveAt'))
     reason = unavailable(by_name.get(pin or previous)) if pin or previous else 'new session'
-    if previous and held and not pin and any(a['name'] == previous for a in ready): reason = 'shared capacity'  # a reserved account never keeps a session while an unreserved one is ready
+    if previous and held and not pin and any(a['name'] == previous for a in ready): reason = 'shared capacity'  # a reserved account never keeps a session while an earlier choice is ready
     elif previous and any(a['name'] == previous for a in ready) and not pin:
         remaining = seconds.get(previous)
         crowded = loads[previous] > loads[best] and remaining is not None and remaining / (loads[previous] + 1) < 600

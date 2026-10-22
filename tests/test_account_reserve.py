@@ -74,6 +74,10 @@ class RoutingTests(unittest.TestCase):
         rows = [account('team', five=1, reserve=85), account('gmail', five=50, reserve=99), account('other', five=97)]
         self.assertEqual(decide(rows, seconds={'team': 99999, 'gmail': 10, 'other': 10})['account'], 'gmail')
         self.assertEqual([routing.backend_priority(n) for n in (None, 0, 99, 85, 1)], [100, 100, 101, 115, 199])
+        # A session already on the Conductor account moves to Gmail at its next request: no cache affinity there.
+        moved = decide(rows, previous='team', seconds={'team': 99999, 'gmail': 10, 'other': 10})
+        self.assertEqual(moved['account'], 'gmail')
+        self.assertNotEqual(moved['reason'], 'cache affinity')
 
     def test_a_blocked_previous_account_names_its_reserve_as_the_reason(self):
         self.assertIn('reserved account', routing.REASONS)
