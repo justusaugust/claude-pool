@@ -196,9 +196,14 @@ def daemon(client, admin):
         alerts = Alerts(Path(CONDUCTOR_HOME).expanduser() / 'state' / 'wake.log', RUNTIME / 'conductor-alerts.json')
         def supervise():
             nonlocal gateway
-            delay, next_probe, next_sample, next_alert = .5, time.monotonic(), time.monotonic() + 30, time.monotonic() + 30
+            delay, next_probe, next_sample, next_alert, next_prune = .5, time.monotonic(), time.monotonic() + 30, time.monotonic() + 30, time.monotonic() + 600
             while not stop.wait(.5):
                 now = time.monotonic()
+                if now >= next_prune:
+                    # What ended sessions left in the agents' scratch folders (disk and the old /tmp place), after three quiet days.
+                    try: scratch.prune([p for p in [scratch.agent_tmpdir({}), Path(tempfile.gettempdir())] if p], scratch.live_sessions(), time.time())
+                    except OSError: pass
+                    next_prune = now + 3600
                 if now >= next_alert:
                     # Backend down, no account left, a login needed or brake stage 2: one line in the Conductor's wake.log.
                     try: alerts.check(server)
