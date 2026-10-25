@@ -190,6 +190,20 @@ class LightTests(BoardBase):
                 self.assertEqual((row['light'], row['code'], row['fix']), ('amber', status + ':app', 'open the Claude app'))
                 self.assertIn('app', row['reason'])
 
+    def test_a_login_note_counts_only_where_the_conductor_runs(self):
+        # what an older claude-pool records for a Native login the pool does not serve, on a device without the Conductor
+        note = ('native-login', 'manual', 'other@x.de (Other) is not a pool account; only needed where a Conductor runs',
+                'claude-native auth login (choose a pool account) only if a Conductor should run here')
+        self.checked('mac', ('reachable', 'ok', 'this device'), ('service', 'ok', 'running'), note)
+        self.checked('vps', ('reachable', 'ok', 'ssh works'), ('service', 'ok', 'running'), note)
+        value = self.snap()
+        self.assertEqual([(row['light'], row['code']) for row in value['machines']], [('green', 'ok'), ('green', 'ok')])
+        registry.update(lambda value: value.update(conductor={'device': 'vps', 'email': 'c@x.de', 'organization': 'Team',
+                                                              'cwd': '~/projects/conductor'}), settings.REGISTRY)
+        value = self.snap()
+        self.assertEqual((self.machine(value, 'mac')['light'], self.machine(value, 'mac')['code']), ('green', 'ok'))
+        self.assertEqual((self.machine(value, 'vps')['light'], self.machine(value, 'vps')['code']), ('amber', 'manual:native-login'))
+
     def test_live_facts_win_over_an_older_cached_check(self):
         self.checked('vps', ('reachable', 'unreachable', 'could not reach alex@vps over ssh', 'ssh alex@vps true'), at=NOW - 3600)
         row = self.machine(self.snap(), 'vps')

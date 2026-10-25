@@ -217,9 +217,11 @@ class Board:
             live.update(entries)
             try: _store(_path(PROBE_FILE), entries)
             except (OSError, ValueError, RuntimeError): pass
-        return [self._machine(row, row['name'] == me, live.get(row['name']), checks.get(row['name']) or {}) for row in value['devices']]
+        entry = registry.conductor(value)
+        return [self._machine(row, row['name'] == me, live.get(row['name']), checks.get(row['name']) or {},
+                              entry is not None and entry['device'] == row['name']) for row in value['devices']]
 
-    def _machine(self, row, mine, live, check):
+    def _machine(self, row, mine, live, check, conductor_here=False):
         name, ssh = row['name'], row.get('ssh')
         checked = _checked_at(check)
         steps = [step for step in check.get('steps') or [] if isinstance(step, dict)]
@@ -245,6 +247,7 @@ class Board:
         for step in steps:
             status, label, detail, fix = step.get('status'), step.get('name', 'step'), step.get('detail') or '', step.get('fix') or ''
             if status in ('ok', 'skipped'): continue
+            if label == 'native-login' and status == 'manual' and not conductor_here: continue  # older results: not needed here
             if label == 'reachable' and status == 'unreachable': issues.append(('red', 'unreachable', 'Not reachable over ssh.', fix))
             elif label == 'service': issues.append(('red', 'pool-stopped', 'The pool is not running: ' + detail, fix or start_fix))
             elif label == 'version' and status == 'missing': issues.append(('amber', 'version-mismatch', 'It runs another claude-pool version: ' + detail, fix))
