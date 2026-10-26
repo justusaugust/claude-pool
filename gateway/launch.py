@@ -24,6 +24,7 @@ from views import usage, history
 from bridge import PoolBridge, atomic_write
 import memory
 import readings
+import registry
 import scratch
 from native_auth import NativeAuth
 import service
@@ -37,6 +38,7 @@ INSTALLATION = service.receipt(ROOT)
 SERVICE_LABEL = service.installed_label(INSTALLATION)
 SERVICE_FILE = service.service_file(SERVICE_LABEL)
 ACCOUNT_SHORTCUTS = ALIASES
+SELF_CHECK_FIRST, SELF_CHECK_EVERY = 600, 6 * 3600  # seconds after the start and between two device checks of this machine
 
 
 def service_command(*args, check=True):
@@ -54,6 +56,17 @@ def service_definition():
             'ExitTimeOut': 360, 'WorkingDirectory': str(root),
             'EnvironmentVariables': {'POOL_MANAGED': '1', 'CLAUDE_POOL_CONFIG': str(CONFIG)},
             'StandardOutPath': '/dev/null', 'StandardErrorPath': '/dev/null'}
+
+
+def self_check(running, name, popen=subprocess.Popen):
+    """`device check <this device>` in the background. It shares its result with every peer it reaches, so the check the
+    Board shows stays fresh (the Board greys a check older than a day). A check still running from the last turn is
+    stopped first. Returns the started process, or None on a machine that is no registered device."""
+    if running is not None and running.poll() is None:
+        running.kill(); running.wait(timeout=5)
+    if name is None: return None
+    return popen([*service_definition()['ProgramArguments'][:2], 'device', 'check', name],
+                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def install_service():
@@ -197,8 +210,15 @@ def daemon(client, admin):
         def supervise():
             nonlocal gateway
             delay, next_probe, next_sample, next_alert, next_prune = .5, time.monotonic(), time.monotonic() + 30, time.monotonic() + 30, time.monotonic() + 600
+            next_check, checking = time.monotonic() + SELF_CHECK_FIRST, None
             while not stop.wait(.5):
                 now = time.monotonic()
+                if checking is not None and checking.poll() is not None: checking = None
+                if now >= next_check:
+                    # This machine's own device check, shared with its peers: a healthy machine never shows a stale check.
+                    try: checking = self_check(checking, registry.self_name())
+                    except (OSError, subprocess.SubprocessError): checking = None
+                    next_check = now + SELF_CHECK_EVERY
                 if now >= next_prune:
                     # What ended sessions left in the agents' scratch folders (disk and the old /tmp place), after three quiet days.
                     try: scratch.prune([p for p in [scratch.agent_tmpdir({}), Path(tempfile.gettempdir())] if p], scratch.live_sessions(), time.time())
