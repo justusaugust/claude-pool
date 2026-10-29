@@ -54,6 +54,17 @@ class ConductorBrakeTests(unittest.TestCase):
         text = self.run_cli('usage')[1]
         self.assertIn('pitch-riot', text); self.assertIn('Brake · stage 1: forecast ends before the next reset', text); self.assertNotIn('Sonnet', text)
 
+    def test_usage_counts_todays_brake_waits(self):
+        from brake import wait_line
+        (self.runtime / 'brake-waits').mkdir()
+        now = int(time.time() * 1000)
+        rows = [wait_line(now, now - 35 * 60000, 's', 'pitch-riot', 'subagent', 'stage 1', 'released'),
+                wait_line(now, now - 30 * 60000, 's', 'pitch-riot', 'main', 'stage 1', 'released')]
+        (self.runtime / 'brake-waits' / (time.strftime('%Y-%m-%d') + '.jsonl')).write_text(''.join(json.dumps(r) + '\n' for r in rows))
+        value = json.loads(self.run_cli('usage', '--json')[1])
+        self.assertEqual((value['waits']['requests'], value['waits']['seconds']), (2, 65 * 60))
+        self.assertIn('Background waits today · 2 requests · 1h 05m', self.run_cli('usage')[1])
+
 
 if __name__ == '__main__':
     unittest.main()

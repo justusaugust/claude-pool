@@ -387,6 +387,183 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(json.loads(self.call('/pool/validation')[1])['liveSnapshots'],1)
         self.assertNotIn('fixture-client',next(self.bridge.history_path.glob('*.jsonl')).read_text())
 
+    # --- background sessions wait while the brake holds ---------------------------------------------------------------
+    NUDGE = 'Conductor (Board): Seit 14:05 kommt von dir nichts Neues. Wo stehst du? Mach weiter oder sag, was fehlt.'
+
+    def turn(self, content, stream=True):
+        """A main request whose newest user turn is `content` (a tool result turn says nothing about who is there)."""
+        return json.dumps({'model': 'claude-opus-5-5', 'stream': stream, 'messages': [{'role': 'user', 'content': content}]}).encode()
+
+    def tool_turn(self, stream=True):
+        return self.turn([{'type': 'tool_result', 'tool_use_id': 'toolu_1', 'content': 'ok'}], stream)
+
+    def background(self, session='test-session'):
+        """The pool saw only automatic turns in this session (a Board nudge), with the brake off."""
+        self.call('/v1/messages', self.turn(self.NUDGE), extra_headers={'x-claude-code-session-id': session})
+        self.inputs.clear(); self.headers.clear(); self.preferred.clear()
+
+    def braking(self, stage=1):
+        """The brake from here on: `self.stage` decides every sample; checks every 50 ms, calm releases after 0.2 s."""
+        self.stage = stage
+        self.bridge.brake_check, self.bridge.hold.release = .05, .2
+        return patch.object(self.bridge, 'brake_info', side_effect=lambda: {'stage': self.stage, 'ratio': None, 'resetAt': None})
+
+    def open_stream(self, body, session='test-session', extra=None):
+        conn = http.client.HTTPConnection('127.0.0.1', self.bridge.server_port, timeout=10)
+        conn.request('POST', '/v1/messages', body, {'Authorization': 'Bearer fixture-client', 'x-claude-code-session-id': session, **(extra or {})})
+        response = conn.getresponse()
+        self.addCleanup(conn.close)
+        self.stream_conn = conn
+        return response
+
+    def until(self, check, seconds=3):
+        for _ in range(int(seconds / .02)):
+            if check(): return True
+            threading.Event().wait(.02)
+        return False
+
+    def waits(self):
+        import time
+        path = Path(self.temp.name) / 'brake-waits' / (time.strftime('%Y-%m-%d') + '.jsonl')
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def test_a_background_request_waits_with_pings_while_the_brake_holds_and_goes_once_calm_holds(self):
+        self.background()
+        with self.braking(1):
+            response = self.open_stream(self.tool_turn())
+            self.assertEqual(response.status, 200)
+            self.assertIn(b'event: ping', response.read1(256))
+            self.assertEqual(self.inputs, [], 'nothing goes upstream while it waits')
+            overview = json.loads(self.call('/pool/overview')[1])
+            row = next(r for r in overview['sessions'] if r['session'] == 'test-session')
+            self.assertEqual((row['brakeWaiting']['reason'], row['brakeWaiting']['requests']), ('stage 1', 1))
+            self.assertEqual((overview['brake']['hold'], overview['brake']['waiting']), (True, 1))
+            health = self.bridge.diagnostics()['health']
+            self.assertEqual((health['activeRequests'], health['waitingRequests']), (0, 1), 'a waiting request takes no request slot')
+            self.stage = 0
+            body = response.read()
+        self.assertIn(b'message_stop', body)
+        self.assertEqual(json.loads(self.inputs[-1])['messages'][0]['content'][0]['type'], 'tool_result', 'the request as sent')
+        self.assertNotIn('brakeWaiting', self.bridge.session('test-session'))
+        self.assertEqual(self.bridge.session('test-session')['active'], 'gmail')
+        row = self.ledger()[-1]
+        self.assertTrue(row['braked']); self.assertGreaterEqual(row['brakeWaitSeconds'], 0)
+        wait = self.waits()[-1]
+        self.assertEqual((wait['session'], wait['class'], wait['reason'], wait['end']), ('test-session', 'main', 'stage 1', 'released'))
+        self.assertIn('brake_wait', [r['code'] for r in self.bridge.journal.snapshot()])
+        self.assertNotIn(self.NUDGE, json.dumps(self.waits()) + json.dumps(self.ledger()) + self.bridge.state_path.read_text())
+
+    def test_a_flicker_back_to_the_brake_restarts_the_calm(self):
+        self.background()
+        with self.braking(1):
+            response = self.open_stream(self.tool_turn())
+            response.read1(256)
+            self.stage = 0
+            self.assertTrue(self.until(lambda: self.bridge.hold.calm is not None))
+            self.stage = 1
+            self.assertTrue(self.until(lambda: self.bridge.hold.calm is None))
+            self.assertEqual(self.inputs, [])
+            self.stage = 0
+            self.assertIn(b'message_stop', response.read())
+
+    def test_a_subagent_waits_or_goes_with_its_main_session(self):
+        self.background('quiet')
+        with self.braking(2):
+            sub = self.open_stream(json.dumps({'model': 'claude-opus-5-5', 'stream': True, 'messages': [{'role': 'user', 'content': 'x'}]}).encode(),
+                                   'quiet', {'x-claude-code-request-class': 'subagent', 'x-claude-code-agent-id': 'agent-quiet'})
+            self.assertIn(b'event: ping', sub.read1(256))
+            status, body = self.subagent()    # a subagent of test-session: the pool never classified that session
+            self.assertEqual(status, 200); self.assertNotIn(b'event: ping', body)
+            self.assertEqual(len(self.inputs), 1)
+            # The owner writes in the quiet session: its own request goes at once, and so does the agent that waited.
+            status, body = self.call('/v1/messages', self.turn('Mach bitte erst mobil fertig.'), extra_headers={'x-claude-code-session-id': 'quiet'})
+            self.assertEqual(status, 200); self.assertNotIn(b'event: ping', body)
+            self.assertIn(b'message_stop', sub.read())
+        self.assertEqual(len(self.inputs), 3)
+        self.assertEqual(self.waits()[-1]['class'], 'subagent')
+
+    def test_interactive_unknown_and_exempt_sessions_never_wait(self):
+        self.call('/v1/messages', self.turn('Bau die Suche.'))       # the owner typed this turn
+        with self.braking(2):
+            status, body = self.call('/v1/messages', self.tool_turn())
+            self.assertEqual(status, 200); self.assertNotIn(b'event: ping', body)
+            status, body = self.call('/v1/messages', self.tool_turn(), extra_headers={'x-claude-code-session-id': 'never-seen'})
+            self.assertNotIn(b'event: ping', body)
+            with self.bridge.lock: self.bridge.session('board')['project'] = 'conductor'
+            self.background('board')
+            self.assertNotIn(b'event: ping', self.call('/v1/messages', self.tool_turn(), extra_headers={'x-claude-code-session-id': 'board'})[1])
+        self.assertEqual(self.waits(), [])
+
+    def test_an_urgent_mark_releases_a_waiting_session(self):
+        import time
+        self.background()
+        with self.bridge.lock: self.bridge.session('test-session')['project'] = 'pitch-riot'
+        with self.braking(1):
+            response = self.open_stream(self.tool_turn())
+            response.read1(256)
+            (Path(self.temp.name) / 'brake.json').write_text(json.dumps({'urgent': {'pitch-riot': time.time() + 3600}}))
+            self.assertIn(b'message_stop', response.read())
+        self.assertEqual(self.waits()[-1]['end'], 'released')
+
+    def test_non_streaming_and_token_counts_pass_while_the_brake_holds(self):
+        self.background()
+        with self.braking(2):
+            self.assertNotIn(b'event: ping', self.call('/v1/messages', self.tool_turn(stream=False))[1])
+            self.call('/v1/messages/count_tokens', self.tool_turn())
+        self.assertEqual(len(self.inputs), 2)
+
+    def test_draining_ends_the_wait_with_a_framed_error_and_sends_nothing(self):
+        self.background()
+        with self.braking(1):
+            response = self.open_stream(self.tool_turn())
+            response.read1(256)
+            self.bridge.draining = True
+            body = response.read()
+        self.assertIn(b'event: error', body); self.assertNotIn(b'message_stop', body)
+        self.assertEqual(self.inputs, [])
+        self.assertEqual(self.waits()[-1]['end'], 'draining')
+        self.assertNotIn('brakeWaiting', self.bridge.session('test-session'))
+        self.assertTrue(self.until(lambda: not self.bridge.requests))
+
+    def test_a_closed_client_ends_the_wait_without_sending(self):
+        self.background()
+        with self.braking(1):
+            response = self.open_stream(self.tool_turn())
+            response.read1(256); response.close(); self.stream_conn.close()
+            self.assertTrue(self.until(lambda: not self.bridge.requests))
+        self.assertEqual(self.inputs, [])
+        self.assertEqual(self.waits()[-1]['end'], 'cancelled')
+
+    def test_no_request_waits_longer_than_the_cap(self):
+        self.background()
+        with self.braking(2):
+            self.bridge.brake_max_wait = .2
+            status, body = self.call('/v1/messages', self.tool_turn())
+        self.assertEqual(status, 200); self.assertIn(b'event: ping', body); self.assertIn(b'message_stop', body)
+        self.assertEqual(len(self.inputs), 1)
+        self.assertEqual(self.waits()[-1]['end'], 'capped')
+        self.assertIn('brake_wait_capped', [r['code'] for r in self.bridge.journal.snapshot()])
+
+    def test_the_owner_and_automatic_turns_and_the_hold_survive_a_restart(self):
+        self.background()
+        self.call('/v1/messages', self.turn('Weiter so.'), extra_headers={'x-claude-code-session-id': 'owned'})
+        with self.braking(1): self.bridge.brake_hold()
+        self.bridge.save()
+        second = PoolBridge(('127.0.0.1', 0), self.upstream.server_port, 'fixture-client', 'fixture-admin', self.bridge.state_path)
+        try:
+            self.assertIn('autoAt', second.session('test-session')); self.assertNotIn('ownerAt', second.session('test-session'))
+            self.assertIn('ownerAt', second.session('owned'))
+            self.assertTrue(second.hold.on)
+        finally: second.server_close()
+
+    def test_a_full_waiting_room_sends_background_work_instead_of_holding_it(self):
+        self.background()
+        with self.braking(1):
+            self.bridge.max_waiting = 0
+            status, body = self.call('/v1/messages', self.tool_turn())
+        self.assertNotIn(b'event: ping', body); self.assertEqual(len(self.inputs), 1)
+        self.assertIn('brake_wait_full', [r['code'] for r in self.bridge.journal.snapshot()])
+
     def test_state_restart_retains_pin_without_storing_credentials_or_prompts(self):
         self.call(body={'action':'pin','account':'team'})
         data=self.bridge.state_path.read_text()

@@ -388,6 +388,31 @@ class AccountTests(BoardBase):
         self.assertNotIn('f' * 12, text); self.assertNotIn('user-a', text); self.assertNotIn('sk-', text)
 
 
+class BrakeTests(BoardBase):
+    """The Board shows which sessions wait because of the brake ("wartet wegen der Bremse")."""
+    def test_waiting_sessions_and_the_hold_come_from_the_usage_overview(self):
+        self.devices(MAC, VPS)
+        overview = json.loads(json.dumps(OVERVIEW))
+        overview['forecast'] = {'brake': {'stage': 1, 'ratio': .7, 'resetAt': 1}}
+        overview['brake'] = {'hold': True, 'calmSince': None, 'waiting': 3}
+        overview['sessions'] += [{'session': 's-pitch', 'project': 'pitch-riot', 'account': None, 'busy': False,
+                                  'brakeWaiting': {'since': 1_799_997_900_000, 'reason': 'stage 1', 'requests': 2}},
+                                 {'session': 's-web', 'project': 'website', 'busy': False,
+                                  'brakeWaiting': {'since': 1_799_999_400_000, 'reason': 'stage 1', 'requests': 1}}]
+        value = self.snap(board=self.board(overview=overview))
+        self.assertEqual(value['brake'], {'hold': True, 'stage': 1, 'waiting': [
+            {'session': 's-pitch', 'project': 'pitch-riot', 'since': 1_799_997_900_000, 'requests': 2},
+            {'session': 's-web', 'project': 'website', 'since': 1_799_999_400_000, 'requests': 1}]})
+        text = ct.snapshot(ct.Tools(), now=NOW, queue_path=self.queue_path, board=self.board(overview=overview))
+        self.assertIn('brake: background sessions wait (stage 1) · pitch-riot 35m · website 10m', text)
+
+    def test_no_hold_or_no_pool_shows_no_waiting(self):
+        self.devices(MAC, VPS)
+        self.assertEqual(self.snap()['brake'], {'hold': False, 'stage': None, 'waiting': []})
+        self.assertNotIn('brake:', ct.snapshot(ct.Tools(), now=NOW, queue_path=self.queue_path, board=self.board()))
+        self.assertEqual(self.snap(board=self.board(overview=ConnectionRefusedError()))['brake'], {'hold': None, 'stage': None, 'waiting': []})
+
+
 class QueueTests(BoardBase):
     def queue(self, *items):
         self.runtime.mkdir(mode=0o700, parents=True, exist_ok=True)

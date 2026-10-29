@@ -44,6 +44,66 @@ class ExemptionTests(unittest.TestCase):
         self.assertFalse(brake.exempt(''))
 
 
+class HoldTests(unittest.TestCase):
+    """Background work waits from the first sample with the brake on; it goes again after 15 minutes of calm in a row."""
+    def test_stage_zero_must_hold_fifteen_minutes_before_the_hold_lets_go(self):
+        hold = brake.Hold()
+        self.assertFalse(hold.on)
+        self.assertEqual(hold.update(True, 0), 'on')
+        self.assertIsNone(hold.update(True, 60))
+        for t in (120, 600, 1019):
+            self.assertIsNone(hold.update(False, t)); self.assertTrue(hold.on, t)
+        self.assertEqual(hold.update(False, 120 + 15 * 60), 'off')
+        self.assertFalse(hold.on)
+        self.assertIsNone(hold.update(False, 5000), 'off stays off without a change')
+
+    def test_one_braking_sample_starts_the_calm_over(self):
+        hold = brake.Hold()
+        hold.update(True, 0)
+        hold.update(False, 60)
+        hold.update(True, 14 * 60)                 # the stage flickers back
+        self.assertIsNone(hold.update(False, 15 * 60))
+        self.assertIsNone(hold.update(False, 16 * 60), 'fifteen minutes after the first calm sample is not enough')
+        self.assertTrue(hold.on)
+        self.assertEqual(hold.update(False, 30 * 60), 'off')
+
+    def test_the_hold_survives_a_restart_with_its_calm(self):
+        hold = brake.Hold()
+        hold.update(True, 0); hold.update(False, 100)
+        again = brake.Hold.restore(json.loads(json.dumps(hold.state())))
+        self.assertTrue(again.on)
+        self.assertEqual(again.update(False, 100 + 15 * 60), 'off')
+        for bad in (None, [], {'on': 'yes'}, {'on': True, 'calmSince': 'later'}):
+            self.assertIn(brake.Hold.restore(bad).on, (False, True))
+        self.assertFalse(brake.Hold.restore(None).on)
+
+    def test_braking_means_stage_one_or_a_confirmed_standstill(self):
+        self.assertTrue(brake.braking({'stage': 1}))
+        self.assertTrue(brake.braking({'stage': 0, 'standstill': True}))
+        self.assertFalse(brake.braking({'stage': 0, 'standstill': False}))
+        self.assertFalse(brake.braking({}))
+        ready, limited, unknown = {'status': 'ready'}, {'status': 'limited'}, {'status': 'unknown'}
+        self.assertTrue(brake.standstill([limited, unknown]))
+        self.assertFalse(brake.standstill([limited, ready]))
+        self.assertFalse(brake.standstill([unknown, unknown]), 'no reading yet (a fresh start) is no standstill')
+        self.assertFalse(brake.standstill([]))
+
+
+class SessionClassTests(unittest.TestCase):
+    """A session is interactive for 90 minutes after a message from a person; one the pool never classified, too."""
+    def test_a_recent_owner_message_makes_the_session_interactive(self):
+        now = 10 * 3600
+        self.assertTrue(brake.interactive({'ownerAt': now - 89 * 60, 'autoAt': now - 60}, now))
+        self.assertFalse(brake.interactive({'ownerAt': now - 91 * 60, 'autoAt': now - 60}, now))
+        self.assertFalse(brake.interactive({'ownerAt': now - 91 * 60}, now))
+        self.assertFalse(brake.interactive({'autoAt': now - 60}, now))
+
+    def test_a_session_the_pool_never_classified_counts_as_interactive(self):
+        self.assertTrue(brake.interactive({}, 100))
+        self.assertTrue(brake.interactive(None, 100))
+        self.assertTrue(brake.interactive({'mode': 'auto', 'ownerAt': 'yesterday'}, 100))
+
+
 class LedgerTests(unittest.TestCase):
     def test_usd_weighs_tokens_by_model_price(self):
         usage = {'input_tokens': 1000000, 'output_tokens': 100000, 'cache_read_input_tokens': 1000000, 'cache_creation_input_tokens': 0}
@@ -85,6 +145,27 @@ class LedgerTests(unittest.TestCase):
             self.assertAlmostEqual(s['sessions'][0]['usd'], 12, places=3)
             self.assertAlmostEqual(s['sessions'][0]['classes']['main'], 2, places=3)
             self.assertNotIn('content', json.dumps(rows), 'no prompt content in the ledger')
+
+    def test_an_answer_that_waited_for_the_brake_carries_its_wait(self):
+        row = ledger_line(NOW, 's1', 'website', 'subagent', 'claude-opus-5-5', 'team', {'output_tokens': 1}, waited=125.4)
+        self.assertEqual((row['braked'], row['brakeWaitSeconds']), (True, 125))
+        plain = ledger_line(NOW, 's1', 'website', 'main', 'claude-opus-5-5', 'team', {'output_tokens': 1})
+        self.assertFalse(plain['braked']); self.assertNotIn('brakeWaitSeconds', plain)
+
+    def test_waits_per_day_count_requests_and_seconds_without_content(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / 'today.jsonl'
+            rows = [brake.wait_line(NOW, NOW - 600000, 's1', 'pitch-riot', 'subagent', 'stage 1', 'released'),
+                    brake.wait_line(NOW, NOW - 3 * H, 's2', 'website', 'main', 'stage 2', 'capped'),
+                    brake.wait_line(NOW, NOW - 5000, 's1', 'pitch-riot', 'main', 'stage 1', 'cancelled')]
+            self.assertEqual(set(rows[0]), {'at', 'since', 'seconds', 'session', 'project', 'class', 'reason', 'end'})
+            self.assertEqual(rows[0]['seconds'], 600)
+            path.write_text(''.join(json.dumps(r) + '\n' for r in rows) + 'kaputt\n')
+            s = brake.wait_summary(path)
+            self.assertEqual((s['requests'], s['seconds']), (3, 600 + 3 * 3600 + 5))
+            self.assertEqual(s['ends'], {'released': 1, 'capped': 1, 'cancelled': 1})
+            self.assertEqual(s['projects'], {'pitch-riot': 605, 'website': 3 * 3600})
+            self.assertEqual(brake.wait_summary(Path(d) / 'missing.jsonl')['requests'], 0)
 
 
 if __name__ == '__main__':
