@@ -54,13 +54,15 @@ def backend_priority(reserve_at):
 def session_rows(sessions, now):
     rows = []
     for key, s in sessions.items():
-        if not s.get('inFlight') and now - s.get('requestAt', 0) > ACTIVE_SECONDS and now - s.get('uiAt', 0) > 30: continue
+        waiting = s.get('brakeWaiting') if isinstance(s.get('brakeWaiting'), dict) else None
+        if not s.get('inFlight') and not waiting and now - s.get('requestAt', 0) > ACTIVE_SECONDS and now - s.get('uiAt', 0) > 30: continue
         p = s.get('profile', {})
         rows.append({'session': key, 'project': s.get('project'), 'account': s.get('serving') or s.get('reserved') or s.get('active'),
                      'model': p.get('model', 'unknown'), 'effort': p.get('effort', 'standard'),
                      'workload': p.get('workload', 'other/standard'), 'pin': s.get('pin'),
                      'busy': bool(s.get('inFlight')), 'lastRequestAt': s.get('requestAt', 0) * 1000,
-                     'reason': s.get('routing', {}).get('reason', 'awaiting next request' if s.get('active') else 'new session')})
+                     'reason': s.get('routing', {}).get('reason', 'awaiting next request' if s.get('active') else 'new session'),
+                     **({'brakeWaiting': dict(waiting)} if waiting else {})})
     return sorted(rows, key=lambda r: (not r['busy'], -r['lastRequestAt']))
 
 

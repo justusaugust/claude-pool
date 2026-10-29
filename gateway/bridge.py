@@ -18,8 +18,9 @@ from forecast import estimate, renewal_scenario, workload_estimates
 from routing import choose, profile, session_rows, unavailable, REASONS
 from validation import archive, HistoryIndex
 from diagnostics import Journal
-from brake import CLASSES as BACKGROUND, ledger_line, stage as brake_stage
+from brake import CLASSES as BACKGROUND, ledger_line, stage as brake_stage, Hold, MAX_WAIT, braking, exempt, interactive, standstill, wait_line
 from agent_cache import AgentAccounts, one_hour
+import activity
 import memory
 import readings
 from native_auth import NativeAuthUnavailable
@@ -71,9 +72,14 @@ class PoolBridge(ThreadingHTTPServer):
         self.journal = Journal(self.state_path.parent / 'incidents.json' if self.state_path else None, atomic_write)
         self.health = {"backend": "starting", "failures": 0, "checkedAt": None, "supervisor": ("systemd" if sys.platform.startswith("linux") else "launchd") if os.environ.get("POOL_MANAGED") == "1" else "standalone"}
         self.last_accounts, self.accounts_at = [], -math.inf
-        self._brake_cache = (-60.0, {'stage': 0, 'ratio': None, 'resetAt': None})
+        self._brake_cache = (-60.0, {'stage': 0, 'ratio': None, 'resetAt': None, 'unmeasured': True})
+        self.hold = Hold()
+        # Background requests wait in a room of at most max_waiting; they check every brake_check s, at most brake_max_wait s.
+        self.brake_check, self.brake_max_wait, self.max_waiting = 30, MAX_WAIT, 24
         self.agents = AgentAccounts()
-        self.ledger_dir, self.ledger_lock, self._ledger_day = (self.state_path.parent / 'usage-ledger' if self.state_path else None), threading.Lock(), None
+        self.ledger_dir = self.state_path.parent / 'usage-ledger' if self.state_path else None
+        self.waits_dir = self.state_path.parent / 'brake-waits' if self.state_path else None
+        self.ledger_lock, self._ledger_days = threading.Lock(), {}
         self.draining = False
         self.connections = threading.BoundedSemaphore(64)
         self.requests = {}
@@ -101,6 +107,7 @@ class PoolBridge(ThreadingHTTPServer):
                         state = {**names, "mode": "pinned" if value.get("mode") == "pinned" and names["pin"] else "auto", "wrap": value.get("wrap") is not False, "at": stamp,
                                  "thinkingDropped": value.get("thinkingDropped") is True, "interrupted": bool(value.get("interrupted") or value.get("inFlight") or value.get("serving"))}
                         state["requestAt"] = value.get("requestAt", 0) if number(value.get("requestAt", 0)) else 0
+                        state.update({k: value[k] for k in ('ownerAt', 'autoAt') if number(value.get(k))})
                         if isinstance(value.get('connectorIdentity'), str) and re.fullmatch(r'[a-z0-9-]{1,80}', value['connectorIdentity']): state['connectorIdentity'] = value['connectorIdentity']
                         state["profile"] = profile({"model": value.get("profile", {}).get("model"), "output_config": {"effort": value.get("profile", {}).get("effort")}, "thinking": {"type": "enabled" if value.get("profile", {}).get("effort") == "thinking" else "disabled"}}) if isinstance(value.get("profile"), dict) else profile({})
                         if isinstance(value.get("project"), str) and re.fullmatch(r"[\w .-]{1,60}", value["project"]): state["project"] = value["project"]
@@ -124,8 +131,9 @@ class PoolBridge(ThreadingHTTPServer):
                             if not isinstance(row, dict) or not number(row.get("at")) or not isinstance(row.get("account"), str) or not re.fullmatch(r"[a-z0-9-]{1,80}", row["account"]) or not isinstance(row.get("workload"), str) or not re.fullmatch(r"(opus|sonnet|haiku|other)/(standard|thinking|low|medium|high|max)", row["workload"]): continue
                             self.traffic.append({"at": row["at"], "account": row["account"], "workload": row["workload"], **{k: row[k] for k in ("inputTokens", "outputTokens", "thinkingTokens", "cacheReadTokens", "cacheCreationTokens", "durationSeconds") if number(row.get(k)) and row[k] >= 0}})
                         self.paused_names = {n for n in (stored.get("paused") if isinstance(stored.get("paused"), list) else []) if isinstance(n, str) and re.fullmatch(r"[a-z0-9-]{1,80}", n)}
+                        self.hold = Hold.restore(stored.get("brake"))
                     if path != self.state_path: self.recovery["restoredBackup"] = True
-                    self._last_saved = json.dumps({"version": 1, "sessions": self.sessions, "observations": self.observations, "paused": sorted(self.paused_names), "traffic": self.traffic})
+                    self._last_saved = json.dumps(self.stored())
                     break
                 except FileNotFoundError:
                     continue
@@ -182,12 +190,17 @@ class PoolBridge(ThreadingHTTPServer):
                         try: connection.shutdown(socket.SHUT_RDWR)
                         except OSError: pass
 
+    def active(self):
+        """Admitted requests that are not waiting for the brake (waiting ones take no request slot)."""
+        return [r for r in self.requests.values() if not r.get('waiting')]
+
     def admit(self, handler, length):
         main = handler.path.split('?', 1)[0] == '/v1/messages' and handler.headers.get('x-claude-code-request-class', 'main') == 'main' and not handler.headers.get('x-claude-code-agent-id')
         with self.lock:
-            auxiliary = sum(not r['main'] for r in self.requests.values())
-            if self.draining or self.health['failures'] >= 3 or len(self.requests) >= self.max_requests or (not main and auxiliary >= max(0, self.max_requests - self.main_reserve)) or self.body_bytes + length > self.max_body_bytes:
-                self.journal.record('request_rejected', requests=len(self.requests))
+            active = self.active()
+            auxiliary = sum(not r['main'] for r in active)
+            if self.draining or self.health['failures'] >= 3 or len(active) >= self.max_requests or (not main and auxiliary >= max(0, self.max_requests - self.main_reserve)) or self.body_bytes + length > self.max_body_bytes:
+                self.journal.record('request_rejected', requests=len(active))
                 return None
             row = {'client': handler.connection, 'progress': time.monotonic(), 'bytes': length, 'upstream': None, 'main': main}
             self.requests[id(handler)] = row
@@ -220,9 +233,11 @@ class PoolBridge(ThreadingHTTPServer):
 
     def diagnostics(self):
         with self.lock:
-            return {'health': {**self.health, 'draining': self.draining, 'activeRequests': len(self.requests),
+            active = self.active()
+            return {'health': {**self.health, 'draining': self.draining, 'activeRequests': len(active),
+                    'waitingRequests': len(self.requests) - len(active),
                     'requestLimit': self.max_requests, 'bufferedBytes': self.body_bytes,
-                    'mainRequests': sum(r['main'] for r in self.requests.values()), 'mainReservedSlots': self.main_reserve,
+                    'mainRequests': sum(r['main'] for r in active), 'mainReservedSlots': self.main_reserve,
                     'storageError': self.persistence_error or self.history_error or self.journal.error},
                     'incidents': self.journal.snapshot()[:50]}
 
@@ -337,13 +352,19 @@ class PoolBridge(ThreadingHTTPServer):
             histories = [{**e, "session": key} for key, state in self.sessions.items() for e in state.get("history", [])]
             return {"version": "0.8.0", "accounts": accounts, "updatedAt": now, "ready": sum(a["status"] == "ready" for a in accounts),
                     "forecast": self.forecast(accounts, now), "sessions": session_rows(self.sessions, now / 1000), "history": sorted(histories, key=lambda e: e["at"], reverse=True)[:50],
-                    "recovery": dict(self.recovery), "persistenceError": self.persistence_error or self.history_error, **self.diagnostics()}
+                    "brake": self.brake_state(), "recovery": dict(self.recovery), "persistenceError": self.persistence_error or self.history_error, **self.diagnostics()}
+
+    def brake_state(self):
+        """The hold for usage views and the Conductor snapshot: on, since when calm (ms) and how many requests wait."""
+        with self.lock:
+            return {'hold': self.hold.on, 'calmSince': int(self.hold.calm * 1000) if self.hold.calm is not None else None,
+                    'waiting': sum(bool(r.get('waiting')) for r in self.requests.values())}
 
     def session(self, session_id):
         with self.lock:
-            self.sessions = {k: v for k, v in self.sessions.items() if v.get("inFlight") or time.time() - v.get("at", 0) < 86400}
+            self.sessions = {k: v for k, v in self.sessions.items() if v.get("inFlight") or v.get("brakeWaiting") or time.time() - v.get("at", 0) < 86400}
             if session_id not in self.sessions and len(self.sessions) >= 256:
-                idle = [k for k, v in self.sessions.items() if not v.get("inFlight")]
+                idle = [k for k, v in self.sessions.items() if not v.get("inFlight") and not v.get("brakeWaiting")]
                 if not idle: raise RuntimeError("All session slots are in use; retry after a response finishes")
                 oldest = min(idle, key=lambda k: self.sessions[k].get("at", 0))
                 self.sessions.pop(oldest)
@@ -368,15 +389,75 @@ class PoolBridge(ThreadingHTTPServer):
         return result
 
     def brake_info(self):
-        """Brake stage at most once a minute: the pooled forecast against the next usable five-hour reset."""
+        """Brake stage at most once a minute: the pooled forecast against the next usable five-hour reset, and whether the
+        pool stands still. A sample that failed reads stage 0 and is marked unmeasured."""
         at, info = self._brake_cache
         if time.monotonic() - at < 60: return info
         try:
             accounts, now = self.accounts(), int(time.time() * 1000)
-            with self.lock: info = brake_stage(estimate(accounts, self.observations, now), accounts, now)
-        except (OSError, ValueError, RuntimeError, KeyError, TypeError): info = {'stage': 0, 'ratio': None, 'resetAt': None}
+            with self.lock: info = {**brake_stage(estimate(accounts, self.observations, now), accounts, now), 'standstill': standstill(accounts)}
+        except (OSError, ValueError, RuntimeError, KeyError, TypeError): info = {'stage': 0, 'ratio': None, 'resetAt': None, 'unmeasured': True}
         self._brake_cache = (time.monotonic(), info)
         return info
+
+    def brake_hold(self):
+        """Whether background work waits, and why: (on, reason). Every call is a sample of the hold; an unmeasured one is not."""
+        info = self.brake_info() or {}
+        with self.lock:
+            change = None if info.get('unmeasured') else self.hold.update(braking(info), time.time())
+            on = self.hold.on
+            if change: self.save()
+        stage = info.get('stage') or 0
+        reason = f'stage {stage}' if stage else 'no ready account' if info.get('standstill') else 'settling'
+        if change: self.journal.record('brake_hold_' + change, reason=reason)
+        return on, reason
+
+    def brake_reason(self, session_id):
+        """Why a request of this session waits now, or None: the session is interactive (or never classified), its project
+        is exempt (the Conductor, claude-pool conductor urgent), or the hold is off. Subagents share their main session's id."""
+        with self.lock:
+            state = self.sessions.get(session_id)
+            calm, project = interactive(state, time.time()), (state or {}).get('project', '')
+        if calm or exempt(project, self.urgent()): return None
+        on, reason = self.brake_hold()
+        return reason if on else None
+
+    def note_turn(self, session_id, request):
+        """Remembers when the owner or an automatic sender last started a turn of this main session; never its text."""
+        found = activity.classify(request)
+        if not found: return
+        with self.lock:
+            try: self.session(session_id)['ownerAt' if found == activity.OWNER else 'autoAt'] = time.time()
+            except RuntimeError: pass
+
+    def brake_started(self, lease, session_id, reason):
+        """A request starts to wait: it leaves its request slot, and its session shows brakeWaiting {since, reason, requests}.
+        False when the waiting room is full (max_waiting, or half the body budget held): then it goes at once."""
+        with self.lock:
+            waiting = sum(bool(r.get('waiting')) for r in self.requests.values())
+            full = waiting >= self.max_waiting or self.body_bytes > self.max_body_bytes // 2
+            if not full:
+                lease['waiting'] = True
+                try:
+                    state = self.session(session_id)
+                    mark = state.get('brakeWaiting') if isinstance(state.get('brakeWaiting'), dict) else {'since': int(time.time() * 1000), 'requests': 0}
+                    state.update(brakeWaiting={**mark, 'reason': reason, 'requests': mark['requests'] + 1}, at=time.time())
+                except RuntimeError: pass
+                self.save()
+        if full: self.journal.record('brake_wait_full', requests=waiting)
+        else: self.journal.record('brake_wait', reason=reason)
+        return not full
+
+    def brake_ended(self, lease, session_id, since, project, cls, reason, end):
+        """The wait is over (released, capped, cancelled, draining or failed): one row in today's brake-waits ledger."""
+        with self.lock:
+            lease['waiting'] = False
+            state = self.sessions.get(session_id)
+            mark = state.get('brakeWaiting') if state else None
+            if isinstance(mark, dict) and mark.get('requests', 1) > 1: state['brakeWaiting'] = {**mark, 'requests': mark['requests'] - 1}
+            elif state: state.pop('brakeWaiting', None)
+            self.save()
+        self.append_day(self.waits_dir, wait_line(int(time.time() * 1000), int(since * 1000), session_id, project, cls, reason, end))
 
     def urgent(self):
         """Projects Conductor marked urgent (claude-pool conductor urgent): never braked while their time runs."""
@@ -386,18 +467,22 @@ class PoolBridge(ThreadingHTTPServer):
         return {p for p, until in rows.items() if isinstance(until, (int, float)) and until > time.time()} if isinstance(rows, dict) else set()
 
     def record_usage(self, row):
-        """Appends one answered request to today's ledger; ledgers older than 31 days are removed."""
-        if not self.ledger_dir: return
+        """Appends one answered request to today's ledger."""
+        self.append_day(self.ledger_dir, row)
+
+    def append_day(self, folder, row):
+        """Appends a row to today's file in `folder`; files older than 31 days are removed."""
+        if not folder: return
         day = time.strftime('%Y-%m-%d')
         try:
             with self.ledger_lock:
-                self.ledger_dir.mkdir(parents=True, exist_ok=True)
-                if day != self._ledger_day:
-                    self._ledger_day = day
+                folder.mkdir(parents=True, exist_ok=True)
+                if day != self._ledger_days.get(folder):
+                    self._ledger_days[folder] = day
                     limit = time.time() - 31 * 86400
-                    for old in self.ledger_dir.glob('*.jsonl'):
+                    for old in folder.glob('*.jsonl'):
                         if old.stat().st_mtime < limit: old.unlink()
-                with open(self.ledger_dir / (day + '.jsonl'), 'a') as f: f.write(json.dumps(row) + '\n')
+                with open(folder / (day + '.jsonl'), 'a') as f: f.write(json.dumps(row) + '\n')
         except OSError: self.journal.record('storage_failed')
 
     def reserve(self, session_id, request):
@@ -428,11 +513,15 @@ class PoolBridge(ThreadingHTTPServer):
             self.save()
             return context
 
+    def stored(self):
+        return {"version": 1, "sessions": self.sessions, "observations": self.observations, "paused": sorted(self.paused_names), "traffic": self.traffic,
+                "brake": self.hold.state()}
+
     def save(self):
         if not self.state_path: return
         try:
             if self._last_saved is not None: atomic_write(self.state_path.with_suffix(".bak"), self._last_saved)
-            data = json.dumps({"version": 1, "sessions": self.sessions, "observations": self.observations, "paused": sorted(self.paused_names), "traffic": self.traffic})
+            data = json.dumps(self.stored())
             atomic_write(self.state_path, data)
             self._last_saved = data
             self.persistence_error = False
@@ -619,6 +708,51 @@ class Handler(BaseHTTPRequestHandler):
         try: self.proxy(path, length, lease)
         finally: self.server.release(self)
 
+    def stream_failed(self, message):
+        """Ends a committed event stream with a framed API error, so Native retries; never a replay."""
+        try:
+            self.wfile.write(b'event: error\ndata: ' + json.dumps({'type': 'error', 'error': {'type': 'api_error', 'message': message}}).encode() + b'\n\n')
+            self.wfile.flush()
+        except OSError: pass
+        self.close_connection = True
+
+    def brake_wait(self, lease, session_id, project, cls, reason):
+        """Holds a background streaming request before anything goes upstream, like the quota wait: a committed 200 event
+        stream with a ping every ten seconds, a check every brake_check seconds, at most brake_max_wait seconds. True: it may
+        go now (the stream is committed). False: the wait ended the response (cancelled, draining, the client went away).
+        None: the waiting room is full and the request goes at once."""
+        server = self.server
+        if not server.brake_started(lease, session_id, reason): return None
+        since, end = time.time(), 'released'
+        try:
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream')
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('Connection', 'close')
+            self.end_headers()
+            next_ping = next_check = 0
+            while True:
+                if server.draining or lease.get('cancelled') or server.monitor_stop.is_set(): raise ConnectionError()
+                now = time.monotonic()
+                if now >= next_ping:
+                    self.wfile.write(b'event: ping\ndata: {"type":"ping"}\n\n'); self.wfile.flush()
+                    lease['progress'], next_ping = now, now + 10
+                if now >= next_check:
+                    next_check = now + server.brake_check
+                    if time.time() - since >= server.brake_max_wait:
+                        end = 'capped'
+                        server.journal.record('brake_wait_capped', reason=reason)
+                        return True
+                    if server.brake_reason(session_id) is None: return True
+                server.monitor_stop.wait(.25)
+        except (OSError, ConnectionError, ValueError, RuntimeError, http.client.HTTPException):
+            end = 'cancelled' if lease.get('cancelled') else 'draining' if server.draining or server.monitor_stop.is_set() else 'failed'
+            if lease.get('cancelled'): self.close_connection = True
+            else: self.stream_failed('The pool stopped before this request was sent; retry this request')
+            return False
+        finally:
+            server.brake_ended(lease, session_id, since, project, cls, reason, end)
+
     def proxy(self, path, length, lease):
         body, request = None, {}
         session_id = self.headers.get("x-claude-code-session-id", "")
@@ -640,8 +774,19 @@ class Handler(BaseHTTPRequestHandler):
         main = lease['main']
         tracked = main and bool(session_id)
         cls, project = headers.get('x-claude-code-request-class', 'main'), ''
+        messages = self.command == 'POST' and path == '/v1/messages'
+        if main and messages and session_id: self.server.note_turn(session_id, request)
         if session_id:
             with self.server.lock: project = (self.server.sessions.get(session_id) or {}).get('project', '')
+        committed, sse, waited = False, False, 0
+        if messages and session_id and request.get('stream') is True:
+            # Background sessions wait while the brake holds, before anything goes upstream.
+            reason = self.server.brake_reason(session_id)
+            if reason:
+                since = time.time()
+                held = self.brake_wait(lease, session_id, project, cls, reason)
+                if held is False: return
+                if held: committed, sse, waited = True, True, time.time() - since
         original, hour_cache, agent = body, False, ''
         if self.command == 'POST' and path == '/v1/messages' and cls in BACKGROUND:
             # Background agents keep their prompt cache: one-hour writes, and the account that answered them while it is ready.
@@ -653,7 +798,8 @@ class Handler(BaseHTTPRequestHandler):
         if tracked:
             try: context = self.server.reserve(session_id, request or {})
             except (OSError, ValueError, RuntimeError):
-                self.answer(503, {"error": "Unable to confirm pool accounts; retry shortly"})
+                if committed: self.stream_failed('Unable to confirm pool accounts; retry this request')
+                else: self.answer(503, {"error": "Unable to confirm pool accounts; retry shortly"})
                 return
             preferred = context["routing"]["account"]
             if self.native_identity:
@@ -661,9 +807,9 @@ class Handler(BaseHTTPRequestHandler):
             if preferred: headers["x-shunt-session-account"] = preferred
             beta = headers.get("anthropic-beta", "")
             headers["anthropic-beta"] = ",".join(dict.fromkeys([v for v in beta.split(",") if v] + ["thinking-binding-controls-2026-08-01"]))
-        complete, sse = False, False
+        complete = False
         conn = http.client.HTTPConnection("127.0.0.1", self.server.upstream_port, timeout=300)
-        committed, stream_error, account = False, False, None
+        stream_error, account = False, None
         response = None
         try:
             conn.connect()
@@ -782,7 +928,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.flush()
                     if complete and not stream_error and session_id and not logged and path == '/v1/messages':
                         logged = True
-                        self.server.record_usage(ledger_line(int(time.time() * 1000), session_id, project, cls, served_model or request.get('model'), account, usage))
+                        self.server.record_usage(ledger_line(int(time.time() * 1000), session_id, project, cls, served_model or request.get('model'), account, usage, waited=waited))
                     if main and complete and not stream_error and session_id:
                         self.server.served(session_id, account, usage, transformations, context)
                         main = False

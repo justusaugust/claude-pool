@@ -258,7 +258,7 @@ def _board(board, now, previews):
     guard only covers a board that cannot be built at all."""
     import conductor_board
     try: return conductor_board.facts(board or conductor_board.Board(), now, previews)
-    except Exception: return {'machines': [], 'accounts': [], 'quickAccess': []}
+    except Exception: return {'machines': [], 'accounts': [], 'quickAccess': [], 'brake': dict(conductor_board.NO_BRAKE)}
 
 
 def _light_lines(value):
@@ -271,6 +271,11 @@ def _light_lines(value):
         lines.append('accounts: ' + ' · '.join(' '.join(part for part in (row['label'], row['status'], pct('5h', row['fiveHourPct']),
                                                                           pct('week', row['weekPct'])) if part)
                                                for row in value['accounts']))
+    brake = value.get('brake') or {}
+    if brake.get('hold') or brake.get('waiting'):
+        now = value.get('generatedAt') or 0
+        lines.append('brake: background sessions wait' + (' (stage ' + str(brake['stage']) + ')' if brake.get('stage') else '')
+                     + ''.join(' · ' + (row['project'] or row['session'][:8]) + ' ' + _ago((now - row['since']) / 1000) for row in brake['waiting'][:8]))
     return lines
 
 
@@ -828,7 +833,7 @@ def urgent_projects():
 
 
 def urgent_set(project, hours=None):
-    """The owner waits on a project: the pool brake leaves its subagents alone for some hours (hours None lifts it)."""
+    """The owner waits on a project: the pool brake does not hold its sessions for some hours (hours None lifts it)."""
     rows = urgent_projects()
     if hours is None: rows.pop(project, None)
     else: rows[project] = time.time() + hours * 3600
@@ -841,7 +846,10 @@ def urgent_set(project, hours=None):
 def usage_today(as_json=False):
     """Today's usage from the pool ledger by project and request class, API-price equivalent, plus the brake stage."""
     from brake import today_summary, describe
+    from brake import wait_summary
+    from views import duration
     summary = today_summary(settings.RUNTIME / 'usage-ledger' / (time.strftime('%Y-%m-%d') + '.jsonl'))
+    summary['waits'] = wait_summary(settings.RUNTIME / 'brake-waits' / (time.strftime('%Y-%m-%d') + '.jsonl'))
     summary['brake'] = None
     try:
         lines = (settings.RUNTIME / 'usage-history' / (time.strftime('%Y-%m') + '.jsonl')).read_text().splitlines()
@@ -852,6 +860,8 @@ def usage_today(as_json=False):
     text = ['Usage today · ~$' + format(round(summary['usd']), ',') + ' API price equivalent',
             'Brake · ' + ('off' if not stage else describe(stage))
             + (f" · {summary['braked']} braked answers" if summary['braked'] else '')]
+    if summary['waits']['requests']:
+        text.append(f"Background waits today · {summary['waits']['requests']} requests · {duration(summary['waits']['seconds'])}")
     for row in summary['projects'][:12]:
         text.append(f"  {row['project'][:28]:<28} ~${row['usd']:>7.0f}  {row['usd'] / summary['usd']:>4.0%}" if summary['usd'] else '')
     text.append('  ' + ' · '.join(f"{k} {v / summary['usd']:.0%}" for k, v in sorted(summary['classes'].items(), key=lambda kv: -kv[1])) if summary['usd'] else '  no answers logged today')
@@ -893,7 +903,7 @@ def cli(argv):
     told.add_argument('--list', action='store_true', help='show the queued tasks: id, agent, age, failed attempts, text')
     told.add_argument('--json', action='store_true', help='with --list: the queue as JSON')
     told.add_argument('--cancel', metavar='ID', help='remove one queued task by the id --list shows')
-    urgent = commands.add_parser('urgent', help='the owner waits on a project: the brake leaves its subagents alone for some hours',
+    urgent = commands.add_parser('urgent', help='the owner waits on a project: the brake does not hold its sessions for some hours',
                                  usage='claude-pool conductor urgent <project> [--hours N] | urgent --off <project> | urgent --list')
     urgent.add_argument('project', nargs='?', help='COCKPIT_PROJECT, the folder name the agent works in')
     urgent.add_argument('--hours', type=float, default=3); urgent.add_argument('--off', action='store_true'); urgent.add_argument('--list', action='store_true')
