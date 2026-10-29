@@ -4,6 +4,13 @@ from brake import Brake, stage, usd, ledger_line, today_summary, SONNET
 
 NOW = 1900000000000
 H = 3600000
+# Request shapes captured from Claude Code 2.1.312 through the pool on 29.10.2026 (roles and block types only). A subagent's
+# first request already holds two messages: its prompt and a system message that announces its tools.
+FIRST = [{'role': 'user', 'content': [{'type': 'text', 'text': 'x'}] * 5},
+         {'role': 'system', 'content': [{'type': 'text', 'text': 'x'}] + [{'type': 'tool_addition'}] * 3}]
+LATER = FIRST + [{'role': 'assistant', 'content': [{'type': 'tool_use', 'id': 't1', 'name': 'Read', 'input': {}}]},
+                 {'role': 'user', 'content': [{'type': 'tool_result', 'tool_use_id': 't1', 'content': 'x'}]},
+                 {'role': 'system', 'content': [{'type': 'text', 'text': 'x'}]}]
 
 
 def acct(name, pct, reset_in, status='ready', week=None):
@@ -54,10 +61,18 @@ class BrakeTests(unittest.TestCase):
         later = dict(self.opus, messages=[{'role': 'user', 'content': 'go'}] * 7)
         self.assertEqual(self.decide(later, 0)[0]['model'], SONNET, 'no switch back mid-conversation')
 
+    def test_a_subagents_real_first_request_starts_on_sonnet(self):
+        # 22.-29.10.: 1,079 minutes at stage 1 or 2, 97 Opus subagents started, none braked: their first request had two messages.
+        new, decision = self.decide(dict(self.opus, messages=FIRST), 1, agent='real-first')
+        self.assertEqual((new['model'], decision['stage']), (SONNET, 1))
+        meta = [{'role': 'user', 'content': 'go'}, {'role': 'user', 'content': [{'type': 'text', 'text': 'x'}]}]
+        self.assertEqual(self.decide(dict(self.opus, messages=meta), 2, agent='meta-first')[0]['model'], SONNET)
+        self.assertEqual(self.decide(dict(self.opus, messages=LATER), 0, agent='real-first')[0]['model'], SONNET, 'kept for its lifetime')
+
     def test_a_conversation_already_running_keeps_its_model(self):
-        running = dict(self.opus, messages=[{'role': 'user', 'content': 'go'}] * 5)
-        self.assertIsNone(self.decide(running, 2, agent='seen-mid')[0])
-        self.assertIsNone(self.decide(dict(self.opus), 2, agent='seen-mid')[0], 'sticky keep')
+        # An agent first seen after it has answered (a pool restart mid-task) keeps the model its thinking blocks belong to.
+        self.assertIsNone(self.decide(dict(self.opus, messages=LATER), 2, agent='seen-mid')[0])
+        self.assertIsNone(self.decide(dict(self.opus, messages=FIRST), 2, agent='seen-mid')[0], 'sticky keep')
 
     def test_conductor_urgent_projects_main_sessions_and_small_models_are_never_braked(self):
         self.assertIsNone(self.decide(dict(self.opus), 2, project='conductor-wecker')[0])

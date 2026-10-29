@@ -68,7 +68,9 @@ class BridgeTests(unittest.TestCase):
             response=conn.getresponse();data=response.read();return response.status,data
         finally:conn.close()
     def subagent(self, model='claude-opus-5-5', agent='fixture-agent'):
-        body = {'model': model, 'messages': [{'role': 'user', 'content': 'x'}], 'stream': True, 'output_config': {'effort': 'xhigh'}}
+        # A subagent's first request as Claude Code 2.1.312 sends it: the prompt and a system message announcing its tools.
+        messages = [{'role': 'user', 'content': 'x'}, {'role': 'system', 'content': [{'type': 'text', 'text': 'x'}, {'type': 'tool_addition'}]}]
+        body = {'model': model, 'messages': messages, 'stream': True, 'output_config': {'effort': 'xhigh'}}
         return self.call('/v1/messages', body, extra_headers={'x-claude-code-request-class': 'subagent', 'x-claude-code-agent-id': agent})
     def ledger(self):
         import time
