@@ -564,6 +564,86 @@ class BridgeTests(unittest.TestCase):
         self.assertNotIn(b'event: ping', body); self.assertEqual(len(self.inputs), 1)
         self.assertIn('brake_wait_full', [r['code'] for r in self.bridge.journal.snapshot()])
 
+    # A message typed or relayed into a waiting session lands in its transcript as a queue "enqueue" line at once; Claude
+    # Code sends it only after the waiting request. The wait reads what is appended and lets a person's message through.
+    RELAY = 'Conductor (Board): Alex schreibt dir: Bitte zuerst die mobile Ansicht.'
+
+    def transcript(self, session='test-session'):
+        self.bridge.transcripts = Path(self.temp.name) / 'projects'
+        path = self.bridge.transcripts / '-work-website' / (session + '.jsonl')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({'type': 'user', 'sessionId': session, 'message': {'role': 'user', 'content': 'Bau die Suche.'}}) + '\n')
+        self.bridge.queue_check = .05
+        return path
+
+    def enqueue(self, path, content, session='test-session'):
+        import time
+        line = {'type': 'queue-operation', 'operation': 'enqueue', 'timestamp': time.strftime('%Y-%m-%dT%H:%M:%S.000Z'), 'sessionId': session}
+        if content is not None: line['content'] = content
+        with path.open('a') as f: f.write(json.dumps(line) + '\n')
+
+    def test_a_message_queued_into_a_waiting_session_releases_all_its_waits_at_once(self):
+        path = self.transcript()
+        self.background()
+        with self.braking(2):
+            self.bridge.brake_check = 30         # only the transcript can release it within this test
+            main = self.open_stream(self.tool_turn())
+            self.assertIn(b'event: ping', main.read1(256))
+            sub = self.open_stream(json.dumps({'model': 'claude-opus-5-5', 'stream': True, 'messages': [{'role': 'user', 'content': 'x'}]}).encode(),
+                                   extra={'x-claude-code-request-class': 'subagent', 'x-claude-code-agent-id': 'agent-a'})
+            self.assertIn(b'event: ping', sub.read1(256))
+            self.assertTrue(self.until(lambda: self.bridge.brake_state()['waiting'] == 2))
+            self.enqueue(path, None)                                  # some enqueues carry no content
+            line = json.dumps({'type': 'queue-operation', 'operation': 'enqueue', 'sessionId': 'test-session', 'content': self.RELAY})
+            with path.open('a') as f: f.write(line[:40])              # Claude Code is still writing the line
+            threading.Event().wait(.2)
+            self.assertEqual(self.inputs, [])
+            with path.open('a') as f: f.write(line[40:] + '\n')
+            self.assertIn(b'message_stop', main.read())
+            self.assertIn(b'message_stop', sub.read())
+        self.assertEqual(len(self.inputs), 2)
+        self.assertIn('ownerAt', self.bridge.session('test-session'))
+        self.assertEqual(sorted(w['end'] for w in self.waits()), ['owner_message', 'owner_message'])
+        released = [r for r in self.bridge.journal.snapshot() if r['code'] == 'brake_wait_released']
+        self.assertEqual([r.get('reason') for r in released], ['owner_message'])
+        stored = self.bridge.state_path.read_text() + json.dumps(self.bridge.journal.snapshot()) + json.dumps(self.waits())
+        self.assertNotIn('mobile Ansicht', stored, 'the message text is never kept')
+
+    def test_an_automatic_enqueue_or_one_from_before_the_wait_releases_nothing(self):
+        path = self.transcript()
+        self.background()
+        self.enqueue(path, self.RELAY)                                 # queued before the wait began
+        with self.braking(1):
+            response = self.open_stream(self.tool_turn())
+            response.read1(256)
+            self.enqueue(path, self.NUDGE)
+            self.enqueue(path, '<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n</task-notification>')
+            self.enqueue(path, self.RELAY, session='another-session')  # a line of another session
+            threading.Event().wait(.4)
+            self.assertEqual(self.inputs, [], 'still waiting')
+            self.assertNotIn('ownerAt', self.bridge.session('test-session'))
+            self.stage = 0
+            self.assertIn(b'message_stop', response.read())
+        self.assertEqual(self.waits()[-1]['end'], 'released')
+
+    def test_a_missing_or_unreadable_transcript_is_harmless(self):
+        self.bridge.transcripts = Path(self.temp.name) / 'no-such-folder'
+        self.bridge.queue_check = .05
+        self.background()
+        with self.braking(1):
+            response = self.open_stream(self.tool_turn())
+            response.read1(256)
+            threading.Event().wait(.2)
+            path = self.transcript()
+            path.chmod(0)
+            threading.Event().wait(.2)
+            self.assertEqual(self.inputs, [])
+            self.stage = 0
+            self.assertIn(b'message_stop', response.read())
+        path.chmod(0o600)
+        self.assertEqual(self.waits()[-1]['end'], 'released')
+        self.assertNotIn('storage_failed', [r['code'] for r in self.bridge.journal.snapshot()])
+
     def test_state_restart_retains_pin_without_storing_credentials_or_prompts(self):
         self.call(body={'action':'pin','account':'team'})
         data=self.bridge.state_path.read_text()
