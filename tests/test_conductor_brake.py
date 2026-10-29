@@ -52,7 +52,7 @@ class ConductorBrakeTests(unittest.TestCase):
         self.assertEqual([(r['session'], r['project'], round(r['usd'], 3)) for r in value['sessions']], [('s', 'pitch-riot', 12.0)])
         self.assertEqual(set(value['sessions'][0]['classes']), {'subagent', 'main'})
         text = self.run_cli('usage')[1]
-        self.assertIn('pitch-riot', text); self.assertIn('Sonnet', text)
+        self.assertIn('pitch-riot', text); self.assertIn('Brake · stage 1: forecast ends before the next reset', text); self.assertNotIn('Sonnet', text)
 
 
 if __name__ == '__main__':

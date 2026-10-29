@@ -21,6 +21,7 @@ class BridgeTests(unittest.TestCase):
         self.keep_open = False
         self.http_status = 200
         self.statuses = []
+        self.default_account = 'gmail'
         self.hold = False
         self.entered, self.release = threading.Event(), threading.Event()
         owner = self
@@ -36,7 +37,7 @@ class BridgeTests(unittest.TestCase):
             def do_POST(self):
                 owner.inputs.append(self.rfile.read(int(self.headers['Content-Length'])))
                 owner.headers.append(self.headers)
-                account = self.headers.get('x-shunt-session-account', 'gmail')
+                account = self.headers.get('x-shunt-session-account', owner.default_account)
                 owner.preferred.append(account)
                 if owner.hold:
                     owner.entered.set()
@@ -74,23 +75,56 @@ class BridgeTests(unittest.TestCase):
         import time
         path = Path(self.temp.name) / 'usage-ledger' / (time.strftime('%Y-%m-%d') + '.jsonl')
         return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
-    def test_a_new_subagent_starts_on_sonnet_while_the_brake_is_on_and_is_logged(self):
+    def cached(self):
+        return {'model': 'claude-opus-5-5', 'stream': True, 'system': [{'type': 'text', 'text': 'fixture', 'cache_control': {'type': 'ephemeral'}}],
+                'messages': [{'role': 'user', 'content': [{'type': 'text', 'text': 'go', 'cache_control': {'type': 'ephemeral', 'ttl': '5m'}}]}]}
+    def test_while_the_brake_is_on_a_subagent_keeps_its_model_and_effort_and_is_logged(self):
         with self.bridge.lock: self.bridge.session('test-session')['project'] = 'pitch-riot'
-        with patch.object(self.bridge, 'brake_info', return_value={'stage': 1}):
+        with patch.object(self.bridge, 'brake_info', return_value={'stage': 2}):
             status, _ = self.subagent()
         self.assertEqual(status, 200)
-        self.assertEqual(json.loads(self.inputs[-1])['model'], 'claude-sonnet-5-5')
+        sent = json.loads(self.inputs[-1])
+        self.assertEqual((sent['model'], sent['output_config']['effort']), ('claude-opus-5-5', 'xhigh'))
         row = self.ledger()[-1]
-        self.assertEqual((row['project'], row['class'], row['model'], row['braked']), ('pitch-riot', 'subagent', 'claude-sonnet-5-5', True))
+        self.assertEqual((row['project'], row['class'], row['model'], row['braked']), ('pitch-riot', 'subagent', 'claude-opus-5-5', False))
         self.assertEqual((row['input_tokens'], row['output_tokens']), (2, 4))
-    def test_a_rejected_braked_request_is_sent_once_more_as_asked(self):
+    def test_subagent_and_workflow_requests_write_one_hour_cache_and_others_pass_byte_for_byte(self):
+        for cls in ['subagent', 'workflow']:
+            self.call('/v1/messages', self.cached(), extra_headers={'x-claude-code-request-class': cls, 'x-claude-code-agent-id': cls + '-agent'})
+            sent = json.loads(self.inputs[-1])
+            self.assertEqual([sent['system'][0]['cache_control'], sent['messages'][0]['content'][0]['cache_control']], [{'type': 'ephemeral', 'ttl': '1h'}] * 2, cls)
+        raw = json.dumps(self.cached()).encode()
+        self.call('/v1/messages', raw)
+        self.assertEqual(self.inputs[-1], raw, 'main requests are forwarded as sent')
+        sub = {'x-claude-code-request-class': 'subagent', 'x-claude-code-agent-id': 'subagent-agent'}
+        self.call('/v1/messages/count_tokens', raw, extra_headers=sub)
+        self.assertEqual(self.inputs[-1], raw, 'only Messages requests')
+        plain = b'{"model": "claude-opus-5-5", "stream": true, "messages": [{"role": "user", "content": "x"}]}'
+        self.call('/v1/messages', plain, extra_headers=sub)
+        self.assertEqual(self.inputs[-1], plain, 'nothing to change: the bytes stay as sent')
+    def test_a_refused_one_hour_cache_is_sent_once_more_as_the_agent_sent_it(self):
         self.statuses = [400]
-        with patch.object(self.bridge, 'brake_info', return_value={'stage': 1}):
-            status, _ = self.subagent(agent='rejected-agent')
-            self.assertEqual(status, 200)
-            self.assertEqual([json.loads(b)['model'] for b in self.inputs[-2:]], ['claude-sonnet-5-5', 'claude-opus-5-5'])
-            self.subagent(agent='rejected-agent')
-        self.assertEqual(json.loads(self.inputs[-1])['model'], 'claude-opus-5-5', 'that agent stays on its model')
+        raw = json.dumps(self.cached()).encode()
+        status, _ = self.call('/v1/messages', raw, extra_headers={'x-claude-code-request-class': 'subagent', 'x-claude-code-agent-id': 'refused'})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(self.inputs[-2])['system'][0]['cache_control'], {'type': 'ephemeral', 'ttl': '1h'})
+        self.assertEqual(self.inputs[-1], raw)
+        self.assertIn('cache_fallback', [row['code'] for row in self.bridge.journal.snapshot()])
+    def test_a_subagent_stays_on_the_account_it_was_first_routed_to_while_that_account_is_ready(self):
+        self.default_account = 'team'      # Shunt's own choice for the agent's first request
+        self.subagent(agent='steady')
+        self.default_account = 'gmail'     # later Shunt would choose another account
+        self.subagent(agent='steady'); self.subagent(agent='steady')
+        self.assertEqual(self.preferred[-3:], ['team', 'team', 'team'])
+        self.assertIsNone(self.headers[-3].get('x-shunt-session-account'), 'a new agent: Shunt chooses')
+        self.subagent(agent='other')
+        self.assertEqual(self.preferred[-1], 'gmail')
+        self.paused['team'] = True; self.bridge.accounts()      # the next account sample shows team paused
+        self.subagent(agent='steady')
+        self.assertEqual(self.preferred[-1], 'gmail', 'its account is not ready: the normal choice applies')
+        self.paused['team'] = False; self.bridge.accounts()
+        self.subagent(agent='steady')
+        self.assertEqual(self.preferred[-1], 'gmail', 'the account that answered became its account')
     def test_without_brake_subagents_pass_unchanged_and_every_answer_is_logged(self):
         status, _ = self.subagent()
         self.assertEqual((status, json.loads(self.inputs[-1])['model']), (200, 'claude-opus-5-5'))

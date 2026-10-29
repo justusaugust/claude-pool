@@ -1,6 +1,7 @@
 import json, tempfile, unittest
 from pathlib import Path
-from brake import Brake, stage, usd, ledger_line, today_summary, SONNET
+import brake
+from brake import stage, usd, ledger_line, today_summary
 
 NOW = 1900000000000
 H = 3600000
@@ -33,42 +34,14 @@ class StageTests(unittest.TestCase):
         self.assertEqual(stage({'seconds': 2.5 * 3600}, accounts, NOW)['resetAt'], NOW + 3 * H)
 
 
-class BrakeTests(unittest.TestCase):
-    def setUp(self):
-        self.brake = Brake()
-        self.opus = {'model': 'claude-opus-5-5', 'messages': [{'role': 'user', 'content': 'go'}], 'output_config': {'effort': 'xhigh'},
-                     'thinking': {'type': 'adaptive'}, 'speed': 'fast', 'stream': True}
-
-    def decide(self, request, level, cls='subagent', agent='a1', project='website', urgent=()):
-        headers = {'x-claude-code-request-class': cls, 'x-claude-code-agent-id': agent}
-        return self.brake.decide(headers, request, {'stage': level}, project, urgent)
-
-    def test_no_brake_leaves_requests_alone(self):
-        self.assertIsNone(self.decide(dict(self.opus), 0)[0])
-
-    def test_a_new_subagent_starts_on_sonnet_and_stays_there(self):
-        new, decision = self.decide(dict(self.opus), 1)
-        self.assertEqual((new['model'], decision['model']), (SONNET, SONNET))
-        self.assertNotIn('speed', new)
-        self.assertEqual(new['output_config']['effort'], 'xhigh')
-        later = dict(self.opus, messages=[{'role': 'user', 'content': 'go'}] * 7)
-        self.assertEqual(self.decide(later, 0)[0]['model'], SONNET, 'no switch back mid-conversation')
-
-    def test_a_conversation_already_running_keeps_its_model(self):
-        running = dict(self.opus, messages=[{'role': 'user', 'content': 'go'}] * 5)
-        self.assertIsNone(self.decide(running, 2, agent='seen-mid')[0])
-        self.assertIsNone(self.decide(dict(self.opus), 2, agent='seen-mid')[0], 'sticky keep')
-
-    def test_conductor_urgent_projects_main_sessions_and_small_models_are_never_braked(self):
-        self.assertIsNone(self.decide(dict(self.opus), 2, project='conductor-wecker')[0])
-        self.assertIsNone(self.decide(dict(self.opus), 2, agent='a2', project='pitch-riot', urgent={'pitch-riot'})[0])
-        self.assertIsNone(self.decide(dict(self.opus), 2, cls='main', agent='')[0])
-        self.assertIsNone(self.decide(dict(self.opus), 2, cls='compaction', agent='a3')[0])
-        self.assertIsNone(self.decide(dict(self.opus, model='claude-haiku-5-5'), 2, agent='a4')[0])
-
-    def test_workflow_agents_brake_too_and_stage_two_caps_effort(self):
-        new, _ = self.decide(dict(self.opus), 2, cls='workflow', agent='w1')
-        self.assertEqual((new['model'], new['output_config']['effort']), (SONNET, 'high'))
+class ExemptionTests(unittest.TestCase):
+    def test_the_conductor_and_urgent_projects_are_exempt_from_the_brake(self):
+        # The Conductor runs as project conductor (COCKPIT_PROJECT is its folder name); conductor-wecker is its wake session.
+        self.assertTrue(brake.exempt('conductor'))
+        self.assertTrue(brake.exempt('conductor-wecker'))
+        self.assertTrue(brake.exempt('pitch-riot', {'pitch-riot'}))
+        self.assertFalse(brake.exempt('website', {'pitch-riot'}))
+        self.assertFalse(brake.exempt(''))
 
 
 class LedgerTests(unittest.TestCase):
@@ -77,6 +50,24 @@ class LedgerTests(unittest.TestCase):
         self.assertAlmostEqual(usd('claude-opus-5-5', usage), 4 + 2 + 0.2)
         self.assertAlmostEqual(usd('claude-sonnet-5-5', usage), 2 + 1 + 0.2)
         self.assertAlmostEqual(usd('claude-fable-5-1', usage), 10 + 5 + 0.25)
+
+    def test_usd_prices_one_hour_cache_writes_at_twice_input_and_five_minute_writes_at_one_and_a_quarter(self):
+        usage = {'cache_creation_input_tokens': 3000000,
+                 'cache_creation': {'ephemeral_5m_input_tokens': 1000000, 'ephemeral_1h_input_tokens': 2000000}}
+        self.assertAlmostEqual(usd('claude-opus-5-5', usage), 1 * 4 * 1.25 + 2 * 4 * 2)
+        self.assertAlmostEqual(usd('claude-opus-5-5', {'cache_creation_input_tokens': 3000000}), 3 * 4 * 1.25, msg='no breakdown: 5-minute price')
+        partial = {'cache_creation_input_tokens': 3000000, 'cache_creation': {'ephemeral_1h_input_tokens': 1000000}}
+        self.assertAlmostEqual(usd('claude-opus-5-5', partial), 1 * 4 * 2 + 2 * 4 * 1.25, msg='the rest is a 5-minute write')
+
+    def test_the_ledger_keeps_cache_writes_by_ttl_when_usage_reports_them(self):
+        usage = {'input_tokens': 3, 'cache_creation_input_tokens': 11683,
+                 'cache_creation': {'ephemeral_5m_input_tokens': 0, 'ephemeral_1h_input_tokens': 11683}}
+        row = ledger_line(NOW, 's1', 'website', 'subagent', 'claude-opus-5-5', 'team', usage)
+        self.assertEqual((row['cache_creation_input_tokens'], row['ephemeral_5m_input_tokens'], row['ephemeral_1h_input_tokens']), (11683, 0, 11683))
+        self.assertAlmostEqual(row['usd'], round((3 * 4 + 11683 * 4 * 2) / 1e6, 6))
+        self.assertFalse(row['braked'])
+        plain = ledger_line(NOW, 's1', 'website', 'main', 'claude-opus-5-5', 'team', {'cache_creation_input_tokens': 5})
+        self.assertNotIn('ephemeral_1h_input_tokens', plain)
 
     def test_summary_groups_today_by_project_and_class(self):
         with tempfile.TemporaryDirectory() as d:
