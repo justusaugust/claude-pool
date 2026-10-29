@@ -66,4 +66,22 @@ class UsageViewTests(unittest.TestCase):
         self.assertIn('recovery state could not be saved',text)
         self.assertIn('last good backup',text)
 
+    def test_background_sessions_waiting_for_the_brake_are_visible(self):
+        data=self.data()
+        data['forecast']['brake']={'stage':1,'ratio':.7,'resetAt':NOW+3600000}
+        data['brake']={'hold':True,'calmSince':None,'waiting':2}
+        data['sessions']=[{'busy':False,'brakeWaiting':{'since':NOW-35*60000,'reason':'stage 1','requests':2}},{'busy':True}]
+        text=usage(data)
+        self.assertIn('Brake · stage 1',text)
+        self.assertIn('Background sessions wait · 2 requests',text)
+        self.assertIn('2 connected/recent session(s) · 1 working · 1 waiting for the brake',text)
+        data['forecast']['brake']={'stage':0}
+        data['brake']={'hold':True,'calmSince':NOW-4*60000,'waiting':1}
+        self.assertIn('Brake off for 4m; background work goes after 15m',usage(data))
+        data['brake']={'hold':False,'calmSince':None,'waiting':0}
+        self.assertNotIn('Background sessions wait',usage(data))
+        for width in [20,40,64,80]:
+            data['brake']={'hold':True,'calmSince':NOW-4*60000,'waiting':12}
+            self.assertTrue(all(len(line)<=width for line in usage(data,width=width).splitlines()))
+
 if __name__=='__main__':unittest.main()

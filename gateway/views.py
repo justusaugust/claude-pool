@@ -2,6 +2,7 @@
 import textwrap
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from brake import describe
 from telemetry import coverage_note
 from settings import OPTIONS
 
@@ -59,7 +60,9 @@ def usage(data, *, width=80, color=False):
     add('Not reported = Anthropic has not supplied a reading.', '90')
     if coverage_note(data['accounts']): add('Partial forecast · weekly all-model readings missing.', '33')
     if data.get('sessions'):
-        add(f"{len(data['sessions'])} connected/recent session(s) · {sum(s['busy'] for s in data['sessions'])} working", '90')
+        held = sum(bool(s.get('brakeWaiting')) for s in data['sessions'])
+        add(f"{len(data['sessions'])} connected/recent session(s) · {sum(s['busy'] for s in data['sessions'])} working"
+            + (f' · {held} waiting for the brake' if held else ''), '90')
     add('─' * (width - 2), '90')
     for account in data['accounts']:
         status = account['status']
@@ -109,9 +112,14 @@ def usage(data, *, width=80, color=False):
             add('Allowance range · ~' + duration(round(low / 300) * 300) + '–' + duration(round(high / 300) * 300), '90')
         elif low is not None and high is None:
             add('Allowance range not settled yet.', '90')
-    brake = forecast.get('brake') or {}
+    brake, hold = forecast.get('brake') or {}, data.get('brake') or {}
     if brake.get('stage'):
-        add('Brake · stage ' + str(brake['stage']) + ': new subagents on Sonnet 5.5' + (', effort high' if brake['stage'] >= 2 else ''), '33')
+        add('Brake · ' + describe(brake['stage']), '33')
+    if hold.get('hold'):
+        count = hold.get('waiting') or 0
+        add('Background sessions wait' + (f" · {count} request{'s' if count != 1 else ''}" if count else ''), '33')
+        if hold.get('calmSince'):
+            add('Brake off for ' + duration((now - hold['calmSince']) / 1000) + '; background work goes after 15m', '90')
     if forecast['partial']:
         add('Unmeasured accounts/windows excluded.', '90')
     note = coverage_note(data['accounts'])

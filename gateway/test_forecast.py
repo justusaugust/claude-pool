@@ -113,5 +113,6 @@ class ForecastTests(unittest.TestCase):
         a=self.account('gmail',30);forecast=estimate([a],{},NOW)
         self.assertNotIn('Brake',usage({'ready':1,'accounts':[a],'updatedAt':NOW,'forecast':forecast,'history':[]}))
         forecast['brake']={'stage':2,'ratio':.4,'resetAt':NOW+3600000}
-        self.assertIn('Brake · stage 2: new subagents on Sonnet 5.5, effort high',usage({'ready':1,'accounts':[a],'updatedAt':NOW,'forecast':forecast,'history':[]}))
+        text=usage({'ready':1,'accounts':[a],'updatedAt':NOW,'forecast':forecast,'history':[]})
+        self.assertIn('Brake · stage 2: forecast ends before half the time to the next reset',text);self.assertNotIn('Sonnet',text)
 if __name__=='__main__':unittest.main()

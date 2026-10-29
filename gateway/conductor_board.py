@@ -32,6 +32,7 @@ RANK = {'red': 0, 'amber': 1, 'grey': 2}
 STEP_NAME = re.compile(r'[a-z][a-z-]{0,39}')
 CUA_SPACES = range(18501, 18600)          # per-desktop shares: they need the ticket the index hands out, never linked directly
 APP = {'label': 'Conductor in der Claude-App', 'link': 'https://claude.ai/code', 'kind': 'app'}
+NO_BRAKE = {'hold': None, 'stage': None, 'waiting': []}
 WINDOWS = (('fiveHour', 'fiveHour', 'fiveHourPct'), ('sevenDay', 'week', 'weekPct'), ('fableWeekly', 'fableWeek', 'fableWeekPct'))
 
 
@@ -166,6 +167,16 @@ class Board:
         self.version = version or device_sync.build_version
         self.overview = overview or device_sync.pool_overview
         self.account_rows = account_rows or device_sync.account_rows
+        self._seen = (-1.0, None)
+
+    def pool(self):
+        """The local pool overview; accounts and brake share one read per snapshot (at most every five seconds)."""
+        at, value = self._seen
+        if time.monotonic() - at > 5:
+            try: value = self.overview()
+            except Exception: value = None
+            self._seen = (time.monotonic(), value)
+        return value
 
     # machines --------------------------------------------------------------------------------------------------------
 
@@ -265,8 +276,7 @@ class Board:
     # accounts --------------------------------------------------------------------------------------------------------
 
     def accounts(self, now):
-        try: overview = self.overview()
-        except Exception: overview = None
+        overview = self.pool()
         try: config = {row['name']: row for row in load_config(settings.CONFIG).get('accounts', [])}
         except (OSError, ValueError): config = {}
         try: local = {row['name']: row for row in self.account_rows() if isinstance(row, dict) and isinstance(row.get('name'), str)}
@@ -310,6 +320,25 @@ class Board:
         return out
 
 
+    # brake -----------------------------------------------------------------------------------------------------------
+
+    def brake(self, now):
+        """Whether the brake holds background sessions and which ones wait ("wartet wegen der Bremse"); None when the pool
+        does not answer."""
+        overview = self.pool()
+        if not isinstance(overview, dict): return dict(NO_BRAKE)
+        hold = overview.get('brake') if isinstance(overview.get('brake'), dict) else {}
+        stage = ((overview.get('forecast') or {}).get('brake') or {}).get('stage')
+        waiting = []
+        for row in overview.get('sessions') or []:
+            mark = row.get('brakeWaiting') if isinstance(row, dict) else None
+            if not isinstance(mark, dict) or type(mark.get('since')) is not int: continue
+            waiting.append({'session': clean(str(row.get('session') or ''), 80), 'project': clean(str(row.get('project') or ''), 60),
+                            'since': mark['since'], 'requests': mark['requests'] if type(mark.get('requests')) is int else 1})
+        return {'hold': hold.get('hold') is True, 'stage': stage if type(stage) is int else None,
+                'waiting': sorted(waiting, key=lambda row: row['since'])}
+
+
 def quick_access(previews, value):
     """The Cua desktops index first, then every other preview as `preview list --json` reports it, then the Conductor in
     the Claude app when one is configured. Never a per-desktop share (18501 and up): those need the index's ticket."""
@@ -330,4 +359,4 @@ def facts(board, now, previews):
     try: value = registry.load()
     except Exception: value = None
     return {'machines': part(lambda: board.machines(now)), 'accounts': part(lambda: board.accounts(now)),
-            'quickAccess': part(lambda: quick_access(previews, value))}
+            'quickAccess': part(lambda: quick_access(previews, value)), 'brake': part(lambda: board.brake(now)) or dict(NO_BRAKE)}

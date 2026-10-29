@@ -228,6 +228,9 @@ def daemon(client, admin):
                     # Backend down, no account left, a login needed or brake stage 2: one line in the Conductor's wake.log.
                     try: alerts.check(server)
                     except (OSError, RuntimeError, ValueError, KeyError, TypeError, http.client.HTTPException): pass
+                    # The brake hold samples with it, so its 15 minutes of calm count in real time, not only when a request comes.
+                    try: server.brake_hold()
+                    except (OSError, RuntimeError, ValueError, KeyError, TypeError, http.client.HTTPException): pass
                     next_alert = now + 30
                 if gateway.poll() is None:
                     if now >= next_probe:
@@ -326,11 +329,12 @@ def orphaned(parent):
 
 
 def restart_idle(server, process):
-    # The check and admission gate share a lock; no newly admitted request can be killed.
+    # The check and admission gate share a lock; no newly admitted request can be killed. Requests waiting for the brake
+    # have sent nothing upstream; the restart ends their wait with a framed error and Native retries them.
     with server.lock:
-        if server.requests:
+        if server.active():
             server.recovery['state'] = 'waiting for active responses'
-            server.journal.record('restart_deferred', requests=len(server.requests))
+            server.journal.record('restart_deferred', requests=len(server.active()))
             return False
         server.draining = True
     try:

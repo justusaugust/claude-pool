@@ -73,5 +73,5 @@ class Alerts:
             self.update('anmeldung', bool(relogin), who + ' eine neue Anmeldung', 'Anmeldungen wieder gültig')
         info = server.brake_info() or {}
         self.update('bremse', (info.get('stage') or 0) >= 2,
-                    'Bremse Stufe 2: Prognose reicht nicht bis zum nächsten Reset um ' + _clock(info.get('resetAt')) +
-                    '; neue Unteragenten laufen auf Sonnet mit Effort high', 'Bremse unter Stufe 2')
+                    'Bremse Stufe 2: Prognose reicht nicht bis zur Hälfte der Zeit bis zum nächsten Reset um ' + _clock(info.get('resetAt')),
+                    'Bremse unter Stufe 2')
