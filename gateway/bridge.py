@@ -29,6 +29,7 @@ from private_files import atomic_write
 
 from settings import LABELS, CONFIG
 HOP = {"host", "connection", "content-length", "transfer-encoding"}
+QUEUE_READ = 4 * 1024 * 1024   # bytes of a waiting session's transcript read per look
 
 
 def number(value):
@@ -76,6 +77,8 @@ class PoolBridge(ThreadingHTTPServer):
         self.hold = Hold()
         # Background requests wait in a room of at most max_waiting; they check every brake_check s, at most brake_max_wait s.
         self.brake_check, self.brake_max_wait, self.max_waiting = 30, MAX_WAIT, 24
+        # While a session waits, its transcript (Claude Code's, by session id) is read every queue_check s for queued messages.
+        self.transcripts, self.queue_check, self.watches, self.watch_lock = Path.home() / '.claude' / 'projects', 2, {}, threading.Lock()
         self.agents = AgentAccounts()
         self.ledger_dir = self.state_path.parent / 'usage-ledger' if self.state_path else None
         self.waits_dir = self.state_path.parent / 'brake-waits' if self.state_path else None
@@ -448,6 +451,62 @@ class PoolBridge(ThreadingHTTPServer):
         else: self.journal.record('brake_wait', reason=reason)
         return not full
 
+    def watch_start(self, session_id):
+        """A message typed or relayed into a session lands in its transcript at once, as a queue "enqueue" line; Claude Code
+        sends it only after the current request. While requests of the session wait, one watch reads what is appended to
+        that transcript after the first of them began."""
+        with self.watch_lock:
+            watch = self.watches.setdefault(session_id, {'waits': 0, 'path': None, 'offset': 0, 'rest': b''})
+            watch['waits'] += 1
+            if watch['waits'] == 1: self.locate(watch, session_id)
+
+    def watch_end(self, session_id):
+        with self.watch_lock:
+            watch = self.watches.get(session_id)
+            if watch:
+                watch['waits'] -= 1
+                if watch['waits'] <= 0: del self.watches[session_id]
+
+    def locate(self, watch, session_id):
+        """The session's transcript (~/.claude/projects/<folder>/<session id>.jsonl), from its end; none is harmless."""
+        try:
+            path = next(iter(sorted(self.transcripts.glob('*/' + session_id + '.jsonl'))), None)
+            if path: watch.update(path=path, offset=path.stat().st_size)
+        except OSError: pass
+
+    def owner_typed(self, session_id, since):
+        """True once a person's message reached the waiting session: queued into its transcript since the wait began (its
+        text is classified and dropped, never kept), or a person's turn the gateway saw since `since`."""
+        found = False
+        with self.watch_lock:
+            watch = self.watches.get(session_id)
+            if watch and watch['path'] is None: self.locate(watch, session_id)
+            if watch and watch['path'] is not None:
+                try:
+                    with open(watch['path'], 'rb') as f:
+                        if os.fstat(f.fileno()).st_size < watch['offset']: watch['offset'], watch['rest'] = 0, b''
+                        f.seek(watch['offset'])
+                        data = f.read(QUEUE_READ)
+                except OSError: data = b''
+                watch['offset'] += len(data)
+                lines = (watch['rest'] + data).split(b'\n')
+                watch['rest'] = lines.pop()[-QUEUE_READ:]   # a line still being written waits for its end
+                for line in lines:
+                    if b'"queue-operation"' not in line or b'"enqueue"' not in line: continue
+                    try: row = json.loads(line)
+                    except ValueError: continue
+                    if not isinstance(row, dict) or row.get('type') != 'queue-operation' or row.get('operation') != 'enqueue': continue
+                    if row.get('sessionId', session_id) != session_id or not isinstance(row.get('content'), (str, list)): continue
+                    found = found or activity.classify({'messages': [{'role': 'user', 'content': row['content']}]}) == activity.OWNER
+        with self.lock:
+            state = self.sessions.get(session_id)
+            if found and state is not None:
+                state['ownerAt'] = time.time()
+                self.save()
+            seen = number((state or {}).get('ownerAt')) and state['ownerAt'] >= since
+        if found: self.journal.record('brake_wait_released', reason='owner_message')
+        return bool(found or seen)
+
     def brake_ended(self, lease, session_id, since, project, cls, reason, end):
         """The wait is over (released, capped, cancelled, draining or failed): one row in today's brake-waits ledger."""
         with self.lock:
@@ -724,19 +783,25 @@ class Handler(BaseHTTPRequestHandler):
         server = self.server
         if not server.brake_started(lease, session_id, reason): return None
         since, end = time.time(), 'released'
+        server.watch_start(session_id)
         try:
             self.send_response(200)
             self.send_header('Content-Type', 'text/event-stream')
             self.send_header('Cache-Control', 'no-store')
             self.send_header('Connection', 'close')
             self.end_headers()
-            next_ping = next_check = 0
+            next_ping = next_check = next_queue = 0
             while True:
                 if server.draining or lease.get('cancelled') or server.monitor_stop.is_set(): raise ConnectionError()
                 now = time.monotonic()
                 if now >= next_ping:
                     self.wfile.write(b'event: ping\ndata: {"type":"ping"}\n\n'); self.wfile.flush()
                     lease['progress'], next_ping = now, now + 10
+                if now >= next_queue:
+                    next_queue = now + server.queue_check
+                    if server.owner_typed(session_id, since):
+                        end = 'owner_message'
+                        return True
                 if now >= next_check:
                     next_check = now + server.brake_check
                     if time.time() - since >= server.brake_max_wait:
@@ -751,6 +816,7 @@ class Handler(BaseHTTPRequestHandler):
             else: self.stream_failed('The pool stopped before this request was sent; retry this request')
             return False
         finally:
+            server.watch_end(session_id)
             server.brake_ended(lease, session_id, since, project, cls, reason, end)
 
     def proxy(self, path, length, lease):

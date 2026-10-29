@@ -25,6 +25,7 @@ CODES = {
     'brake_wait': 'A background request waits for the brake',
     'brake_wait_capped': 'A background request waited three hours and went anyway',
     'brake_wait_full': 'Too many requests wait for the brake; this one went at once',
+    'brake_wait_released': 'A person wrote into a waiting session: its requests went at once',
     'stream_interrupted': 'Response ended before completion',
     'client_disconnected': 'Claude connection closed; upstream cancelled',
     'request_idle_timeout': 'Response stalled; connection closed',
