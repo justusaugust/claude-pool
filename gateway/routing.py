@@ -40,6 +40,11 @@ def reserve_blocked(account):
     return limit > 0 and any(account.get(k) and account[k]['pct'] >= limit for k in ('fiveHour', 'sevenDay', 'fableWeekly'))
 
 
+def eligible(account):
+    """Takes new pool work: ready, both all-model windows under 95 %, and not held back by its reserve."""
+    return account['status'] == 'ready' and all(not account.get(k) or account[k]['pct'] < 95 for k in ('fiveHour', 'sevenDay')) and not reserve_blocked(account)
+
+
 def backend_priority(reserve_at):
     """Shunt's per-account priority (lower is preferred, default 100): a reserved account comes after every other,
     and the larger its reserve the later (99 -> 101, 85 -> 115)."""
@@ -83,8 +88,7 @@ def choose(accounts, sessions, session_id, forecast, now):
     state = sessions[session_id]
     rows = [r for r in session_rows({k: v for k, v in sessions.items() if k != session_id}, now)
             if r['busy'] or now - r['lastRequestAt'] / 1000 <= ACTIVE_SECONDS]
-    ready = [a for a in accounts if a['status'] == 'ready' and
-             all(not a.get(k) or a[k]['pct'] < 95 for k in ('fiveHour', 'sevenDay')) and not reserve_blocked(a)]
+    ready = [a for a in accounts if eligible(a)]
     by_name = {a['name']: a for a in accounts}
     loads = {a['name']: sum(r['account'] == a['name'] for r in rows) for a in accounts}
     busy = {a['name']: sum(r['account'] == a['name'] and r['busy'] for r in rows) for a in accounts}

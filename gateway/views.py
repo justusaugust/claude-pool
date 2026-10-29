@@ -2,6 +2,7 @@
 import textwrap
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from brake import describe
 from telemetry import coverage_note
 from settings import OPTIONS
 
@@ -111,7 +112,7 @@ def usage(data, *, width=80, color=False):
             add('Allowance range not settled yet.', '90')
     brake = forecast.get('brake') or {}
     if brake.get('stage'):
-        add('Brake · stage ' + str(brake['stage']) + ': new subagents on Sonnet 5.5' + (', effort high' if brake['stage'] >= 2 else ''), '33')
+        add('Brake · ' + describe(brake['stage']), '33')
     if forecast['partial']:
         add('Unmeasured accounts/windows excluded.', '90')
     note = coverage_note(data['accounts'])

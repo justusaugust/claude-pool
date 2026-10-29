@@ -840,7 +840,7 @@ def urgent_set(project, hours=None):
 
 def usage_today(as_json=False):
     """Today's usage from the pool ledger by project and request class, API-price equivalent, plus the brake stage."""
-    from brake import today_summary
+    from brake import today_summary, describe
     summary = today_summary(settings.RUNTIME / 'usage-ledger' / (time.strftime('%Y-%m-%d') + '.jsonl'))
     summary['brake'] = None
     try:
@@ -850,7 +850,7 @@ def usage_today(as_json=False):
     if as_json: return json.dumps(summary)
     stage = (summary['brake'] or {}).get('stage') or 0
     text = ['Usage today · ~$' + format(round(summary['usd']), ',') + ' API price equivalent',
-            'Brake · ' + ('off' if not stage else f'stage {stage}: new subagents on Sonnet 5.5' + (', effort high' if stage >= 2 else ''))
+            'Brake · ' + ('off' if not stage else describe(stage))
             + (f" · {summary['braked']} braked answers" if summary['braked'] else '')]
     for row in summary['projects'][:12]:
         text.append(f"  {row['project'][:28]:<28} ~${row['usd']:>7.0f}  {row['usd'] / summary['usd']:>4.0%}" if summary['usd'] else '')

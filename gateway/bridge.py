@@ -18,7 +18,8 @@ from forecast import estimate, renewal_scenario, workload_estimates
 from routing import choose, profile, session_rows, unavailable, REASONS
 from validation import archive, HistoryIndex
 from diagnostics import Journal
-from brake import Brake, CLASSES as BRAKE_CLASSES, ledger_line, stage as brake_stage
+from brake import CLASSES as BACKGROUND, ledger_line, stage as brake_stage
+from agent_cache import AgentAccounts, one_hour
 import memory
 import readings
 from native_auth import NativeAuthUnavailable
@@ -69,8 +70,9 @@ class PoolBridge(ThreadingHTTPServer):
         self.history_error = False
         self.journal = Journal(self.state_path.parent / 'incidents.json' if self.state_path else None, atomic_write)
         self.health = {"backend": "starting", "failures": 0, "checkedAt": None, "supervisor": ("systemd" if sys.platform.startswith("linux") else "launchd") if os.environ.get("POOL_MANAGED") == "1" else "standalone"}
-        self.last_accounts = []
-        self.brake, self._brake_cache = Brake(), (-60.0, {'stage': 0, 'ratio': None, 'resetAt': None})
+        self.last_accounts, self.accounts_at = [], -math.inf
+        self._brake_cache = (-60.0, {'stage': 0, 'ratio': None, 'resetAt': None})
+        self.agents = AgentAccounts()
         self.ledger_dir, self.ledger_lock, self._ledger_day = (self.state_path.parent / 'usage-ledger' if self.state_path else None), threading.Lock(), None
         self.draining = False
         self.connections = threading.BoundedSemaphore(64)
@@ -275,7 +277,7 @@ class PoolBridge(ThreadingHTTPServer):
         from account_metadata import decorate
         decorate({'accounts': rows}, CONFIG)
         with self.lock:
-            self.last_accounts = rows
+            self.last_accounts, self.accounts_at = rows, time.monotonic()
             changed = False
             for row in rows:
                 points = self.observations.setdefault(row["id"], [])
@@ -295,6 +297,20 @@ class PoolBridge(ThreadingHTTPServer):
                         self.history_error = False
                     except (OSError, ValueError): self.history_error = True
         return rows
+
+    def recent_accounts(self):
+        """The last account sample while it is under a minute old, else a new one (or the last one if Shunt does not answer)."""
+        if time.monotonic() - self.accounts_at >= 60:
+            try: return self.accounts()
+            except (OSError, ValueError, RuntimeError, http.client.HTTPException): pass
+        with self.lock: return list(self.last_accounts)
+
+    def agent_account(self, agent):
+        """The account a subagent or workflow agent keeps while that account is ready; None lets Shunt choose."""
+        with self.lock:
+            if agent not in self.agents.rows: return None
+        accounts = self.recent_accounts()
+        with self.lock: return self.agents.preferred(agent, accounts)
 
     def validation(self):
         self.accounts()
@@ -626,11 +642,13 @@ class Handler(BaseHTTPRequestHandler):
         cls, project = headers.get('x-claude-code-request-class', 'main'), ''
         if session_id:
             with self.server.lock: project = (self.server.sessions.get(session_id) or {}).get('project', '')
-        original, braked, sent_model = body, None, request.get('model')
-        if self.command == 'POST' and path == '/v1/messages' and cls in BRAKE_CLASSES:
-            info, urgent = self.server.brake_info(), self.server.urgent()
-            with self.server.lock: new, decision = self.server.brake.decide(headers, request, info, project, urgent)
-            if new is not None: body, braked, sent_model = json.dumps(new).encode(), decision, new['model']
+        original, hour_cache, agent = body, False, ''
+        if self.command == 'POST' and path == '/v1/messages' and cls in BACKGROUND:
+            # Background agents keep their prompt cache: one-hour writes, and the account that answered them while it is ready.
+            if one_hour(request): body, hour_cache = json.dumps(request, separators=(',', ':')).encode(), True
+            agent = headers.get('x-claude-code-agent-id', '')
+            preferred = self.server.agent_account(agent) if agent else None
+            if preferred: headers['x-shunt-session-account'] = preferred
         context = None
         if tracked:
             try: context = self.server.reserve(session_id, request or {})
@@ -656,11 +674,11 @@ class Handler(BaseHTTPRequestHandler):
             lease['progress'] = time.monotonic()
             account = response.getheader('x-shunt-account')
             self.server.note_outcome(response.status, account)
-            if braked and response.status == 400:
-                # The braked model refused this request before any output: send it once more as the agent asked, keep it there.
+            if hour_cache and response.status == 400:
+                # Refused before any output: send it once more exactly as the agent sent it.
                 response.read(); response.close(); conn.close()
-                braked['model'], braked, body, sent_model = None, None, original, request.get('model')
-                self.server.journal.record('brake_fallback', account=account)
+                hour_cache, body = False, original
+                self.server.journal.record('cache_fallback', account=account)
                 conn.connect(); lease['upstream'] = conn.sock
                 conn.request(self.command, self.path, body, headers)
                 response = conn.getresponse()
@@ -719,6 +737,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Connection", "close")
                 self.end_headers()
                 committed = True
+            if agent and response.status == 200:
+                with self.server.lock: self.server.agents.served(agent, account)
             if main and response.status == 200 and session_id:
                 with self.server.lock:
                     state = self.server.session(session_id)
@@ -762,7 +782,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.flush()
                     if complete and not stream_error and session_id and not logged and path == '/v1/messages':
                         logged = True
-                        self.server.record_usage(ledger_line(int(time.time() * 1000), session_id, project, cls, served_model or sent_model, account, usage, braked=bool(braked)))
+                        self.server.record_usage(ledger_line(int(time.time() * 1000), session_id, project, cls, served_model or request.get('model'), account, usage))
                     if main and complete and not stream_error and session_id:
                         self.server.served(session_id, account, usage, transformations, context)
                         main = False

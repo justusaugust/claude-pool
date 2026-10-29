@@ -90,7 +90,7 @@ class AlertTests(unittest.TestCase):
         self.assertEqual(kinds, [('backend', 'an conductor'), ('backend', 'vorbei'), ('konten-limit', 'an conductor'),
                                  ('anmeldung', 'an conductor'), ('bremse', 'an conductor')])
         text = '\n'.join(self.lines())
-        self.assertIn('Gmail', text); self.assertIn('Stufe 2', text)
+        self.assertIn('Gmail', text); self.assertIn('Stufe 2', text); self.assertNotIn('Sonnet', text)
         self.server.last_accounts = [self.server.account('Intern'), self.server.account('Team')]
         self.server.stage = {'stage': 0, 'ratio': None, 'resetAt': None}
         self.clock.now += 30; self.alerts.check(self.server)

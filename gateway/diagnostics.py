@@ -19,6 +19,7 @@ CODES = {
     'upstream_http_error': 'Provider request failed',
     'stream_error': 'Provider reported a stream error',
     'brake_fallback': 'A braked subagent request was refused; sent once more with its own model',
+    'cache_fallback': 'A background request with one-hour cache was refused; sent once more as the agent sent it',
     'stream_interrupted': 'Response ended before completion',
     'client_disconnected': 'Claude connection closed; upstream cancelled',
     'request_idle_timeout': 'Response stalled; connection closed',

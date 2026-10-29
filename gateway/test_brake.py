@@ -36,7 +36,7 @@ class StageTests(unittest.TestCase):
 
 class ExemptionTests(unittest.TestCase):
     def test_the_conductor_and_urgent_projects_are_exempt_from_the_brake(self):
-        # The Conductor runs as project conductor (COCKPIT_PROJECT is its folder name); conductor-wecker is its wake session.
+        # The Conductor runs as project conductor (COCKPIT_PROJECT is its folder name); conductor-wecker is its watcher.
         self.assertTrue(brake.exempt('conductor'))
         self.assertTrue(brake.exempt('conductor-wecker'))
         self.assertTrue(brake.exempt('pitch-riot', {'pitch-riot'}))
