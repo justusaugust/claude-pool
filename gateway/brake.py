@@ -2,7 +2,8 @@
 
 Stage 1 (forecast below the time until an account next gains capacity): new subagent and workflow conversations start on
 Sonnet 5.5. Stage 2 (below half that time): their effort is also capped at high. The model is chosen once, at the first
-request of an agent, and kept for its lifetime: caches and thinking blocks belong to one model. Main sessions, the
+request of an agent, and kept for its lifetime: caches and thinking blocks belong to one model. An agent counts as new
+while its messages hold no assistant turn; one first seen later (after a pool restart) keeps its model. Main sessions, the
 Conductor, compaction and projects marked urgent are never braked. Replayed on 21.10.2026 this removed a 65-minute stall.
 """
 import json
@@ -52,7 +53,10 @@ class Brake:
             return None, None
         decision = self.agents.get(agent)
         if decision is None:
-            fresh = len(request.get('messages') or []) <= 1
+            # Fresh means no model has answered yet. Counting messages missed every agent: Claude Code 2.1.312 sends the
+            # first request with the prompt and a system message announcing tools (0 braked rows, 22.-29.10.).
+            messages = request.get('messages') if isinstance(request.get('messages'), list) else []
+            fresh = not any(isinstance(m, dict) and m.get('role') == 'assistant' for m in messages)
             level = info.get('stage', 0) if fresh and project not in NEVER and project not in urgent else 0
             decision = {'model': SONNET if level else None, 'capEffort': level >= 2, 'stage': level, 'at': time.time()}
             if len(self.agents) >= STICKY_LIMIT:
