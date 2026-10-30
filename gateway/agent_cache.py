@@ -2,10 +2,16 @@
 
 Measured 22.-29.10.2026: Claude Code writes a subagent's cache for five minutes (a main session's for an hour). 65 % of the
 subagents' cache-write spend rebuilt a prefix after a pause over five minutes, 25 % after the agent moved to another account.
+
+Claude Code's background-agent labeler sends every 30 seconds per background agent the agent's whole transcript as class
+`auxiliary` with the agent's own id. It reads the agent's cache, so it goes to the agent's account; it keeps its five-minute
+writes (a read of the agent's one-hour entry costs the same, a miss costs 1.25x instead of 2x) and never pins the agent.
+Measured 29./30.10.2026 while only the agents kept their account: 413 $ of labeler cache writes on other accounts in 15 hours.
 """
 import re
 from routing import eligible
 
+FOLLOWS = {'auxiliary'}   # request classes that go to their agent's account but neither change cache nor pin the agent
 HOUR = {'type': 'ephemeral', 'ttl': '1h'}
 LIMIT = 4096
 AGENT, ACCOUNT = re.compile(r'[A-Za-z0-9_-]{1,80}'), re.compile(r'[a-z0-9-]{1,80}')
