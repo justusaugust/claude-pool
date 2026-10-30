@@ -19,7 +19,7 @@ from routing import choose, profile, session_rows, unavailable, REASONS
 from validation import archive, HistoryIndex
 from diagnostics import Journal
 from brake import CLASSES as BACKGROUND, ledger_line, stage as brake_stage, Hold, MAX_WAIT, braking, exempt, interactive, standstill, wait_line
-from agent_cache import AgentAccounts, one_hour
+from agent_cache import FOLLOWS, AgentAccounts, one_hour
 import activity
 import memory
 import readings
@@ -324,7 +324,7 @@ class PoolBridge(ThreadingHTTPServer):
         with self.lock: return list(self.last_accounts)
 
     def agent_account(self, agent):
-        """The account a subagent or workflow agent keeps while that account is ready; None lets Shunt choose."""
+        """The account a subagent or workflow agent keeps (its labeler follows it) while that account is ready; None lets Shunt choose."""
         with self.lock:
             if agent not in self.agents.rows: return None
         accounts = self.recent_accounts()
@@ -854,12 +854,14 @@ class Handler(BaseHTTPRequestHandler):
                 if held is False: return
                 if held: committed, sse, waited = True, True, time.time() - since
         original, hour_cache, agent = body, False, ''
-        if self.command == 'POST' and path == '/v1/messages' and cls in BACKGROUND:
+        if self.command == 'POST' and path == '/v1/messages' and (cls in BACKGROUND or cls in FOLLOWS):
             # Background agents keep their prompt cache: one-hour writes, and the account that answered them while it is ready.
-            if one_hour(request): body, hour_cache = json.dumps(request, separators=(',', ':')).encode(), True
-            agent = headers.get('x-claude-code-agent-id', '')
-            preferred = self.server.agent_account(agent) if agent else None
+            # Their labeler (auxiliary, with the agent's id) reads that cache: the agent's account, its body as sent, no pinning.
+            if cls in BACKGROUND and one_hour(request): body, hour_cache = json.dumps(request, separators=(',', ':')).encode(), True
+            owner = headers.get('x-claude-code-agent-id', '')
+            preferred = self.server.agent_account(owner) if owner else None
             if preferred: headers['x-shunt-session-account'] = preferred
+            if cls in BACKGROUND: agent = owner    # only the agent's own answers decide its account
         context = None
         if tracked:
             try: context = self.server.reserve(session_id, request or {})
