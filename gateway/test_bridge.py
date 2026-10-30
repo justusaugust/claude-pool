@@ -178,6 +178,59 @@ class BridgeTests(unittest.TestCase):
         self.assertIsNone(self.headers[-1].get('x-shunt-session-account'))
         self.assertEqual((self.preferred[-1], self.inputs[-1]), ('gmail', raw))
         self.assertEqual(self.bridge.agents.rows, {'steady': 'team'})
+    def labels(self):
+        import time
+        path = Path(self.temp.name) / 'short-labels' / (time.strftime('%Y-%m-%d') + '.jsonl')
+        return [json.loads(line)['result'] for line in path.read_text().splitlines()] if path.exists() else []
+    def test_a_labeler_request_goes_in_short_form_to_its_agents_account_and_is_marked_in_the_ledger(self):
+        import short_label
+        from test_short_label import labeler as labeler_request, SYSTEM
+        self.default_account = 'team'
+        self.subagent(agent='steady')
+        self.default_account = 'gmail'
+        status, _ = self.call('/v1/messages', labeler_request(), extra_headers=self.labeler('steady'))
+        self.assertEqual(status, 200)
+        self.assertEqual((self.headers[-1].get('x-shunt-session-account'), self.preferred[-1]), ('team', 'team'))
+        sent = json.loads(self.inputs[-1])
+        self.assertEqual((sent['model'], sent['max_tokens'], sent['system'][-1]['text']), ('claude-opus-5-5', 2108, SYSTEM))
+        self.assertNotIn('tools', sent)
+        self.assertEqual(sent, short_label.rewrite(labeler_request()))
+        row = self.ledger()[-1]
+        self.assertEqual((row['class'], row['short_label']), ('auxiliary', True))
+        self.assertEqual(self.labels(), ['short'])
+        self.assertEqual(self.bridge.agents.rows, {'steady': 'team'}, 'a label neither pins nor moves its agent')
+    def test_a_refused_short_label_is_sent_once_more_as_claude_code_sent_it(self):
+        from test_short_label import labeler as labeler_request
+        self.statuses = [400]
+        raw = json.dumps(labeler_request()).encode()
+        status, _ = self.call('/v1/messages', raw, extra_headers=self.labeler('steady'))
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(self.inputs[-2])['max_tokens'], 2108)
+        self.assertEqual(self.inputs[-1], raw)
+        self.assertIn('short_label_fallback', [row['code'] for row in self.bridge.journal.snapshot()])
+        self.assertNotIn('short_label', self.ledger()[-1])
+        self.assertEqual(self.labels(), ['short', 'refused'])
+    def test_other_auxiliary_requests_of_an_agent_pass_byte_for_byte_and_are_counted(self):
+        from test_short_label import labeler as labeler_request
+        raw = json.dumps(self.cached()).encode()
+        self.call('/v1/messages', raw, extra_headers=self.labeler('steady'))
+        self.assertEqual(self.inputs[-1], raw)
+        full = json.dumps(labeler_request()).encode()
+        self.call('/v1/messages', full, extra_headers={**self.labeler('steady'), 'x-claude-code-agent-type': 'general-purpose'})
+        self.assertEqual(self.inputs[-1], full)
+        self.call('/v1/messages', full, extra_headers=self.labeler())          # no agent id: not counted
+        self.assertEqual(self.inputs[-1], full)
+        with patch('short_label.rewrite', side_effect=RuntimeError('fixture')):
+            self.call('/v1/messages', full, extra_headers=self.labeler('steady'))
+        self.assertEqual(self.inputs[-1], full, 'an error while rewriting: sent as Claude Code sent it')
+        self.assertEqual(self.labels(), ['other', 'unmatched', 'kept'])
+        self.assertNotIn('short_label', json.dumps(self.ledger()))
+    def test_most_labeler_requests_in_full_leave_a_warning_in_the_journal(self):
+        from test_short_label import labeler as labeler_request
+        full = json.dumps(labeler_request()).encode()
+        with patch('short_label.MIN_LABELS', 2):
+            for _ in range(2): self.call('/v1/messages', full, extra_headers={**self.labeler('steady'), 'x-claude-code-agent-type': 'x'})
+        self.assertIn('short_label_missed', [row['code'] for row in self.bridge.journal.snapshot()])
     def test_without_brake_subagents_pass_unchanged_and_every_answer_is_logged(self):
         status, _ = self.subagent()
         self.assertEqual((status, json.loads(self.inputs[-1])['model']), (200, 'claude-opus-5-5'))
