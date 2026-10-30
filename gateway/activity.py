@@ -31,6 +31,9 @@ AUTOMATIC = re.compile('|'.join([
     BOARD + r'Neue Aufgabe aus dem Backlog', r'Conductor-Board: Dein Planstand ist von ',
     BOARD + r'Ich habe dich (?:frisch|neu) gestartet', BOARD + r'Dein Monitor auf wecker\.log fehlt', BOARD + r'Dein Neustart ist gescheitert',
     BOARD + r'Nach .{1,60}? fehlt dir der Monitor',
+    # the Weitermacher since 30.10.: check-in after an announced wait, delivery of what it waited for, idle-time nudge
+    BOARD + r'Du wolltest auf .{1,300}? warten \(seit ', BOARD + r'Worauf du gewartet hast, ist da: ',
+    BOARD + r'Du hast seit .{1,40}? keinen Auftrag',
     # ~/.local/bin/conductor-abfrager (the Board's answer poller) and older quota nudges, as in the replay's rule
     r'Lade mit ToolSearch \(query select:Monitor,ArtifactData\)', r'Kontingent ist zurück', r'Das Kontingent ist wieder frei',
     # Claude Code (2.1.312): its marks for what no person typed, peer messages, subagent hand-backs, compaction, hooks

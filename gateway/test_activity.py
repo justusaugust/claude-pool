@@ -20,6 +20,10 @@ NUDGES = [
     'Conductor (Board): Ich habe dich frisch gestartet (neue Unterhaltung), damit dein Verlauf klein bleibt. Starte den Monitor auf wecker.log.',
     'Conductor (Board): Dein Monitor auf wecker.log fehlt seit 14:05. Starte ihn neu wie in deiner CLAUDE.md.',
     'Conductor (Board): Nach deinem Neustart fehlt dir der Monitor auf wecker.log. Starte ihn neu wie in deiner CLAUDE.md.',
+    # since 30.10.: the Weitermacher's check-in after an announced wait, delivery of what an agent waited for, idle-time nudge
+    'Conductor (Board): Du wolltest auf den Nachtlauf warten (seit 14:05). Ist es da? Mach weiter oder sag, was fehlt. Brauchst du Alex, frag über conductor-board frage.',
+    'Conductor (Board): Worauf du gewartet hast, ist da: board-design hat gemergt. Mach weiter, wo du auf board-design gewartet hast. Brauchst du Alex, frag über conductor-board frage.',
+    "Conductor (Board): Du hast seit 14:05 keinen Auftrag. Nach Alex' Leerlauf-Regel: Such in deinem Projekt nach Verbesserungen, kleine sichere selbst mit Test und Messung.",
     # ~/.local/bin/conductor-abfrager starts its Board poller with this; older quota nudges (the replay's rule)
     'Lade mit ToolSearch (query select:Monitor,ArtifactData) die Werkzeuge Monitor und ArtifactData. Starte dann Monitor.',
     'Kontingent ist zurück. Mach weiter, wo du warst.',
