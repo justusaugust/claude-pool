@@ -733,7 +733,13 @@ def main():
     if not any(arg in {'--safe-mode', '--bare'} for arg in options):
         claude_args = ['--plugin-dir', str(configured_plugin('cockpit')), *claude_args]
     # The service manager owns recovery; a TUI never launches a second background watcher.
-    raise SystemExit(subprocess.call([NATIVE_CLAUDE, *claude_args], env=env))
+    run_native(claude_args, env)
+
+
+def run_native(claude_args, env):
+    """Become Native Claude, so terminals see `claude` as the pane's program and signals reach it directly."""
+    sys.stdout.flush(); sys.stderr.flush()
+    os.execve(NATIVE_CLAUDE, [NATIVE_CLAUDE, *claude_args], env)
 
 
 if __name__ == "__main__":
