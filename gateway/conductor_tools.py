@@ -844,12 +844,15 @@ def urgent_set(project, hours=None):
 
 
 def usage_today(as_json=False):
-    """Today's usage from the pool ledger by project and request class, API-price equivalent, plus the brake stage."""
+    """Today's usage from the pool ledger by project and request class, API-price equivalent, plus the brake stage and
+    today's background-agent label requests (short form or in full)."""
     from brake import today_summary, describe
     from brake import wait_summary
     from views import duration
+    import short_label
     summary = today_summary(settings.RUNTIME / 'usage-ledger' / (time.strftime('%Y-%m-%d') + '.jsonl'))
     summary['waits'] = wait_summary(settings.RUNTIME / 'brake-waits' / (time.strftime('%Y-%m-%d') + '.jsonl'))
+    summary['labels'] = short_label.day_summary(settings.RUNTIME / 'short-labels' / (time.strftime('%Y-%m-%d') + '.jsonl'))
     summary['brake'] = None
     try:
         lines = (settings.RUNTIME / 'usage-history' / (time.strftime('%Y-%m') + '.jsonl')).read_text().splitlines()
@@ -862,6 +865,8 @@ def usage_today(as_json=False):
             + (f" · {summary['braked']} braked answers" if summary['braked'] else '')]
     if summary['waits']['requests']:
         text.append(f"Background waits today · {summary['waits']['requests']} requests · {duration(summary['waits']['seconds'])}")
+    labels, full = short_label.in_full(summary['labels'])
+    if labels: text.append(f'Agent labels today · {labels - full} short · {full} in full')
     for row in summary['projects'][:12]:
         text.append(f"  {row['project'][:28]:<28} ~${row['usd']:>7.0f}  {row['usd'] / summary['usd']:>4.0%}" if summary['usd'] else '')
     text.append('  ' + ' · '.join(f"{k} {v / summary['usd']:.0%}" for k, v in sorted(summary['classes'].items(), key=lambda kv: -kv[1])) if summary['usd'] else '  no answers logged today')

@@ -120,16 +120,17 @@ def usd(model, usage):
             + five * price[0] * 1.25 + hour * price[0] * 2) / 1e6
 
 
-def ledger_line(at, session, project, cls, model, account, usage, braked=False, waited=0):
+def ledger_line(at, session, project, cls, model, account, usage, braked=False, waited=0, short_label=False):
     """One answered request: who, where, which model and account, tokens (cache writes by TTL when reported) and API-price
-    equivalent; never content. `braked` with `brakeWaitSeconds`: it waited for the brake before it went upstream."""
+    equivalent; never content. `braked` with `brakeWaitSeconds`: it waited for the brake before it went upstream.
+    `short_label`: a background-agent labeler request the gateway sent in Claude Code's short form (short_label.py)."""
     keys = ('input_tokens', 'output_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens')
     written = usage.get('cache_creation') if isinstance(usage.get('cache_creation'), dict) else {}
     return {'at': at, 'session': session, 'project': project or '', 'class': cls, 'model': model or '', 'account': account or '',
             **{k: usage.get(k, 0) for k in keys if isinstance(usage.get(k, 0), int)},
             **{k: written[k] for k in ('ephemeral_5m_input_tokens', 'ephemeral_1h_input_tokens') if isinstance(written.get(k), int)},
             'usd': round(usd(model, usage), 6), 'braked': bool(braked or waited),
-            **({'brakeWaitSeconds': round(waited)} if waited else {})}
+            **({'brakeWaitSeconds': round(waited)} if waited else {}), **({'short_label': True} if short_label else {})}
 
 
 def wait_line(at, since, session, project, cls, reason, end):
