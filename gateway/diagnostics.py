@@ -20,6 +20,8 @@ CODES = {
     'stream_error': 'Provider reported a stream error',
     'brake_fallback': 'A braked subagent request was refused; sent once more with its own model',
     'cache_fallback': 'A background request with one-hour cache was refused; sent once more as the agent sent it',
+    'short_label_fallback': 'A background-agent label request in short form was refused; sent once more as Claude Code sent it',
+    'short_label_missed': 'Most background-agent label requests today went in full; Claude Code may have changed its labeler',
     'brake_hold_on': 'Brake on: background sessions wait',
     'brake_hold_off': 'Brake off for 15 minutes: background sessions go again',
     'brake_wait': 'A background request waits for the brake',

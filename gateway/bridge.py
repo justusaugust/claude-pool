@@ -21,6 +21,7 @@ from diagnostics import Journal
 from brake import CLASSES as BACKGROUND, ledger_line, stage as brake_stage, Hold, MAX_WAIT, braking, exempt, interactive, standstill, wait_line
 from agent_cache import FOLLOWS, AgentAccounts, one_hour
 import activity
+import short_label
 import memory
 import readings
 from native_auth import NativeAuthUnavailable
@@ -82,6 +83,8 @@ class PoolBridge(ThreadingHTTPServer):
         self.agents = AgentAccounts()
         self.ledger_dir = self.state_path.parent / 'usage-ledger' if self.state_path else None
         self.waits_dir = self.state_path.parent / 'brake-waits' if self.state_path else None
+        self.labels_dir = self.state_path.parent / 'short-labels' if self.state_path else None
+        self.label_counts = short_label.Counts(self.labels_dir)
         self.ledger_lock, self._ledger_days = threading.Lock(), {}
         self.draining = False
         self.connections = threading.BoundedSemaphore(64)
@@ -529,6 +532,13 @@ class PoolBridge(ThreadingHTTPServer):
         """Appends one answered request to today's ledger."""
         self.append_day(self.ledger_dir, row)
 
+    def label_counted(self, result):
+        """One auxiliary request of a background agent, counted by result (short_label.RESULTS), never content. Once a day a
+        journal warning when most labeler requests went upstream in full: Claude Code may have changed its labeler."""
+        with self.lock: warn = self.label_counts.add(result)
+        self.append_day(self.labels_dir, short_label.count_line(int(time.time() * 1000), result))
+        if warn: self.journal.record('short_label_missed')
+
     def append_day(self, folder, row):
         """Appends a row to today's file in `folder`; files older than 31 days are removed."""
         if not folder: return
@@ -853,12 +863,17 @@ class Handler(BaseHTTPRequestHandler):
                 held = self.brake_wait(lease, session_id, project, cls, reason)
                 if held is False: return
                 if held: committed, sse, waited = True, True, time.time() - since
-        original, hour_cache, agent = body, False, ''
+        original, hour_cache, agent, short = body, False, '', False
         if self.command == 'POST' and path == '/v1/messages' and (cls in BACKGROUND or cls in FOLLOWS):
             # Background agents keep their prompt cache: one-hour writes, and the account that answered them while it is ready.
-            # Their labeler (auxiliary, with the agent's id) reads that cache: the agent's account, its body as sent, no pinning.
+            # Their auxiliary requests (with the agent's id) go to the agent's account and never pin it. The labeler among them
+            # goes in Claude Code's own short form (notes, not the whole transcript); anything else passes as sent.
             if cls in BACKGROUND and one_hour(request): body, hour_cache = json.dumps(request, separators=(',', ':')).encode(), True
             owner = headers.get('x-claude-code-agent-id', '')
+            if cls in FOLLOWS and owner:
+                result, label = short_label.apply(headers, request)
+                if label: body, short = json.dumps(label, separators=(',', ':')).encode(), True
+                if result: self.server.label_counted(result)
             preferred = self.server.agent_account(owner) if owner else None
             if preferred: headers['x-shunt-session-account'] = preferred
             if cls in BACKGROUND: agent = owner    # only the agent's own answers decide its account
@@ -888,11 +903,12 @@ class Handler(BaseHTTPRequestHandler):
             lease['progress'] = time.monotonic()
             account = response.getheader('x-shunt-account')
             self.server.note_outcome(response.status, account)
-            if hour_cache and response.status == 400:
+            if (hour_cache or short) and response.status == 400:
                 # Refused before any output: send it once more exactly as the agent sent it.
                 response.read(); response.close(); conn.close()
-                hour_cache, body = False, original
-                self.server.journal.record('cache_fallback', account=account)
+                self.server.journal.record('cache_fallback' if hour_cache else 'short_label_fallback', account=account)
+                if short: self.server.label_counted('refused')
+                hour_cache, short, body = False, False, original
                 conn.connect(); lease['upstream'] = conn.sock
                 conn.request(self.command, self.path, body, headers)
                 response = conn.getresponse()
@@ -996,7 +1012,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.flush()
                     if complete and not stream_error and session_id and not logged and path == '/v1/messages':
                         logged = True
-                        self.server.record_usage(ledger_line(int(time.time() * 1000), session_id, project, cls, served_model or request.get('model'), account, usage, waited=waited))
+                        self.server.record_usage(ledger_line(int(time.time() * 1000), session_id, project, cls, served_model or request.get('model'), account, usage, waited=waited, short_label=short))
                     if main and complete and not stream_error and session_id:
                         self.server.served(session_id, account, usage, transformations, context)
                         main = False

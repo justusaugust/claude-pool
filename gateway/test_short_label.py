@@ -86,7 +86,7 @@ def labeler(messages=None, previous=None, system_extra='', **extra):
 
 
 def describe(name, given):
-    return short_label.describer('/work/repo', '/home/fixture')(name, given)
+    return short_label.describer('/work/repo', '/srv/fixture-home')(name, given)
 
 
 def lines(text):
@@ -198,7 +198,7 @@ class NotesTests(unittest.TestCase):
 
     def test_tools_without_a_description_are_described_like_claude_code_does(self):
         cases = [(call('t', 'Read', file_path='/work/repo/gateway/bridge.py'), 'Read - Reading gateway/bridge.py'),
-                 (call('t', 'Write', file_path='/home/fixture/notes/a.md'), 'Write - Writing ~/notes/a.md'),
+                 (call('t', 'Write', file_path='/srv/fixture-home/notes/a.md'), 'Write - Writing ~/notes/a.md'),
                  (call('t', 'Edit', file_path='/etc/hosts'), 'Edit - Editing /etc/hosts'),
                  (call('t', 'NotebookEdit', notebook_path='/work/repo/n.ipynb'), 'NotebookEdit - Editing notebook n.ipynb'),
                  (call('t', 'Grep', pattern='p' * 60), 'Grep - Searching for ' + 'p' * 49 + '\u2026'),
@@ -223,9 +223,10 @@ class RewriteTests(unittest.TestCase):
 
     def test_the_short_request_keeps_the_model_and_nothing_else_of_the_transcript(self):
         sent, text = self.content(labeler())
-        self.assertEqual(set(sent), {'model', 'max_tokens', 'stream', 'metadata', 'system', 'messages', 'thinking', 'output_config'})
+        self.assertEqual(set(sent), {'model', 'max_tokens', 'stream', 'metadata', 'system', 'messages', 'output_config'})
         self.assertEqual((sent['model'], sent['max_tokens'], sent['stream'], sent['metadata']), ('claude-opus-5-5', 2108, True, {'user_id': 'fixture-user'}))
-        self.assertEqual(sent['thinking'], {'type': 'disabled'})
+        self.assertNotIn('thinking', sent, 'no thinking: Opus 5.5 refuses thinking.type disabled (live check 30.10.2026), and without '
+                         'the key it does not think')
         self.assertEqual(sent['output_config'], {'effort': 'low'})
         self.assertEqual(sent['system'], [{'type': 'text', 'text': BILLING}, {'type': 'text', 'text': IDENTITY}, {'type': 'text', 'text': SYSTEM}])
         self.assertNotIn('cache_control', json.dumps(sent))
