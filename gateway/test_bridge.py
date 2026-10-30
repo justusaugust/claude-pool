@@ -125,6 +125,59 @@ class BridgeTests(unittest.TestCase):
         self.paused['team'] = False; self.bridge.accounts()
         self.subagent(agent='steady')
         self.assertEqual(self.preferred[-1], 'gmail', 'the account that answered became its account')
+    def labeler(self, agent=None):
+        """Claude Code's background-agent labeler: class auxiliary, the agent's own id, the agent's cached transcript."""
+        return {'x-claude-code-request-class': 'auxiliary', **({'x-claude-code-agent-id': agent} if agent else {})}
+    def test_a_labeler_request_goes_to_its_agents_account_and_is_sent_byte_for_byte(self):
+        self.default_account = 'team'
+        self.subagent(agent='steady')      # the agent's own request: team becomes its account
+        self.default_account = 'gmail'     # Shunt alone would send the labeler elsewhere and write the transcript there again
+        raw = json.dumps(self.cached()).encode()
+        status, _ = self.call('/v1/messages', raw, extra_headers=self.labeler('steady'))
+        self.assertEqual(status, 200)
+        self.assertEqual(self.headers[-1].get('x-shunt-session-account'), 'team')
+        self.assertEqual(self.preferred[-1], 'team')
+        self.assertEqual(self.inputs[-1], raw, 'five-minute cache as sent: it reads the agent\'s one-hour entry')
+        self.assertEqual(self.ledger()[-1]['class'], 'auxiliary')
+    def test_a_labeler_request_neither_pins_nor_moves_its_agent(self):
+        raw = json.dumps(self.cached()).encode()
+        self.call('/v1/messages', raw, extra_headers=self.labeler('fresh'))    # before the agent's own first answer
+        self.assertIsNone(self.headers[-1].get('x-shunt-session-account'), 'no account yet: Shunt chooses')
+        self.assertEqual(self.inputs[-1], raw)
+        self.assertNotIn('fresh', self.bridge.agents.rows)
+        self.default_account = 'team'
+        self.subagent(agent='fresh')
+        self.assertIsNone(self.headers[-1].get('x-shunt-session-account'), 'the agent\'s own first request: Shunt chooses')
+        self.assertEqual(self.bridge.agents.rows['fresh'], 'team')
+        self.default_account = 'gmail'
+        self.paused['team'] = True; self.bridge.accounts()
+        self.call('/v1/messages', raw, extra_headers=self.labeler('fresh'))    # answered by gmail
+        self.assertEqual(self.preferred[-1], 'gmail')
+        self.assertEqual(self.bridge.agents.rows['fresh'], 'team', 'only the agent\'s own answers decide its account')
+        self.paused['team'] = False; self.bridge.accounts()
+        self.call('/v1/messages', raw, extra_headers=self.labeler('fresh')); self.subagent(agent='fresh')
+        self.assertEqual(self.preferred[-2:], ['team', 'team'])
+    def test_a_labeler_request_is_routed_normally_while_its_agents_account_is_not_ready(self):
+        self.default_account = 'team'
+        self.subagent(agent='steady')
+        self.default_account = 'gmail'
+        self.call('/v1/messages', self.cached(), extra_headers=self.labeler('steady'))
+        self.assertEqual(self.preferred[-1], 'team')
+        self.paused['team'] = True; self.bridge.accounts()      # the next account sample shows team paused
+        raw = json.dumps(self.cached()).encode()
+        self.call('/v1/messages', raw, extra_headers=self.labeler('steady'))
+        self.assertIsNone(self.headers[-1].get('x-shunt-session-account'), 'its agent\'s account is not ready: the normal choice applies')
+        self.assertEqual((self.preferred[-1], self.inputs[-1]), ('gmail', raw))
+    def test_auxiliary_requests_without_an_agent_id_pass_as_before(self):
+        self.default_account = 'team'
+        self.subagent(agent='steady')
+        self.default_account = 'gmail'
+        raw = json.dumps(self.cached()).encode()
+        status, _ = self.call('/v1/messages', raw, extra_headers=self.labeler())
+        self.assertEqual(status, 200)
+        self.assertIsNone(self.headers[-1].get('x-shunt-session-account'))
+        self.assertEqual((self.preferred[-1], self.inputs[-1]), ('gmail', raw))
+        self.assertEqual(self.bridge.agents.rows, {'steady': 'team'})
     def test_without_brake_subagents_pass_unchanged_and_every_answer_is_logged(self):
         status, _ = self.subagent()
         self.assertEqual((status, json.loads(self.inputs[-1])['model']), (200, 'claude-opus-5-5'))
