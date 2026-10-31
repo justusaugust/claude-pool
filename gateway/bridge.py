@@ -532,11 +532,12 @@ class PoolBridge(ThreadingHTTPServer):
         """Appends one answered request to today's ledger."""
         self.append_day(self.ledger_dir, row)
 
-    def label_counted(self, result):
-        """One auxiliary request of a background agent, counted by result (short_label.RESULTS), never content. Once a day a
-        journal warning when most labeler requests went upstream in full: Claude Code may have changed its labeler."""
+    def label_counted(self, result, form=None):
+        """One auxiliary request of a background agent, counted by result (short_label.RESULTS), never content; an unmatched one
+        with its form (short_label.form). Once a day a journal warning when most labeler requests went upstream in full: Claude
+        Code may have changed its labeler."""
         with self.lock: warn = self.label_counts.add(result)
-        self.append_day(self.labels_dir, short_label.count_line(int(time.time() * 1000), result))
+        self.append_day(self.labels_dir, short_label.count_line(int(time.time() * 1000), result, form))
         if warn: self.journal.record('short_label_missed')
 
     def append_day(self, folder, row):
@@ -873,7 +874,7 @@ class Handler(BaseHTTPRequestHandler):
             if cls in FOLLOWS and owner:
                 result, label = short_label.apply(headers, request)
                 if label: body, short = json.dumps(label, separators=(',', ':')).encode(), True
-                if result: self.server.label_counted(result)
+                if result: self.server.label_counted(result, short_label.form(headers, request) if result == 'unmatched' else None)
             preferred = self.server.agent_account(owner) if owner else None
             if preferred: headers['x-shunt-session-account'] = preferred
             if cls in BACKGROUND: agent = owner    # only the agent's own answers decide its account

@@ -178,10 +178,12 @@ class BridgeTests(unittest.TestCase):
         self.assertIsNone(self.headers[-1].get('x-shunt-session-account'))
         self.assertEqual((self.preferred[-1], self.inputs[-1]), ('gmail', raw))
         self.assertEqual(self.bridge.agents.rows, {'steady': 'team'})
-    def labels(self):
+    def label_rows(self):
         import time
         path = Path(self.temp.name) / 'short-labels' / (time.strftime('%Y-%m-%d') + '.jsonl')
-        return [json.loads(line)['result'] for line in path.read_text().splitlines()] if path.exists() else []
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+    def labels(self):
+        return [row['result'] for row in self.label_rows()]
     def test_a_labeler_request_goes_in_short_form_to_its_agents_account_and_is_marked_in_the_ledger(self):
         import short_label
         from test_short_label import labeler as labeler_request, SYSTEM
@@ -224,6 +226,7 @@ class BridgeTests(unittest.TestCase):
             self.call('/v1/messages', full, extra_headers=self.labeler('steady'))
         self.assertEqual(self.inputs[-1], full, 'an error while rewriting: sent as Claude Code sent it')
         self.assertEqual(self.labels(), ['other', 'unmatched', 'kept'])
+        self.assertEqual([row.get('form') for row in self.label_rows()], [None, 'agent type general-purpose', None], 'why unmatched')
         self.assertNotIn('short_label', json.dumps(self.ledger()))
     def test_most_labeler_requests_in_full_leave_a_warning_in_the_journal(self):
         from test_short_label import labeler as labeler_request
