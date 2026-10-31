@@ -269,10 +269,18 @@ def system_text(system):
     return '\n'.join(b['text'] for b in system if isinstance(b, dict) and isinstance(b.get('text'), str)) if isinstance(system, list) else ''
 
 
+def without_system_tail(messages):
+    """The messages without the role "system" turns at their end: Claude Code 2.1.316 can send some after the last user message."""
+    end = len(messages)
+    while end and isinstance(messages[end - 1], dict) and messages[end - 1].get('role') == 'system': end -= 1
+    return messages[:end]
+
+
 def labeler_block(messages):
-    """Where the labeler's text is: the index of the last text block of the last (user) message, -1 for string content; None
-    when the last message is no user message ending in the labeler's text."""
-    last = messages[-1] if isinstance(messages, list) and messages else None
+    """Where the labeler's text is: the index of the last text block of the last (user) message before any system turns, -1 for
+    string content; None when that message is no user message ending in the labeler's text."""
+    messages = without_system_tail(messages) if isinstance(messages, list) else None
+    last = messages[-1] if messages else None
     if not isinstance(last, dict) or last.get('role') != 'user': return None
     content = last.get('content')
     if isinstance(content, str): return -1 if content.startswith(FORK_PROMPT) else None
@@ -406,6 +414,7 @@ def rewrite(request):
     if not isinstance(request, dict) or not isinstance(request.get('model'), str): return None
     messages, system = request.get('messages'), request.get('system')
     if not isinstance(messages, list) or not isinstance(system, (str, list)): return None
+    messages = without_system_tail(messages)
     at = labeler_block(messages)
     if at is None: return None
     content = messages[-1]['content']

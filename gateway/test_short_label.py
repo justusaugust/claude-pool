@@ -122,6 +122,15 @@ class RecognitionTests(unittest.TestCase):
         self.assertEqual(short_label.recognise(HEADERS, bare), 'other')
         self.assertEqual(short_label.recognise(HEADERS, {**labeler(), 'tools': []}), 'labeler', 'the labeler text decides, not the tools')
 
+    def test_system_turns_after_the_labeler_text_do_not_hide_it(self):
+        # Claude Code 2.1.316 can end a request with role "system" turns, such as notes cleared at the next user message.
+        tail = labeler(); tail['messages'] += [{'role': 'system', 'content': 'fixture note', 'clear_at': 'next_user_message'},
+                                               {'role': 'system', 'content': [{'type': 'text', 'text': 'fixture'}]}]
+        self.assertEqual(short_label.recognise(HEADERS, tail), 'labeler')
+        self.assertEqual(short_label.apply(HEADERS, tail)[0], 'short')
+        answer = labeler(); answer['messages'] += [assistant('Reading'), {'role': 'system', 'content': 'fixture note'}]
+        self.assertEqual(short_label.recognise(HEADERS, answer), 'unmatched', 'before the system turns the last message is the assistant\'s')
+
     def test_claude_codes_own_short_form_passes(self):
         native = {'model': 'claude-opus-5-5', 'system': [{'type': 'text', 'text': BILLING}, {'type': 'text', 'text': SYSTEM}],
                   'messages': [user('<recent_steps>\nsaid: x\n</recent_steps>\n\n' + instruction())]}
@@ -243,6 +252,10 @@ class RewriteTests(unittest.TestCase):
         plain = labeler(); del plain['stream']; del plain['output_config']; del plain['metadata']
         sent = short_label.rewrite(plain)
         self.assertNotIn('stream', sent); self.assertNotIn('output_config', sent, 'a model without effort gets none'); self.assertNotIn('metadata', sent)
+
+    def test_system_turns_at_the_end_are_left_out(self):
+        tail = labeler(); tail['messages'].append({'role': 'system', 'content': 'fixture note', 'clear_at': 'next_user_message'})
+        self.assertEqual(short_label.rewrite(tail), short_label.rewrite(labeler()))
 
     def test_the_previous_label_is_kept_when_the_agent_still_does_that(self):
         _, text = self.content(labeler(previous='Reading <config> "a"'))
