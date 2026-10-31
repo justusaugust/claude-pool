@@ -321,6 +321,30 @@ class CountTests(unittest.TestCase):
             self.assertTrue(short_label.Counts(Path(d)).add('unmatched', '2026-10-30'))
 
 
+class FormTests(unittest.TestCase):
+    def test_an_unmatched_request_says_where_the_labeler_text_is_never_its_content(self):
+        typed = {**HEADERS, 'x-claude-code-agent-type': 'general-purpose'}
+        self.assertEqual(short_label.form(typed, labeler()), 'agent type general-purpose')
+        later = labeler()
+        later['messages'][-1]['content'] += [{'type': 'text', 'text': '<system-reminder>\nfixture secret\n</system-reminder>'},
+                                             {'type': 'text', 'text': 'fixture secret'}]
+        self.assertEqual(short_label.form(HEADERS, later), 'labeler text in block 3 of 5, then reminder, text')
+        inner = labeler(); inner['messages'][-1]['content'][-1]['text'] = 'fixture secret\n' + fork_prompt()
+        self.assertEqual(short_label.form(HEADERS, inner), 'labeler text in block 3 of 3, not at its start')
+        answer = labeler(); answer['messages'].append(assistant('fixture secret'))
+        self.assertEqual(short_label.form(HEADERS, answer), 'last message assistant, labeler text 1 back')
+        other = labeler(); other['messages'][-1]['content'][-1]['text'] = 'fixture secret'
+        self.assertEqual(short_label.form(HEADERS, other), 'labeler text missing, last blocks tool_result, reminder, text')
+        text = labeler(); text['messages'][-1]['content'] = 'fixture secret'
+        self.assertEqual(short_label.form(HEADERS, text), 'string, labeler text missing')
+        for broken in [None, {}, {'messages': 'x'}, {'messages': [None]}]:
+            self.assertIn(short_label.form(HEADERS, broken), ('no messages', 'last message None'), broken)
+
+    def test_the_day_line_carries_the_form_only_when_given(self):
+        self.assertEqual(short_label.count_line(1, 'unmatched', 'agent type x'), {'at': 1, 'result': 'unmatched', 'form': 'agent type x'})
+        self.assertEqual(short_label.count_line(1, 'short'), {'at': 1, 'result': 'short'})
+
+
 class LedgerTests(unittest.TestCase):
     def test_a_short_label_is_marked_in_the_ledger(self):
         row = ledger_line(1, 's', 'p', 'auxiliary', 'claude-opus-5-5', 'team', {'input_tokens': 900, 'output_tokens': 9}, short_label=True)

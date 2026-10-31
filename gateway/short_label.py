@@ -292,6 +292,42 @@ def recognise(headers, request):
     return 'unmatched' if isinstance(tools, list) and tools and isinstance(messages, list) and len(messages) >= 3 else 'other'
 
 
+def form(headers, request):
+    """Why an agent's request shaped like the labeler was not recognised, never its content: the agent type, the last message's
+    role, or where the labeler text is in the last message and the kinds of the blocks after it. Never raises."""
+    try:
+        if 'x-claude-code-agent-type' in headers: return 'agent type ' + str(headers['x-claude-code-agent-type'])[:40]
+        messages = request.get('messages') if isinstance(request, dict) else None
+        if not isinstance(messages, list) or not messages: return 'no messages'
+        last = messages[-1] if isinstance(messages[-1], dict) else {}
+        if last.get('role') != 'user':
+            back = next((n for n, m in enumerate(reversed(messages)) if prompt_in(m)), None)
+            return f"last message {str(last.get('role'))[:20]}" + (f', labeler text {back} back' if back is not None else '')
+        content = last.get('content')
+        if isinstance(content, str): return 'string, labeler text ' + ('inside' if FORK_PROMPT in content else 'missing')
+        blocks = content if isinstance(content, list) else []
+        kinds = [block_kind(b) for b in blocks]
+        at = next((i for i, b in enumerate(blocks) if kinds[i] in ('text', 'reminder') and FORK_PROMPT in b['text']), None)
+        if at is None: return 'labeler text missing, last blocks ' + ', '.join(kinds[-4:])
+        start = '' if blocks[at]['text'].startswith(FORK_PROMPT) else ', not at its start'
+        after = ', then ' + ', '.join(kinds[at + 1:at + 5]) if at + 1 < len(blocks) else ''
+        return f'labeler text in block {at + 1} of {len(blocks)}{start}{after}'
+    except Exception: return 'unreadable'
+
+
+def block_kind(block):
+    if not isinstance(block, dict): return 'other'
+    if block.get('type') == 'text' and isinstance(block.get('text'), str):
+        return 'reminder' if block['text'].lstrip().startswith('<system-reminder>') else 'text'
+    return str(block.get('type'))[:20]
+
+
+def prompt_in(message):
+    content = message.get('content') if isinstance(message, dict) else None
+    if isinstance(content, str): return FORK_PROMPT in content
+    return isinstance(content, list) and any(isinstance(b, dict) and FORK_PROMPT in ' '.join(texts(b)) for b in content)
+
+
 def task_of(messages):
     """The agent's task: a fork's directive, else the first text of its first user message that is no reminder."""
     for message in reversed(messages):
@@ -403,8 +439,8 @@ def apply(headers, request):
 
 # --- day counts --------------------------------------------------------------------------------------------------------------
 
-def count_line(at, result):
-    return {'at': at, 'result': result}
+def count_line(at, result, form=None):
+    return {'at': at, 'result': result, **({'form': form} if form else {})}
 
 
 def day_summary(path):
