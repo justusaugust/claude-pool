@@ -18,9 +18,9 @@ INTERACTIVE = 90 * 60   # seconds a session counts as interactive after a messag
 RELEASE = 15 * 60       # seconds the brake must stay off in a row before background work goes again (the stage flickers)
 MAX_WAIT = 3 * 3600     # seconds one request waits at most; then it goes and the journal records it
 # $ per million tokens: input, output, cache read; a cache write costs 1.25 x input for five minutes, 2 x input for an hour
-# (API list prices, October 2026).
+# (API list prices, October 2026). Sonnet 5.5 cache reads cost 0.10 since 7 October (0.05 x input), Sonnet 5 stays at 0.20.
 PRICES = [('fable', (10, 50, .25)), ('mythos', (10, 50, .25)), ('opus-5-5', (4, 20, .2)), ('opus', (5, 25, .5)),
-          ('sonnet-5', (2, 10, .2)), ('sonnet', (3, 15, .3)), ('haiku-5-5', (.1, .5, .01)), ('haiku', (1, 5, .1))]
+          ('sonnet-5-5', (2, 10, .1)), ('sonnet-5', (2, 10, .2)), ('sonnet', (3, 15, .3)), ('haiku-5-5', (.1, .5, .01)), ('haiku', (1, 5, .1))]
 
 
 def returns_at(account, now):
