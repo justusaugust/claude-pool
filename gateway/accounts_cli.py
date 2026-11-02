@@ -726,7 +726,7 @@ ACCOUNT_HELP = '\n'.join([
     '  claude-pool account remove <name> [--wait]             disconnect without interrupting running requests',
     '  claude-pool account rename <old> <new> [--wait]        rename the account on this machine; label and shortcut stay',
     '  claude-pool account reserve <name> --at <pct> | --off  last choice from a percent of its 5-hour or weekly limit',
-    '      [--hours 6-24 --timezone Europe/Stockholm] [--soft]   only during those local hours; soft: above it once no other can', '',
+    '      [--hours 6-24 --timezone Europe/Stockholm] [--soft]   only during those local hours; --soft: above it when no other account can', '',
     'rename moves the login, the long-lived token, the config row, the runtime config, the reserve and the local state',
     '(probe results, pulled readings, session pins) to the new name. It refuses a name that is already connected, that is not',
     'lowercase a-z, 0-9 and -, or under which a token of another subscription is saved. A second copy of the same token under',

@@ -28,7 +28,7 @@ After shell setup, `claude` starts pooled sessions and preserves Native administ
 | `claude-pool account add <email> --long-lived` | Enroll a one-year token that every device can use |
 | `claude-pool account remove <name> [--wait]` | Disconnect a subscription without interrupting requests |
 | `claude-pool account rename <old> <new> [--wait]` | Rename an account on this machine (label and shortcut stay); `claude-pool help account` |
-| `claude-pool account reserve <name> --at <pct>` / `--off` | Make an account the last choice from a percent of its limit |
+| `claude-pool account reserve <name> --at <pct> [--hours 6-24 --timezone <zone>] [--soft]` / `--off` | Make an account the last choice from a percent of its limit, all day or only during some hours |
 | `claude-pool conductor snapshot` / `events` / `tell` / `journal` | Tools Conductor Claude uses for herdr agents |
 | `claude-pool conductor usage [--json]` | Today's usage by project and request class (API price equivalent), the brake stage, today's brake waits and today's background-agent label requests (short form or in full) |
 | `claude-pool conductor urgent <project> [--hours N]` / `--off <project>` / `--list` | The owner waits on a project: the brake does not hold its sessions for some hours |
@@ -37,6 +37,8 @@ After shell setup, `claude` starts pooled sessions and preserves Native administ
 | `claude-native agents --json` | Native worker inventory |
 
 Native commands such as `auth`, `plugin`, `mcp`, `agents`, `install`, `doctor`, `update` and `upgrade` run without starting or contacting the pool. `claude --help` keeps Native help and adds a short pool-command guide. `claude-native` remains a direct escape to Native Claude.
+
+A reserved account is the last choice and takes no new pool work from its percent on. With `--hours 6-24 --timezone Europe/Stockholm` the reserve holds only from 06:00 to 24:00 in that time zone; outside those hours the account is used like any other, and the pool switches Shunt's settings within a minute of each edge. With `--soft` the account still takes work above its percent once no other account can take it, until its own limit; without it the reserve stays hard. A plain `--at` or `--off` clears an earlier window.
 
 An account pin is a routing preference and retains quota/failure fallback. It is not a promise to spend an exhausted account. `/cockpit unpin` returns that session to automatic routing. Pausing an account through Cockpit affects the pool globally; inspect the scope before using a pause.
 
