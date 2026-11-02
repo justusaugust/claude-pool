@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import shutil
 import sys
+import time
 
 HERE = Path(__file__).resolve().parent
 CONFIG = Path(os.environ.get('CLAUDE_POOL_CONFIG', Path.home() / '.config/claude-pool/config.json')).expanduser().resolve()
@@ -49,9 +50,10 @@ LABELS = {a['name']: a.get('label', a['name']) for a in ACCOUNTS}
 ALIASES = {a.get('alias', a['name']): a['name'] for a in ACCOUNTS}
 
 
-def backend_config(state=RUNTIME):
+def backend_config(state=RUNTIME, *, now=None):
     if not ACCOUNTS: raise RuntimeError('No accounts configured. Read docs/SETUP.md before starting the pool.')
-    from routing import backend_priority  # not at import: the control hook loads settings without routing
+    from routing import backend_options  # not at import: the control hook loads settings without routing
+    now = time.time() if now is None else now
     lines = [f'[server]\nbind = "127.0.0.1:{BACKEND_PORT}"\ndefault_provider = "anthropic"',
              '[server.auth]\ntokens_env = "POOL_CLIENT_TOKENS"',
              '[server.admin]\ntokens_env = "POOL_ADMIN_TOKENS"\nhide_observed = true',
@@ -59,10 +61,12 @@ def backend_config(state=RUNTIME):
              '[providers.anthropic]\nkind = "anthropic"\nbase_url = "https://api.anthropic.com"\nauth = "claude_oauth"']
     # Shunt picks the account for every request the pool does not steer (subagents, auxiliary, failover after the preferred
     # account): a reserved account gets its hard cap (resolved for the 5h, weekly and Fable windows) and a priority after
-    # every unreserved account, so it is Shunt's last choice too. Unreserved accounts keep Shunt's defaults.
+    # every unreserved account, so it is Shunt's last choice too; a soft reserve only the priority. Shunt has no clock: a
+    # reserve window gets the options of the current hour, and the pool service switches them at its edges
+    # (accounts_cli.apply_reserve_windows). Unreserved accounts keep Shunt's defaults.
     lines.extend('[[providers.anthropic.accounts]]\nname = ' + json.dumps(a['name'])
-                 + ('\nmax_utilization = ' + repr(a['reserveAt'] / 100) + '\npriority = ' + str(backend_priority(a['reserveAt']))
-                    if a.get('reserveAt', 0) > 0 else '') for a in ACCOUNTS)
+                 + ''.join('\n' + key + ' = ' + repr(value) for key, value in backend_options(a, now).items() if value is not None)
+                 for a in ACCOUNTS)
     return '\n\n'.join(lines) + '\n'
 
 

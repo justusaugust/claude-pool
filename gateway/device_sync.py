@@ -250,7 +250,8 @@ def receive_account(name, data, journal=None):
     if (entry.get('reserveAt') or 0) > 0:
         try:
             config, binary, paths, env = accounts_cli.local_context()
-            accounts_cli.reserve(config, binary, paths, env, local, entry['reserveAt'], registry_path=False)
+            accounts_cli.reserve(config, binary, paths, env, local, entry['reserveAt'], hours=entry.get('reserveHours'),
+                                 timezone=entry.get('reserveTimezone'), soft=bool(entry.get('reserveSoft')), registry_path=False)
         except Exception:
             # The install stands; the failure is recorded for diagnostics, never in the return value.
             if journal is not None:

@@ -1,5 +1,6 @@
 """Guided subscription enrollment. Shunt owns OAuth, token refresh and routing."""
 import argparse
+import contextlib
 import copy
 import fcntl
 import json
@@ -17,7 +18,7 @@ import urllib.error
 import urllib.request
 
 from account_login import login
-from account_metadata import load
+from account_metadata import RESERVE_WINDOW, check_reserve, load, reserve_hours_ok, time_zone_ok
 import long_lived
 from long_lived import fingerprint, kind
 from private_files import atomic_write, private_directory, read_private, write_private
@@ -219,12 +220,19 @@ def refuse_other_name(rows, stores, name, info, known):
                            + '); choose another --name. Nothing was enrolled.')
 
 
-def apply_change(config, binary, paths, env, change_value, change_toml,
-                 rejected='Backend rejected the change; live membership is unchanged'):
-    """The one validated write path for membership: candidates are checked before anything is written."""
+@contextlib.contextmanager
+def config_lock(config):
+    """The lock every write of config.json and the runtime TOML it describes holds."""
     config.parent.mkdir(parents=True, exist_ok=True)
     with (config.parent / ('.' + config.name + '.lock')).open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def apply_change(config, binary, paths, env, change_value, change_toml,
+                 rejected='Backend rejected the change; live membership is unchanged'):
+    """The one validated write path for membership: candidates are checked before anything is written."""
+    with config_lock(config):
         value = load(config)
         change_value(value)
         candidates = [(p, change_toml(p.read_text())) for p in paths if p.exists()]
@@ -298,21 +306,96 @@ def set_account_option(text, name, key, value):
     return candidate
 
 
-def reserve(config, binary, paths, env, name, pct, *, registry_path=None):
+def set_reserve_options(text, name, options):
+    """Write Shunt's reserve options (routing.backend_options; None leaves a key out) into the table named `name`: the
+    text stays as it is when the table already holds them, else both keys go and the set ones follow in that order."""
+    rows = tomllib.loads(text).get('providers', {}).get('anthropic', {}).get('accounts', [])
+    row = next((r for r in rows if r.get('name') == name), None)
+    if row is None or all(row.get(key) == value for key, value in options.items()): return text
+    for key in options: text = set_account_option(text, name, key, None)
+    for key, value in options.items():
+        if value is not None: text = set_account_option(text, name, key, value)
+    return text
+
+
+def reserve_window_toml(text, accounts, now):
+    """`text` with the reserve options for `now` (epoch seconds) on every account that has reserveHours; every other byte
+    stays the same."""
+    for account in accounts:
+        if account.get('reserveHours'): text = set_reserve_options(text, account['name'], routing.backend_options(account, now))
+    return text
+
+
+def apply_reserve_windows(config, paths, now):
+    """Shunt has no clock: write each reserve window's options for `now` into every runtime TOML in `paths` that exists,
+    atomically and only when that changes it. True when something changed. No `shunt check`: these are the values
+    `reserve` validated, at the hour they apply to."""
+    config = Path(config)
+    if not any(row.get('reserveHours') for row in load(config).get('accounts', [])): return False
+    changed = False
+    with config_lock(config):  # never between `reserve` reading a runtime file and writing it
+        accounts = load(config).get('accounts', [])
+        for path in map(Path, paths):
+            if not path.exists(): continue
+            text = path.read_text()
+            content = reserve_window_toml(text, accounts, now)
+            if content != text: atomic_write(path, content); changed = True
+    return changed
+
+
+def reserve_fields(pct, hours=None, timezone=None, soft=False):
+    """The reserve fields a config or registry row stores: `reserveAt` (0 = off), and only with a reserve its window
+    (reserveHours and reserveTimezone) and reserveSoft when soft."""
+    if not pct and (hours is not None or timezone is not None or soft): raise ValueError('A reserve window or soft reserve needs a percent')
+    fields = {'reserveAt': pct or 0}
+    if hours is not None: fields['reserveHours'] = list(hours)
+    if timezone is not None: fields['reserveTimezone'] = timezone
+    if soft: fields['reserveSoft'] = True
+    check_reserve(fields)
+    return fields
+
+
+def reserve_of(row):
+    """The reserve of a config or registry row as one comparable value: (percent, hours, zone, soft), all off at 0 %."""
+    pct = row.get('reserveAt') or 0
+    if not pct: return (0, None, None, False)
+    return (pct, row.get('reserveHours'), row.get('reserveTimezone'), bool(row.get('reserveSoft')))
+
+
+def reserve_words(reserve):
+    """`90 % 06:00-24:00 Europe/Stockholm, soft` for a reserve_of value."""
+    pct, hours, zone, soft = reserve
+    return str(pct) + ' %' + (' %02d:00-%02d:00 %s' % (hours[0], hours[1], zone) if hours else '') + (', soft' if soft else '')
+
+
+def reserve_args(reserve):
+    """The `claude-pool account reserve <name>` arguments that set a reserve_of value."""
+    pct, hours, zone, soft = reserve
+    if not pct: return ' --off'
+    return ' --at ' + str(pct) + (' --hours %d-%d --timezone %s' % (hours[0], hours[1], zone) if hours else '') + (' --soft' if soft else '')
+
+
+def reserve(config, binary, paths, env, name, pct, *, hours=None, timezone=None, soft=False, registry_path=None):
     """Make `name` the pool's last choice from `pct` percent (None = off). Same validated write path as membership.
     Shunt (pinned e147f9b9, src/accounts.rs resolved_max_utilization): an account-level `max_utilization` caps every
     quota window (5h, weekly and Fable 7d_oi) and excludes the account from selection at or above it, with or without
     [server.pool]; no per-window key is needed. Below it, `priority` (routing.backend_priority, ordered before headroom)
     makes it Shunt's last choice for the requests the pool does not steer (subagents, auxiliary, failover); one write sets
     or removes both. The pool layer (routing.choose) applies the same order and limit on merged readings.
+    With `hours` [start, end] and `timezone` the reserve holds only from start to end o'clock there; `soft` lets it take
+    work above its limit once no other account can (Shunt then gets only the priority, no cap). This hour's options are
+    written now; the pool service switches them at the window's edges (apply_reserve_windows). A reserve without a window,
+    or off, clears an earlier window.
     The registry entry (when there is one) follows so other devices apply it; the hook passes no registry_path."""
+    fields = reserve_fields(pct, hours, timezone, soft)
     if not any(r['name'] == name for r in load(config).get('accounts', [])):
         raise RuntimeError('No account named ' + name + ' is connected (see claude-pool account list)')
-    def change(value):
-        next(r for r in value['accounts'] if r['name'] == name)['reserveAt'] = pct or 0
-    def change_toml(text):
-        text = set_account_option(text, name, 'max_utilization', pct / 100 if pct else None)
-        return set_account_option(text, name, 'priority', routing.backend_priority(pct) if pct else None)
+    def follow(row):
+        for key in RESERVE_WINDOW: row.pop(key, None)
+        row.update(fields)
+    def change(value): follow(next(r for r in value['accounts'] if r['name'] == name))
+    now = time.time()
+    def change_toml(text): return set_reserve_options(text, name, routing.backend_options(fields, now))
     apply_change(config, binary, paths, env, change, change_toml, rejected='Backend rejected the reserve; live routing is unchanged')
     if registry_path is not False:
         try:
@@ -320,7 +403,7 @@ def reserve(config, binary, paths, env, name, pct, *, registry_path=None):
             mine = member_identity(env.get('SHUNT_CLAUDE_ACCOUNTS_DIR'), name)
             entry = registry.entry_for(registry.load(registry_path), mine)
             if entry is not None:
-                def note(value): registry.account(value, entry['name'])['reserveAt'] = pct or 0
+                def note(value): follow(registry.account(value, entry['name']))
                 registry.update(note, registry_path)
         except ValueError: pass  # an unreadable registry never undoes a reserve that is already applied
 
@@ -343,19 +426,21 @@ def local_context():
 
 
 def reserve_hook(value, context=None):
-    """Device sync: apply each registry `reserveAt` that differs from this device (never syncs onward). Tries every account,
-    then raises one error naming the failed ones (names only) so device sync records the hook as failed."""
+    """Device sync: apply each registry reserve (reserveAt, its window or soft) that differs from this device (never syncs
+    onward). Tries every account, then raises one error naming the failed ones (names only) so device sync records the hook
+    as failed."""
     try:
         config, binary, paths, env = context or local_context()
-        local = {r['name']: r.get('reserveAt', 0) for r in load(config).get('accounts', [])}
+        local = {r['name']: reserve_of(r) for r in load(config).get('accounts', [])}
         members = [member_identity(env.get('SHUNT_CLAUDE_ACCOUNTS_DIR'), name) for name in local]
     except (OSError, ValueError, RuntimeError, ImportError): return
     failed = []
     for row in value.get('accounts', []):
         # Each device holds the subscription under its own name; the registry row reaches it by UUIDs.
-        name, want = registry.local_name(row, members), row.get('reserveAt')
-        if name not in local or want is None or want == local[name]: continue
-        try: reserve(config, binary, paths, env, name, want or None, registry_path=False)
+        name, want = registry.local_name(row, members), reserve_of(row)
+        if name not in local or row.get('reserveAt') is None or want == local[name]: continue
+        pct, hours, zone, soft = want
+        try: reserve(config, binary, paths, env, name, pct or None, hours=hours, timezone=zone, soft=soft, registry_path=False)
         except Exception: failed.append(name)
     if failed: raise RuntimeError('Reserve not applied for: ' + ', '.join(failed))
 
@@ -482,7 +567,7 @@ def enroll_steps(args, email, name, entry, *, config, stores, binary, runtime, b
               'expiresAt': long_lived.expires_at_ms(value)}
     def wanted(current):
         old = registry.account(current, name) or {}
-        return {**shared, **({'reserveAt': old['reserveAt']} if 'reserveAt' in old else {})}
+        return {**shared, **{key: old[key] for key in ('reserveAt', *RESERVE_WINDOW) if key in old}}
     def upsert(current):
         current['accounts'] = [r for r in current['accounts'] if r['name'] != name] + [wanted(current)]
     known = registry.load(registry_path)
@@ -640,7 +725,8 @@ ACCOUNT_HELP = '\n'.join([
     '  claude-pool account add <email> --long-lived [--replace] [--from-file F] [--name N]   a one-year token every device can use',
     '  claude-pool account remove <name> [--wait]             disconnect without interrupting running requests',
     '  claude-pool account rename <old> <new> [--wait]        rename the account on this machine; label and shortcut stay',
-    '  claude-pool account reserve <name> --at <pct> | --off  last choice from a percent of its 5-hour or weekly limit', '',
+    '  claude-pool account reserve <name> --at <pct> | --off  last choice from a percent of its 5-hour or weekly limit',
+    '      [--hours 6-24 --timezone Europe/Stockholm] [--soft]   only during those local hours; soft: above it once no other can', '',
     'rename moves the login, the long-lived token, the config row, the runtime config, the reserve and the local state',
     '(probe results, pulled readings, session pins) to the new name. It refuses a name that is already connected, that is not',
     'lowercase a-z, 0-9 and -, or under which a token of another subscription is saved. A second copy of the same token under',
@@ -914,6 +1000,18 @@ def percent(text):
     return int(text)
 
 
+def hour_range(text):
+    match = re.fullmatch('([0-9]{1,2})-([0-9]{1,2})', text)
+    hours = [int(match[1]), int(match[2])] if match else None
+    if not reserve_hours_ok(hours): raise argparse.ArgumentTypeError('--hours must be START-END in whole hours with 0 <= START < END <= 24, such as 6-24')
+    return hours
+
+
+def time_zone(text):
+    if not time_zone_ok(text): raise argparse.ArgumentTypeError('--timezone must be an IANA time zone this machine knows, such as Europe/Stockholm')
+    return text
+
+
 def cli(argv, *, on_change=None, **options):
     """Run an account command. After a successful add or remove, `on_change()` (a device sync) reports one line per
     device; a failing sync never changes the exit code of a change that already succeeded."""
@@ -947,7 +1045,13 @@ def run_cli(argv, *, config, stores, binary, runtime, backend_source=None, backe
     mode = reserved.add_mutually_exclusive_group(required=True)
     mode.add_argument('--at', type=percent, metavar='PCT', help='Reserve from this percent (1-99) of its 5-hour or weekly limit')
     mode.add_argument('--off', action='store_true', help='Use the account like any other again')
+    reserved.add_argument('--hours', type=hour_range, metavar='START-END', help='Only from START to END o\'clock (0-24), such as 6-24; needs --timezone')
+    reserved.add_argument('--timezone', type=time_zone, metavar='ZONE', help='The IANA time zone of --hours, such as Europe/Stockholm')
+    reserved.add_argument('--soft', action='store_true', help='Above its percent it still takes work once no other account can')
     args = parser.parse_args(argv)
+    if args.command == 'reserve':
+        if args.off and (args.hours or args.timezone or args.soft): reserved.error('--hours, --timezone and --soft need --at')
+        if (args.hours is None) != (args.timezone is None): reserved.error('--hours and --timezone go together')
     config, stores, binary, runtime = map(Path, (config, stores, binary, runtime))
     directory = Path(long_lived) if long_lived else stores.parent / 'claude-long-lived'
     if args.command == 'remove':
@@ -962,10 +1066,15 @@ def run_cli(argv, *, config, stores, binary, runtime, backend_source=None, backe
         row = next((r for r in load(config).get('accounts', []) if r['name'] == args.name), None)
         if row is None: raise RuntimeError('No account named ' + args.name + ' is connected (see claude-pool account list)')
         paths, env = local_paths_env(runtime, stores, backend_source, backend_env)
-        reserve(config, binary, paths, env, args.name, None if args.off else args.at, registry_path=registry_path)
+        reserve(config, binary, paths, env, args.name, None if args.off else args.at, hours=args.hours, timezone=args.timezone,
+                soft=args.soft, registry_path=registry_path)
         label = row.get('label', row['name'])
         if args.off: print(label + ' is no longer reserved.')
-        else: print('Reserved ' + label + ' from ' + str(args.at) + '%: last choice, and no new pool work at or above ' + str(args.at) + '% of its 5-hour or weekly limit.')
+        else:
+            hours = ' from %02d:00 to %02d:00 %s' % (args.hours[0], args.hours[1], args.timezone) if args.hours else ''
+            print('Reserved ' + label + ' from ' + str(args.at) + '%' + hours + ': last choice, and no new pool work at or above '
+                  + str(args.at) + '% of its 5-hour or weekly limit' + (' while another account can take it' if args.soft else '') + '.'
+                  + (' Outside those hours it is used like any other account.' if args.hours else ''))
         return 0
     if args.command == 'list':
         for row in load(config).get('accounts', []):

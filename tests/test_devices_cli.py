@@ -1280,6 +1280,23 @@ class CheckTests(OrchestrationBase):
             code, out, err = self.cli('check', 'mac')
         hook.assert_called_once(); self.assertNotRegex(out, r'failed +accounts')
 
+    def test_check_compares_the_reserve_window_too(self):
+        window = {'reserveAt': 90, 'reserveHours': [6, 24], 'reserveTimezone': 'Europe/Stockholm', 'reserveSoft': True}
+        registry.update(lambda value: registry.account(value, 'team').update(window), self.reg)
+        self.config.write_text(json.dumps({'accounts': [{'name': 'team', 'label': 'Team', 'reserveAt': 90}]}))
+        self.local.registry = self.vps.registry = registry.load(self.reg)
+        with patch.object(accounts_cli, 'reserve_hook') as hook:
+            code, out, _ = self.cli('check', 'mac')
+        hook.assert_called_once()
+        self.assertEqual(code, 2)
+        self.assertIn('team reserve 90 % here, 90 % 06:00-24:00 Europe/Stockholm, soft in the registry', out)
+        self.assertIn('fix: claude-pool account reserve team --at 90 --hours 6-24 --timezone Europe/Stockholm --soft', out)
+
+        def apply(value): self.config.write_text(json.dumps({'accounts': [{'name': 'team', 'label': 'Team', **window}]}))
+        with patch.object(accounts_cli, 'reserve_hook', side_effect=apply):
+            code, out, err = self.cli('check', 'mac')
+        self.assertNotRegex(out, r'failed +accounts')
+
     def test_check_json_reports_every_device(self):
         code, out, err = self.cli('check', '--json')
         value = json.loads(out)
