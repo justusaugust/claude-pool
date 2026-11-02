@@ -1,6 +1,8 @@
 """Session demand is a routing preference; Shunt still enforces eligibility."""
+from datetime import datetime
 import re
 import time
+from zoneinfo import ZoneInfo
 
 ACTIVE_SECONDS = 300
 REASONS = {'manual selection', 'cache affinity', 'shared capacity', 'new session',
@@ -21,7 +23,7 @@ def profile(request):
     return {'model': model, 'effort': effort, 'workload': family + '/' + effort}
 
 
-def unavailable(account):
+def unavailable(account, now=None):
     if not account: return 'upstream failover'
     status = account['status']
     if status == 'paused': return 'account paused'
@@ -30,25 +32,65 @@ def unavailable(account):
     if account.get('quotaLimits', {}).get('sevenDay', {}).get('status') == 'rejected': return 'weekly quota exhausted'
     if account.get('sevenDay') and account['sevenDay']['pct'] >= 95: return 'weekly quota exhausted'
     if account.get('fiveHour') and account['fiveHour']['pct'] >= 95: return 'five-hour quota exhausted'
-    if reserve_blocked(account): return 'reserved account'
+    if reserve_blocked(account, now): return 'reserved account'
     return 'quota or upstream failover'
 
 
-def reserve_blocked(account):
-    """A reserved account takes no new pool work once any window reaches its reserve limit."""
+def reserve_active(account, now):
+    """Whether the reserve window holds at `now` (epoch seconds): always without `reserveHours`, else while
+    start <= local hour < end in `reserveTimezone`. A zone this machine cannot load keeps the reserve."""
+    hours = account.get('reserveHours')
+    if not hours: return True
+    try: hour = datetime.fromtimestamp(now, ZoneInfo(account['reserveTimezone'])).hour
+    except (KeyError, ValueError, TypeError, OSError): return True
+    return hours[0] <= hour < hours[1]
+
+
+def reserve_limit(account, now):
+    """The reserve percent that holds at `now` (epoch seconds): `reserveAt` all day, or only inside its window; 0 otherwise."""
     limit = account.get('reserveAt') or 0
+    return limit if limit > 0 and reserve_active(account, now) else 0
+
+
+def reserve_text(account, now):
+    """The reserve as status lines show it: 'reserved from 75%' all day; with a window 'reserved from 90% until 24:00'
+    while it holds and 'reserved from 90% from 06:00' otherwise; '' without a reserve."""
+    limit = account.get('reserveAt') or 0
+    if limit <= 0: return ''
+    hours = account.get('reserveHours')
+    edge = '' if not hours else ' until %02d:00' % hours[1] if reserve_active(account, now) else ' from %02d:00' % hours[0]
+    return 'reserved from ' + str(limit) + '%' + edge
+
+
+def reserve_blocked(account, now=None):
+    """A reserved account takes no new pool work once any window reaches the reserve limit that holds at `now`."""
+    limit = reserve_limit(account, time.time() if now is None else now)
     return limit > 0 and any(account.get(k) and account[k]['pct'] >= limit for k in ('fiveHour', 'sevenDay', 'fableWeekly'))
 
 
-def eligible(account):
+def open_quota(account):
+    """Ready, and both all-model windows under 95 %."""
+    return account['status'] == 'ready' and all(not account.get(k) or account[k]['pct'] < 95 for k in ('fiveHour', 'sevenDay'))
+
+
+def eligible(account, now=None):
     """Takes new pool work: ready, both all-model windows under 95 %, and not held back by its reserve."""
-    return account['status'] == 'ready' and all(not account.get(k) or account[k]['pct'] < 95 for k in ('fiveHour', 'sevenDay')) and not reserve_blocked(account)
+    return open_quota(account) and not reserve_blocked(account, now)
 
 
 def backend_priority(reserve_at):
     """Shunt's per-account priority (lower is preferred, default 100): a reserved account comes after every other,
     and the larger its reserve the later (99 -> 101, 85 -> 115)."""
     return 200 - reserve_at if reserve_at else 100
+
+
+def backend_options(account, now):
+    """Shunt's reserve options for `account` at `now`, in the order they are written (None: the key is left out). A hard
+    reserve that holds gets its cap and a late priority; a soft one only the priority, so Shunt still uses it after every
+    other account and the pool may send it work once no other account can; outside its window it gets neither."""
+    limit = reserve_limit(account, now)
+    return {'max_utilization': limit / 100 if limit and not account.get('reserveSoft') else None,
+            'priority': backend_priority(limit) if limit else None}
 
 
 def session_rows(sessions, now):
@@ -90,7 +132,9 @@ def choose(accounts, sessions, session_id, forecast, now):
     state = sessions[session_id]
     rows = [r for r in session_rows({k: v for k, v in sessions.items() if k != session_id}, now)
             if r['busy'] or now - r['lastRequestAt'] / 1000 <= ACTIVE_SECONDS]
-    ready = [a for a in accounts if eligible(a)]
+    ready = [a for a in accounts if eligible(a, now)]
+    if not ready:  # every account is out: a soft reserve goes on above its limit until its quota ends; a hard one never does
+        ready = [a for a in accounts if a.get('reserveSoft') and open_quota(a)]
     by_name = {a['name']: a for a in accounts}
     loads = {a['name']: sum(r['account'] == a['name'] for r in rows) for a in accounts}
     busy = {a['name']: sum(r['account'] == a['name'] and r['busy'] for r in rows) for a in accounts}
@@ -100,14 +144,14 @@ def choose(accounts, sessions, session_id, forecast, now):
         return {'account': pin, 'reason': 'manual selection', 'peers': loads[pin]}
     if not ready:
         keep = pin or previous  # a reserved account at its limit is never the preferred account: no header steers to it
-        return {'account': None if keep in by_name and reserve_blocked(by_name[keep]) else keep, 'reason': 'no eligible account', 'peers': 0}
+        return {'account': None if keep in by_name and reserve_blocked(by_name[keep], now) else keep, 'reason': 'no eligible account', 'peers': 0}
     # Remaining time is comparable across plans; percentages are not.
     def score(a):
         name = a['name']; capacity = seconds.get(name)
-        return (backend_priority(a.get('reserveAt')), busy[name], loads[name], -(capacity or 0), name)
+        return (backend_priority(reserve_limit(a, now)), busy[name], loads[name], -(capacity or 0), name)
     best = min(ready, key=score)['name']
-    held = previous in by_name and backend_priority(by_name[previous].get('reserveAt')) > backend_priority(by_name[best].get('reserveAt'))
-    reason = unavailable(by_name.get(pin or previous)) if pin or previous else 'new session'
+    held = previous in by_name and backend_priority(reserve_limit(by_name[previous], now)) > backend_priority(reserve_limit(by_name[best], now))
+    reason = unavailable(by_name.get(pin or previous), now) if pin or previous else 'new session'
     if previous and held and not pin and any(a['name'] == previous for a in ready): reason = 'shared capacity'  # a reserved account never keeps a session while an earlier choice is ready
     elif previous and any(a['name'] == previous for a in ready) and not pin:
         remaining = seconds.get(previous)

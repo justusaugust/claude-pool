@@ -12,6 +12,7 @@ import json
 import re
 import time
 
+from account_metadata import RESERVE_WINDOW, check_reserve
 from private_files import private_directory, read_private, write_private
 import settings
 
@@ -22,7 +23,7 @@ TOKEN_PREFIX = 'sk-' + 'ant-'
 TOP = {'version', 'generation', 'updatedAt', 'devices', 'accounts', 'conductor', 'conductorGeneration', 'removed'}
 DEVICE_KEYS = {'name', 'ssh', 'platform', 'roles', 'tailscaleIp', 'cua', 'cuaTunnels', 'herdrSession', 'herdrSessions', 'addedAt', 'generation'}
 ACCOUNT_TEXT = ['label', 'alias', 'plan', 'email', 'organization', 'userId', 'organizationId', 'fingerprint']
-ACCOUNT_KEYS = {'name', 'expiresAt', 'reserveAt', 'generation', *ACCOUNT_TEXT}
+ACCOUNT_KEYS = {'name', 'expiresAt', 'reserveAt', *RESERVE_WINDOW, 'generation', *ACCOUNT_TEXT}
 TOMBSTONE_KEYS = {'kind', 'name', 'generation', 'fingerprint'}
 KINDS = {'device': 'devices', 'account': 'accounts'}
 CONDUCTOR_KEYS = {'device', 'email', 'organization', 'cwd'}
@@ -89,7 +90,7 @@ def check_account(row):
     if not isinstance(row.get('name'), str) or not row['name']: raise ValueError('Account needs a name')
     for key in ACCOUNT_TEXT: optional_text(row, key)
     if row.get('expiresAt') is not None and not is_int(row['expiresAt']): raise ValueError('expiresAt must be an integer or null')
-    if 'reserveAt' in row and not (is_int(row['reserveAt']) and 0 <= row['reserveAt'] <= 99): raise ValueError('reserveAt must be an integer from 0 to 99')
+    check_reserve(row)
     check_generation(row)
 
 
