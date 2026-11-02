@@ -129,8 +129,10 @@ class ShuntConfigTests(unittest.TestCase):
         rows = [{'name': 'ops'}, {'name': 'intern', **WINDOW}, {'name': 'team', 'reserveAt': 75},
                 {'name': 'gmail', 'reserveAt': 80, 'reserveHours': [6, 24], 'reserveTimezone': ZONE}]
         day, night = self.blocks(self.config(rows, DAY)), self.blocks(self.config(rows, NIGHT))
-        # Soft: only the order (Shunt uses it once every other account is out), no cap, so the pool may still send work.
-        self.assertEqual(day['intern'], {'name': 'intern', 'priority': 110})
+        # Soft: no cap, so the pool may still send work, and a priority after every hard reserve too (those stay <= 199):
+        # Shunt cannot tell 89 % from 92 %, so it uses the account only once every other account is out.
+        self.assertEqual(day['intern'], {'name': 'intern', 'priority': 200})
+        self.assertGreater(day['intern']['priority'], routing.backend_priority(1))
         self.assertEqual(night['intern'], {'name': 'intern'})
         self.assertEqual(day['gmail'], {'name': 'gmail', 'max_utilization': 0.8, 'priority': 120})
         self.assertEqual(night['gmail'], {'name': 'gmail'})
@@ -143,7 +145,7 @@ class ShuntConfigTests(unittest.TestCase):
         accounts = [{'name': 'ops'}, {'name': 'intern', **WINDOW}, {'name': 'team', 'reserveAt': 75}]
         self.assertEqual(setup.reserve_window_toml(BASE, accounts, at('2026-11-03T05:59')), BASE)
         day = setup.reserve_window_toml(BASE, accounts, at('2026-11-03T06:00'))
-        self.assertEqual(day, BASE.replace('name = "intern"\n', 'name = "intern"\npriority = 110\n'))
+        self.assertEqual(day, BASE.replace('name = "intern"\n', 'name = "intern"\npriority = 200\n'))
         self.assertEqual(setup.reserve_window_toml(day, accounts, at('2026-11-03T23:00')), day)
         self.assertEqual(setup.reserve_window_toml(day, accounts, at('2026-11-04T00:00')), BASE)
 
@@ -156,7 +158,7 @@ class ShuntConfigTests(unittest.TestCase):
             self.assertFalse(setup.apply_reserve_windows(config, [toml], NIGHT))
             self.assertEqual(toml.read_text(), BASE)
             self.assertTrue(setup.apply_reserve_windows(config, [toml], DAY))
-            self.assertIn('name = "intern"\npriority = 110\n', toml.read_text())
+            self.assertIn('name = "intern"\npriority = 200\n', toml.read_text())
             self.assertFalse(setup.apply_reserve_windows(config, [toml], DAY + 60))
             self.assertTrue(setup.apply_reserve_windows(config, [toml], at('2026-11-04T00:00')))
             self.assertEqual(toml.read_text(), BASE)
@@ -253,7 +255,7 @@ class ReserveCliTests(unittest.TestCase):
         code, _ = self.run_cli('reserve', 'intern', '--at', '90', '--hours', '6-24', '--timezone', ZONE, '--soft')
         self.assertEqual(code, 0)
         self.assertEqual({k: self.row('intern')[k] for k in WINDOW}, WINDOW)
-        self.assertIn('name = "intern"\npriority = 110\n', self.toml.read_text())
+        self.assertIn('name = "intern"\npriority = 200\n', self.toml.read_text())
         self.assertEqual(self.row('team'), {'name': 'team', 'reserveAt': 75})
         self.assertEqual({k: registry.account(registry.load(self.reg), 'intern')[k] for k in WINDOW}, WINDOW)
 
@@ -278,7 +280,7 @@ class ReserveCliTests(unittest.TestCase):
         with patch('time.time', return_value=DAY):
             setup.reserve_hook(registry.load(self.reg), (self.config, self.binary, paths, env))
         self.assertEqual({k: self.row('intern')[k] for k in WINDOW}, WINDOW)
-        self.assertIn('name = "intern"\npriority = 110\n', self.toml.read_text())
+        self.assertIn('name = "intern"\npriority = 200\n', self.toml.read_text())
 
 
 if __name__ == '__main__':

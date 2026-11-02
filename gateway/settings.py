@@ -61,9 +61,9 @@ def backend_config(state=RUNTIME, *, now=None):
              '[providers.anthropic]\nkind = "anthropic"\nbase_url = "https://api.anthropic.com"\nauth = "claude_oauth"']
     # Shunt picks the account for every request the pool does not steer (subagents, auxiliary, failover after the preferred
     # account): a reserved account gets its hard cap (resolved for the 5h, weekly and Fable windows) and a priority after
-    # every unreserved account, so it is Shunt's last choice too; a soft reserve only the priority. Shunt has no clock: a
-    # reserve window gets the options of the current hour, and the pool service switches them at its edges
-    # (accounts_cli.apply_reserve_windows). Unreserved accounts keep Shunt's defaults.
+    # every unreserved account, so it is Shunt's last choice too; a soft reserve gets no cap and a priority after every
+    # hard reserve. Shunt has no clock: a reserve window gets the options of the current hour, and the pool service
+    # switches them at its edges (accounts_cli.apply_reserve_windows). Unreserved accounts keep Shunt's defaults.
     lines.extend('[[providers.anthropic.accounts]]\nname = ' + json.dumps(a['name'])
                  + ''.join('\n' + key + ' = ' + repr(value) for key, value in backend_options(a, now).items() if value is not None)
                  for a in ACCOUNTS)

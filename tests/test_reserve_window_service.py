@@ -20,7 +20,7 @@ WINDOW = {'reserveAt': 90, 'reserveHours': [6, 24], 'reserveTimezone': ZONE, 're
 BASE = ('[providers.anthropic]\nkind = "anthropic"\nauth = "claude_oauth"\n\n'
         '[[providers.anthropic.accounts]]\nname = "ops"\n\n'
         '[[providers.anthropic.accounts]]\nname = "intern"\n\n[server]\nbind = "x"\n')
-DAY_TOML = BASE.replace('name = "intern"\n', 'name = "intern"\npriority = 110\n')
+DAY_TOML = BASE.replace('name = "intern"\n', 'name = "intern"\npriority = 200\n')
 
 
 def at(text):

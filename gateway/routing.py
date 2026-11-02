@@ -84,13 +84,18 @@ def backend_priority(reserve_at):
     return 200 - reserve_at if reserve_at else 100
 
 
+SOFT_PRIORITY = 200  # after every hard reserve (backend_priority stays <= 199)
+
+
 def backend_options(account, now):
     """Shunt's reserve options for `account` at `now`, in the order they are written (None: the key is left out). A hard
-    reserve that holds gets its cap and a late priority; a soft one only the priority, so Shunt still uses it after every
-    other account and the pool may send it work once no other account can; outside its window it gets neither."""
+    reserve that holds gets its cap and a late priority. A soft one gets no cap, so the pool may send it work once no
+    other account can, and SOFT_PRIORITY: Shunt cannot tell it below from above its limit, so it uses it only after every
+    other account, hard reserves included. Outside its window it gets neither."""
     limit = reserve_limit(account, now)
-    return {'max_utilization': limit / 100 if limit and not account.get('reserveSoft') else None,
-            'priority': backend_priority(limit) if limit else None}
+    soft = bool(account.get('reserveSoft'))
+    return {'max_utilization': limit / 100 if limit and not soft else None,
+            'priority': (SOFT_PRIORITY if soft else backend_priority(limit)) if limit else None}
 
 
 def session_rows(sessions, now):
