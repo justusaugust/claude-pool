@@ -6,6 +6,7 @@ environment and is never printed, logged or put in argv. `host setup` output can
 When a firewall drops port 3211 on the way to a peer (only ssh gets through), the registering device reaches the peer's host
 through an SSH tunnel that claude-pool owns there: a LaunchAgent or systemd user unit bound to 127.0.0.1 only, named by our
 label prefix, so a tunnel claude-pool did not create is never touched. No root is needed on either machine."""
+import concurrent.futures
 import hashlib
 import ipaddress
 import json
@@ -500,15 +501,21 @@ class _Bounded:
     def call(self, argv, stdin=None, timeout=10): return self._inner.call(argv, stdin=stdin, timeout=min(timeout, 10))
 
 
+def _tunnels(local):
+    try: return tunnels(run=local)
+    except Exception: return {}
+
+
 def _status():
+    """The host, its Spaces and the tunnels are read beside the one chain that needs order: Native, then its MCP server."""
     try:
         local = _Bounded(Local())
         if not _has_cua(local): return {'cua': None}
-        native = device_install.check_native(local)[1]
-        try: found = tunnels(run=local)
-        except Exception: found = {}
-        return {'cua': {'host': _running(_host_status(local)), 'spaces': _space_ids(local) or [],
-                        'mcp': bool(native) and local.call([native, 'mcp', 'get', 'cua']).returncode == 0, 'tunnels': found}}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+            found, state, spaces = (pool.submit(read, local) for read in (_tunnels, _host_status, _space_ids))
+            native = device_install.check_native(local)[1]
+            mcp = bool(native) and local.call([native, 'mcp', 'get', 'cua']).returncode == 0
+            return {'cua': {'host': _running(state.result()), 'spaces': spaces.result() or [], 'mcp': mcp, 'tunnels': found.result()}}
     except Exception: return {'cua': None}
 
 

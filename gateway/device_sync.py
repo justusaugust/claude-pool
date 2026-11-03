@@ -1,5 +1,6 @@
 """Move long-lived accounts and the registry between devices. Tokens travel only on ssh stdin or an ssh stdout pipe.
 Receiving never stops or starts the service; only `switch` does, and only while nothing is in flight."""
+import concurrent.futures
 import fcntl
 import json
 import os
@@ -167,13 +168,17 @@ def local_name(entry, rows=None):
 
 
 def status():
-    """Non-secret state of this device: fingerprints only, never a token."""
-    known = registry.load()
-    value = {'name': registry.self_name(), 'version': build_version(), 'platform': service.platform(), 'service': service_state(),
-             'serviceStale': service_stale(),
-             'accounts': account_rows(), 'switchPending': switch_pending(settings.STORES, settings.LONG_LIVED, known, registry.self_name()),
-             'registryGeneration': known['generation'], 'registryHash': registry.digest(known), 'serviceLabel': service_label()}
-    for part in STATUS_PARTS: value.update(part())
+    """Non-secret state of this device: fingerprints only, never a token. The STATUS_PARTS (each a read that catches its
+    own errors) run at once, beside the base keys; their keys go in in the order of the parts, as one after the other."""
+    parts = list(STATUS_PARTS)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(parts)) or 1) as pool:
+        running = [pool.submit(part) for part in parts]
+        known = registry.load()
+        value = {'name': registry.self_name(), 'version': build_version(), 'platform': service.platform(), 'service': service_state(),
+                 'serviceStale': service_stale(),
+                 'accounts': account_rows(), 'switchPending': switch_pending(settings.STORES, settings.LONG_LIVED, known, registry.self_name()),
+                 'registryGeneration': known['generation'], 'registryHash': registry.digest(known), 'serviceLabel': service_label()}
+        for part in running: value.update(part.result())
     return value
 
 

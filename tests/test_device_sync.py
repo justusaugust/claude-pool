@@ -82,6 +82,29 @@ class DeviceSyncTests(unittest.TestCase):
         self.assertEqual(device_sync.build_version(), 'sourceonly')
         self.assertEqual(device_sync.status()['version'], 'sourceonly')
 
+    def test_status_parts_run_at_once_and_give_the_same_dict(self):
+        import threading, time
+        lock, now, most = threading.Lock(), [0], [0]
+        def part(keys, wait=0.3):
+            def run():
+                with lock: now[0] += 1; most[0] = max(most[0], now[0])
+                time.sleep(wait)
+                with lock: now[0] -= 1
+                return dict(keys)
+            return run
+        def broken():
+            try: raise OSError('fixture')
+            except OSError: return {'broken': None}
+        parts = [part({'a': 1, 'shared': 'first'}), part({'b': [2]}, 0.35), part({'c': {'d': 3}}, 0.25), broken,
+                 part({'shared': 'last', 'e': None})]
+        with patch.object(device_sync, 'STATUS_PARTS', parts):
+            started = time.monotonic(); value = device_sync.status(); took = time.monotonic() - started
+        self.assertEqual({k: value[k] for k in ('a', 'b', 'c', 'broken', 'shared', 'e')},
+                         {'a': 1, 'b': [2], 'c': {'d': 3}, 'broken': None, 'shared': 'last', 'e': None})
+        self.assertEqual(list(value)[-6:], ['a', 'shared', 'b', 'c', 'broken', 'e'])
+        self.assertLess(took, 0.6, 'one part after the other takes 1.2 s')
+        self.assertGreater(most[0], 1)
+
     def test_send_account_refuses_a_terminal_and_refreshable_files(self):
         long_lived_file(self.directory, 'team')
         refreshable_file(self.directory, 'ops-refreshable', 'user-o', 'org-o')
