@@ -391,6 +391,9 @@ class FakeSystem(pv.System):
     def unit_state(self, unit):
         return "active" if unit in self.units else "inactive"
 
+    def unit_states(self, units):
+        return {u: self.unit_state(u) for u in dict.fromkeys(units) if isinstance(u, str)}  # never a real systemctl
+
     def unit_start(self, unit, desc, argv):
         self.calls.append(("unit_start", unit))
         listen = argv[argv.index("--listen") + 1]
@@ -586,6 +589,43 @@ class LifecycleTests(unittest.TestCase):
         pv.cmd_list(s, out=out)
         self.assertIn("PORT", out.getvalue())
         self.assertIn(f"http://{TS_NAME}:5173", out.getvalue())
+
+    def test_list_asks_systemctl_once_for_every_unit_it_shows(self):
+        class Counting(FakeSystem):
+            """Unit states come from `systemctl --user is-active` as System asks for them; one line per unit, or one line
+            less when `short` (systemctl wrote an error for a unit to stderr instead)."""
+            unit_state = pv.System.unit_state
+            unit_states = pv.System.__dict__.get("unit_states", FakeSystem.unit_states)
+            short, asked = False, []
+
+            def run(self, argv, timeout=30):
+                argv = list(argv)
+                if argv[:3] != ["systemctl", "--user", "is-active"]:
+                    raise AssertionError(argv)
+                self.asked.append(argv)
+                states = [("active" if u in self.units else "inactive") + "\n" for u in argv[3:]]
+                return subprocess.CompletedProcess(argv, 0, "".join(states[:-1] if self.short and len(states) > 1 else states), "")
+
+        s = Counting(operator=False)
+        for port in (5173, 5174, 5175, 5176):
+            run_start(s, port, "p%d" % port)
+        share = pv.load_state(5175)
+        pv.save_state({**share, "file_unit": f"{pv.FILE_UNIT_PREFIX}5175.service", "path": "/srv/alex/shared"})
+        s.units.pop(pv.load_state(5174)["unit"])
+        outputs = []
+        for short in (True, False):
+            s.short, s.asked = short, []
+            out, table = io.StringIO(), io.StringIO()
+            pv.cmd_list(s, as_json=True, out=out)
+            pv.cmd_list(s, out=table)
+            outputs.append((json.loads(out.getvalue()), table.getvalue(), len(s.asked)))
+        (fallback, fallback_table, per_unit), (rows, table, calls) = outputs
+        self.assertEqual((rows, table), (fallback, fallback_table))
+        self.assertEqual([r["proxy"] for r in rows], ["active", "inactive", "active", "active"])
+        self.assertEqual(rows[2]["file_server"], "inactive")
+        self.assertIn("/srv/alex/shared", table)
+        self.assertEqual(calls, 2)  # one for --json, one for the table
+        self.assertGreater(per_unit, calls)
 
     def test_doctor_names_the_one_command(self):
         s = FakeSystem(operator=False)
