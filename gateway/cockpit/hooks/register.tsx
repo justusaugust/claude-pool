@@ -161,16 +161,7 @@ export const register: Register = on => {
 
   on('turn.step', async function* ($, e, next) {
     const result = yield* next(e)
-    if (!e.agentId) {
-      await refreshPool($)
-      const p = await read($, pool)
-      const pressure = p && !p.error && p.wrap && p.accounts.length > 0 && p.accounts.every(a => a.status === 'limited' || a.status === 'paused' || a.status === 'reauthenticate') && p.accounts.some(a => a.status === 'limited')
-      if (pressure && !(await read($, wrapNoted))) {
-        const appended = await $.session.append({ message: { type: 'user', content: [{ type: 'text', text: 'Cockpit auto-wrap: all eligible subscriptions are near their usage limits. Finish the current safe step, record completed work and next actions, then pause for quota recovery.' }] } })
-        await update($, wrapNoted, () => !appended.deny)
-        $.ui.log('Pool near its limit; requested a checkpoint before quota recovery.')
-      } else if (!pressure) await update($, wrapNoted, () => false)
-    }
+    if (!e.agentId) void followStep($)
     return result
   })
 
@@ -1083,6 +1074,33 @@ async function refreshPool($: $) {
     })
     if (announce) $.ui.log(`${accountLabel(event.from, accounts)} → ${accountLabel(event.to, accounts)} · ${event.reason}`)
   }
+}
+
+// After a main-thread step the pool is read again for the band and the auto-wrap check while the
+// step's tools start: nothing in the step waits for /cockpit. A step during a read queues one more.
+let stepRead: 'idle' | 'running' | 'again' = 'idle'
+
+async function followStep($: $) {
+  if (stepRead !== 'idle') { stepRead = 'again'; return }
+  try {
+    do {
+      stepRead = 'running'
+      await refreshPool($)
+      await autoWrap($)
+    } while (stepRead === 'again')
+  } catch { /* The last known pool stays; the 5 s poll and the next step read it again. */ }
+  finally { stepRead = 'idle' }
+}
+
+// Once the whole known pool is limited, the main thread is asked once for a checkpoint.
+async function autoWrap($: $) {
+  const p = await read($, pool)
+  const pressure = p && !p.error && p.wrap && p.accounts.length > 0 && p.accounts.every(a => a.status === 'limited' || a.status === 'paused' || a.status === 'reauthenticate') && p.accounts.some(a => a.status === 'limited')
+  if (pressure && !(await read($, wrapNoted))) {
+    const appended = await $.session.append({ message: { type: 'user', content: [{ type: 'text', text: 'Cockpit auto-wrap: all eligible subscriptions are near their usage limits. Finish the current safe step, record completed work and next actions, then pause for quota recovery.' }] } })
+    await update($, wrapNoted, () => !appended.deny)
+    $.ui.log('Pool near its limit; requested a checkpoint before quota recovery.')
+  } else if (!pressure) await update($, wrapNoted, () => false)
 }
 
 function accountLabel(name: string, accounts: { name: string; label: string }[]) {

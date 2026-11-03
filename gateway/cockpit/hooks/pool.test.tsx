@@ -300,7 +300,7 @@ describe('cockpit pooled routing', () => {
   })
 
   test('auto-wrap requests one checkpoint only when the entire known pool is limited', async ($, on) => {
-    mock.clock(on, { now: NOW }); mock.store(on)
+    const clock = mock.clock(on, { now: NOW }); mock.store(on)
     mock.env(on, { COCKPIT_BASE_URL: 'http://127.0.0.1:18341', ANTHROPIC_AUTH_TOKEN: 'fixture-client' })
     on('session.id', () => ({ value: 'pool-session' }))
     const state = initial()
@@ -308,13 +308,50 @@ describe('cockpit pooled routing', () => {
     on('http.fetch', () => ({ value: { status: 200, ok: true, headers: {}, text: JSON.stringify(state) } }))
     on('session.append', ($, e, next) => { notes.push(JSON.stringify(e.message)); return next(e) })
     on('turn.step', async function* ($, e) { return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: null } })
-    const step = async (index: number) => { const stream = $.turn.step({ turnId: 'test', index, model: 'fixture', messageCount: 0 }); for await (const chunk of stream) void chunk }
+    // The check follows the step; settling lets the pool reply land before the next look.
+    const step = async (index: number) => { const stream = $.turn.step({ turnId: 'test', index, model: 'fixture', messageCount: 0 }); for await (const chunk of stream) void chunk; await clock.settle() }
     state.accounts[0]!.status = 'limited'
     await step(0); expect(notes.length).toBe(0)
     state.accounts[1]!.status = 'unknown'
     await step(1); expect(notes.length).toBe(0)
     state.accounts[1]!.status = 'limited'; state.ready = 0
     await step(2); await step(3); expect(notes.length).toBe(1)
+    expect(notes[0]).toMatch(/record completed work and next actions/)
+  })
+  test('a model step ends without waiting for the pool reply, and the late reply still requests one checkpoint', async ($, on) => {
+    const clock = mock.clock(on, { now: NOW }); mock.store(on)
+    mock.env(on, { COCKPIT_BASE_URL: 'http://127.0.0.1:18341', ANTHROPIC_AUTH_TOKEN: 'fixture-client' })
+    on('session.id', () => ({ value: 'pool-session' }))
+    const state = initial()
+    for (const a of state.accounts) a.status = 'limited'
+    state.ready = 0
+    const notes: string[] = []
+    let asked = 0, answered = 0
+    on('http.fetch', async () => {
+      asked++
+      await clock.sleep(20)
+      answered++
+      return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify(state) } }
+    })
+    on('session.append', ($, e, next) => { notes.push(JSON.stringify(e.message)); return next(e) })
+    on('turn.step', async function* ($, e) { return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'tool_use', usage: null } })
+    let ended = 0
+    const step = async (index: number) => { const stream = $.turn.step({ turnId: 'test', index, model: 'fixture', messageCount: 0 }); for await (const chunk of stream) void chunk; ended++ }
+    const first = step(0)
+    await clock.settle()
+    expect(ended).toBe(1)
+    expect(asked).toBe(1)
+    expect(answered).toBe(0)
+    // A second step while the first reply is still out: one more read follows it, never a second note.
+    const second = step(1)
+    await clock.settle()
+    expect(ended).toBe(2)
+    await clock.advance(20)
+    await clock.advance(20)
+    await Promise.all([first, second])
+    expect(asked).toBe(2)
+    expect(answered).toBe(2)
+    expect(notes.length).toBe(1)
     expect(notes[0]).toMatch(/record completed work and next actions/)
   })
   test('routing, session overview and renewal/workload panes retain both surfaces', async ($, on) => {
