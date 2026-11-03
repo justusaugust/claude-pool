@@ -633,6 +633,7 @@ class PoolBridge(ThreadingHTTPServer):
             self.journal.record('storage_failed')
 
     def served(self, session_id, account, usage, transformations, context=None):
+        """Records a completed answer in memory; the end of its request (proxy's finally) saves it."""
         if not session_id or not account:
             return
         with self.lock:
@@ -663,7 +664,6 @@ class PoolBridge(ThreadingHTTPServer):
                          thinkingDropped=dropped or (previous == account and state.get("thinkingDropped", False)))
             if isinstance(usage.get("output_tokens_details"), dict) and number(usage["output_tokens_details"].get("thinking_tokens")):
                 state["usage"]["output_tokens_details"] = {"thinking_tokens": usage["output_tokens_details"]["thinking_tokens"]}
-            self.save()
 
 
 class Handler(BaseHTTPRequestHandler):

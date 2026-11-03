@@ -312,6 +312,26 @@ class BridgeTests(unittest.TestCase):
         self.assertGreater(seen[0], routed, 'the first check reads Shunt after the 429')
         self.assertEqual(seen, sorted(set(seen)), 'every later check reads Shunt anew')
 
+    def state_writes(self):
+        """Every write of the state file (not its backup) from here on, as written."""
+        import bridge
+        writes, real = [], bridge.atomic_write
+        def counted(path, data):
+            if path == self.bridge.state_path: writes.append(json.loads(data))
+            return real(path, data)
+        patcher = patch('bridge.atomic_write', side_effect=counted)
+        patcher.start(); self.addCleanup(patcher.stop)
+        return writes
+
+    def test_a_finished_main_request_saves_its_result_once(self):
+        self.call()                                     # the session exists, the account reading is taken and saved
+        writes = self.state_writes()
+        self.assertEqual(self.call('/v1/messages', self.MESSAGE)[0], 200)
+        answered = [w['sessions']['test-session'] for w in writes if w['sessions']['test-session'].get('active') == 'gmail']
+        self.assertEqual(len(answered), 1, 'the answer and the end of the request are one save')
+        self.assertNotIn('inFlight', answered[0])
+        self.assertEqual(answered[0]['usage']['output_tokens'], 4)
+
     def test_quota_rejection_waits_before_resending_identical_request(self):
         self.http_status = 429
         request = b'{"model":"claude-opus-5-5","output_config":{"effort":"high"},"thinking":{"type":"adaptive"},"stream":true,"messages":[]}'
@@ -454,6 +474,7 @@ class BridgeTests(unittest.TestCase):
             'output_config':{'effort':'low'}})
         self.bridge.served('overlap','gmail',{'output_tokens':17,
             'output_tokens_details':{'thinking_tokens':7}},[],main)
+        self.bridge.save()      # the end of the request
         state = self.bridge.session('overlap')
         self.assertEqual(state['profile'], main['profile'])
         self.assertEqual(state['usage']['output_tokens_details']['thinking_tokens'],7)
@@ -508,6 +529,7 @@ class BridgeTests(unittest.TestCase):
         self.bridge.served('test-session','gmail',{'output_tokens':1,'prompt':'must-not-persist'},[])
         for index in range(60):
             self.bridge.served('test-session','team' if index%2==0 else 'gmail',{'cache_read_input_tokens':9,'cache_creation_input_tokens':3},[])
+        self.bridge.save()      # the end of the request
         state=json.loads(self.call()[1]);self.assertEqual(len(state['history']),50)
         self.assertEqual(state['history'][0]['cacheReadTokens'],9)
         self.assertNotIn('must-not-persist',self.bridge.state_path.read_text())
