@@ -583,6 +583,43 @@ class BridgeTests(unittest.TestCase):
             second.restore_pauses();self.assertTrue(self.paused['team'])
             second.save();json.loads(second.state_path.read_text())
         finally:second.server_close()
+    def test_the_backup_is_the_previous_state_file_itself_not_a_second_write(self):
+        import bridge, errno, os, stat
+        backup = self.bridge.state_path.with_suffix('.bak')
+        self.bridge.save(); self.bridge.save()
+        first, inode = self.bridge.state_path.read_text(), os.stat(self.bridge.state_path).st_ino
+        with self.bridge.lock: self.bridge.session('test-session')['project'] = 'second'
+        with patch('bridge.atomic_write', wraps=bridge.atomic_write) as write:
+            self.bridge.save()
+        self.assertEqual([c.args[0] for c in write.call_args_list], [self.bridge.state_path], 'only the state file is written')
+        self.assertEqual(backup.read_text(), first)
+        self.assertEqual(os.stat(backup).st_ino, inode, 'the backup is the previous file, by hard link')
+        self.assertEqual(json.loads(self.bridge.state_path.read_text())['sessions']['test-session']['project'], 'second')
+        for path in (self.bridge.state_path, backup): self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600, path.name)
+        self.assertEqual(sorted(p.name for p in self.bridge.state_path.parent.iterdir() if p.name.startswith('state.')), ['state.bak', 'state.json'])
+        second = self.bridge.state_path.read_text()
+        with self.bridge.lock: self.bridge.session('test-session')['project'] = 'third'
+        with patch('os.link', side_effect=OSError(errno.EPERM, 'no hard links on this file system')):
+            self.bridge.save()
+        self.assertEqual(backup.read_text(), second, 'without hard links the backup is written in full, as before')
+        self.assertNotEqual(os.stat(backup).st_ino, os.stat(self.bridge.state_path).st_ino)
+        self.assertEqual(stat.S_IMODE(os.stat(backup).st_mode), 0o600)
+        self.assertFalse(self.bridge.persistence_error)
+
+    def test_a_damaged_state_file_never_becomes_the_backup(self):
+        self.call(body={'action': 'pin', 'account': 'team'})
+        self.bridge.save()
+        self.bridge.state_path.write_text('broken write')
+        restarted = PoolBridge(('127.0.0.1', 0), self.upstream.server_port, 'fixture-client', 'fixture-admin', self.bridge.state_path)
+        try:
+            self.assertTrue(restarted.recovery['restoredBackup'])
+            restarted.save()      # the first save after start writes the backup from what it restored
+            backup = self.bridge.state_path.with_suffix('.bak')
+            self.assertEqual(json.loads(backup.read_text())['sessions']['test-session']['pin'], 'team')
+            restarted.save()
+            self.assertEqual(json.loads(backup.read_text())['sessions']['test-session']['pin'], 'team')
+        finally: restarted.server_close()
+
     def test_disk_error_does_not_truncate_a_completed_model_response(self):
         with patch('bridge.atomic_write',side_effect=OSError('fixture disk full')):
             status,body=self.call('/v1/messages',b'{"messages":[],"stream":true}')

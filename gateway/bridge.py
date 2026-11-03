@@ -26,7 +26,7 @@ import memory
 import readings
 from native_auth import NativeAuthUnavailable
 from telemetry import fable_windows, capacity
-from private_files import atomic_write
+from private_files import atomic_write, link_replace
 
 from settings import LABELS, CONFIG
 HOP = {"host", "connection", "content-length", "transfer-encoding"}
@@ -69,6 +69,7 @@ class PoolBridge(ThreadingHTTPServer):
         self.recovery = {"restarts": 0, "state": "ready"}
         self.persistence_error = False
         self._last_saved = None
+        self._wrote_state = False  # the state file on disk is the one this process last wrote (_last_saved)
         self.state_path = Path(state_path) if state_path else None
         self.history_path = self.state_path.parent / 'usage-history' if self.state_path else None
         self.history_error = False
@@ -623,10 +624,15 @@ class PoolBridge(ThreadingHTTPServer):
     def save(self):
         if not self.state_path: return
         try:
-            if self._last_saved is not None: atomic_write(self.state_path.with_suffix(".bak"), self._last_saved)
+            # The backup is the state as last saved. Once this process wrote the state file, the backup becomes that file
+            # itself by hard link; the first save after start writes it in full from what was loaded, so a damaged file on
+            # disk never becomes the backup. Without hard links it is written in full, as before.
+            backup = self.state_path.with_suffix(".bak")
+            if self._last_saved is not None and not (self._wrote_state and link_replace(self.state_path, backup)):
+                atomic_write(backup, self._last_saved)
             data = json.dumps(self.stored())
             atomic_write(self.state_path, data)
-            self._last_saved = data
+            self._last_saved, self._wrote_state = data, True
             self.persistence_error = False
         except (OSError, ValueError):
             self.persistence_error = True
