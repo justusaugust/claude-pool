@@ -872,6 +872,25 @@ def urgent_set(project, hours=None):
     return rows
 
 
+def last_line_with(path, needle, block=1 << 16):
+    """The last line of the UTF-8 text file `path` that contains `needle` (lines as str.splitlines gives them), or None.
+    It reads backwards from the end in blocks, so a large monthly file costs only the tail it needs. Each block is cut just
+    after its first newline: the part before belongs to a line the block before completes."""
+    with open(path, 'rb') as file:
+        end, head = file.seek(0, os.SEEK_END), b''
+        while end > 0:
+            start = max(0, end - block)
+            file.seek(start)
+            data, end = file.read(end - start) + head, start
+            if start:
+                cut = data.find(b'\n') + 1
+                if not cut: head = data; continue
+                head, data = data[:cut], data[cut:]
+            for line in reversed(data.decode().splitlines()):
+                if needle in line: return line
+    return None
+
+
 def usage_today(as_json=False):
     """Today's usage from the pool ledger by project and request class, API-price equivalent, plus the brake stage and
     today's background-agent label requests (short form or in full)."""
@@ -883,9 +902,9 @@ def usage_today(as_json=False):
     summary['waits'] = wait_summary(settings.RUNTIME / 'brake-waits' / (time.strftime('%Y-%m-%d') + '.jsonl'))
     summary['labels'] = short_label.day_summary(settings.RUNTIME / 'short-labels' / (time.strftime('%Y-%m-%d') + '.jsonl'))
     summary['brake'] = None
-    try:
-        lines = (settings.RUNTIME / 'usage-history' / (time.strftime('%Y-%m') + '.jsonl')).read_text().splitlines()
-        summary['brake'] = next((json.loads(l).get('forecast', {}).get('brake') for l in reversed(lines) if '"brake"' in l), None)
+    try:  # the month's file grows to more than 600 MB; only its tail is read
+        line = last_line_with(settings.RUNTIME / 'usage-history' / (time.strftime('%Y-%m') + '.jsonl'), '"brake"')
+        summary['brake'] = json.loads(line).get('forecast', {}).get('brake') if line is not None else None
     except (OSError, ValueError): pass
     if as_json: return json.dumps(summary)
     stage = (summary['brake'] or {}).get('stage') or 0

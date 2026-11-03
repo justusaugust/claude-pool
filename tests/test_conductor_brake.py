@@ -54,6 +54,49 @@ class ConductorBrakeTests(unittest.TestCase):
         text = self.run_cli('usage')[1]
         self.assertIn('pitch-riot', text); self.assertIn('Brake · stage 1: forecast ends before the next reset', text); self.assertNotIn('Sonnet', text)
 
+    def test_usage_reads_only_the_tail_of_a_large_monthly_history(self):
+        history = self.runtime / 'usage-history'; history.mkdir()
+        path = history / (time.strftime('%Y-%m') + '.jsonl')
+        with path.open('w') as file:
+            for at in range(5000):  # earlier days of the month: about 10 MB of rows with a brake
+                file.write(json.dumps({'at': at, 'forecast': {'brake': {'stage': at % 3, 'ratio': .5}, 'pad': 'y' * 1900}}) + '\n')
+            file.write(json.dumps({'at': 5000, 'forecast': {'brake': {'stage': 2, 'ratio': .9, 'resetAt': 7}}}) + '\n')
+            for at in range(100):  # 200 KB of newer rows without one: several blocks back from the end
+                file.write(json.dumps({'at': 5001 + at, 'forecast': {'pad': 'z' * 1900}}) + '\n')
+        full = next((json.loads(l).get('forecast', {}).get('brake') for l in reversed(path.read_text().splitlines()) if '"brake"' in l), None)
+        read, real = [], io.open
+        class Counted:
+            def __init__(self, inner): self.inner = inner
+            def read(self, *args):
+                data = self.inner.read(*args); read.append(len(data)); return data
+            def __enter__(self): return self
+            def __exit__(self, *error): self.inner.close()
+            def __getattr__(self, name): return getattr(self.inner, name)
+        def counting(file, *args, **kwargs):
+            handle = real(file, *args, **kwargs)
+            return Counted(handle) if str(file) == str(path) else handle
+        with mock.patch('builtins.open', counting), mock.patch('io.open', counting):
+            value = json.loads(self.run_cli('usage', '--json')[1])
+        self.assertEqual(value['brake'], full)
+        self.assertEqual(value['brake'], {'stage': 2, 'ratio': .9, 'resetAt': 7})
+        self.assertGreater(path.stat().st_size, 8 << 20)
+        self.assertLess(sum(read), 1 << 20, 'read %d bytes of a %d byte file' % (sum(read), path.stat().st_size))
+
+    def test_the_tail_read_finds_the_line_a_full_read_finds(self):
+        text = ('{"brake": 1}\n\n{"a": "ü€ brake"}\r\n{"brake": "\\u00fc", "x": "ä"}\r{"no": 1}\n{"brake": 3}\n'
+                '{"x": "brake ' + 'ö' * 50 + '"}\n{"brake": 4, "y": "' + 'é' * 30 + '"}\n{"z": 1}')
+        folder = Path(self.temp.name)
+        for name, content in [('mixed', text), ('trailing', text + '\n'), ('partial', text + '\n{"brake": 9'), ('empty', ''),
+                              ('none', '{"a": 1}\n{"b": 2}\n'), ('only', '{"brake": 7}'), ('blank', '\n\n\n')]:
+            path = folder / (name + '.jsonl'); path.write_bytes(content.encode())
+            for needle in ('"brake"', 'brake', '"x"', 'ü', '{', 'missing'):
+                lines = path.read_text().splitlines()
+                full = next((line for line in reversed(lines) if needle in line), None)
+                for block in (1, 2, 3, 5, 8, 13, 64, 1 << 16):
+                    with self.subTest(name=name, needle=needle, block=block):
+                        self.assertEqual(ct.last_line_with(path, needle, block), full)
+        with self.assertRaises(FileNotFoundError): ct.last_line_with(folder / 'gone.jsonl', '"brake"')
+
     def test_usage_counts_todays_brake_waits(self):
         from brake import wait_line
         (self.runtime / 'brake-waits').mkdir()
