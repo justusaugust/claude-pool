@@ -170,6 +170,29 @@ class HTTPTests(unittest.TestCase):
         with patch.object(self.server, 'overview', side_effect=http.client.BadStatusLine('fixture')):
             self.assertEqual(self.request('GET', '/internal/usage', headers={'Authorization': 'Bearer worker-token'})[0], 503)
 
+    def test_state_reads_the_tasks_and_the_pool_at_once_and_a_pool_failure_is_still_no_pool(self):
+        import time
+        def slow(value):
+            def read():
+                time.sleep(0.3)
+                if isinstance(value, Exception): raise value
+                return value
+            return read
+        self.server.discover = slow([])
+        human = {'Host': 'phone.test:8443', 'Tailscale-User-Login': 'owner@test'}
+        worker = {'Authorization': 'Bearer worker-token', 'Content-Type': 'application/json'}
+        for overview, pool in [({'accounts': []}, {'accounts': []}), (OSError('fixture'), None), (http.client.BadStatusLine('fixture'), None)]:
+            self.server.overview = slow(overview)
+            for method, path, body, headers in [('GET', '/api/state', None, human), ('POST', '/internal/overview', {}, worker)]:
+                with self.subTest(path=path, overview=overview):
+                    started = time.monotonic()
+                    status, raw = self.request(method, path, body, headers)
+                    took = time.monotonic() - started
+                    self.assertEqual(status, 200)
+                    value = json.loads(raw)
+                    self.assertEqual((value['pool'], value['tasks'], value['pending']), (pool, [], []))
+                    self.assertLess(took, 0.45, 'the tasks and then the pool take 0.6 s')
+
     def test_human_write_requires_origin_cookie_and_csrf(self):
         headers = {'Host': 'phone.test:8443', 'Tailscale-User-Login': 'owner@test', 'Content-Type': 'application/json'}
         self.assertEqual(self.request('GET', '/api/state', headers=headers)[0], 200)
