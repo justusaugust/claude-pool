@@ -1546,6 +1546,17 @@ class System:
         r = self.run(["systemctl", "--user", "is-active", unit], timeout=10)
         return (r.stdout or "").strip() or "unknown"
 
+    def unit_states(self, units):
+        """{unit: state} for many units in one systemctl call (is-active prints one line per unit, in order)."""
+        units = list(dict.fromkeys(u for u in units if isinstance(u, str)))
+        if not units:
+            return {}
+        r = self.run(["systemctl", "--user", "is-active", *units], timeout=30)
+        lines = (r.stdout or "").splitlines()
+        if len(lines) != len(units):
+            return {u: self.unit_state(u) for u in units}
+        return {u: line.strip() or "unknown" for u, line in zip(units, lines)}
+
     def unit_dir(self):
         """Where the systemd user manager reads unit files (it does not see this shell's XDG_CONFIG_HOME)."""
         return Path.home() / ".config" / "systemd" / "user"
@@ -2101,13 +2112,16 @@ def cmd_file(sysm, path, label=None, out=None, err=None):
 
 def cmd_list(sysm, as_json=False, out=None):
     out = out or sys.stdout
+    entries = all_states()
+    states = sysm.unit_states([u for e in entries for u in entry_units(e)])  # one systemctl call for every unit shown
+    state = lambda unit: states.get(unit) or sysm.unit_state(unit)
     rows = []
-    for e in all_states():
-        row = {**e, "target_listening": target_listening(sysm, e["port"]), "proxy": sysm.unit_state(e["unit"])}
+    for e in entries:
+        row = {**e, "target_listening": target_listening(sysm, e["port"]), "proxy": state(e["unit"])}
         if file_unit_of(e):
-            row["file_server"] = sysm.unit_state(file_unit_of(e))
+            row["file_server"] = state(file_unit_of(e))
         if cua_unit_of(e):
-            row["index"] = sysm.unit_state(CUA_UNIT)
+            row["index"] = state(CUA_UNIT)
         rows.append(row)
     if as_json:
         print(json.dumps(rows, indent=2), file=out)

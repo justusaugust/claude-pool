@@ -44,6 +44,7 @@ class Machine:
         self.next_pid, self.inode = 4000, 7000
         self.restore = 'same'  # what a server started by a unit brings back: same, other-workspaces, other-id, no-agents
         self.list_fails = False
+        self.short = False  # an is-enabled/is-active for several units prints a line less (an error went to stderr instead)
 
     def add(self, name, running=True, agents=(), workspaces=None, statuses=None, saved=True):
         folder = self.home / '.config/herdr/sessions' / name; folder.mkdir(parents=True)
@@ -118,8 +119,15 @@ class Machine:
         if quiet == ['daemon-reload']: return ok()
         verb, unit = quiet[0], quiet[-1]
         name = unit[len('claude-pool-herdr@'):-len('.service')] if unit.startswith('claude-pool-herdr@') else None
-        if verb == 'is-enabled': return ok() if unit in self.enabled else fail()
-        if verb == 'is-active': return ok() if unit in self.active else fail(3)
+        if verb in ('is-enabled', 'is-active'):
+            # Like systemctl: one state per unit and line (none with --quiet); exit 0 when any unit is enabled or active.
+            units, on = quiet[1:], self.enabled if verb == 'is-enabled' else self.active
+            template = (self.units / 'claude-pool-herdr@.service').exists()
+            if verb == 'is-active': states = ['active' if u in on else 'inactive' for u in units]
+            else: states = ['enabled' if u in on else 'disabled' if template else 'not-found' for u in units]
+            if self.short and len(units) > 1: states = states[:-1]
+            out = b'' if '--quiet' in args else ''.join(state + '\n' for state in states).encode()
+            return Completed(0 if any(u in on for u in units) else 1 if verb == 'is-enabled' else 3, out, b'')
         if verb == 'enable':
             if not (self.units / 'claude-pool-herdr@.service').exists(): return fail()
             self.enabled.add(unit)
@@ -330,6 +338,38 @@ class AdoptTests(Base):
         step = self.by_name(self.apply(['dashboard'], adopt=True))['dashboard']
         self.assertEqual(step.status, 'ok'); self.assertEqual(self.m.killed, []); self.assertEqual(self.starts(), [])
 
+
+class ReportTests(Base):
+    NAMES = ('dashboard', 'objekt', 'leitstand', 'scratch', 'notes', 'docs')
+
+    def sessions(self, template=True):
+        for name in self.NAMES: self.m.add(name, running=name in ('dashboard', 'leitstand', 'notes'))
+        self.m.add('trial'); (self.m.units / 'herdr-trial.service').write_text('[Service]\nExecStart=/x/herdr --session trial server\n')
+        if template: (self.m.units / device_herdr.TEMPLATE).write_text(device_herdr.template(str(self.m.herdr_path), self.m.home))
+        self.m.enabled |= {device_herdr.unit(n) for n in ('dashboard', 'objekt', 'scratch')}
+        self.m.active |= {device_herdr.unit(n) for n in ('dashboard', 'notes')}
+
+    def expected(self):
+        rows = [{'name': n, 'running': n in ('dashboard', 'leitstand', 'notes'), 'enabled': device_herdr.unit(n) in self.m.enabled,
+                 'active': device_herdr.unit(n) in self.m.active} for n in self.NAMES]
+        rows.append({'name': 'trial', 'running': True, 'unit': 'herdr-trial.service'})
+        return sorted(rows, key=lambda row: row['name'])
+
+    def systemctl(self): return [c for c in self.m.calls if c[:1] == ['systemctl']]
+
+    def test_report_asks_systemctl_once_per_question_for_every_session(self):
+        for template in (True, False):
+            with self.subTest(template=template):
+                self.setUp(); self.sessions(template)
+                value = device_herdr.report(self.host())
+                self.assertEqual(value['sessions'], self.expected())
+                self.assertEqual(value['template'], 'current' if template else 'absent')
+                self.assertEqual(len(self.systemctl()), 2)
+
+    def test_a_reply_without_one_line_per_unit_falls_back_to_one_call_per_unit(self):
+        self.sessions(); self.m.short = True
+        self.assertEqual(device_herdr.report(self.host())['sessions'], self.expected())
+        self.assertEqual(len(self.systemctl()), 2 + 2 * len(self.NAMES))
 
 class CheckTests(Base):
     FIX = 'ssh vps .local/bin/claude-pool device herdr-units'

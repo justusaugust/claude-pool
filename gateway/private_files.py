@@ -18,6 +18,20 @@ def atomic_write(path, data):
         if tmp: tmp.unlink(missing_ok=True)
 
 
+def link_replace(source, target):
+    """Makes `target` the file `source` is now, without writing it again: a hard link under a temporary name in the same
+    folder, moved onto `target`. False when no hard link can be made there (the caller then writes a copy)."""
+    tmp = target.with_name(target.name + '.' + os.urandom(6).hex() + '.link')
+    try:
+        os.link(source, tmp)
+        os.replace(tmp, target)
+        return True
+    except OSError:
+        try: tmp.unlink(missing_ok=True)
+        except OSError: pass
+        return False
+
+
 def private_directory(path):
     if path.is_symlink(): raise RuntimeError('Private directory cannot be a symlink: ' + str(path))
     path.mkdir(parents=True, exist_ok=True, mode=0o700)

@@ -24,13 +24,19 @@ class BridgeTests(unittest.TestCase):
         self.default_account = 'gmail'
         self.hold = False
         self.entered, self.release = threading.Event(), threading.Event()
+        # Shunt's admin readings: how many were asked for, whether each one is newer (a busy pool), and its answer status.
+        self.admin_reads, self.advance, self.admin_status = 0, False, 200
+        # gated: after its headers the upstream waits for go_first before its first event and for go_rest after it.
+        self.gated, self.headers_out, self.go_first, self.go_rest = False, threading.Event(), threading.Event(), threading.Event()
         owner = self
         class Upstream(BaseHTTPRequestHandler):
             def log_message(self, *args): pass
             def do_GET(self):
-                rows = [{"name": a, "account_ref": a, "has_state": True, "available": not owner.paused[a], "paused": owner.paused[a], "observed_at_5h": 1900000000, "utilization_5h": .2, "reset_5h": 2000000000} for a in owner.paused]
+                owner.admin_reads += 1
+                seen = 1900000000 + (owner.admin_reads if owner.advance else 0)
+                rows = [{"name": a, "account_ref": a, "has_state": True, "available": not owner.paused[a], "paused": owner.paused[a], "observed_at_5h": seen, "utilization_5h": .2, "reset_5h": 2000000000} for a in owner.paused]
                 body = json.dumps({"providers": [{"provider": "anthropic", "auth": "claude_oauth", "accounts": rows}]}).encode()
-                self.send_response(200); self.end_headers(); self.wfile.write(body)
+                self.send_response(owner.admin_status); self.end_headers(); self.wfile.write(body)
             def do_PATCH(self):
                 owner.paused[self.path.split('/')[-1]] = json.loads(self.rfile.read(int(self.headers['Content-Length'])))['paused']
                 self.send_response(200); self.end_headers(); self.wfile.write(b'{}')
@@ -46,10 +52,12 @@ class BridgeTests(unittest.TestCase):
                 events = [{'type': 'message_start', 'message': {'usage': {'input_tokens': 2}, 'input_transformations': []}}, {'type': 'message_delta', 'usage': {'output_tokens': 4}}]
                 if owner.complete: events.append({'type': 'message_stop'})
                 if owner.stream_events is not None: events = owner.stream_events
-                for event in events:
+                if owner.gated: owner.headers_out.set(); owner.go_first.wait(5)
+                for index, event in enumerate(events):
                     try:
                         self.wfile.write(event if isinstance(event, bytes) else ('data: '+json.dumps(event)+'\n\n').encode()); self.wfile.flush()
                         if owner.event_interval: threading.Event().wait(owner.event_interval)
+                        if owner.gated and index == 0: owner.go_rest.wait(5)
                     except OSError: break
                 if owner.keep_open: owner.release.wait(5)
         self.upstream = ThreadingHTTPServer(('127.0.0.1', 0), Upstream)
@@ -119,10 +127,10 @@ class BridgeTests(unittest.TestCase):
         self.assertIsNone(self.headers[-3].get('x-shunt-session-account'), 'a new agent: Shunt chooses')
         self.subagent(agent='other')
         self.assertEqual(self.preferred[-1], 'gmail')
-        self.paused['team'] = True; self.bridge.accounts()      # the next account sample shows team paused
+        self.paused['team'] = True; self.sample()      # the next account sample shows team paused
         self.subagent(agent='steady')
         self.assertEqual(self.preferred[-1], 'gmail', 'its account is not ready: the normal choice applies')
-        self.paused['team'] = False; self.bridge.accounts()
+        self.paused['team'] = False; self.sample()
         self.subagent(agent='steady')
         self.assertEqual(self.preferred[-1], 'gmail', 'the account that answered became its account')
     def labeler(self, agent=None):
@@ -150,11 +158,11 @@ class BridgeTests(unittest.TestCase):
         self.assertIsNone(self.headers[-1].get('x-shunt-session-account'), 'the agent\'s own first request: Shunt chooses')
         self.assertEqual(self.bridge.agents.rows['fresh'], 'team')
         self.default_account = 'gmail'
-        self.paused['team'] = True; self.bridge.accounts()
+        self.paused['team'] = True; self.sample()
         self.call('/v1/messages', raw, extra_headers=self.labeler('fresh'))    # answered by gmail
         self.assertEqual(self.preferred[-1], 'gmail')
         self.assertEqual(self.bridge.agents.rows['fresh'], 'team', 'only the agent\'s own answers decide its account')
-        self.paused['team'] = False; self.bridge.accounts()
+        self.paused['team'] = False; self.sample()
         self.call('/v1/messages', raw, extra_headers=self.labeler('fresh')); self.subagent(agent='fresh')
         self.assertEqual(self.preferred[-2:], ['team', 'team'])
     def test_a_labeler_request_is_routed_normally_while_its_agents_account_is_not_ready(self):
@@ -163,7 +171,7 @@ class BridgeTests(unittest.TestCase):
         self.default_account = 'gmail'
         self.call('/v1/messages', self.cached(), extra_headers=self.labeler('steady'))
         self.assertEqual(self.preferred[-1], 'team')
-        self.paused['team'] = True; self.bridge.accounts()      # the next account sample shows team paused
+        self.paused['team'] = True; self.sample()      # the next account sample shows team paused
         raw = json.dumps(self.cached()).encode()
         self.call('/v1/messages', raw, extra_headers=self.labeler('steady'))
         self.assertIsNone(self.headers[-1].get('x-shunt-session-account'), 'its agent\'s account is not ready: the normal choice applies')
@@ -249,6 +257,113 @@ class BridgeTests(unittest.TestCase):
         self.call('/v1/messages', b'{"model":"claude-opus-5-5","messages":[]}')
         self.assertEqual([(row['status'], row['account']) for row in self.bridge.outcomes_since(start)], [(401, 'gmail'), (200, 'gmail')])
         self.assertEqual(self.bridge.outcomes_since(int(time.time() * 1000) + 1000), [])
+
+    def sample(self):
+        """The next account sample: a new Shunt reading, as once the shared one is a few seconds old."""
+        import time
+        return self.bridge.accounts(since=time.monotonic())
+    def history(self):
+        return [line for path in sorted(self.bridge.history_path.glob('*.jsonl')) for line in path.read_text().splitlines()]
+    MESSAGE = b'{"model":"claude-opus-5-5","messages":[],"stream":true}'
+
+    def test_one_shunt_reading_serves_every_caller_for_a_few_seconds(self):
+        # Cockpit polls, the step's capacity check and the model request itself share one admin reading; the new reading
+        # is saved and archived once and its forecast computed once.
+        self.advance = True
+        self.bridge.reading_ttl = 60
+        with patch.object(self.bridge, 'forecast', wraps=self.bridge.forecast) as forecast:
+            for _ in range(10): self.assertEqual(self.call()[0], 200)
+            self.assertEqual(self.call('/pool/capacity?model=claude-opus-5-5')[0], 200)
+            self.assertEqual(self.call('/v1/messages', self.MESSAGE)[0], 200)
+        self.assertEqual(self.admin_reads, 1)
+        self.assertEqual(len(self.history()), 1, 'the new reading is archived once')
+        self.assertEqual(forecast.call_count, 1, 'its forecast is computed once')
+        self.bridge.reading_at -= 61                      # the shared reading is older than its TTL
+        self.assertEqual(self.call()[0], 200)
+        self.assertEqual((self.admin_reads, len(self.history())), (2, 2), 'then a new reading')
+        self.bridge.reading_at -= 61
+        self.admin_status = 500
+        self.assertEqual(self.call('/pool/capacity?model=claude-opus-5-5')[0], 503)
+        self.assertEqual(self.call('/v1/messages', self.MESSAGE)[0], 503)
+        self.assertEqual(self.admin_reads, 4, 'a failed reading is never kept: each caller asks Shunt again')
+        self.admin_status = 200
+        self.assertEqual(self.call('/pool/capacity?model=claude-opus-5-5')[0], 200)
+        self.assertEqual(self.admin_reads, 5)
+        self.assertTrue(1 <= PoolBridge.reading_ttl <= 2, 'a few seconds at most')
+
+    def test_a_pause_from_the_cockpit_shows_in_its_answer_at_once(self):
+        self.bridge.reading_ttl = 60
+        self.call()
+        status, data = self.call(body={'action': 'pause', 'account': 'team'})
+        self.assertEqual(status, 200)
+        self.assertEqual(next(a for a in json.loads(data)['accounts'] if a['name'] == 'team')['status'], 'paused')
+
+    def test_every_quota_check_after_a_429_reads_shunt_anew(self):
+        self.advance = True
+        self.bridge.reading_ttl = 60
+        self.call('/pool/capacity?model=claude-opus-5-5')      # the reading this request is routed with
+        routed = self.bridge.accounts()[0]['seenAt']
+        self.http_status = 429
+        seen = []
+        def capacity_fixture(accounts, model, now):
+            seen.append(accounts[0]['seenAt'])
+            if len(seen) == 3: self.http_status = 200
+            return {'state': 'quota_wait' if len(seen) < 3 else 'ready', 'nextResetAt': now + 100, 'checkedAt': now}
+        with patch('bridge.capacity', side_effect=capacity_fixture):
+            code, body = self.call('/v1/messages', self.MESSAGE)
+        self.assertEqual(code, 200); self.assertIn(b'message_stop', body)
+        self.assertEqual(len(seen), 3)
+        self.assertGreater(seen[0], routed, 'the first check reads Shunt after the 429')
+        self.assertEqual(seen, sorted(set(seen)), 'every later check reads Shunt anew')
+
+    def state_writes(self):
+        """Every write of the state file (not its backup) from here on, as written."""
+        import bridge
+        writes, real = [], bridge.atomic_write
+        def counted(path, data):
+            if path == self.bridge.state_path: writes.append(json.loads(data))
+            return real(path, data)
+        patcher = patch('bridge.atomic_write', side_effect=counted)
+        patcher.start(); self.addCleanup(patcher.stop)
+        return writes
+
+    def test_a_finished_main_request_saves_its_result_once(self):
+        self.call()                                     # the session exists, the account reading is taken and saved
+        writes = self.state_writes()
+        self.assertEqual(self.call('/v1/messages', self.MESSAGE)[0], 200)
+        answered = [w['sessions']['test-session'] for w in writes if w['sessions']['test-session'].get('active') == 'gmail']
+        self.assertEqual(len(answered), 1, 'the answer and the end of the request are one save')
+        self.assertNotIn('inFlight', answered[0])
+        self.assertEqual(answered[0]['usage']['output_tokens'], 4)
+
+    def test_the_serving_account_is_saved_after_the_first_relayed_bytes_not_before(self):
+        # A save between the upstream's headers and the first relayed byte delays that byte. Until then the state file
+        # holds what reserve() saved (crash recovery marks the request interrupted); from the first bytes on, as before,
+        # it shows the account serving the request.
+        self.call()
+        saves, save = [], self.bridge.save
+        def counted():
+            saves.append(self.headers_out.is_set()); save()
+        self.gated = True
+        try:
+            with patch.object(self.bridge, 'save', side_effect=counted):
+                response = self.open_stream(self.MESSAGE)
+                self.assertEqual(response.status, 200)
+                self.assertTrue(self.headers_out.wait(3))
+                self.assertFalse(self.until(lambda: any(saves), .5), 'no save before the first relayed byte')
+                stored = json.loads(self.bridge.state_path.read_text())['sessions']['test-session']
+                self.assertEqual((stored['inFlight'], stored['reserved']), (1, 'gmail'))
+                recovered = PoolBridge(('127.0.0.1', 0), self.upstream.server_port, 'fixture-client', 'fixture-admin', self.bridge.state_path)
+                try: self.assertTrue(recovered.session('test-session')['interrupted'])
+                finally: recovered.server_close()
+                self.go_first.set()
+                self.assertIn(b'message_start', response.read1(65536))
+                serving = lambda: json.loads(self.bridge.state_path.read_text())['sessions']['test-session'].get('serving') == 'gmail'
+                self.assertTrue(self.until(serving), 'the upstream holds the stream open: the state file shows it serving')
+                self.go_rest.set()
+                self.assertIn(b'message_stop', response.read())
+        finally: self.go_first.set(); self.go_rest.set()     # never leave the upstream waiting
+        self.assertNotIn('serving', json.loads(self.bridge.state_path.read_text())['sessions']['test-session'])
 
     def test_quota_rejection_waits_before_resending_identical_request(self):
         self.http_status = 429
@@ -392,6 +507,7 @@ class BridgeTests(unittest.TestCase):
             'output_config':{'effort':'low'}})
         self.bridge.served('overlap','gmail',{'output_tokens':17,
             'output_tokens_details':{'thinking_tokens':7}},[],main)
+        self.bridge.save()      # the end of the request
         state = self.bridge.session('overlap')
         self.assertEqual(state['profile'], main['profile'])
         self.assertEqual(state['usage']['output_tokens_details']['thinking_tokens'],7)
@@ -446,6 +562,7 @@ class BridgeTests(unittest.TestCase):
         self.bridge.served('test-session','gmail',{'output_tokens':1,'prompt':'must-not-persist'},[])
         for index in range(60):
             self.bridge.served('test-session','team' if index%2==0 else 'gmail',{'cache_read_input_tokens':9,'cache_creation_input_tokens':3},[])
+        self.bridge.save()      # the end of the request
         state=json.loads(self.call()[1]);self.assertEqual(len(state['history']),50)
         self.assertEqual(state['history'][0]['cacheReadTokens'],9)
         self.assertNotIn('must-not-persist',self.bridge.state_path.read_text())
@@ -466,6 +583,43 @@ class BridgeTests(unittest.TestCase):
             second.restore_pauses();self.assertTrue(self.paused['team'])
             second.save();json.loads(second.state_path.read_text())
         finally:second.server_close()
+    def test_the_backup_is_the_previous_state_file_itself_not_a_second_write(self):
+        import bridge, errno, os, stat
+        backup = self.bridge.state_path.with_suffix('.bak')
+        self.bridge.save(); self.bridge.save()
+        first, inode = self.bridge.state_path.read_text(), os.stat(self.bridge.state_path).st_ino
+        with self.bridge.lock: self.bridge.session('test-session')['project'] = 'second'
+        with patch('bridge.atomic_write', wraps=bridge.atomic_write) as write:
+            self.bridge.save()
+        self.assertEqual([c.args[0] for c in write.call_args_list], [self.bridge.state_path], 'only the state file is written')
+        self.assertEqual(backup.read_text(), first)
+        self.assertEqual(os.stat(backup).st_ino, inode, 'the backup is the previous file, by hard link')
+        self.assertEqual(json.loads(self.bridge.state_path.read_text())['sessions']['test-session']['project'], 'second')
+        for path in (self.bridge.state_path, backup): self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600, path.name)
+        self.assertEqual(sorted(p.name for p in self.bridge.state_path.parent.iterdir() if p.name.startswith('state.')), ['state.bak', 'state.json'])
+        second = self.bridge.state_path.read_text()
+        with self.bridge.lock: self.bridge.session('test-session')['project'] = 'third'
+        with patch('os.link', side_effect=OSError(errno.EPERM, 'no hard links on this file system')):
+            self.bridge.save()
+        self.assertEqual(backup.read_text(), second, 'without hard links the backup is written in full, as before')
+        self.assertNotEqual(os.stat(backup).st_ino, os.stat(self.bridge.state_path).st_ino)
+        self.assertEqual(stat.S_IMODE(os.stat(backup).st_mode), 0o600)
+        self.assertFalse(self.bridge.persistence_error)
+
+    def test_a_damaged_state_file_never_becomes_the_backup(self):
+        self.call(body={'action': 'pin', 'account': 'team'})
+        self.bridge.save()
+        self.bridge.state_path.write_text('broken write')
+        restarted = PoolBridge(('127.0.0.1', 0), self.upstream.server_port, 'fixture-client', 'fixture-admin', self.bridge.state_path)
+        try:
+            self.assertTrue(restarted.recovery['restoredBackup'])
+            restarted.save()      # the first save after start writes the backup from what it restored
+            backup = self.bridge.state_path.with_suffix('.bak')
+            self.assertEqual(json.loads(backup.read_text())['sessions']['test-session']['pin'], 'team')
+            restarted.save()
+            self.assertEqual(json.loads(backup.read_text())['sessions']['test-session']['pin'], 'team')
+        finally: restarted.server_close()
+
     def test_disk_error_does_not_truncate_a_completed_model_response(self):
         with patch('bridge.atomic_write',side_effect=OSError('fixture disk full')):
             status,body=self.call('/v1/messages',b'{"messages":[],"stream":true}')

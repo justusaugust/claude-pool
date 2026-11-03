@@ -12,6 +12,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'gateway')); sys.path.insert(0, str(ROOT / 'tests'))
 import device_cua
+import device_install
 import device_sync
 from fakes import FakeRemote, SecretWatch, fixture_token
 from remote import Completed
@@ -212,6 +213,33 @@ class CuaTests(unittest.TestCase):
             target.cua = False
             self.assertEqual(device_cua._status(), {'cua': None})
 
+
+    def test_status_part_reads_host_spaces_and_tunnels_alongside_the_native_and_mcp_chain(self):
+        import threading, time
+        target = Target(state=host(), spaces=['direct:x:1'], mcp=True)
+        order, lock = [], threading.Lock()
+        def slow(label, answer):
+            def run(*args, **kwargs):
+                with lock: order.append(label + ' start')
+                time.sleep(0.3)
+                with lock: order.append(label + ' end')
+                return answer(*args, **kwargs)
+            return run
+        class Rec:
+            name = 'local'
+            def call(self, argv, stdin=None, timeout=120):
+                if has(argv, 'mcp', 'get'): return slow('mcp', lambda: target.handle(list(argv), stdin))()
+                return target.handle(list(argv), stdin)
+        found = {'vps': {'port': 32345, 'running': True}}
+        with mock.patch('device_cua.Local', Rec), mock.patch('device_cua.tunnels', slow('tunnels', lambda run: found)), \
+                mock.patch('device_cua._host_status', slow('host', device_cua._host_status)), \
+                mock.patch('device_cua._space_ids', slow('spaces', device_cua._space_ids)), \
+                mock.patch('device_install.check_native', slow('native', device_install.check_native)):
+            started = time.monotonic(); value = device_cua._status(); took = time.monotonic() - started
+        self.assertEqual(value, {'cua': {'host': True, 'spaces': ['direct:x:1'], 'mcp': True, 'tunnels': found}})
+        self.assertLess(took, 0.9, 'one read after the other takes 1.5 s')
+        self.assertLess(order.index('native end'), order.index('mcp start'))
+        for name in ('tunnels', 'host', 'spaces'): self.assertLess(order.index(name + ' start'), order.index('native end'))
 
 # SSH tunnel when the peer's Cua port is blocked ----------------------------------------------------------------------------
 

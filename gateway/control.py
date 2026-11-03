@@ -1,4 +1,5 @@
 """Private human controls beside the live inference bridge; never a model endpoint."""
+import concurrent.futures
 import hashlib
 import hmac
 import http.client
@@ -270,6 +271,18 @@ class ControlServer(ThreadingHTTPServer):
         value['tasks'].extend(observed)
         return value
 
+    def state(self):
+        """(view(), the pool overview or None), read at once: a view failure is raised as before (without waiting for the
+        pool), an overview that fails to answer is no pool, any other overview error is raised."""
+        pool = concurrent.futures.Future()
+        def read():
+            try: pool.set_result(self.overview())
+            except BaseException as error: pool.set_exception(error)
+        threading.Thread(target=read, name='control-overview', daemon=True).start()
+        value = self.view()
+        try: return value, pool.result()
+        except (OSError, ValueError, RuntimeError, http.client.HTTPException): return value, None
+
     def process_request(self, request, client_address):
         if not self.clients.acquire(blocking=False):
             self.shutdown_request(request)
@@ -341,10 +354,9 @@ class ControlHandler(BaseHTTPRequestHandler):
                 return self.reply(200, {k: value[k] for k in ['accounts', 'updatedAt']})
             if internal and self.command == 'POST':
                 if path == '/internal/overview':
-                    value = self.server.view()
+                    value, pool = self.server.state()
                     value['pending'] = [{'task': r['task'], 'tool': r['tool'], 'kind': r['kind']} for r in value['pending']]
-                    try: value['pool'] = self.server.overview()
-                    except (OSError, ValueError, RuntimeError, http.client.HTTPException): value['pool'] = None
+                    value['pool'] = pool
                     return self.reply(200, value)
                 call = {'/internal/register': self.server.controls.register, '/internal/worker': self.server.controls.worker,
                         '/internal/challenge': self.server.controls.challenge, '/internal/result': self.server.controls.result,
@@ -356,9 +368,8 @@ class ControlHandler(BaseHTTPRequestHandler):
                     mime = {'index.html': 'text/html; charset=utf-8', 'app.js': 'text/javascript; charset=utf-8', 'style.css': 'text/css; charset=utf-8'}[name]
                     return self.reply(200, (STATIC / name).read_bytes(), mime, cookie=True)
                 if path == '/api/state':
-                    value = self.server.view()
-                    try: value['pool'] = self.server.overview()
-                    except (OSError, ValueError, RuntimeError, http.client.HTTPException): value['pool'] = None
+                    value, pool = self.server.state()
+                    value['pool'] = pool
                     value['csrf'] = self.server.csrf
                     return self.reply(200, value, cookie=True)
                 if path.startswith('/api/task/'):

@@ -107,6 +107,26 @@ class InstallTests(unittest.TestCase):
             self.assertIn('/opt/homebrew/bin:/usr/local/bin', script)
         for name in ('python3.14', 'python3.13', 'python3.12', 'python3.11', 'python3'): self.assertIn(name, device_install.INSTALL_SCRIPT)
 
+    def native_script(self, files):
+        """Run NATIVE_SCRIPT with a temp HOME holding `files` ({path under HOME: bytes}) and no claude on PATH."""
+        home = Path(tempfile.mkdtemp(prefix='native-')); self.addCleanup(shutil.rmtree, home)
+        for name, data in files.items():
+            path = home / name; path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(data); path.chmod(0o755)
+        empty = home / 'empty-bin'; empty.mkdir()
+        done = subprocess.run(['sh', '-c', device_install.NATIVE_SCRIPT], env={'HOME': str(home), 'PATH': str(empty) + ':/usr/bin:/bin'},
+                              capture_output=True)
+        return home, done.stdout.decode().splitlines()
+
+    def test_native_script_reads_only_the_head_of_a_candidate_for_the_pool_marker(self):
+        # The installer writes its marker on the line after the shebang; a 300 MB Native binary is never read past its head.
+        marker = b'# managed by claude-pool installer\n'
+        binary = b'\x7fELF' + b'\0' * 4092 + b'x' * (4 << 20) + marker + b'y' * (4 << 20)
+        home, lines = self.native_script({'.local/bin/claude': binary})
+        self.assertEqual(lines[:1], [str(home / '.local/bin/claude')])
+        wrapper = b'#!/bin/sh\n' + marker + b'exec /opt/native/claude "$@"\n'
+        home, lines = self.native_script({'.local/bin/claude': wrapper})
+        self.assertNotIn(str(home / '.local/bin/claude'), lines)
+
     def test_install_script_runs_the_installer_with_a_spaced_argument_and_cleans_up(self):
         body = b'import sys,os; print(sys.argv[1:]); print(os.path.dirname(os.path.abspath(__file__)))\n'
         raw = io.BytesIO()

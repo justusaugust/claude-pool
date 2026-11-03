@@ -119,6 +119,31 @@ describe('cockpit quota band', () => {
     }
   })
 
+  test('without the pool, a session still pulls the other sessions\' readings every 30 s', async ($, on) => {
+    const clock = mock.clock(on, { now: T0 })
+    mock.store(on)
+    mock.env(on, { HOME: '/h' })
+    let logins = 0
+    on('fs.read', () => { logins++; return { value: WORK } as never })
+    on('fs.exists', () => ({ value: false }) as never)
+    on('session.start', ($, e) => ({ cwd: e.cwd }) as never)
+    on('session.usage', () => ({ value: { startedAt: T0, context: { window: 200000 }, rateLimits: limits(30, T0 + 60 * MIN, 10) } }) as never)
+    on('command.register', ($, e) => ({ value: { command: e.name } }) as never)
+    on('ui.panes', () => ({ value: [] }) as never)
+    on('http.fetch', () => { throw new Error('No pool, no /cockpit') })
+    on('ui.render', ($, e) => {
+      const { Box } = $.ui.resolve(e)
+      return <Box />
+    })
+    await $.session.start({ cwd: '/h', surface: 'terminal', isInteractive: true } as never)
+    const ui = await $.ui.mount({ ...BAND, surface: 'terminal' } as never)
+    expect(await ui.find({ type: 'Text', text: /30%/ })).toBeDefined()
+    await ui.unmount()
+    const before = logins
+    await clock.advance(30_000)
+    expect(logins).toBe(before + 1)
+  })
+
   test('auto-wrap switch: toggles ~/.claude/NOWRAP and shows the guard wrapping up', async ($, on) => {
     mock.clock(on, { now: T0 })
     mock.store(on)

@@ -229,6 +229,7 @@ class FailureTests(unittest.TestCase):
 
     def test_network_loss_shows_unknown_cached_accounts_and_diagnostics_remain_available(self):
         self.call()
+        self.bridge.reading_ttl = 0     # Shunt stops answering once the shared reading has expired
         with patch.object(self.bridge, 'admin', side_effect=ConnectionRefusedError):
             status, payload = self.call('/pool/overview')
             value = json.loads(payload)
