@@ -24,13 +24,17 @@ class BridgeTests(unittest.TestCase):
         self.default_account = 'gmail'
         self.hold = False
         self.entered, self.release = threading.Event(), threading.Event()
+        # Shunt's admin readings: how many were asked for, whether each one is newer (a busy pool), and its answer status.
+        self.admin_reads, self.advance, self.admin_status = 0, False, 200
         owner = self
         class Upstream(BaseHTTPRequestHandler):
             def log_message(self, *args): pass
             def do_GET(self):
-                rows = [{"name": a, "account_ref": a, "has_state": True, "available": not owner.paused[a], "paused": owner.paused[a], "observed_at_5h": 1900000000, "utilization_5h": .2, "reset_5h": 2000000000} for a in owner.paused]
+                owner.admin_reads += 1
+                seen = 1900000000 + (owner.admin_reads if owner.advance else 0)
+                rows = [{"name": a, "account_ref": a, "has_state": True, "available": not owner.paused[a], "paused": owner.paused[a], "observed_at_5h": seen, "utilization_5h": .2, "reset_5h": 2000000000} for a in owner.paused]
                 body = json.dumps({"providers": [{"provider": "anthropic", "auth": "claude_oauth", "accounts": rows}]}).encode()
-                self.send_response(200); self.end_headers(); self.wfile.write(body)
+                self.send_response(owner.admin_status); self.end_headers(); self.wfile.write(body)
             def do_PATCH(self):
                 owner.paused[self.path.split('/')[-1]] = json.loads(self.rfile.read(int(self.headers['Content-Length'])))['paused']
                 self.send_response(200); self.end_headers(); self.wfile.write(b'{}')
@@ -119,10 +123,10 @@ class BridgeTests(unittest.TestCase):
         self.assertIsNone(self.headers[-3].get('x-shunt-session-account'), 'a new agent: Shunt chooses')
         self.subagent(agent='other')
         self.assertEqual(self.preferred[-1], 'gmail')
-        self.paused['team'] = True; self.bridge.accounts()      # the next account sample shows team paused
+        self.paused['team'] = True; self.sample()      # the next account sample shows team paused
         self.subagent(agent='steady')
         self.assertEqual(self.preferred[-1], 'gmail', 'its account is not ready: the normal choice applies')
-        self.paused['team'] = False; self.bridge.accounts()
+        self.paused['team'] = False; self.sample()
         self.subagent(agent='steady')
         self.assertEqual(self.preferred[-1], 'gmail', 'the account that answered became its account')
     def labeler(self, agent=None):
@@ -150,11 +154,11 @@ class BridgeTests(unittest.TestCase):
         self.assertIsNone(self.headers[-1].get('x-shunt-session-account'), 'the agent\'s own first request: Shunt chooses')
         self.assertEqual(self.bridge.agents.rows['fresh'], 'team')
         self.default_account = 'gmail'
-        self.paused['team'] = True; self.bridge.accounts()
+        self.paused['team'] = True; self.sample()
         self.call('/v1/messages', raw, extra_headers=self.labeler('fresh'))    # answered by gmail
         self.assertEqual(self.preferred[-1], 'gmail')
         self.assertEqual(self.bridge.agents.rows['fresh'], 'team', 'only the agent\'s own answers decide its account')
-        self.paused['team'] = False; self.bridge.accounts()
+        self.paused['team'] = False; self.sample()
         self.call('/v1/messages', raw, extra_headers=self.labeler('fresh')); self.subagent(agent='fresh')
         self.assertEqual(self.preferred[-2:], ['team', 'team'])
     def test_a_labeler_request_is_routed_normally_while_its_agents_account_is_not_ready(self):
@@ -163,7 +167,7 @@ class BridgeTests(unittest.TestCase):
         self.default_account = 'gmail'
         self.call('/v1/messages', self.cached(), extra_headers=self.labeler('steady'))
         self.assertEqual(self.preferred[-1], 'team')
-        self.paused['team'] = True; self.bridge.accounts()      # the next account sample shows team paused
+        self.paused['team'] = True; self.sample()      # the next account sample shows team paused
         raw = json.dumps(self.cached()).encode()
         self.call('/v1/messages', raw, extra_headers=self.labeler('steady'))
         self.assertIsNone(self.headers[-1].get('x-shunt-session-account'), 'its agent\'s account is not ready: the normal choice applies')
@@ -249,6 +253,64 @@ class BridgeTests(unittest.TestCase):
         self.call('/v1/messages', b'{"model":"claude-opus-5-5","messages":[]}')
         self.assertEqual([(row['status'], row['account']) for row in self.bridge.outcomes_since(start)], [(401, 'gmail'), (200, 'gmail')])
         self.assertEqual(self.bridge.outcomes_since(int(time.time() * 1000) + 1000), [])
+
+    def sample(self):
+        """The next account sample: a new Shunt reading, as once the shared one is a few seconds old."""
+        import time
+        return self.bridge.accounts(since=time.monotonic())
+    def history(self):
+        return [line for path in sorted(self.bridge.history_path.glob('*.jsonl')) for line in path.read_text().splitlines()]
+    MESSAGE = b'{"model":"claude-opus-5-5","messages":[],"stream":true}'
+
+    def test_one_shunt_reading_serves_every_caller_for_a_few_seconds(self):
+        # Cockpit polls, the step's capacity check and the model request itself share one admin reading; the new reading
+        # is saved and archived once and its forecast computed once.
+        self.advance = True
+        self.bridge.reading_ttl = 60
+        with patch.object(self.bridge, 'forecast', wraps=self.bridge.forecast) as forecast:
+            for _ in range(10): self.assertEqual(self.call()[0], 200)
+            self.assertEqual(self.call('/pool/capacity?model=claude-opus-5-5')[0], 200)
+            self.assertEqual(self.call('/v1/messages', self.MESSAGE)[0], 200)
+        self.assertEqual(self.admin_reads, 1)
+        self.assertEqual(len(self.history()), 1, 'the new reading is archived once')
+        self.assertEqual(forecast.call_count, 1, 'its forecast is computed once')
+        self.bridge.reading_at -= 61                      # the shared reading is older than its TTL
+        self.assertEqual(self.call()[0], 200)
+        self.assertEqual((self.admin_reads, len(self.history())), (2, 2), 'then a new reading')
+        self.bridge.reading_at -= 61
+        self.admin_status = 500
+        self.assertEqual(self.call('/pool/capacity?model=claude-opus-5-5')[0], 503)
+        self.assertEqual(self.call('/v1/messages', self.MESSAGE)[0], 503)
+        self.assertEqual(self.admin_reads, 4, 'a failed reading is never kept: each caller asks Shunt again')
+        self.admin_status = 200
+        self.assertEqual(self.call('/pool/capacity?model=claude-opus-5-5')[0], 200)
+        self.assertEqual(self.admin_reads, 5)
+        self.assertTrue(1 <= PoolBridge.reading_ttl <= 2, 'a few seconds at most')
+
+    def test_a_pause_from_the_cockpit_shows_in_its_answer_at_once(self):
+        self.bridge.reading_ttl = 60
+        self.call()
+        status, data = self.call(body={'action': 'pause', 'account': 'team'})
+        self.assertEqual(status, 200)
+        self.assertEqual(next(a for a in json.loads(data)['accounts'] if a['name'] == 'team')['status'], 'paused')
+
+    def test_every_quota_check_after_a_429_reads_shunt_anew(self):
+        self.advance = True
+        self.bridge.reading_ttl = 60
+        self.call('/pool/capacity?model=claude-opus-5-5')      # the reading this request is routed with
+        routed = self.bridge.accounts()[0]['seenAt']
+        self.http_status = 429
+        seen = []
+        def capacity_fixture(accounts, model, now):
+            seen.append(accounts[0]['seenAt'])
+            if len(seen) == 3: self.http_status = 200
+            return {'state': 'quota_wait' if len(seen) < 3 else 'ready', 'nextResetAt': now + 100, 'checkedAt': now}
+        with patch('bridge.capacity', side_effect=capacity_fixture):
+            code, body = self.call('/v1/messages', self.MESSAGE)
+        self.assertEqual(code, 200); self.assertIn(b'message_stop', body)
+        self.assertEqual(len(seen), 3)
+        self.assertGreater(seen[0], routed, 'the first check reads Shunt after the 429')
+        self.assertEqual(seen, sorted(set(seen)), 'every later check reads Shunt anew')
 
     def test_quota_rejection_waits_before_resending_identical_request(self):
         self.http_status = 429

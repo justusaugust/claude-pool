@@ -55,6 +55,7 @@ def event(value):
 class PoolBridge(ThreadingHTTPServer):
     daemon_threads = False
     allow_reuse_address = True
+    reading_ttl = 2  # s: one successful Shunt admin reading serves every caller this long
 
     def __init__(self, address, upstream_port, client_token, admin_token, state_path=None, native_auth=None, shared_readings=None):
         super().__init__(address, Handler)
@@ -74,6 +75,9 @@ class PoolBridge(ThreadingHTTPServer):
         self.journal = Journal(self.state_path.parent / 'incidents.json' if self.state_path else None, atomic_write)
         self.health = {"backend": "starting", "failures": 0, "checkedAt": None, "supervisor": ("systemd" if sys.platform.startswith("linux") else "launchd") if os.environ.get("POOL_MANAGED") == "1" else "standalone"}
         self.last_accounts, self.accounts_at = [], -math.inf
+        # The shared reading (last_accounts): when its admin request started (monotonic) and its forecast, once computed;
+        # after a change sent to Shunt only readings started later count (reading_floor).
+        self.reading_at, self.reading_forecast, self.reading_floor = -math.inf, None, -math.inf
         self._brake_cache = (-60.0, {'stage': 0, 'ratio': None, 'resetAt': None, 'unmeasured': True})
         self.hold = Hold()
         # Background requests wait in a room of at most max_waiting; they check every brake_check s, at most brake_max_wait s.
@@ -260,6 +264,9 @@ class PoolBridge(ThreadingHTTPServer):
             return data
         finally:
             conn.close()
+            if body is not None:
+                # A change (pause, resume): the next caller reads Shunt anew, never a reading from before it.
+                with self.lock: self.reading_floor = time.monotonic()
 
     def note_outcome(self, status, account):
         """Keep the last 200 upstream answers (time, status, x-shunt-account) for the long-lived probe; no body, no token."""
@@ -270,8 +277,18 @@ class PoolBridge(ThreadingHTTPServer):
     def outcomes_since(self, at_ms):
         with self.lock: return [dict(row) for row in self.outcomes if row['at'] >= at_ms]
 
-    def accounts(self):
+    def accounts(self, since=None):
+        """Shunt's accounts. Every caller within reading_ttl s of the last successful reading shares it; `since` (monotonic)
+        asks for a reading that started at that moment or later. A failed reading is never kept: the next caller asks again."""
+        with self.lock:
+            floor = self.reading_floor if since is None else max(since, self.reading_floor)
+            if time.monotonic() - self.reading_at < self.reading_ttl and self.reading_at >= floor: return list(self.last_accounts)
+        return self.read_accounts()
+
+    def read_accounts(self):
+        """A new admin reading; it becomes the shared one unless a later-started reading already did."""
         rows = []
+        started = time.monotonic()
         admin = self.admin()
         fable = fable_windows(admin)
         for provider in admin.get("providers", []):
@@ -298,7 +315,8 @@ class PoolBridge(ThreadingHTTPServer):
         from account_metadata import decorate
         decorate({'accounts': rows}, CONFIG)
         with self.lock:
-            self.last_accounts, self.accounts_at = rows, time.monotonic()
+            if started >= self.reading_at:
+                self.last_accounts, self.accounts_at, self.reading_at, self.reading_forecast = rows, time.monotonic(), started, None
             changed = False
             for row in rows:
                 points = self.observations.setdefault(row["id"], [])
@@ -314,7 +332,9 @@ class PoolBridge(ThreadingHTTPServer):
                 if self.history_path:
                     try:
                         now = int(time.time() * 1000)
-                        archive(self.history_path, rows, self.forecast(rows, now), now)
+                        forecast = self.forecast(rows, now)
+                        if self.last_accounts is rows: self.reading_forecast = forecast
+                        archive(self.history_path, rows, forecast, now)
                         self.history_error = False
                     except (OSError, ValueError): self.history_error = True
         return rows
@@ -357,7 +377,7 @@ class PoolBridge(ThreadingHTTPServer):
         with self.lock:
             histories = [{**e, "session": key} for key, state in self.sessions.items() for e in state.get("history", [])]
             return {"version": "0.8.0", "accounts": accounts, "updatedAt": now, "ready": sum(a["status"] == "ready" for a in accounts),
-                    "forecast": self.forecast(accounts, now), "sessions": session_rows(self.sessions, now / 1000), "history": sorted(histories, key=lambda e: e["at"], reverse=True)[:50],
+                    "forecast": self.shared_forecast(accounts, now), "sessions": session_rows(self.sessions, now / 1000), "history": sorted(histories, key=lambda e: e["at"], reverse=True)[:50],
                     "brake": self.brake_state(), "recovery": dict(self.recovery), "persistenceError": self.persistence_error or self.history_error, **self.diagnostics()}
 
     def brake_state(self):
@@ -384,8 +404,21 @@ class PoolBridge(ThreadingHTTPServer):
         now = int(time.time() * 1000)
         return {**state, "active": state.get("serving") or state.get("active"), "session": session_id, "accounts": accounts,
                 "updatedAt": now, "ready": sum(a["status"] == "ready" for a in accounts),
-                "forecast": self.forecast(accounts, now), "sessions": session_rows(self.sessions, now / 1000), "history": list(reversed(state.get("history", []))),
+                "forecast": self.shared_forecast(accounts, now), "sessions": session_rows(self.sessions, now / 1000), "history": list(reversed(state.get("history", []))),
                 "recovery": dict(self.recovery), "persistenceError": self.persistence_error or self.history_error, **self.diagnostics()}
+
+    def shared_forecast(self, accounts, now):
+        """The forecast of the shared reading, computed once per reading; other rows (the fallback while Shunt does not
+        answer) get their own."""
+        with self.lock:
+            rows, cached = self.last_accounts, self.reading_forecast
+        shared = len(accounts) == len(rows) and all(a is b for a, b in zip(accounts, rows))
+        if shared and cached is not None: return cached
+        result = self.forecast(accounts, now)
+        if shared:
+            with self.lock:
+                if self.last_accounts is rows and self.reading_forecast is None: self.reading_forecast = result
+        return result
 
     def forecast(self, accounts, now):
         result = estimate(accounts, self.observations, now)
@@ -745,7 +778,7 @@ class Handler(BaseHTTPRequestHandler):
                     delay = min(20, max(.25, (state['nextResetAt'] - state['checkedAt']) / 1000)) if state['nextResetAt'] else 20
                     # Long polling uses no inference admission slot or model traffic.
                     self.server.monitor_stop.wait(delay)
-                    state = capacity(self.server.accounts(), model, int(time.time() * 1000))
+                    state = capacity(self.server.accounts(since=time.monotonic()), model, int(time.time() * 1000))
                 self.answer(200, state)
             except (OSError, ValueError, RuntimeError, http.client.HTTPException):
                 self.answer(503, {'error': 'Quota availability could not be confirmed'})
@@ -918,7 +951,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.server.note_outcome(response.status, account)
             if response.status >= 400: self.server.journal.record('upstream_http_error', status=response.status, account=account)
             while response.status == 429 and path == '/v1/messages' and request.get('stream') is True and isinstance(request.get('model'), str):
-                quota = capacity(self.server.accounts(), request.get('model', ''), int(time.time() * 1000))
+                # Quota checks read Shunt after the 429 and anew at every check, never the shared reading from before.
+                quota = capacity(self.server.accounts(since=time.monotonic()), request.get('model', ''), int(time.time() * 1000))
                 if quota['state'] != 'quota_wait': break
                 # This request was rejected before any model output or tool call.
                 response.close(); conn.close(); lease['upstream'] = None
@@ -942,7 +976,7 @@ class Handler(BaseHTTPRequestHandler):
                         lease['progress'] = now
                         next_ping = now + 10
                     if now >= next_check:
-                        quota = capacity(self.server.accounts(), request.get('model', ''), int(time.time() * 1000))
+                        quota = capacity(self.server.accounts(since=now), request.get('model', ''), int(time.time() * 1000))
                         delay = min(20, max(.25, (quota['nextResetAt'] - quota['checkedAt']) / 1000)) if quota['nextResetAt'] else 20
                         next_check = now + delay
                     if quota['state'] == 'quota_wait': self.server.monitor_stop.wait(.25)
