@@ -32,6 +32,8 @@ VERB = 'claude-pool device herdr-units'
 TIMEOUT = 15
 STOP_WAIT, VERIFY_WAIT, POLL = 30, 180, 2
 LISTENING = 0x10000  # __SO_ACCEPTCON in /proc/net/unix
+ENABLED = ('enabled', 'enabled-runtime', 'static', 'alias', 'indirect', 'generated')  # `systemctl is-enabled` exits 0 for these
+ACTIVE = ('active', 'reloading', 'refreshing')                                        # `systemctl is-active` exits 0 for these
 
 
 def unit(name): return PREFIX + name + '.service'
@@ -132,6 +134,19 @@ class Host:
 
     def enabled(self, name): return self.systemctl('is-enabled', '--quiet', unit(name)) == 0
     def active(self, name): return self.systemctl('is-active', '--quiet', unit(name)) == 0
+
+    def states(self, names):
+        """{name: (enabled, active)} for many sessions in two systemctl calls, which print one state per unit and line, in
+        order. A reply without one line per unit (an older systemd writes an unknown unit's error to stderr only) falls back
+        to `enabled` and `active`, one call per unit."""
+        names = list(names)
+        if not names: return {}
+        found = []
+        for verb, good, one in (('is-enabled', ENABLED, self.enabled), ('is-active', ACTIVE, self.active)):
+            done = self.local.call(['systemctl', '--user', verb, *map(unit, names)], timeout=TIMEOUT)
+            lines = (done.stdout or b'').decode('utf-8', 'replace').splitlines()
+            found.append([line.strip() in good for line in lines] if len(lines) == len(names) else [one(name) for name in names])
+        return dict(zip(names, zip(*found)))
 
     def sessions(self):
         """{name: {'running', 'socket', 'file'}} for every session herdr saved (it has a session.json); None when herdr cannot list."""
@@ -339,10 +354,11 @@ def report(host=None):
     found = host.sessions()
     if found is None: return {'available': True, 'sessions': None}
     foreign, rows = host.foreign(), []
+    states = host.states(name for name in sorted(found) if name not in foreign)
     for name, info in sorted(found.items()):
         row = {'name': name, 'running': info['running']}
         if name in foreign: row['unit'] = foreign[name]
-        else: row.update(enabled=host.enabled(name), active=host.active(name))
+        else: row.update(enabled=states[name][0], active=states[name][1])
         rows.append(row)
     return {'available': True, 'sessions': rows, 'template': host.template_state(herdr)}
 
