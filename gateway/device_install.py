@@ -20,10 +20,12 @@ FUNCTION = 'claude() { command claude-pool exec "$@"; }'
 NATIVE_FIX = 'curl -fsSL https://claude.ai/install.sh | bash'
 SKIP = ('gateway/bin/', '.superpowers/')
 
+# The installer writes its marker on the line after a wrapper's shebang, so only the first KiB of a candidate is read: the
+# Native binary is about 330 MB and never contains the marker.
 NATIVE_SCRIPT = '''PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; export PATH
 for c in "$HOME/.local/bin/claude" "$(command -v claude 2>/dev/null)"; do
   [ -n "$c" ] && [ -f "$c" ] && [ -x "$c" ] || continue
-  grep -q 'managed by claude-pool installer' "$c" 2>/dev/null && continue
+  head -c 1024 "$c" 2>/dev/null | grep -q 'managed by claude-pool installer' && continue
   printf '%s\\n' "$c"; exit 0
 done
 exit 1'''
