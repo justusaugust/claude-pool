@@ -1004,6 +1004,7 @@ class Handler(BaseHTTPRequestHandler):
                 committed = True
             if agent and response.status == 200:
                 with self.server.lock: self.server.agents.served(agent, account)
+            unsaved = False
             if main and response.status == 200 and session_id:
                 with self.server.lock:
                     state = self.server.session(session_id)
@@ -1011,14 +1012,19 @@ class Handler(BaseHTTPRequestHandler):
                     state["serving"] = actual
                     if actual and state.get("routing", {}).get("account") != actual:
                         state["routing"].update(account=actual, reason="upstream failover")
-                    self.server.save()
+                # Saved once the first bytes are relayed, never between the upstream's headers and those bytes; until then
+                # the state file holds the reservation reserve() saved, which recovery marks interrupted.
+                unsaved = True
             sse = "text/event-stream" in response.getheader("Content-Type", "") and response.status == 200
-            pending, usage, transformations, complete, logged, served_model = b"", {}, [], False, False, None
+            pending, usage, transformations, complete, logged, served_model, relayed = b"", {}, [], False, False, None, False
             while chunk := response.read1(65536):
                 lease['progress'] = time.monotonic()
                 if not sse:
                     self.wfile.write(chunk)
                     self.wfile.flush()
+                    if unsaved:
+                        with self.server.lock: self.server.save()
+                        unsaved = False
                     continue
                 pending += chunk
                 # Hold an incomplete SSE frame so a transport error remains valid JSON.
@@ -1045,6 +1051,7 @@ class Handler(BaseHTTPRequestHandler):
                         if event.get("type") == "message_stop": complete = True
                     self.wfile.write(frame)
                     self.wfile.flush()
+                    relayed = True
                     if complete and not stream_error and session_id and not logged and path == '/v1/messages':
                         logged = True
                         self.server.record_usage(ledger_line(int(time.time() * 1000), session_id, project, cls, served_model or request.get('model'), account, usage, waited=waited, short_label=short))
@@ -1055,6 +1062,9 @@ class Handler(BaseHTTPRequestHandler):
                 if len(pending) > 1024 * 1024: raise ValueError('SSE frame too large')
                 # Terminal events release the slot even if upstream leaves its socket open.
                 if complete or stream_error: break
+                if unsaved and relayed:
+                    with self.server.lock: self.server.save()
+                    unsaved = False
         except (OSError, ValueError, RuntimeError, http.client.HTTPException):
             if not lease.get('cancelled'):
                 self.server.journal.record('stream_interrupted' if committed else 'upstream_unavailable', account=account)

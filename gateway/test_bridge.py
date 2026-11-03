@@ -26,6 +26,8 @@ class BridgeTests(unittest.TestCase):
         self.entered, self.release = threading.Event(), threading.Event()
         # Shunt's admin readings: how many were asked for, whether each one is newer (a busy pool), and its answer status.
         self.admin_reads, self.advance, self.admin_status = 0, False, 200
+        # gated: after its headers the upstream waits for go_first before its first event and for go_rest after it.
+        self.gated, self.headers_out, self.go_first, self.go_rest = False, threading.Event(), threading.Event(), threading.Event()
         owner = self
         class Upstream(BaseHTTPRequestHandler):
             def log_message(self, *args): pass
@@ -50,10 +52,12 @@ class BridgeTests(unittest.TestCase):
                 events = [{'type': 'message_start', 'message': {'usage': {'input_tokens': 2}, 'input_transformations': []}}, {'type': 'message_delta', 'usage': {'output_tokens': 4}}]
                 if owner.complete: events.append({'type': 'message_stop'})
                 if owner.stream_events is not None: events = owner.stream_events
-                for event in events:
+                if owner.gated: owner.headers_out.set(); owner.go_first.wait(5)
+                for index, event in enumerate(events):
                     try:
                         self.wfile.write(event if isinstance(event, bytes) else ('data: '+json.dumps(event)+'\n\n').encode()); self.wfile.flush()
                         if owner.event_interval: threading.Event().wait(owner.event_interval)
+                        if owner.gated and index == 0: owner.go_rest.wait(5)
                     except OSError: break
                 if owner.keep_open: owner.release.wait(5)
         self.upstream = ThreadingHTTPServer(('127.0.0.1', 0), Upstream)
@@ -331,6 +335,35 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(len(answered), 1, 'the answer and the end of the request are one save')
         self.assertNotIn('inFlight', answered[0])
         self.assertEqual(answered[0]['usage']['output_tokens'], 4)
+
+    def test_the_serving_account_is_saved_after_the_first_relayed_bytes_not_before(self):
+        # A save between the upstream's headers and the first relayed byte delays that byte. Until then the state file
+        # holds what reserve() saved (crash recovery marks the request interrupted); from the first bytes on, as before,
+        # it shows the account serving the request.
+        self.call()
+        saves, save = [], self.bridge.save
+        def counted():
+            saves.append(self.headers_out.is_set()); save()
+        self.gated = True
+        try:
+            with patch.object(self.bridge, 'save', side_effect=counted):
+                response = self.open_stream(self.MESSAGE)
+                self.assertEqual(response.status, 200)
+                self.assertTrue(self.headers_out.wait(3))
+                self.assertFalse(self.until(lambda: any(saves), .5), 'no save before the first relayed byte')
+                stored = json.loads(self.bridge.state_path.read_text())['sessions']['test-session']
+                self.assertEqual((stored['inFlight'], stored['reserved']), (1, 'gmail'))
+                recovered = PoolBridge(('127.0.0.1', 0), self.upstream.server_port, 'fixture-client', 'fixture-admin', self.bridge.state_path)
+                try: self.assertTrue(recovered.session('test-session')['interrupted'])
+                finally: recovered.server_close()
+                self.go_first.set()
+                self.assertIn(b'message_start', response.read1(65536))
+                serving = lambda: json.loads(self.bridge.state_path.read_text())['sessions']['test-session'].get('serving') == 'gmail'
+                self.assertTrue(self.until(serving), 'the upstream holds the stream open: the state file shows it serving')
+                self.go_rest.set()
+                self.assertIn(b'message_stop', response.read())
+        finally: self.go_first.set(); self.go_rest.set()     # never leave the upstream waiting
+        self.assertNotIn('serving', json.loads(self.bridge.state_path.read_text())['sessions']['test-session'])
 
     def test_quota_rejection_waits_before_resending_identical_request(self):
         self.http_status = 429
