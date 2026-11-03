@@ -239,6 +239,42 @@ describe('cockpit pooled routing', () => {
     }
   })
 
+  test('a session start reads /cockpit once, beside the wrap files and its usage, and only the 5 s poll reads it again', async ($, on) => {
+    const clock = mock.clock(on, { now: NOW }); mock.store(on)
+    mock.env(on, { HOME: '/fixture', COCKPIT_BASE_URL: 'http://127.0.0.1:18341', ANTHROPIC_AUTH_TOKEN: 'fixture-client' })
+    on('session.id', () => ({ value: 'pool-session' }))
+    on('session.start', ($, e) => ({ cwd: e.cwd }))
+    on('command.register', ($, e) => ({ value: { command: e.name } }))
+    on('ui.panes', () => ({ value: [] }))
+    // Every read answers after 20 ms; which ones are out at the same time?
+    let reads = 0
+    const out = new Set<string>(), together = new Set<string>()
+    const late = async (name: string) => {
+      for (const other of out) together.add([name, other].sort().join(' + '))
+      out.add(name)
+      await clock.sleep(20)
+      out.delete(name)
+    }
+    on('session.usage', async () => { await late('usage'); return { value: { startedAt: NOW, context: { window: 200000 }, rateLimits: [] } } })
+    on('fs.exists', async () => { await late('wrap files'); return { value: false } })
+    on('http.fetch', async ($, e) => {
+      if (e.url.includes('/cockpit/')) reads++
+      await late('cockpit')
+      return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify(initial()) } }
+    })
+    let started = false, waited = 0
+    const start = $.session.start({ cwd: '/fixture', surface: 'terminal', isInteractive: true }).then(() => { started = true })
+    while (!started && waited < 200) { await clock.advance(20); waited += 20 }
+    await start
+    expect(reads).toBe(1)
+    expect(together.has('cockpit + usage')).toBe(true)
+    expect(together.has('cockpit + wrap files')).toBe(true)
+    // The wrap files are two reads in a row (NOWRAP, then WRAPUP); the rest runs beside them.
+    expect(waited).toBe(40)
+    await clock.advance(30_000)
+    expect(reads).toBe(7)
+  })
+
   test('backend pace, quota bars and allowance range refresh automatically without a model turn', async ($, on) => {
     const clock = mock.clock(on, { now: NOW }); mock.store(on)
     mock.env(on, { HOME: '/fixture', COCKPIT_BASE_URL: 'http://127.0.0.1:18341', ANTHROPIC_AUTH_TOKEN: 'fixture-client' })

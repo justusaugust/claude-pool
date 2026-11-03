@@ -105,15 +105,13 @@ export const register: Register = on => {
       description: 'Toggle auto-wrap: whether the usage guard tells agents to wrap up before the 5h limit',
       immediate: true,
     })
-    await refreshPool($)
+    // One /cockpit read, beside the wrap files and this session's usage; any failure still fails the start.
+    const pooled = Boolean(await $.env.get('COCKPIT_BASE_URL'))
+    await Promise.all([refreshPool($), refreshWrap($), startUsage($, pooled)])
     $.clock.every(5_000, () => void refreshPool($))
-    await refreshWrap($)
     $.clock.every(15_000, () => void refreshWrap($))
-    const usage = await $.session.usage()
-    await measureLive($, usage)
-    await measure($, usage.rateLimits)
-    // Other sessions update the store; pull their numbers in now and then.
-    $.clock.every(30_000, () => void refresh($))
+    // Other sessions update the store; pull their numbers in now and then. Pooled, the 5 s poll does.
+    if (!pooled) $.clock.every(30_000, () => void refresh($))
     await $.command.register({
       name: 'machine',
       description: 'Toggle the machine pane: load, what uses the CPU, which Claude session spawned it',
@@ -746,6 +744,13 @@ function longDur(ms: number) {
 async function measureLive($: $, m: { context: { tokens?: number; percent?: number }; cost?: { usd: number } }) {
   const pooled = await $.env.get('COCKPIT_BASE_URL')
   await update($, live, () => ({ contextPct: m.context.percent, contextTokens: m.context.tokens, usd: pooled ? undefined : m.cost?.usd }))
+}
+
+// This session's context and cost; native, also its quota reading (pooled, measure() would only read /cockpit again).
+async function startUsage($: $, pooled: boolean) {
+  const usage = await $.session.usage()
+  await measureLive($, usage)
+  if (!pooled) await measure($, usage.rateLimits)
 }
 
 function sampleLive(): Live {
