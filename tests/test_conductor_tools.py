@@ -368,7 +368,7 @@ class EventsTests(ToolsBase):
         self.assertEqual(self.tick(1020, with_prs=True), [])  # first sight of a repo seeds it
         gh = [c for c in self.calls() if c[0] == 'gh']
         fields = ['--json', 'number,title,state,url,headRefName', '--limit', '20']
-        self.assertEqual(gh, [['gh', 'pr', 'list', '--repo', 'ai-vaerk/website', *fields],
+        self.assertCountEqual(gh, [['gh', 'pr', 'list', '--repo', 'ai-vaerk/website', *fields],  # both lists are asked at once
                               ['gh', 'pr', 'list', '--repo', 'ai-vaerk/website', *fields, '--state', 'merged',
                                '--search', 'merged:>=' + time.strftime('%Y-%m-%d', time.gmtime(1020 - 86400))]])
 
@@ -757,6 +757,113 @@ class JournalTests(unittest.TestCase):
         self.assertEqual([ct.duration(v) for v in ('30m', '12h', '1d', '14d')], [1800, 43200, 86400, 14 * 86400])
         with self.assertRaises(ValueError): ct.duration('soon')
 
+
+
+class SlowRun:
+    """A `run` for Tools that answers herdr, git, preview and gh from Python. Each call takes about `delay` seconds (a little
+    more or less per call, so calls finish out of order; an open-PR list takes longer than its merged list) and the most
+    calls in flight at once is recorded."""
+    SESSIONS = [('web', True), ('pool', True), ('docs', True), ('flaky', True), ('old', False)]
+    AGENTS = {'web': [('w1:p1', '/srv/alex/dev/website'), ('w1:p2', '/srv/alex/dev/website'), ('w2:p1', '/srv/alex/dev/website/sub'),
+                      ('w2:p2', '/srv/alex/dev/shop'), ('w3:p1', '/srv/alex/dev/website')],
+              'pool': [('w1:p1', '/srv/alex/dev/claude-pool'), ('w1:p2', '/srv/alex/dev/notes'), ('w2:p1', ''),
+                       ('w2:p2', '/srv/alex/dev/claude-pool')],
+              'docs': [('w1:p1', '/srv/alex/dev/docs'), ('w1:p2', '/srv/alex/dev/docs'), ('w1:p3', '/srv/alex/dev/docs')]}
+    REPOS = {'/srv/alex/dev/website': 'ai-vaerk/website', '/srv/alex/dev/website/sub': 'ai-vaerk/website',
+             '/srv/alex/dev/shop': 'alex/shop', '/srv/alex/dev/claude-pool': 'alex/claude-pool', '/srv/alex/dev/docs': 'alex/docs'}
+
+    def __init__(self, delay=0.2):
+        self.delay, self.lock, self.now, self.most, self.argvs, self.spent = delay, threading.Lock(), 0, 0, [], 0.0
+
+    def answer(self, argv):
+        done = lambda out='', code=0: subprocess.CompletedProcess(argv, code, out, '')
+        if argv == ['herdr', 'session', 'list', '--json']:
+            return done(json.dumps({'sessions': [{'name': n, 'running': r} for n, r in self.SESSIONS]}))
+        if argv[:2] == ['herdr', '--session']:
+            session, verb = argv[2], argv[3:5]
+            if verb == ['workspace', 'list']:
+                return done(json.dumps({'result': {'workspaces': [{'workspace_id': w, 'label': session + '-' + w} for w in ('w1', 'w2', 'w3')]}}))
+            if verb == ['agent', 'list']:
+                if session not in self.AGENTS: return done('', 1)
+                return done(json.dumps({'result': {'agents': [
+                    {'pane_id': pane, 'workspace_id': pane.split(':')[0], 'cwd': cwd, 'name': session + '-' + pane.replace(':', ''),
+                     'agent_status': ('working', 'idle', 'blocked')[index % 3]} for index, (pane, cwd) in enumerate(self.AGENTS[session])]}}))
+            if verb == ['agent', 'read']: return done(json.dumps({'result': {'read': {'text': 'Step for ' + session + ' ' + argv[5] + '\n> \n'}}}))
+        if argv[:2] == ['git', '-C']:
+            cwd = argv[2]
+            if cwd not in self.REPOS: return done('', 128)
+            if argv[3:] == ['rev-parse', '--show-toplevel']: return done(cwd + '\n')
+            return done('git@github.com:' + self.REPOS[cwd] + '.git\n')
+        if argv == ['preview', 'list', '--json']:
+            return done(json.dumps([{'port': 5173, 'label': 'web', 'link': 'https://example-vps.tail1.ts.net:5173/'},
+                                    {'port': 8000, 'label': 'docs', 'link': 'https://example-vps.tail1.ts.net:8000/'}]))
+        if argv[:3] == ['gh', 'pr', 'list']:
+            slug = argv[argv.index('--repo') + 1]
+            if slug == 'alex/shop': return done('', 1)
+            if '--state' in argv:
+                return done(json.dumps([{'number': 7, 'title': 'Merged ' + slug, 'state': 'MERGED', 'url': 'u7', 'headRefName': 'b7'}]))
+            return done(json.dumps([{'number': 7, 'title': 'Open ' + slug, 'state': 'OPEN', 'url': 'u7', 'headRefName': 'b7'},
+                                    {'number': 8, 'title': 'Next ' + slug, 'state': 'OPEN', 'url': 'u8', 'headRefName': 'b8'}]))
+        return done('', 2)
+
+    def __call__(self, argv, timeout):
+        import zlib
+        argv = list(argv)
+        wait = self.delay * (0.8 + 0.4 * (zlib.crc32(' '.join(argv).encode()) % 100) / 100)
+        if argv[:3] == ['gh', 'pr', 'list']: wait = self.delay * (0.6 if '--state' in argv else 1.4)
+        with self.lock:
+            self.now += 1; self.most = max(self.most, self.now); self.argvs.append(argv); self.spent += wait
+        try:
+            time.sleep(wait)
+            return self.answer(argv)
+        finally:
+            with self.lock: self.now -= 1
+
+
+class ConcurrentReadTests(unittest.TestCase):
+    """Snapshot and the event poll run their independent herdr, git, preview and gh reads at once, at most ct.WORKERS at a
+    time, with the same result as one call after the other."""
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory(); self.addCleanup(folder.cleanup)
+        self.state, self.queue = Path(folder.name) / 'events.json', Path(folder.name) / 'queue.json'
+        board = {'machines': [], 'accounts': [], 'quickAccess': [], 'brake': {}}
+        patcher = mock.patch.object(ct, '_board', lambda *args: dict(board)); patcher.start(); self.addCleanup(patcher.stop)
+
+    def snapshot(self, run):
+        started = time.monotonic()
+        value = ct.snapshot(ct.Tools(run=run), as_json=True, now=5000, state_path=self.state, queue_path=self.queue)
+        return json.loads(value), time.monotonic() - started
+
+    def test_snapshot_reads_at_once_within_the_bound_and_keeps_its_json(self):
+        with mock.patch.object(ct, 'MAX_AGENTS', 10):
+            quick, slow = SlowRun(delay=0), SlowRun()
+            expected, _ = self.snapshot(quick)
+            value, took = self.snapshot(slow)
+        self.assertEqual(value, expected)
+        self.assertEqual(sorted(slow.argvs), sorted(quick.argvs))
+        self.assertEqual(len(slow.argvs), 35)
+        self.assertLess(took, slow.spent * 0.4, 'one call after the other would take %.1f s' % slow.spent)
+        self.assertLessEqual(slow.most, ct.WORKERS)
+        self.assertGreater(slow.most, 1)
+        rows = {a['pane']: a for s in value['sessions'] for w in s['workspaces'] for a in w['agents'] if s['name'] == 'web'}
+        self.assertEqual((rows['w2:p1']['repo'], rows['w2:p1']['last']), ('ai-vaerk/website', 'Step for web w2:p1'))
+        self.assertEqual(next(s for s in value['sessions'] if s['name'] == 'docs').get('more'), 2)
+        self.assertEqual(sorted(value['prs']), ['ai-vaerk/website', 'alex/claude-pool', 'alex/docs'])
+        self.assertEqual([p['link'] for p in value['previews']][:1], ['https://example-vps.tail1.ts.net:5173/'])
+
+    def test_event_poll_asks_every_repo_at_once_and_a_merge_still_wins_over_the_open_list(self):
+        quick, slow = SlowRun(delay=0), SlowRun()
+        expected = ct._observe(ct.Tools(run=quick), {}, True, 5000)
+        started = time.monotonic()
+        value = ct._observe(ct.Tools(run=slow), {}, True, 5000)
+        took = time.monotonic() - started
+        self.assertEqual(value, expected)
+        self.assertEqual(sorted(slow.argvs), sorted(quick.argvs))
+        self.assertLess(took, slow.spent * 0.4, 'one call after the other would take %.1f s' % slow.spent)
+        self.assertLessEqual(slow.most, ct.WORKERS)
+        self.assertEqual(sorted(value['prs']), ['ai-vaerk/website', 'alex/claude-pool', 'alex/docs'])
+        self.assertEqual({slug: rows['7']['state'] for slug, rows in value['prs'].items()}, dict.fromkeys(value['prs'], 'MERGED'))
+        self.assertEqual(value['prs']['alex/docs']['8']['state'], 'OPEN')
 
 class CliTests(ToolsBase):
     def test_help_lists_conductor(self):

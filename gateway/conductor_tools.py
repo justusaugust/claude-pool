@@ -16,8 +16,10 @@ Tool shapes (example-vps 2026-10-17, controller-verified; herdr 0.9.5 usage stri
 Only running sessions are ever addressed with `--session`; nothing here creates a herdr session or a project.
 avd is left out: no read-only JSON listing of its decisions is pinned yet."""
 import argparse
+import concurrent.futures
 import contextlib
 import fcntl
+import functools
 import json
 import os
 from pathlib import Path
@@ -43,6 +45,7 @@ KEEP_DAYS = 14
 MAX_TEXT_LINES, MAX_TEXT_BYTES = 60, 6 * 1024
 MAX_LAST = 160          # per-agent last line
 MAX_SESSIONS, MAX_AGENTS, MAX_PREVIEWS, MAX_REPOS, MAX_PRS = 20, 40, 20, 10, 10
+WORKERS = 8             # herdr, git, preview and gh calls a snapshot or an event poll runs at once
 IDLE = ('idle', 'done')
 ATTEMPTS = 3            # failed prompts to a present agent before a queued task is dropped
 ORPHAN_KEEP = 86400     # a task whose agent is gone is kept this long from when it was queued
@@ -95,6 +98,18 @@ def run_tool(argv, timeout=15):
 def _json(text):
     try: return json.loads(text)
     except ValueError: return None
+
+
+def _map(fn, items, workers=WORKERS):
+    """[fn(item) for item in items] with at most `workers` calls at once; the results keep the order of `items` and the
+    first exception is raised, as in the loop."""
+    items = list(items)
+    if len(items) < 2: return [fn(item) for item in items]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(workers, len(items))) as pool:
+        return list(pool.map(fn, items))
+
+
+def _call(fn): return fn()
 
 
 class Tools:
@@ -180,19 +195,26 @@ class Tools:
     def prs(self, slug, merged_since=None):
         """{number: row} of open PRs, plus PRs merged since `merged_since` (two calls, so a merge behind twenty newer PRs
         is not missed); None when gh is missing, unauthenticated or fails."""
-        fields = ['gh', 'pr', 'list', '--repo', slug, '--json', 'number,title,state,url,headRefName', '--limit', '20']
-        calls = [fields]
-        if merged_since is not None:
-            calls.append(fields + ['--state', 'merged', '--search', 'merged:>=' + time.strftime('%Y-%m-%d', time.gmtime(merged_since))])
-        rows = {}
-        for argv in calls:
-            done = self.run(argv, 30)
+        return self.prs_of([slug], merged_since)[slug]
+
+    def prs_of(self, slugs, merged_since=None):
+        """{slug: prs(slug, merged_since)} in the order of `slugs`. Every gh call of every repo runs at once (at most
+        WORKERS); a repo's merged list still updates its open list, and a failed open list still gives None."""
+        def argvs(slug):
+            fields = ['gh', 'pr', 'list', '--repo', slug, '--json', 'number,title,state,url,headRefName', '--limit', '20']
+            if merged_since is None: return [fields]
+            return [fields, fields + ['--state', 'merged', '--search', 'merged:>=' + time.strftime('%Y-%m-%d', time.gmtime(merged_since))]]
+        calls = [(slug, argv) for slug in slugs for argv in argvs(slug)]
+        found = {}
+        for (slug, _), done in zip(calls, _map(lambda call: self.run(call[1], 30), calls)):
+            if slug in found and found[slug] is None: continue
             data = _json(done.stdout) if done.returncode == 0 else None
-            if not isinstance(data, list): return None
-            rows.update({str(row['number']): {'state': str(row.get('state', '')), 'title': clean(row.get('title', ''), 100),
-                                              'url': clean(row.get('url', ''), 200), 'branch': clean(row.get('headRefName', ''), 60)}
-                         for row in data if isinstance(row, dict) and isinstance(row.get('number'), int)})
-        return rows
+            if not isinstance(data, list): found[slug] = None; continue
+            found.setdefault(slug, {}).update(
+                {str(row['number']): {'state': str(row.get('state', '')), 'title': clean(row.get('title', ''), 100),
+                                      'url': clean(row.get('url', ''), 200), 'branch': clean(row.get('headRefName', ''), 60)}
+                 for row in data if isinstance(row, dict) and isinstance(row.get('number'), int)})
+        return found
 
 
 # --- shared state files -------------------------------------------------------------------------------------------
@@ -290,38 +312,47 @@ def snapshot(tools=None, as_json=False, now=None, state_path=None, queue_path=No
         return json.dumps({'error': 'herdr is not available', 'generatedAt': int(now * 1000),
                            **_board(board, now, tools.preview_list()), 'queue': _queue_view(queued)}, ensure_ascii=False)
     repos, value, shown, present, unknown = {}, {'sessions': [], 'previews': [], 'prs': {}}, 0, set(), set()
-    for session in sessions[:MAX_SESSIONS]:
+    # The only chain is sessions -> agents -> cwd -> repo -> PRs; the calls of each step run at once (_map).
+    shown_sessions = sessions[:MAX_SESSIONS]
+    running = [session['name'] for session in shown_sessions if session.get('running')]
+    first = _map(_call, [tools.preview_list] + [functools.partial(read, name) for name in running
+                                                 for read in (tools.workspaces, tools.agents)])
+    listed, answers, reads = first[0], iter(first[1:]), []
+    for session in shown_sessions:
         entry = {'name': clean(session['name'], 60), 'running': bool(session.get('running')), 'workspaces': []}
         value['sessions'].append(entry)
         if not entry['running']: continue
-        labels = tools.workspaces(session['name'])
+        labels = next(answers)
         groups = {}
-        agents = tools.agents(session['name'])
+        agents = next(answers)
         if agents is None: unknown.add(session['name'])
         present.update(session['name'] + '/' + agent['pane_id'] for agent in agents or [])
         for agent in agents or []:
             if shown >= MAX_AGENTS: entry['more'] = entry.get('more', 0) + 1; continue
             shown += 1
             cwd = agent.get('cwd') or ''
-            if cwd and cwd not in repos: repos[cwd] = tools.repo(cwd)
-            repo = repos.get(cwd) or {'name': '', 'slug': ''}
+            if cwd and cwd not in repos: repos[cwd] = None  # asked below, once per cwd
             key, status = session['name'] + '/' + agent['pane_id'], agent.get('agent_status') or 'unknown'
             known = seen.get(key) or {}
             ws = agent.get('workspace_id') or ''
-            groups.setdefault(ws, {'id': ws, 'label': clean(labels.get(ws) or '', 40), 'agents': []})['agents'].append({
-                'name': clean(agent.get('name') or agent['pane_id'], 40), 'pane': agent['pane_id'], 'status': clean(status, 20),
-                'since': known.get('since') if known.get('status') == status else None,
-                'cwd': clean(cwd, 200), 'repo': repo['slug'] or repo['name'],
-                'last': last_line(tools.read(session['name'], agent['pane_id'])),
-                'queued': sum(1 for item in queued if item.get('session') == session['name'] and item.get('pane') == agent['pane_id'])})
+            row = {'name': clean(agent.get('name') or agent['pane_id'], 40), 'pane': agent['pane_id'], 'status': clean(status, 20),
+                   'since': known.get('since') if known.get('status') == status else None,
+                   'cwd': clean(cwd, 200), 'repo': None, 'last': None,
+                   'queued': sum(1 for item in queued if item.get('session') == session['name'] and item.get('pane') == agent['pane_id'])}
+            groups.setdefault(ws, {'id': ws, 'label': clean(labels.get(ws) or '', 40), 'agents': []})['agents'].append(row)
+            reads.append((row, cwd, functools.partial(tools.read, session['name'], agent['pane_id'])))
         entry['workspaces'] = list(groups.values())
-    listed = tools.preview_list()
+    cwds = list(repos)
+    second = _map(_call, [functools.partial(tools.repo, cwd) for cwd in cwds] + [read for _, _, read in reads])
+    repos = dict(zip(cwds, second))
+    for (row, cwd, _), text in zip(reads, second[len(cwds):]):
+        repo = repos.get(cwd) or {'name': '', 'slug': ''}
+        row['repo'], row['last'] = repo['slug'] or repo['name'], last_line(text)
     value['previews'] = [dict(row) for row in list((tools.previews(listed) or {}).values())[:MAX_PREVIEWS]]
     value['orphaned'] = [{'agent': item.get('session', '') + '/' + (item.get('agent') or item.get('pane', '')), 'task': clean(item.get('task', ''), 100)}
                          for item in queued if item.get('session') not in unknown
                          and item.get('session', '') + '/' + item.get('pane', '') not in present][:MAX_PREVIEWS]
-    for slug in sorted({repo['slug'] for repo in repos.values() if repo['slug']})[:MAX_REPOS]:
-        rows = tools.prs(slug)
+    for slug, rows in tools.prs_of(sorted({repo['slug'] for repo in repos.values() if repo['slug']})[:MAX_REPOS]).items():
         if rows: value['prs'][slug] = [{'number': int(n), **row} for n, row in list(rows.items())[:MAX_PRS] if row['state'] in ('', 'OPEN')]
     value['prs'] = {slug: rows for slug, rows in value['prs'].items() if rows}
     value['generatedAt'] = int(now * 1000)
@@ -362,23 +393,21 @@ def _observe(tools, previous, with_prs, now):
     old_agents = previous.get('agents') or {}
     value = {'sessions': {row['name']: bool(row.get('running')) for row in sessions}, 'agents': {},
              'previews': previous.get('previews'), 'prs': dict(previous.get('prs') or {}), 'repos': dict(previous.get('repos') or {})}
-    for name, running in value['sessions'].items():
-        if not running: continue
-        agents = tools.agents(name)
+    running = [name for name, running in value['sessions'].items() if running]
+    previews, *listed = _map(_call, [tools.previews] + [functools.partial(tools.agents, name) for name in running])
+    for name, agents in zip(running, listed):
         if agents is None:
             value['agents'].update({key: dict(row) for key, row in old_agents.items() if row.get('session') == name}); continue
         for agent in agents: value['agents'][name + '/' + agent['pane_id']] = _agent_row(name, agent)
-    previews = tools.previews()
     if previews is not None: value['previews'] = previews
     if with_prs:
         cwds = {row['cwd'] for row in value['agents'].values() if row['cwd']}
-        for cwd in cwds:
-            if cwd not in value['repos']: value['repos'][cwd] = tools.repo(cwd)['slug']
+        new = [cwd for cwd in cwds if cwd not in value['repos']]
+        for cwd, repo in zip(new, _map(tools.repo, new)): value['repos'][cwd] = repo['slug']
         value['repos'] = {cwd: slug for cwd, slug in value['repos'].items() if cwd in cwds}
         slugs = sorted({slug for slug in value['repos'].values() if slug})[:MAX_REPOS]
         value['prs'] = {slug: rows for slug, rows in value['prs'].items() if slug in slugs}
-        for slug in slugs:
-            rows = tools.prs(slug, merged_since=now - 86400)
+        for slug, rows in tools.prs_of(slugs, merged_since=now - 86400).items():
             if rows is not None: value['prs'][slug] = rows
     return value
 
