@@ -30,8 +30,8 @@ VPS = {'name': 'vps', 'ssh': 'alex@vps', 'platform': 'linux', 'roles': ['usage']
 PI = {'name': 'pi', 'ssh': 'alex@pi', 'platform': 'linux', 'roles': [], 'addedAt': 3}
 MACHINE_KEYS = {'name', 'platform', 'self', 'reachable', 'poolRunning', 'versionMatches', 'light', 'code', 'reason', 'fix', 'checkedAt'}
 CODE = r'^(ok|unreachable|pool-stopped|version-mismatch|never-checked|not-checkable|(failed|missing|manual):[a-z-]+)$'
-ACCOUNT_KEYS = {'name', 'label', 'alias', 'registryName', 'fiveHourPct', 'weekPct', 'fableWeekPct', 'resetsAt', 'reserveAt', 'kind',
-                'expiresAt', 'status'}
+ACCOUNT_KEYS = {'name', 'label', 'alias', 'registryName', 'fiveHourPct', 'weekPct', 'fableWeekPct', 'resetsAt', 'reserveAt',
+                'reserveHours', 'reserveTimezone', 'reserveSoft', 'reserveText', 'kind', 'expiresAt', 'status'}
 
 OVERVIEW = {
     'accounts': [
@@ -370,11 +370,23 @@ class AccountTests(BoardBase):
         self.assertEqual(team, {'name': 'team', 'label': 'AI Værk Team', 'alias': 'team', 'registryName': 'ai-vaerk-team-premium',
                                 'fiveHourPct': 42.4, 'weekPct': 61.0, 'fableWeekPct': 12.0,
                                 'resetsAt': {'fiveHour': 1_800_009_000_000, 'week': 1_800_400_000_000, 'fableWeek': None},
-                                'reserveAt': 85, 'kind': 'long-lived', 'expiresAt': 1_830_000_000_000, 'status': 'ready', 'agents': 2})
+                                'reserveAt': 85, 'reserveHours': None, 'reserveTimezone': None, 'reserveSoft': None,
+                                'reserveText': 'reserved from 85%', 'kind': 'long-lived', 'expiresAt': 1_830_000_000_000, 'status': 'ready', 'agents': 2})
         self.assertEqual(personal, {'name': 'personal', 'label': 'Personal', 'alias': 'p', 'registryName': None,
                                     'fiveHourPct': 100.0, 'weekPct': None, 'fableWeekPct': None,
                                     'resetsAt': {'fiveHour': 1_800_001_000_000, 'week': None, 'fableWeek': None},
-                                    'reserveAt': None, 'kind': 'refreshable', 'expiresAt': None, 'status': 'limited', 'agents': 1})
+                                    'reserveAt': None, 'reserveHours': None, 'reserveTimezone': None, 'reserveSoft': None,
+                                    'reserveText': None, 'kind': 'refreshable', 'expiresAt': None, 'status': 'limited', 'agents': 1})
+
+    def test_a_reserve_window_comes_with_its_hours_zone_and_text(self):
+        window = {'reserveAt': 90, 'reserveHours': [6, 24], 'reserveTimezone': 'Europe/Stockholm', 'reserveSoft': True}
+        overview = json.loads(json.dumps(OVERVIEW)); overview['accounts'][0].update(window)
+        settings.CONFIG.write_text(json.dumps({'accounts': [{**CONFIG['accounts'][0], **window}, CONFIG['accounts'][1]]}))
+        for board, when, text in ((self.board(overview=overview), NOW, 'reserved from 90% until 24:00'),  # 09:00 in Stockholm
+                                  (self.board(overview=ConnectionRefusedError()), NOW - 4 * 3600, 'reserved from 90% from 06:00')):
+            with self.subTest(text=text):
+                team = self.snap(now=when, board=board)['accounts'][0]
+                self.assertEqual({key: team[key] for key in (*window, 'reserveText')}, {**window, 'reserveText': text})
 
     def test_a_stopped_pool_still_lists_the_accounts_without_numbers(self):
         rows = self.snap(board=self.board(overview=ConnectionRefusedError()))['accounts']

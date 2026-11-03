@@ -678,18 +678,18 @@ def _local_fingerprint(name):
 def _reserve_issues(value):
     """This device's config rows whose reserve differs from the registry; runs the reserve hook once when any does."""
     def differing():
-        rows = {row['name']: row.get('reserveAt', 0) for row in load_config(settings.CONFIG).get('accounts', [])}
+        rows = {row['name']: accounts_cli.reserve_of(row) for row in load_config(settings.CONFIG).get('accounts', [])}
         members = [accounts_cli.member_identity(settings.STORES, name) for name in rows]
         found = []
         for row in value['accounts']:
-            name = registry.local_name(row, members)
-            if 'reserveAt' in row and name in rows and rows[name] != row['reserveAt']: found.append((name, rows[name], row['reserveAt']))
+            name, want = registry.local_name(row, members), accounts_cli.reserve_of(row)
+            if 'reserveAt' in row and name in rows and rows[name] != want: found.append((name, rows[name], want))
         return found
     if not differing(): return []
     try: accounts_cli.reserve_hook(value)
     except Exception: pass
-    return [('failed', f'{name} reserve {have} % here, {want} % in the registry',
-             'claude-pool account reserve ' + name + (' --at ' + str(want) if want else ' --off')) for name, have, want in differing()]
+    return [('failed', f'{name} reserve {accounts_cli.reserve_words(have)} here, {accounts_cli.reserve_words(want)} in the registry',
+             'claude-pool account reserve ' + name + accounts_cli.reserve_args(want)) for name, have, want in differing()]
 
 
 def check_accounts(t):

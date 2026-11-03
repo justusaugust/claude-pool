@@ -1,6 +1,7 @@
 """Quota pace uses fresh same-window observations. The pool forecast pools rest and pace of accounts that burn at the
 same time; summing each account's own time assumed they run one after another (21.10.2026: 248 min forecast, 70 real)."""
 from statistics import median
+from routing import reserve_limit
 from telemetry import missing_windows
 
 WINDOWS = [('fiveHour', '5h'), ('sevenDay', 'week')]
@@ -39,8 +40,9 @@ def pace(points, key, now):
 def estimate(accounts, observations, now, threshold=95):
     estimates, resets = [], []
     for account in accounts:
-        # A reserved account takes no new pool work from its reserve limit on (routing.reserve_blocked).
-        limit = min(threshold, account['reserveAt']) if account.get('reserveAt') else threshold
+        # A reserved account takes no new pool work from the reserve limit that holds now on (routing.reserve_blocked).
+        reserve = reserve_limit(account, now / 1000)
+        limit = min(threshold, reserve) if reserve else threshold
         row = {'name': account['name'], 'label': account['label'], 'status': account['status'],
                'seconds': None, 'basis': [], 'windows': {}, 'reason': 'collecting pace'}
         times = []

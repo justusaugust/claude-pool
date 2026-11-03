@@ -39,6 +39,16 @@ SERVICE_LABEL = service.installed_label(INSTALLATION)
 SERVICE_FILE = service.service_file(SERVICE_LABEL)
 ACCOUNT_SHORTCUTS = ALIASES
 SELF_CHECK_FIRST, SELF_CHECK_EVERY = 600, 6 * 3600  # seconds after the start and between two device checks of this machine
+RESERVE_WINDOW_EVERY = 60  # seconds between two writes of the reserve windows' Shunt options (their edges are full hours)
+
+
+def reserve_windows(now=None):
+    """Shunt has no clock: write each reserve window's options for this hour into the runtime TOML(s) Shunt watches
+    (accounts_cli.apply_reserve_windows). True when that changed a file; a failure waits for the next turn."""
+    import accounts_cli
+    paths, _ = accounts_cli.local_paths_env(RUNTIME, STORES)
+    try: return accounts_cli.apply_reserve_windows(CONFIG, paths, time.time() if now is None else now)
+    except (OSError, ValueError, RuntimeError): return False
 
 
 def service_command(*args, check=True):
@@ -210,9 +220,13 @@ def daemon(client, admin):
         def supervise():
             nonlocal gateway
             delay, next_probe, next_sample, next_alert, next_prune = .5, time.monotonic(), time.monotonic() + 30, time.monotonic() + 30, time.monotonic() + 600
-            next_check, checking = time.monotonic() + SELF_CHECK_FIRST, None
+            next_check, checking, next_window = time.monotonic() + SELF_CHECK_FIRST, None, time.monotonic()
             while not stop.wait(.5):
                 now = time.monotonic()
+                if now >= next_window:
+                    # A reserve window's Shunt options at start and every minute, so they switch at its edges.
+                    reserve_windows()
+                    next_window = now + RESERVE_WINDOW_EVERY
                 if checking is not None and checking.poll() is not None: checking = None
                 if now >= next_check:
                     # This machine's own device check, shared with its peers: a healthy machine never shows a stale check.

@@ -11,13 +11,14 @@ import json
 import re
 import time
 
-from account_metadata import load as load_config
+from account_metadata import load as load_config, reserve_hours_ok
 from conductor_tools import _locked, clean
 from device_report import STATUSES
 from private_files import read_private, write_private
 import readings
 import registry
 from remote import NO_LAUNCHER, OUTDATED, Remote
+from routing import reserve_text
 import settings
 
 CHECK_FILE = 'device-check-cache.json'   # 0600, in settings.RUNTIME: the last device check result per device
@@ -301,11 +302,17 @@ class Board:
             entry = registry.entry_for(value, held or {'name': name})
             kind = held.get('servingKind') or held.get('kind')
             kind = kind if kind in ('long-lived', 'refreshable') else None
-            reserve = row.get('reserveAt') or own.get('reserveAt') or None
+            source = row if row.get('reserveAt') else own  # a window comes with the percent it belongs to
+            reserve = source['reserveAt'] if type(source.get('reserveAt')) is int and source['reserveAt'] > 0 else None
+            window = reserve and reserve_hours_ok(source.get('reserveHours')) and isinstance(source.get('reserveTimezone'), str)
+            hours, zone = (source['reserveHours'], source['reserveTimezone']) if window else (None, None)
+            soft = source['reserveSoft'] if reserve and type(source.get('reserveSoft')) is bool else None
+            text = reserve_text({'reserveAt': reserve, 'reserveHours': hours, 'reserveTimezone': zone}, now) if reserve else ''
             account = {'name': clean(name, 80), 'label': clean(row.get('label') or own.get('label') or name, 80),
                        'alias': clean(own.get('alias') or name, 80),
                        'registryName': clean(entry['name'], 80) if entry and entry['name'] != name else None,
-                       'resetsAt': {}, 'reserveAt': reserve if type(reserve) is int else None, 'kind': kind,
+                       'resetsAt': {}, 'reserveAt': reserve, 'reserveHours': hours, 'reserveTimezone': clean(zone, 80) if zone else None,
+                       'reserveSoft': soft, 'reserveText': clean(text, 80) or None, 'kind': kind,
                        'expiresAt': held.get('expiresAt') if kind == 'long-lived' and type(held.get('expiresAt')) is int else None,
                        'status': 'reauthenticate' if name in rejected else clean(row.get('status') or 'unknown', 20)}
             for key, short, pct in WINDOWS:
@@ -316,7 +323,8 @@ class Board:
                 account['resetsAt'][short] = int(reset) if readings.number(reset) else None
             if sessions is not None: account['agents'] = sum(1 for session in sessions if session.get('account') == name)
             out.append({key: account[key] for key in ('name', 'label', 'alias', 'registryName', 'fiveHourPct', 'weekPct', 'fableWeekPct',
-                                                       'resetsAt', 'reserveAt', 'kind', 'expiresAt', 'status', 'agents') if key in account})
+                                                       'resetsAt', 'reserveAt', 'reserveHours', 'reserveTimezone', 'reserveSoft', 'reserveText',
+                                                       'kind', 'expiresAt', 'status', 'agents') if key in account})
         return out
 
 
