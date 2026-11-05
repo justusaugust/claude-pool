@@ -3,6 +3,7 @@ import http.client
 import json
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch, Mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -20,7 +21,8 @@ class BridgeTests(unittest.TestCase):
         self.event_interval = 0
         self.keep_open = False
         self.http_status = 200
-        self.statuses = []
+        self.statuses, self.bodies = [], []   # bodies: raw JSON answers instead of the event stream
+        self.honor_pauses = False            # the fake Shunt skips a paused account, as Shunt does
         self.default_account = 'gmail'
         self.hold = False
         self.entered, self.release = threading.Event(), threading.Event()
@@ -44,11 +46,17 @@ class BridgeTests(unittest.TestCase):
                 owner.inputs.append(self.rfile.read(int(self.headers['Content-Length'])))
                 owner.headers.append(self.headers)
                 account = self.headers.get('x-shunt-session-account', owner.default_account)
+                if owner.honor_pauses and owner.paused.get(account): account = next(a for a in owner.paused if not owner.paused[a])
                 owner.preferred.append(account)
                 if owner.hold:
                     owner.entered.set()
                     owner.release.wait(5)
-                self.send_response(owner.statuses.pop(0) if owner.statuses else owner.http_status); self.send_header('Content-Type', 'text/event-stream'); self.send_header('x-shunt-account', account); self.end_headers()
+                status = owner.statuses.pop(0) if owner.statuses else owner.http_status
+                if owner.bodies:
+                    raw = owner.bodies.pop(0)
+                    self.send_response(status); self.send_header('Content-Type', 'application/json'); self.send_header('Content-Length', str(len(raw)))
+                    self.send_header('x-shunt-account', account); self.end_headers(); self.wfile.write(raw); return
+                self.send_response(status); self.send_header('Content-Type', 'text/event-stream'); self.send_header('x-shunt-account', account); self.end_headers()
                 events = [{'type': 'message_start', 'message': {'usage': {'input_tokens': 2}, 'input_transformations': []}}, {'type': 'message_delta', 'usage': {'output_tokens': 4}}]
                 if owner.complete: events.append({'type': 'message_stop'})
                 if owner.stream_events is not None: events = owner.stream_events
@@ -118,6 +126,57 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(json.loads(self.inputs[-2])['system'][0]['cache_control'], {'type': 'ephemeral', 'ttl': '1h'})
         self.assertEqual(self.inputs[-1], raw)
         self.assertIn('cache_fallback', [row['code'] for row in self.bridge.journal.snapshot()])
+    BLOCKED = json.dumps({'type': 'error', 'error': {'type': 'permission_error', 'details': {'error_code': 'oauth_not_allowed_for_organization'},
+                          'message': 'OAuth authentication is currently not allowed for this organization.'}, 'request_id': 'req_fixture'}).encode()
+    AUXILIARY = {'x-claude-code-request-class': 'auxiliary'}
+    def side_request(self):
+        return self.call('/v1/messages', {'model': 'claude-sonnet-5', 'stream': True, 'messages': [{'role': 'user', 'content': 'x'}]},
+                         extra_headers=self.AUXILIARY)
+    def test_an_account_its_organization_refuses_is_paused_and_the_request_goes_to_another(self):
+        # 5.11.2026: Shunt sent auto mode's classifier calls to an account Anthropic refused this way; Bash stopped in the agents.
+        self.honor_pauses, self.default_account = True, 'team'
+        self.statuses, self.bodies = [403], [self.BLOCKED]
+        status, _ = self.side_request()
+        self.assertEqual(status, 200)
+        self.assertEqual(self.preferred, ['team', 'gmail'])
+        self.assertTrue(self.paused['team'])
+        self.assertEqual([(r.get('account'), r.get('reason')) for r in self.bridge.journal.snapshot() if r['code'] == 'account_blocked'],
+                         [('team', 'oauth_not_allowed_for_organization')])
+        self.assertAlmostEqual(self.bridge.blocked['team']['until'] / 1000, time.time() + 6 * 3600, delta=60)
+        self.side_request()
+        self.assertEqual(self.preferred[-1], 'gmail', 'the next request does not try it again')
+    def test_a_session_steered_to_a_refused_account_is_answered_by_another_at_once(self):
+        self.honor_pauses = True
+        self.call('/cockpit/test-session', {'action': 'pin', 'account': 'team'})
+        self.statuses, self.bodies = [403], [self.BLOCKED]
+        status, _ = self.call('/v1/messages', {'model': 'claude-opus-5-5', 'stream': True, 'messages': [{'role': 'user', 'content': 'x'}]})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.preferred, ['team', 'gmail'])
+        self.assertIsNone(self.headers[-1].get('x-shunt-session-account'))
+    def test_any_other_403_reaches_claude_code_unchanged(self):
+        other = json.dumps({'type': 'error', 'error': {'type': 'permission_error', 'message': 'fixture'}}).encode()
+        self.statuses, self.bodies = [403], [other]
+        self.assertEqual(self.side_request(), (403, other))
+        self.assertEqual((self.paused, self.bridge.blocked, len(self.preferred)), ({'gmail': False, 'team': False}, {}, 1))
+    def test_a_block_survives_a_restart_ends_after_six_hours_and_never_lifts_a_pause_by_hand(self):
+        self.honor_pauses, self.default_account = True, 'team'
+        self.statuses, self.bodies = [403], [self.BLOCKED]
+        self.side_request()
+        again = PoolBridge(('127.0.0.1', 0), self.upstream.server_port, 'fixture-client', 'fixture-admin', Path(self.temp.name)/'state.json')
+        self.addCleanup(again.server_close)
+        self.paused['team'] = False                     # Shunt started anew
+        again.restore_pauses()
+        self.assertTrue(self.paused['team'])
+        until = again.blocked['team']['until']
+        again.release_blocks(until - 1)
+        self.assertTrue(self.paused['team'])
+        again.release_blocks(until)
+        self.assertEqual((self.paused['team'], again.blocked), (False, {}))
+        self.assertIn('account_unblocked', [r['code'] for r in again.journal.snapshot()])
+        self.paused['gmail'] = True
+        again.paused_names.add('gmail'); again.blocked['gmail'] = {'until': 0, 'code': 'oauth_not_allowed_for_organization'}
+        again.release_blocks(1)
+        self.assertEqual((self.paused['gmail'], again.blocked), (True, {}))
     def test_a_subagent_stays_on_the_account_it_was_first_routed_to_while_that_account_is_ready(self):
         self.default_account = 'team'      # Shunt's own choice for the agent's first request
         self.subagent(agent='steady')

@@ -35,6 +35,8 @@ CODES = {
     'readings_sync_failed': 'Shared usage readings could not be fetched',
     'reserve_not_applied': 'A reserve from the device registry could not be applied',
     'storage_failed': 'Recovery metadata could not be saved',
+    'account_blocked': 'Anthropic refuses this whole account (an organization setting); paused for six hours',
+    'account_unblocked': 'A refused account was resumed for its next try',
 }
 
 
