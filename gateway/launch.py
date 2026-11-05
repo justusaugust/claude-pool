@@ -245,6 +245,9 @@ def daemon(client, admin):
                     # The brake hold samples with it, so its 15 minutes of calm count in real time, not only when a request comes.
                     try: server.brake_hold()
                     except (OSError, RuntimeError, ValueError, KeyError, TypeError, http.client.HTTPException): pass
+                    # An account Anthropic refused gets its next try once its pause is over.
+                    try: server.release_blocks()
+                    except (OSError, RuntimeError, ValueError, KeyError, TypeError, http.client.HTTPException): pass
                     next_alert = now + 30
                 if gateway.poll() is None:
                     if now >= next_probe:

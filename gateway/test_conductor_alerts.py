@@ -20,6 +20,7 @@ class FakeServer:
         self.health = {'failures': 0}
         self.last_accounts = [self.account('Intern'), self.account('Team')]
         self.stage = {'stage': 0, 'ratio': None, 'resetAt': None}
+        self.blocked = {}
 
     def account(self, label, status='ready', pct=20):
         return {'name': label.lower(), 'label': label, 'status': status, 'fiveHour': {'pct': pct, 'resetsAt': (NOW + 2 * H) * 1000},
@@ -54,6 +55,17 @@ class AlertTests(unittest.TestCase):
         self.assertRegex(end, r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d{4} pool backend vorbei: Backend antwortet wieder$')
         self.assertTrue(LINE.fullmatch(start))
 
+    def test_an_account_anthropic_refuses_wakes_the_conductor_with_its_label_and_next_try(self):
+        self.server.blocked = {'intern': {'until': (NOW + 6 * H) * 1000, 'code': 'oauth_not_allowed_for_organization'}}
+        self.alerts.check(self.server)
+        self.clock.now += 30; self.alerts.check(self.server)
+        self.server.blocked = {}
+        self.clock.now += 30; self.alerts.check(self.server)
+        start, end = self.lines()
+        clock = __import__('time').strftime('%H:%M', __import__('time').localtime(NOW + 6 * H))
+        self.assertRegex(start, r' pool gesperrt an conductor: Konto Intern: Anthropic lässt .*oauth_not_allowed_for_organization.* pausiert bis ' + clock)
+        self.assertRegex(end, r' pool gesperrt vorbei: ')
+        self.assertTrue(LINE.fullmatch(start) and LINE.fullmatch(end))
     def test_a_second_episode_within_the_hour_stays_quiet_and_later_ones_wake_again(self):
         for at, active in [(0, True), (600, False), (1200, True), (1800, False), (H + 60, True)]:
             self.clock.now = NOW + at

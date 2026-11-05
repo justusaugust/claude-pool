@@ -3,7 +3,7 @@
 A start writes `<time> pool <art> an conductor: <sentence>` and wakes the Conductor through its event watcher, at most once
 per art and hour; the end of an announced episode writes the routine line `<time> pool <art> vorbei: <sentence>`. Arts:
 backend (three failed probes, agents get 503), konten-limit (no account can answer), anmeldung (an account needs a new
-login) and bremse (brake stage 2). Nothing is written when the Conductor folder has no state directory. Episode state
+login), gesperrt (Anthropic refuses an account, the pool paused it) and bremse (brake stage 2). Nothing is written when the Conductor folder has no state directory. Episode state
 survives daemon restarts in a 0600 file next to the other pool state."""
 import json
 import os
@@ -71,6 +71,14 @@ class Alerts:
             relogin = [r['label'] for r in rows if r.get('status') == 'reauthenticate']
             who = 'Konto ' + relogin[0] + ' braucht' if len(relogin) == 1 else 'Konten ' + ', '.join(relogin) + ' brauchen'
             self.update('anmeldung', bool(relogin), who + ' eine neue Anmeldung', 'Anmeldungen wieder gültig')
+            blocked = dict(getattr(server, 'blocked', None) or {})
+            if blocked:
+                name, row = min(blocked.items(), key=lambda item: item[1]['until'])
+                label = next((r.get('label') or name for r in rows if r.get('name') == name), name)
+                start = ('Konto ' + label + ': Anthropic lässt seine Organisation nicht über Claude Code anmelden (' + row['code']
+                         + '), der Pool hat es pausiert bis ' + _clock(row['until']) + ' und versucht es dann neu. Prüfen oder aus dem Pool nehmen')
+            else: start = ''
+            self.update('gesperrt', bool(blocked), start, 'Kein Konto mehr gesperrt')
         info = server.brake_info() or {}
         self.update('bremse', (info.get('stage') or 0) >= 2,
                     'Bremse Stufe 2: Prognose reicht nicht bis zur Hälfte der Zeit bis zum nächsten Reset um ' + _clock(info.get('resetAt')),

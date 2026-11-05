@@ -31,6 +31,20 @@ from private_files import atomic_write, link_replace
 from settings import LABELS, CONFIG
 HOP = {"host", "connection", "content-length", "transfer-encoding"}
 QUEUE_READ = 4 * 1024 * 1024   # bytes of a waiting session's transcript read per look
+# A 403 with one of these codes refuses every request of the account, whatever the model (an organization setting, not a
+# quota). 5.11.2026: Shunt sent auto mode's classifier calls to such an account (it had no usage reading, so it looked
+# free) and Bash stopped in the agents. The account is paused in Shunt for BLOCK_SECONDS, then gets its next try.
+BLOCKED_CODES = {'oauth_not_allowed_for_organization'}
+BLOCK_SECONDS = 6 * 3600
+
+
+def blocked_code(head):
+    """The code of a 403 that refuses the whole account, read from the start of its body; None for any other 403."""
+    try: error = json.loads(head).get('error')
+    except (ValueError, AttributeError, UnicodeDecodeError): return None
+    details = error.get('details') if isinstance(error, dict) else None
+    code = details.get('error_code') if isinstance(details, dict) else None
+    return code if code in BLOCKED_CODES else None
 
 
 def number(value):
@@ -64,6 +78,7 @@ class PoolBridge(ThreadingHTTPServer):
         self.shared_readings = Path(shared_readings) if shared_readings else None
         self.lock = threading.RLock()
         self.sessions, self.observations, self.paused_names = {}, {}, set()
+        self.blocked = {}  # name -> {until (ms), code}: accounts Anthropic refuses, paused in Shunt until then
         self.traffic = []
         self.outcomes = []  # recent upstream answers: status and answering account (x-shunt-account), in memory only
         self.recovery = {"restarts": 0, "state": "ready"}
@@ -142,6 +157,9 @@ class PoolBridge(ThreadingHTTPServer):
                             if not isinstance(row, dict) or not number(row.get("at")) or not isinstance(row.get("account"), str) or not re.fullmatch(r"[a-z0-9-]{1,80}", row["account"]) or not isinstance(row.get("workload"), str) or not re.fullmatch(r"(opus|sonnet|haiku|other)/(standard|thinking|low|medium|high|max)", row["workload"]): continue
                             self.traffic.append({"at": row["at"], "account": row["account"], "workload": row["workload"], **{k: row[k] for k in ("inputTokens", "outputTokens", "thinkingTokens", "cacheReadTokens", "cacheCreationTokens", "durationSeconds") if number(row.get(k)) and row[k] >= 0}})
                         self.paused_names = {n for n in (stored.get("paused") if isinstance(stored.get("paused"), list) else []) if isinstance(n, str) and re.fullmatch(r"[a-z0-9-]{1,80}", n)}
+                        blocked = stored.get("blocked") if isinstance(stored.get("blocked"), dict) else {}
+                        self.blocked = {n: {"until": b["until"], "code": b["code"]} for n, b in blocked.items() if isinstance(n, str) and re.fullmatch(r"[a-z0-9-]{1,80}", n)
+                                        and isinstance(b, dict) and number(b.get("until")) and b.get("code") in BLOCKED_CODES}
                         self.hold = Hold.restore(stored.get("brake"))
                     if path != self.state_path: self.recovery["restoredBackup"] = True
                     self._last_saved = json.dumps(self.stored())
@@ -362,8 +380,39 @@ class PoolBridge(ThreadingHTTPServer):
 
     def restore_pauses(self):
         for account in self.accounts():
-            if account["name"] in self.paused_names:
+            if account["name"] in self.paused_names or account["name"] in self.blocked:
                 self.admin(f"/admin/api/pool/{account['provider']}/accounts/{account['id']}", {"paused": True})
+
+    def block_account(self, name, code):
+        """Pause an account Anthropic refuses (blocked_code) in Shunt for BLOCK_SECONDS, so neither the pool nor Shunt picks it.
+        False when it cannot be paused; then the 403 goes to Claude Code as before."""
+        try:
+            account = next((a for a in self.accounts() if a['name'] == name), None)
+            if account is None: return False
+            self.admin(f"/admin/api/pool/{account['provider']}/accounts/{account['id']}", {"paused": True})
+        except (OSError, ValueError, RuntimeError, http.client.HTTPException): return False
+        with self.lock:
+            fresh = name not in self.blocked
+            self.blocked[name] = {'until': int((time.time() + BLOCK_SECONDS) * 1000), 'code': code}
+            self.save()
+        if fresh: self.journal.record('account_blocked', account=name, reason=code)
+        return True
+
+    def release_blocks(self, now=None):
+        """A refused account whose time is up gets its next try: resumed in Shunt unless it was paused by hand. If Anthropic
+        still refuses it, its next request pauses it again (and goes to another account)."""
+        now = int(time.time() * 1000) if now is None else now
+        with self.lock: due = [name for name, b in self.blocked.items() if b['until'] <= now]
+        for name in due:
+            if name not in self.paused_names:
+                try:
+                    account = next((a for a in self.accounts() if a['name'] == name), None)
+                    if account: self.admin(f"/admin/api/pool/{account['provider']}/accounts/{account['id']}", {"paused": False})
+                except (OSError, ValueError, RuntimeError, http.client.HTTPException): continue
+            with self.lock:
+                self.blocked.pop(name, None)
+                self.save()
+            self.journal.record('account_unblocked', account=name)
 
     def display_accounts(self):
         try: return self.accounts()
@@ -619,7 +668,7 @@ class PoolBridge(ThreadingHTTPServer):
 
     def stored(self):
         return {"version": 1, "sessions": self.sessions, "observations": self.observations, "paused": sorted(self.paused_names), "traffic": self.traffic,
-                "brake": self.hold.state()}
+                "brake": self.hold.state(), "blocked": self.blocked}
 
     def save(self):
         if not self.state_path: return
@@ -949,6 +998,17 @@ class Handler(BaseHTTPRequestHandler):
                 self.server.journal.record('cache_fallback' if hour_cache else 'short_label_fallback', account=account)
                 if short: self.server.label_counted('refused')
                 hour_cache, short, body = False, False, original
+                conn.connect(); lease['upstream'] = conn.sock
+                conn.request(self.command, self.path, body, headers)
+                response = conn.getresponse()
+                lease['progress'] = time.monotonic()
+                account = response.getheader('x-shunt-account')
+                self.server.note_outcome(response.status, account)
+            if response.status == 403 and account and (code := blocked_code(response.peek(4096))) and self.server.block_account(account, code):
+                # Anthropic refuses this whole account, before any output: it is paused now, so the request goes once more
+                # and Shunt answers it from another account; a steer to the refused account is dropped.
+                response.read(); response.close(); conn.close()
+                if headers.get('x-shunt-session-account') == account: del headers['x-shunt-session-account']
                 conn.connect(); lease['upstream'] = conn.sock
                 conn.request(self.command, self.path, body, headers)
                 response = conn.getresponse()
