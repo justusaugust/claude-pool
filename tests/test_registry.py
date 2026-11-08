@@ -103,7 +103,7 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(registry.load(self.path), merged)
 
     def test_receive_rejects_invalid_values(self):
-        with self.assertRaises(ValueError): registry.receive({**gen(5), 'extra': 1}, self.path)
+        with self.assertRaises(ValueError): registry.receive({**gen(5), 'generation': -1}, self.path)
 
     def test_force_puts_this_list_above_every_peer_and_tombstones_rows_only_peers_have(self):
         registry.update(lambda v: (v['devices'].append(MAC), v['accounts'].append(ENTRY)), self.path)
