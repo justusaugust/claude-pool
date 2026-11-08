@@ -692,6 +692,20 @@ def _reserve_issues(value):
              'claude-pool account reserve ' + name + accounts_cli.reserve_args(want)) for name, have, want in differing()]
 
 
+def _reserve_differences(here, theirs, device):
+    """A line for each account both devices serve whose reserve differs. A peer that reports no reserve (an older version) is unknown, not different."""
+    found = []
+    for row in here:
+        mine = row.get('reserve')
+        if not row.get('active') or not isinstance(mine, list): continue
+        there = registry.local_name(row, theirs)
+        other = (theirs.get(there) or {}).get('reserve') if there else None
+        if isinstance(other, list) and other != mine:
+            found.append(('failed', f"{row['name']} reserve {accounts_cli.reserve_words(tuple(mine))} here, {accounts_cli.reserve_words(tuple(other))} on {device}",
+                          'claude-pool account reserve ' + row['name'] + accounts_cli.reserve_args(tuple(mine)) + ' on ' + device + ', or the other way round'))
+    return found
+
+
 def check_accounts(t):
     if not t.supported: return t.needs_install('accounts')
     st = t.status()
@@ -749,6 +763,7 @@ def check_accounts(t):
                 issues.append(('failed', 'probe failed for ' + (registry.describe(entry, account) if entry else account),
                                replace_fix(entry.get('email'), entry.get('name') or account)))
     if t.mine: issues += _reserve_issues(value)
+    else: issues += _reserve_differences(here, theirs, name)
     pending = st.get('switchPending') or []
     if pending:
         issues.append(('manual', 'switch pending for ' + ', '.join(pending), t.on('claude-pool device switch')))
