@@ -4,6 +4,8 @@ import http.client
 import json
 import math
 
+from routing import holds
+
 
 def fable_windows(admin):
     windows = {}
@@ -57,21 +59,13 @@ def read_admin(token):
 
 
 def capacity(accounts, model, now):
-    """Wait only on confirmed quota exhaustion, never on auth or network failure."""
+    """Wait only on confirmed quota exhaustion, never on auth or network failure. An account Shunt no longer chooses
+    (routing.holds: a rejected or full window, or its hard reserve reached) is exhausted until the windows holding it reset."""
     windows = ['fiveHour', 'sevenDay'] + (['fableWeekly'] if 'fable' in model.lower() else [])
     candidates = [a for a in accounts if a['status'] not in {'paused', 'reauthenticate'}]
     resets = []
     for account in candidates:
-        blocked = []
-        for key in windows:
-            reading = account.get(key) or {}
-            signal = account.get('quotaLimits', {}).get(key) or {}
-            if signal.get('status') == 'rejected' or reading.get('pct', 0) >= 100:
-                reset = signal.get('resetsAt') or reading.get('resetsAt')
-                # An elapsed boundary is permission to probe, not proof of fresh quota.
-                if reset and reset <= now:
-                    continue
-                blocked.append(reset)
+        blocked = holds(account, windows, now)
         if not blocked:
             return {'state': 'ready', 'nextResetAt': None, 'checkedAt': now}
         resets.append(max(blocked) if all(blocked) else None)

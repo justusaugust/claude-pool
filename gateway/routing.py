@@ -68,6 +68,31 @@ def reserve_blocked(account, now=None):
     return limit > 0 and any(account.get(k) and account[k]['pct'] >= limit for k in ('fiveHour', 'sevenDay', 'fableWeekly'))
 
 
+def hard_reserve(account, now):
+    """The reserve percent Shunt enforces as a cap at `now` (epoch seconds): a hard reserve that holds, else 0. A soft
+    reserve has no cap in Shunt (backend_options)."""
+    return 0 if account.get('reserveSoft') else reserve_limit(account, now)
+
+
+def holds(account, keys, now):
+    """What keeps Shunt from choosing `account` for a request that counts the windows `keys`, at `now` (epoch ms): the
+    reset (ms, None when unknown) of each window that is rejected, full or at the hard reserve. Shunt's own `capped` flag
+    (`cappedFable` for the Fable window) holds the account with an unknown reset when no such window shows. A window whose
+    reset has passed holds nothing: the boundary is permission to probe, not proof of fresh quota. Empty: it takes work."""
+    limit = hard_reserve(account, now / 1000)
+    resets = []
+    for key in keys:
+        reading = account.get(key) or {}
+        signal = (account.get('quotaLimits') or {}).get(key) or {}
+        pct = reading.get('pct') or 0
+        if signal.get('status') == 'rejected' or pct >= 100 or (limit and pct >= limit):
+            reset = signal.get('resetsAt') or reading.get('resetsAt')
+            if reset and reset <= now: continue
+            resets.append(reset)
+    if not resets and (account.get('capped') or ('fableWeekly' in keys and account.get('cappedFable'))): resets.append(None)
+    return resets
+
+
 def open_quota(account):
     """Ready, and both all-model windows under 95 %."""
     return account['status'] == 'ready' and all(not account.get(k) or account[k]['pct'] < 95 for k in ('fiveHour', 'sevenDay'))

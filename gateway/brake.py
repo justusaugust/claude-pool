@@ -10,10 +10,14 @@ work waited 35 minutes in the median, 125 at p90.
 """
 import json
 import math
+import time
 from collections import defaultdict
+
+from routing import holds
 
 NEVER = {'conductor', 'conductor-wecker'}   # COCKPIT_PROJECT (folder name) of Conductor Claude and of its watcher session
 CLASSES = {'subagent', 'workflow'}
+WINDOWS = ('fiveHour', 'sevenDay')  # the all-model windows the brake counts
 INTERACTIVE = 90 * 60   # seconds a session counts as interactive after a message from a person
 RELEASE = 15 * 60       # seconds the brake must stay off in a row before background work goes again (the stage flickers)
 MAX_WAIT = 3 * 3600     # seconds one request waits at most; then it goes and the journal records it
@@ -24,13 +28,11 @@ PRICES = [('fable', (10, 50, .25)), ('mythos', (10, 50, .25)), ('opus-5-5', (4, 
 
 
 def returns_at(account, now):
-    """When an account next gains capacity: its five-hour reset, or for a full week the weekly reset
-    (and the five-hour reset too, if that window is also full)."""
+    """When an account next gains capacity (ms): once every window that holds it has reset (full, rejected or at its hard
+    reserve, routing.holds), else at its five-hour reset. None when unknown or not after `now`."""
     if account.get('status') not in {'ready', 'limited'}: return None
-    five, week = account.get('fiveHour') or {}, account.get('sevenDay') or {}
-    at = five.get('resetsAt') or 0
-    if week.get('pct', 0) >= 100:
-        at = max(week.get('resetsAt') or 0, at) if five.get('pct', 0) >= 100 else (week.get('resetsAt') or 0)
+    held = holds(account, WINDOWS, now)
+    at = (max(held) if all(held) else 0) if held else (account.get('fiveHour') or {}).get('resetsAt') or 0
     return at if at > now else None
 
 
@@ -44,10 +46,13 @@ def stage(forecast, accounts, now):
     return {'stage': 0 if ratio >= 1 else 1 if ratio >= .5 else 2, 'ratio': ratio, 'resetAt': reset}
 
 
-def standstill(accounts):
-    """No account ready and at least one confirmed at its limit; accounts without a reading yet (a fresh start) are none."""
-    statuses = [a.get('status') for a in accounts if isinstance(a, dict)]
-    return 'ready' not in statuses and 'limited' in statuses
+def standstill(accounts, now=None):
+    """No account takes work and at least one is confirmed at its limit (status limited, or held by routing.holds at
+    `now`, epoch ms); accounts without a reading yet (a fresh start) are none."""
+    now = time.time() * 1000 if now is None else now
+    rows = [a for a in accounts if isinstance(a, dict) and a.get('status') in {'ready', 'limited'}]
+    held = [a.get('status') == 'limited' or bool(holds(a, WINDOWS, now)) for a in rows]
+    return bool(held) and all(held)
 
 
 def braking(info):
