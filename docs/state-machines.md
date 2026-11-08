@@ -597,18 +597,18 @@ Possible, not confirmed: F5, F6, F7, F10, F12, F14, F15, F16, F19, F20, F21, F22
 
 | Group | Bugs | Issue | Owner decision |
 |---|---|---|---|
-| [G1](#g1-one-takes-work-predicate) | F1, F2, F17 (F5 moved to G2) | ISSUE_G1 | no |
-| [G2](#g2-brake-waits-as-a-chain-with-re-admission) | F3, F11, F5 | ISSUE_G2 | yes |
-| [G3](#g3-explicit-block-automaton-with-probe) | F8, F9, F18, F10 | ISSUE_G3 | no |
-| [G4](#g4-retry-a-400-only-for-own-rewrites) | F4 | ISSUE_G4 | no |
-| [G5](#g5-make-the-running-service-version-visible) | F13, F15 | ISSUE_G5 | yes |
-| [G6](#g6-sync-with-feedback-and-retry) | F33, F34, F39 | ISSUE_G6 | no |
-| [G7](#g7-reserve-per-subscription-on-all-devices) | F32 | ISSUE_G7 | yes |
-| [G8](#g8-version-against-reference-and-running-code) | F30, F31, F37 | ISSUE_G8 | no |
-| [G9](#g9-service-state-from-the-response-not-the-unit) | F36 | ISSUE_G9 | no |
-| [G10](#g10-forward-compatible-registry) | F35 | ISSUE_G10 | yes |
-| [G11](#g11-drop-a-device-only-after-cleanup) | F38 | ISSUE_G11 | no |
-| [G12](#g12-leftovers-and-cleanup) | F40, F41, F42, F43, F44 | ISSUE_G12 | no |
+| [G1](#g1-one-takes-work-predicate) | F1, F2, F17 (F5 moved to G2) | [#47](https://github.com/justusaugust/claude-pool/issues/47) (closed) | no |
+| [G2](#g2-brake-waits-as-a-chain-with-re-admission) | F3, F11, F5 | [#36](https://github.com/justusaugust/claude-pool/issues/36) | yes |
+| [G3](#g3-explicit-block-automaton-with-probe) | F8, F9, F18, F10 | [#37](https://github.com/justusaugust/claude-pool/issues/37) | no |
+| [G4](#g4-retry-a-400-only-for-own-rewrites) | F4 | [#38](https://github.com/justusaugust/claude-pool/issues/38) | no |
+| [G5](#g5-make-the-running-service-version-visible) | F13, F15 | [#39](https://github.com/justusaugust/claude-pool/issues/39) | yes |
+| [G6](#g6-sync-with-feedback-and-retry) | F33, F34, F39 | [#40](https://github.com/justusaugust/claude-pool/issues/40) | no |
+| [G7](#g7-reserve-per-subscription-on-all-devices) | F32 | [#41](https://github.com/justusaugust/claude-pool/issues/41) | yes |
+| [G8](#g8-version-against-reference-and-running-code) | F30, F31, F37 | [#42](https://github.com/justusaugust/claude-pool/issues/42) | no |
+| [G9](#g9-service-state-from-the-response-not-the-unit) | F36 | [#43](https://github.com/justusaugust/claude-pool/issues/43) | no |
+| [G10](#g10-forward-compatible-registry) | F35 | [#44](https://github.com/justusaugust/claude-pool/issues/44) | yes |
+| [G11](#g11-drop-a-device-only-after-cleanup) | F38 | [#45](https://github.com/justusaugust/claude-pool/issues/45) | no |
+| [G12](#g12-leftovers-and-cleanup) | F40, F41, F42, F43, F44 | [#46](https://github.com/justusaugust/claude-pool/issues/46) | no |
 
 ### G1 One takes-work predicate
 
