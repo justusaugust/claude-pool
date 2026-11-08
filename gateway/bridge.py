@@ -18,7 +18,7 @@ from forecast import estimate, renewal_scenario, workload_estimates
 from routing import choose, profile, session_rows, unavailable, REASONS
 from validation import archive, HistoryIndex
 from diagnostics import Journal
-from brake import CLASSES as BACKGROUND, ledger_line, stage as brake_stage, Hold, MAX_WAIT, braking, exempt, interactive, standstill, wait_line
+from brake import CLASSES as BACKGROUND, ledger_line, stage as brake_stage, Hold, CHAIN_GAP, MAX_WAIT, braking, exempt, interactive, standstill, wait_line
 from agent_cache import FOLLOWS, AgentAccounts, one_hour
 import activity
 import short_label
@@ -96,8 +96,10 @@ class PoolBridge(ThreadingHTTPServer):
         self.reading_at, self.reading_forecast, self.reading_floor = -math.inf, None, -math.inf
         self._brake_cache = (-60.0, {'stage': 0, 'ratio': None, 'resetAt': None, 'unmeasured': True})
         self.hold = Hold()
-        # Background requests wait in a room of at most max_waiting; they check every brake_check s, at most brake_max_wait s.
+        # Background requests wait in a room of at most max_waiting; they check every brake_check s, at most brake_max_wait s
+        # per chain: consecutive waits of one session and class, open brake_chain_gap s after a wait ended without going.
         self.brake_check, self.brake_max_wait, self.max_waiting = 30, MAX_WAIT, 24
+        self.brake_chain_gap, self.chains = CHAIN_GAP, {}
         # While a session waits, its transcript (Claude Code's, by session id) is read every queue_check s for queued messages.
         self.transcripts, self.queue_check, self.watches, self.watch_lock = Path.home() / '.claude' / 'projects', 2, {}, threading.Lock()
         self.agents = AgentAccounts()
@@ -220,21 +222,40 @@ class PoolBridge(ThreadingHTTPServer):
                         except OSError: pass
 
     def active(self):
-        """Admitted requests that are not waiting for the brake (waiting ones take no request slot)."""
+        """Admitted requests that are not waiting for the brake or for quota (waiting ones take no request slot)."""
         return [r for r in self.requests.values() if not r.get('waiting')]
+
+    def no_slot(self, active, main):
+        """Every request slot is taken, or (for a request that is not a main turn) every slot outside the main reserve."""
+        return len(active) >= self.max_requests or (not main and sum(not r['main'] for r in active) >= max(0, self.max_requests - self.main_reserve))
 
     def admit(self, handler, length):
         main = handler.path.split('?', 1)[0] == '/v1/messages' and handler.headers.get('x-claude-code-request-class', 'main') == 'main' and not handler.headers.get('x-claude-code-agent-id')
         with self.lock:
             active = self.active()
-            auxiliary = sum(not r['main'] for r in active)
-            if self.draining or self.health['failures'] >= 3 or len(active) >= self.max_requests or (not main and auxiliary >= max(0, self.max_requests - self.main_reserve)) or self.body_bytes + length > self.max_body_bytes:
+            if self.draining or self.health['failures'] >= 3 or self.no_slot(active, main) or self.body_bytes + length > self.max_body_bytes:
                 self.journal.record('request_rejected', requests=len(active))
                 return None
             row = {'client': handler.connection, 'progress': time.monotonic(), 'bytes': length, 'upstream': None, 'main': main}
             self.requests[id(handler)] = row
             self.body_bytes += length
             return row
+
+    def step_aside(self, lease, kind):
+        """A request starts to wait ('brake' or 'quota') and leaves its request slot, if the waiting room has space (at most
+        max_waiting, and less than half the body budget held). False: it keeps its slot."""
+        with self.lock:
+            waiting = sum(bool(r.get('waiting')) for r in self.requests.values())
+            if waiting >= self.max_waiting or self.body_bytes > self.max_body_bytes // 2: return False
+            lease['waiting'] = kind
+            return True
+
+    def readmit(self, lease):
+        """A waiting request that may go takes a request slot again, under the same limits as `admit`; False while none is free."""
+        with self.lock:
+            if lease.get('waiting') and self.no_slot(self.active(), lease['main']): return False
+            lease['waiting'] = False
+            return True
 
     def release(self, handler):
         with self.lock:
@@ -435,7 +456,7 @@ class PoolBridge(ThreadingHTTPServer):
         """The hold for usage views and the Conductor snapshot: on, since when calm (ms) and how many requests wait."""
         with self.lock:
             return {'hold': self.hold.on, 'calmSince': int(self.hold.calm * 1000) if self.hold.calm is not None else None,
-                    'waiting': sum(bool(r.get('waiting')) for r in self.requests.values())}
+                    'waiting': sum(r.get('waiting') == 'brake' for r in self.requests.values())}
 
     def session(self, session_id):
         with self.lock:
@@ -520,23 +541,33 @@ class PoolBridge(ThreadingHTTPServer):
             try: self.session(session_id)['ownerAt' if found == activity.OWNER else 'autoAt'] = time.time()
             except RuntimeError: pass
 
-    def brake_started(self, lease, session_id, reason):
+    def brake_started(self, lease, session_id, cls, reason):
         """A request starts to wait: it leaves its request slot, and its session shows brakeWaiting {since, reason, requests}.
-        False when the waiting room is full (max_waiting, or half the body budget held): then it goes at once."""
+        It joins the chain of its session and class (Claude Code gives up on a wait after about 600 s and sends the request
+        again); the chain's start, which brake_max_wait counts from, is returned. None when the waiting room is full: then
+        it goes at once."""
         with self.lock:
-            waiting = sum(bool(r.get('waiting')) for r in self.requests.values())
-            full = waiting >= self.max_waiting or self.body_bytes > self.max_body_bytes // 2
-            if not full:
-                lease['waiting'] = True
+            if not self.step_aside(lease, 'brake'):
+                waiting = sum(bool(r.get('waiting')) for r in self.requests.values())
+                full = True
+            else:
+                full, now = False, time.time()
+                self.chains = {key: c for key, c in self.chains.items() if c['waits'] or c['until'] > now}
+                chain = self.chains.get((session_id, cls))
+                new = chain is None
+                if new: chain = self.chains[(session_id, cls)] = {'since': now, 'waits': 0, 'until': 0}
+                chain['waits'] += 1
                 try:
                     state = self.session(session_id)
-                    mark = state.get('brakeWaiting') if isinstance(state.get('brakeWaiting'), dict) else {'since': int(time.time() * 1000), 'requests': 0}
-                    state.update(brakeWaiting={**mark, 'reason': reason, 'requests': mark['requests'] + 1}, at=time.time())
+                    mark = state.get('brakeWaiting') if isinstance(state.get('brakeWaiting'), dict) else {'since': int(chain['since'] * 1000), 'requests': 0}
+                    state.update(brakeWaiting={**mark, 'reason': reason, 'requests': mark['requests'] + 1}, at=now)
                 except RuntimeError: pass
                 self.save()
-        if full: self.journal.record('brake_wait_full', requests=waiting)
-        else: self.journal.record('brake_wait', reason=reason)
-        return not full
+        if full:
+            self.journal.record('brake_wait_full', requests=waiting)
+            return None
+        if new: self.journal.record('brake_wait', reason=reason)
+        return chain['since']
 
     def watch_start(self, session_id):
         """A message typed or relayed into a session lands in its transcript at once, as a queue "enqueue" line; Claude Code
@@ -594,16 +625,22 @@ class PoolBridge(ThreadingHTTPServer):
         if found: self.journal.record('brake_wait_released', reason='owner_message')
         return bool(found or seen)
 
-    def brake_ended(self, lease, session_id, since, project, cls, reason, end):
-        """The wait is over (released, capped, cancelled, draining or failed): one row in today's brake-waits ledger."""
+    def brake_ended(self, session_id, since, chain_since, project, cls, reason, end):
+        """The wait is over (released, owner_message or capped once readmitted; cancelled, draining or failed): one row in
+        today's brake-waits ledger. A wait that did not go keeps its chain open for brake_chain_gap s."""
         with self.lock:
-            lease['waiting'] = False
+            chain = self.chains.get((session_id, cls))
+            if chain and chain['since'] == chain_since:
+                chain['waits'] -= 1
+                if end in ('released', 'owner_message', 'capped'):
+                    if chain['waits'] <= 0: del self.chains[(session_id, cls)]
+                else: chain['until'] = time.time() + self.brake_chain_gap
             state = self.sessions.get(session_id)
             mark = state.get('brakeWaiting') if state else None
             if isinstance(mark, dict) and mark.get('requests', 1) > 1: state['brakeWaiting'] = {**mark, 'requests': mark['requests'] - 1}
             elif state: state.pop('brakeWaiting', None)
             self.save()
-        self.append_day(self.waits_dir, wait_line(int(time.time() * 1000), int(since * 1000), session_id, project, cls, reason, end))
+        self.append_day(self.waits_dir, wait_line(int(time.time() * 1000), int(since * 1000), session_id, project, cls, reason, end, int(chain_since * 1000)))
 
     def urgent(self):
         """Projects Conductor marked urgent (claude-pool conductor urgent): never braked while their time runs."""
@@ -877,12 +914,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def brake_wait(self, lease, session_id, project, cls, reason):
         """Holds a background streaming request before anything goes upstream, like the quota wait: a committed 200 event
-        stream with a ping every ten seconds, a check every brake_check seconds, at most brake_max_wait seconds. True: it may
-        go now (the stream is committed). False: the wait ended the response (cancelled, draining, the client went away).
-        None: the waiting room is full and the request goes at once."""
+        stream with a ping every ten seconds, a check every brake_check seconds, at most brake_max_wait seconds from the start
+        of its chain. Once it may go it waits on (with pings) for a request slot. True: it took a slot and goes now (the stream
+        is committed). False: the wait ended the response (cancelled, draining, the client went away). None: the waiting room
+        is full and the request goes at once."""
         server = self.server
-        if not server.brake_started(lease, session_id, reason): return None
-        since, end = time.time(), 'released'
+        chain = server.brake_started(lease, session_id, cls, reason)
+        if chain is None: return None
+        since, end, go = time.time(), 'released', False
         server.watch_start(session_id)
         try:
             self.send_response(200)
@@ -897,18 +936,16 @@ class Handler(BaseHTTPRequestHandler):
                 if now >= next_ping:
                     self.wfile.write(b'event: ping\ndata: {"type":"ping"}\n\n'); self.wfile.flush()
                     lease['progress'], next_ping = now, now + 10
-                if now >= next_queue:
+                if not go and now >= next_queue:
                     next_queue = now + server.queue_check
-                    if server.owner_typed(session_id, since):
-                        end = 'owner_message'
-                        return True
-                if now >= next_check:
+                    if server.owner_typed(session_id, since): end, go = 'owner_message', True
+                if not go and now >= next_check:
                     next_check = now + server.brake_check
-                    if time.time() - since >= server.brake_max_wait:
-                        end = 'capped'
+                    if time.time() - chain >= server.brake_max_wait:
+                        end, go = 'capped', True
                         server.journal.record('brake_wait_capped', reason=reason)
-                        return True
-                    if server.brake_reason(session_id) is None: return True
+                    elif server.brake_reason(session_id) is None: go = True
+                if go and server.readmit(lease): return True
                 server.monitor_stop.wait(.25)
         except (OSError, ConnectionError, ValueError, RuntimeError, http.client.HTTPException):
             end = 'cancelled' if lease.get('cancelled') else 'draining' if server.draining or server.monitor_stop.is_set() else 'failed'
@@ -917,7 +954,7 @@ class Handler(BaseHTTPRequestHandler):
             return False
         finally:
             server.watch_end(session_id)
-            server.brake_ended(lease, session_id, since, project, cls, reason, end)
+            server.brake_ended(session_id, since, chain, project, cls, reason, end)
 
     def proxy(self, path, length, lease):
         body, request = None, {}
@@ -1034,19 +1071,22 @@ class Handler(BaseHTTPRequestHandler):
                     with self.server.lock:
                         self.server.session(session_id)['quotaWaiting'] = {'since': int(time.time() * 1000), 'resetsAt': quota['nextResetAt']}
                         self.server.save()
+                # The wait leaves its request slot (when the waiting room has space) and takes one again before it resends.
+                self.server.step_aside(lease, 'quota')
                 next_check, next_ping = time.monotonic(), 0
-                while quota['state'] == 'quota_wait':
+                while True:
                     if self.server.draining or lease.get('cancelled'): raise ConnectionError()
                     now = time.monotonic()
                     if now >= next_ping:
                         self.wfile.write(b'event: ping\ndata: {"type":"ping"}\n\n'); self.wfile.flush()
                         lease['progress'] = now
                         next_ping = now + 10
-                    if now >= next_check:
+                    if quota['state'] == 'quota_wait' and now >= next_check:
                         quota = capacity(self.server.accounts(since=now), request.get('model', ''), int(time.time() * 1000))
                         delay = min(20, max(.25, (quota['nextResetAt'] - quota['checkedAt']) / 1000)) if quota['nextResetAt'] else 20
                         next_check = now + delay
-                    if quota['state'] == 'quota_wait': self.server.monitor_stop.wait(.25)
+                    if quota['state'] != 'quota_wait' and self.server.readmit(lease): break
+                    self.server.monitor_stop.wait(.25)
                 if tracked:
                     with self.server.lock:
                         self.server.session(session_id).pop('quotaWaiting', None)
