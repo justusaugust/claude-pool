@@ -329,7 +329,8 @@ class PoolBridge(ThreadingHTTPServer):
                                              for key, suffix in [('fiveHour', '5h'), ('sevenDay', '7d'), ('fableWeekly', '7d_oi')]},
                              "fiveHour": window("5h"), "sevenDay": window("7d"), "fableWeekly": fable.get((provider['provider'], source['name'], source['account_ref'])), "status": status,
                              "plan": source.get("plan"), "seenAt": (source.get("observed_at_5h") or 0) * 1000,
-                             "paused": source.get("paused", False), "cooldownSeconds": source.get("cooldown_secs_remaining", 0) or 0})
+                             "paused": source.get("paused", False), "cooldownSeconds": source.get("cooldown_secs_remaining", 0) or 0,
+                             "capped": bool(source.get("capped")), "cappedFable": bool(source.get("capped_fable"))})
         if self.shared_readings: readings.merge(rows, readings.load_shared(self.shared_readings), int(time.time() * 1000))
         from account_metadata import decorate
         decorate({'accounts': rows}, CONFIG)
@@ -484,7 +485,7 @@ class PoolBridge(ThreadingHTTPServer):
         if time.monotonic() - at < 60: return info
         try:
             accounts, now = self.accounts(), int(time.time() * 1000)
-            with self.lock: info = {**brake_stage(estimate(accounts, self.observations, now), accounts, now), 'standstill': standstill(accounts)}
+            with self.lock: info = {**brake_stage(estimate(accounts, self.observations, now), accounts, now), 'standstill': standstill(accounts, now)}
         except (OSError, ValueError, RuntimeError, KeyError, TypeError): info = {'stage': 0, 'ratio': None, 'resetAt': None, 'unmeasured': True}
         self._brake_cache = (time.monotonic(), info)
         return info
