@@ -9,18 +9,18 @@ Line numbers refer to `main` at 92bf795 (after #35). The repro tests named below
 | ID | Name | Kind | Risk | Confirmed bugs | Status |
 |---|---|---|---|---|---|
 | A1 | Account state and usability | implicit | high | F1, F2 | fixed in #35 |
-| A2 | Request in the gateway (with session state) | implicit | high | F3, F4 | open (F1 path fixed in #35) |
-| A3 | Account block | explicit | medium | F8, F9 | open |
-| A4 | Brake: hold and waiting room | hold explicit, rest implicit | medium | F11 | open |
+| A2 | Request in the gateway (with session state) | implicit | high | F3, F4 | F3 fixed in #54, F4 in #50 (short-form retry remains); F1 path fixed in #35 |
+| A3 | Account block | explicit | medium | F8, F9 | fixed in #55 |
+| A4 | Brake: hold and waiting room | hold explicit, rest implicit | medium | F11 | fixed in #54 |
 | A5 | Backend supervision and service restart | implicit | low | none | open (F12 possible) |
-| A6 | Conductor supervision and code version | serve explicit, version implicit | medium | F13 | open |
+| A6 | Conductor supervision and code version | serve explicit, version implicit | medium | F13 | fixed in #53 (F15 open) |
 | A7 | Conductor inbox, queue, waker | explicit | low | none | open (F16 possible) |
-| A8 | Conductor alerts | explicit | high | F17, F18 | F17 fixed in #35, F18 open |
+| A8 | Conductor alerts | explicit | high | F17, F18 | F17 fixed in #35, F18 in #55 |
 | A9 | Long-lived token probe | explicit | low | none | open (F20 possible) |
 | A10 | Client hooks | implicit | medium | none | open (F21 possible) |
 | A11 | Phone control | explicit | low | none | no bugs found |
 | A12 | Install, update and running code | implicit | high | F31, F42 | open |
-| A13 | Device registry and sync | merge explicit, flow implicit | high | F32, F33, F34, F35 | open |
+| A13 | Device registry and sync | merge explicit, flow implicit | high | F32, F33, F34, F35 | F32 fixed in #52, F33 and F34 in #49, F35 in #51 (F39 report only) |
 | A14 | Long-lived tokens per device | implicit | low | none | no bugs found |
 | A15 | Device state and traffic light | implicit | high | F30, F36, F37 | open |
 | A16 | Account lifecycle | implicit | medium | none (F32 see A13) | open (F40, F43 possible) |
@@ -105,11 +105,11 @@ Possible: `cooling` and `unknown` still count as free in `capacity()`. After a b
 
 **Reachable invalid states**
 
-**F3 A released brake wait goes up without admission and exceeds `max_requests`.** Confirmed (test). `gateway/bridge.py:600` sets `lease['waiting'] = False`; the request then counts as active in `active()` (`gateway/bridge.py:222-224`) without `admit` (`gateway/bridge.py:231`) having checked it. Up to 24 waits release at once when the hold goes off or the owner writes. A new interactive request then gets 503 "Pool request capacity reached" although 4 slots are reserved for it. I1 and I2 violated. Repro: `Anfrage.test_F3_freigegebene_bremswarte_ueberschreitet_die_anfragegrenze` (`max_requests = 1`, a background request waits, an interactive one runs, the brake releases, two requests are active).
+**F3 A released brake wait goes up without admission and exceeds `max_requests`.** Fixed in #54. Confirmed (test). `gateway/bridge.py:600` sets `lease['waiting'] = False`; the request then counts as active in `active()` (`gateway/bridge.py:222-224`) without `admit` (`gateway/bridge.py:231`) having checked it. Up to 24 waits release at once when the hold goes off or the owner writes. A new interactive request then gets 503 "Pool request capacity reached" although 4 slots are reserved for it. I1 and I2 violated. Repro: `Anfrage.test_F3_freigegebene_bremswarte_ueberschreitet_die_anfragegrenze` (`max_requests = 1`, a background request waits, an interactive one runs, the brake releases, two requests are active).
 
-**F4 Every 400 is retried as a cache or short-form rejection.** Confirmed (test). `gateway/bridge.py:996-1007` checks only the status. A 400 such as "prompt is too long" goes up a second time, the journal records `cache_fallback` or `short_label_fallback`, and `label_counted('refused')` counts wrong. Low cost, misleading diagnosis. I6 half kept. Repro: `Anfrage.test_F4_jedes_400_wird_als_cache_ablehnung_wiederholt`.
+**F4 Every 400 is retried as a cache or short-form rejection.** Fixed in #50. Remainder: the short-form label retry still fires on any 400. Confirmed (test). `gateway/bridge.py:996-1007` checks only the status. A 400 such as "prompt is too long" goes up a second time, the journal records `cache_fallback` or `short_label_fallback`, and `label_counted('refused')` counts wrong. Low cost, misleading diagnosis. I6 half kept. Repro: `Anfrage.test_F4_jedes_400_wird_als_cache_ablehnung_wiederholt`.
 
-**F5 The quota wait holds a request slot.** Possible. `gateway/bridge.py:1020-1061` sets no `lease['waiting']`. Rare while F1 prevented the wait; after #35 waiting requests can hold slots until the client timeout (about 600 s, see F11) and push interactive requests into 503. Planned with G2.
+**F5 The quota wait holds a request slot.** Fixed in #54. Possible. `gateway/bridge.py:1020-1061` sets no `lease['waiting']`. Rare while F1 prevented the wait; after #35 waiting requests can hold slots until the client timeout (about 600 s, see F11) and push interactive requests into 503. Planned with G2.
 
 **F6 A session's `quotaWaiting` disappears while a second request of the same session still waits.** Possible. Set at `gateway/bridge.py:1035`, cleared by the first finished request at `gateway/bridge.py:1052`. Display only.
 
@@ -135,17 +135,18 @@ Possible: `cooling` and `unknown` still count as free in `capacity()`. After a b
 | blocked | tick 30 s | `until` reached, manual pause | paused by hand, entry gone | `gateway/bridge.py:408`, `gateway/bridge.py:413-415` |
 | probe | first request to it | 403 with block code | blocked, `account_blocked` | as above |
 | blocked | gateway or Shunt restart | | blocked (`restore_pauses`) | `gateway/bridge.py:160-162`, `gateway/launch.py:213` |
-| blocked | Cockpit `resume` | | free in Shunt, blocked in the pool | `gateway/bridge.py:777-782` |
+| blocked | tick 30 s | `until` reached (since #55) | `probing`, kept until the first answer below 400 removes it (`probing` is the new state; the old "probe" state above is now this one) | `gateway/bridge.py` |
+| blocked | Cockpit `resume` | | free in Shunt, blocked in the pool (since #55: starts the probe) | `gateway/bridge.py:777-782` |
 
 Evidence for the cycle: the journal shows `account_unblocked` followed one to two minutes later by `account_blocked`, every six hours.
 
 **Reachable invalid states**
 
-**F8 A block during the release is lost; the account stays paused in Shunt for good.** Confirmed (test with forced interleaving), not seen live. `release_blocks` resumes the account in Shunt (`gateway/bridge.py:411`) and only then removes it under the lock (`gateway/bridge.py:413-415`). If a 403 arrives in another thread in between, `block_account` pauses it again and rewrites `blocked[name]` (`gateway/bridge.py:393-398`, `fresh` false, so no journal). `release_blocks` then removes exactly that new entry. Shunt keeps the account paused, the pool knows no reason, nothing resumes it, and the alert reports no blocked account. I1 and I3 violated until a service restart. Repro: `Sperre.test_F8_eine_sperre_waehrend_der_freigabe_geht_verloren`.
+**F8 A block during the release is lost; the account stays paused in Shunt for good.** Fixed in #55. Confirmed (test with forced interleaving), not seen live. `release_blocks` resumes the account in Shunt (`gateway/bridge.py:411`) and only then removes it under the lock (`gateway/bridge.py:413-415`). If a 403 arrives in another thread in between, `block_account` pauses it again and rewrites `blocked[name]` (`gateway/bridge.py:393-398`, `fresh` false, so no journal). `release_blocks` then removes exactly that new entry. Shunt keeps the account paused, the pool knows no reason, nothing resumes it, and the alert reports no blocked account. I1 and I3 violated until a service restart. Repro: `Sperre.test_F8_eine_sperre_waehrend_der_freigabe_geht_verloren`.
 
-**F9 A second rejected account of the same organization is not blocked; its 403 reaches Claude Code.** Confirmed (test), not seen live. After a block the request goes once more (`gateway/bridge.py:1013-1018`). If the next account answers with the same code, nothing checks it: `gateway/bridge.py:1019` journals and `gateway/bridge.py:1064-1071` forwards the 403; the account stays in the pool. Several pool accounts can share one organization, so one organization block hits all of them. Auto-mode classifier requests then fail (comment at `gateway/bridge.py:34-36`). I2 violated. Repro: `Anfrage.test_F9_ein_zweites_gesperrtes_konto_derselben_organisation_wird_nicht_pausiert`.
+**F9 A second rejected account of the same organization is not blocked; its 403 reaches Claude Code.** Fixed in #55. Confirmed (test), not seen live. After a block the request goes once more (`gateway/bridge.py:1013-1018`). If the next account answers with the same code, nothing checks it: `gateway/bridge.py:1019` journals and `gateway/bridge.py:1064-1071` forwards the 403; the account stays in the pool. Several pool accounts can share one organization, so one organization block hits all of them. Auto-mode classifier requests then fail (comment at `gateway/bridge.py:34-36`). I2 violated. Repro: `Anfrage.test_F9_ein_zweites_gesperrtes_konto_derselben_organisation_wird_nicht_pausiert`.
 
-**F10 Cockpit `resume` on a blocked account resumes it in Shunt but leaves the entry in `blocked`.** Possible. `gateway/bridge.py:777-782`. The next request gets the 403 and `block_account` extends silently. The button has no effect.
+**F10 Cockpit `resume` on a blocked account resumes it in Shunt but leaves the entry in `blocked`.** Fixed in #55. Possible. `gateway/bridge.py:777-782`. The next request gets the 403 and `block_account` extends silently. The button has no effect.
 
 **Risk**: medium. Making the probe an explicit state under the lock fixes F8, F10 and F18 together.
 
@@ -169,12 +170,12 @@ Evidence for the cycle: the journal shows `account_unblocked` followed one to tw
 | * | restart | | from `sessions.json` | `gateway/brake.py:85-88`, `gateway/bridge.py:163` |
 | waiting | check every 30 s | hold off or project urgent | `released` | `gateway/bridge.py:905-911` |
 | waiting | check every 2 s | a person wrote in the session | `owner_message` | `gateway/bridge.py:900-904`, `gateway/bridge.py:564-595` |
-| waiting | check | 3 h since this HTTP request began | `capped` | `gateway/bridge.py:907-910` |
+| waiting | check | 3 h since the chain began (since #54; chain of one session and class, gap `CHAIN_GAP` 5 min) | `capped` | `gateway/bridge.py:907-910` |
 | waiting | client closes | | `cancelled` | `gateway/bridge.py:895`, `gateway/bridge.py:913-915` |
 
 **Reachable invalid states**
 
-**F11 Claude Code ends every wait after about 600 s; the 3 h cap never applies, the logical wait is unbounded, and `brake_wait` floods the journal.** Confirmed. `brake_wait` measures `since` per HTTP request (`gateway/bridge.py:885`). Claude Code ends the request at its timeout and sends it again; each retry is a new wait with a new `since`, a new line and a new journal entry (`gateway/bridge.py:538`). I2 and I3 violated for the logical request. Evidence: over nine days of `brake-waits`, 501 waits; 386 `cancelled`, 384 of them after at least 590 s (median 610 s, maximum 620 s); 0 `capped`. One subagent session waited 51 times in a row over 8.7 h. 137 of 256 journal lines were `brake_wait`, so the journal reached back only 27 h. Effect: the 3 h emergency release does not exist in practice; each retry resends the whole body (up to 128 MB) and is admitted again; important journal entries fall out sooner. Repro: data above. Test for the fix in G2.
+**F11 Claude Code ends every wait after about 600 s; the 3 h cap never applies, the logical wait is unbounded, and `brake_wait` floods the journal.** Fixed in #54. Confirmed. `brake_wait` measures `since` per HTTP request (`gateway/bridge.py:885`). Claude Code ends the request at its timeout and sends it again; each retry is a new wait with a new `since`, a new line and a new journal entry (`gateway/bridge.py:538`). I2 and I3 violated for the logical request. Evidence: over nine days of `brake-waits`, 501 waits; 386 `cancelled`, 384 of them after at least 590 s (median 610 s, maximum 620 s); 0 `capped`. One subagent session waited 51 times in a row over 8.7 h. 137 of 256 journal lines were `brake_wait`, so the journal reached back only 27 h. Effect: the 3 h emergency release does not exist in practice; each retry resends the whole body (up to 128 MB) and is admitted again; important journal entries fall out sooner. Repro: data above. Test for the fix in G2.
 
 **Risk**: medium. The hold is explicit already; a wait chain per session and class is missing.
 
@@ -225,11 +226,11 @@ Evidence for the cycle: the journal shows `account_unblocked` followed one to tw
 
 **Reachable invalid states**
 
-**F13 After `claude-pool update` and `--stop`/`--start` the Conductor unit keeps running old code.** Confirmed. Code path: the unit starts `run.py`, which resolves `current` once at start (`run.py:14-20`). `update_install` restarts nothing (`install.py:218`); `--stop`/`--start` handle only the pool service (`gateway/launch.py:655-683`); `install` sees no change because the unit points to the stable `run.py` (`gateway/conductor.py:226-230`, `gateway/conductor.py:382`). Evidence: the user service journal shows the pool service restarted three times after updates within one week while the Conductor unit never restarted; it ran next to at least three newer pool versions. No format break was found in the shared files (`conductor.json`, `conductor-queue.json`, `conductor-inbox.json`, `journal.md`, `wake.log`, `shunt.toml`), so the effect is that fixes to `serve`, `deliver_until` and `waker_until` silently wait for the next manual restart. I1 kept only by luck. Repro: to be written with G5.
+**F13 After `claude-pool update` and `--stop`/`--start` the Conductor unit keeps running old code.** Fixed in #53. (F15 not fixed.) Confirmed. Code path: the unit starts `run.py`, which resolves `current` once at start (`run.py:14-20`). `update_install` restarts nothing (`install.py:218`); `--stop`/`--start` handle only the pool service (`gateway/launch.py:655-683`); `install` sees no change because the unit points to the stable `run.py` (`gateway/conductor.py:226-230`, `gateway/conductor.py:382`). Evidence: the user service journal shows the pool service restarted three times after updates within one week while the Conductor unit never restarted; it ran next to at least three newer pool versions. No format break was found in the shared files (`conductor.json`, `conductor-queue.json`, `conductor-inbox.json`, `journal.md`, `wake.log`, `shunt.toml`), so the effect is that fixes to `serve`, `deliver_until` and `waker_until` silently wait for the next manual restart. I1 kept only by luck. Repro: to be written with G5.
 
 **F14 A short network outage while resuming starts a new Conductor conversation.** Possible. Three fast failures suffice (`gateway/conductor.py:193-198`); with pauses of 10 and 20 s they fit in about 70 s. The old conversation is not tried again.
 
-**F15 Going back to an older version drops newer journal codes and state keys.** Possible. the journal drops unknown codes on load (`gateway/diagnostics.py:49-60`) and writes the whole list back (`gateway/diagnostics.py:82`); `gateway/bridge.py:670-672` stores only known keys. A version before #34 would drop `account_blocked` and `blocked`, and a blocked account would not be paused at start.
+**F15 Going back to an older version drops newer journal codes and state keys.** Not fixed (#53 covers F13 only). Possible. the journal drops unknown codes on load (`gateway/diagnostics.py:49-60`) and writes the whole list back (`gateway/diagnostics.py:82`); `gateway/bridge.py:670-672` stores only known keys. A version before #34 would drop `account_blocked` and `blocked`, and a blocked account would not be paused at start.
 
 **Risk**: medium. Recording the running version (in `conductor.json` and `/pool/status`, compared by `device check` and `doctor` with `build-info.json`) costs a few hours. Whether `update` restarts the unit itself is a behavior decision.
 
@@ -281,7 +282,7 @@ Evidence for the cycle: the journal shows `account_unblocked` followed one to tw
 
 **F17 `konten-limit` never reported a standstill while an account sat at its hard reserve cap.** Confirmed; fixed in #35. `gateway/conductor_alerts.py:65` uses `capacity()`; because of F1 it was `ready` while any account sat at its cap, so the alert could not become active. I3 violated. Evidence: `conductor-alerts.json` never had a `konten-limit` key and the wake log had no such line, while the journal shows a standstill of about 27 hours (`brake_wait no ready account` until `brake_hold_off`). The Conductor learned of it only because a session hung in the limit dialog. Repro: `KontoLage.test_F17_alarm_konten_limit_meldet_den_stillstand`.
 
-**F18 `gesperrt` ends and starts again on every probe; the same block wakes the Conductor every six hours.** Confirmed. `release_blocks` empties `blocked` for the probe (A3), `check` reads that as the end (`vorbei`), a minute later the first 403 blocks again, and since the last wake was 6 h ago it wakes again. I4 violated; I1 formally kept. Evidence: wake log pairs `vorbei` and `an` one minute apart, four times in one day, each followed by a Conductor wake with the same text. Repro: `KontoLage.test_F18_gesperrt_endet_und_beginnt_bei_jedem_neuen_versuch`.
+**F18 `gesperrt` ends and starts again on every probe; the same block wakes the Conductor every six hours.** Fixed in #55. Confirmed. `release_blocks` empties `blocked` for the probe (A3), `check` reads that as the end (`vorbei`), a minute later the first 403 blocks again, and since the last wake was 6 h ago it wakes again. I4 violated; I1 formally kept. Evidence: wake log pairs `vorbei` and `an` one minute apart, four times in one day, each followed by a Conductor wake with the same text. Repro: `KontoLage.test_F18_gesperrt_endet_und_beginnt_bei_jedem_neuen_versuch`.
 
 **F19 A state that began silently is never reported later, even if it lasts hours.** Possible. `gateway/conductor_alerts.py:46` decides `announced` only on the start edge.
 
@@ -410,15 +411,15 @@ No bugs found. **Risk**: low.
 
 **Reachable invalid states**
 
-**F32 A reserve on an account without a registry row stays on the device where it was set; output and checks do not say so.** Confirmed (incident, test). Code path: `reserve` writes config and `shunt.toml` (`gateway/accounts_cli.py:399`), looks up the registry row by UUIDs (`gateway/accounts_cli.py:403-404`), finds none for an account with its own login, and leaves the registry unchanged. `sync_all` (`gateway/accounts_cli.py:1018`) then skips a device without ssh target: "skipped: no ssh target from this device (it syncs with this one itself)" (`gateway/device_sync.py:503`). That device pulls only the registry, which does not carry the reserve. `device check` does not see it: `_reserve_issues` compares registry rows only (`gateway/devices_cli.py:683-685`). Evidence: a reserve set on device B for a blocked account never reached device A; it was noticed only when device A kept using the account. Repro: `Abgleich.test_F32_reserve_eines_kontos_ohne_registryzeile_erreicht_kein_anderes_geraet`.
+**F32 A reserve on an account without a registry row stays on the device where it was set; output and checks do not say so.** Fixed in #52. Confirmed (incident, test). Code path: `reserve` writes config and `shunt.toml` (`gateway/accounts_cli.py:399`), looks up the registry row by UUIDs (`gateway/accounts_cli.py:403-404`), finds none for an account with its own login, and leaves the registry unchanged. `sync_all` (`gateway/accounts_cli.py:1018`) then skips a device without ssh target: "skipped: no ssh target from this device (it syncs with this one itself)" (`gateway/device_sync.py:503`). That device pulls only the registry, which does not carry the reserve. `device check` does not see it: `_reserve_issues` compares registry rows only (`gateway/devices_cli.py:683-685`). Evidence: a reserve set on device B for a blocked account never reached device A; it was noticed only when device A kept using the account. Repro: `Abgleich.test_F32_reserve_eines_kontos_ohne_registryzeile_erreicht_kein_anderes_geraet`.
 
-**F33 Hooks run only when a receive changes the registry; a failed hook is never retried by sync.** Confirmed (test). A device pulls a registry with a new reserve, `registry.receive` writes it (`gateway/registry.py:278`), `reserve_hook` fails, report `hooks: failed`. Next pull: `now == previous`, no hook (`gateway/device_sync.py:351`). The reserve arrives only with the 6 h self-check (`gateway/devices_cli.py:751`), and only if the daemon runs new code (F31). herdr and Conductor hooks have no repair. Same pattern in `receive_account`: a failed reserve after enrolment is journaled only if a journal is passed (`gateway/device_sync.py:255-264`); `pull` passes none (`gateway/device_sync.py:484`), and the next receive returns before the reserve (`gateway/device_sync.py:244-246`). Repro: `Abgleich.test_F33_ein_fehlgeschlagener_reserve_hook_wird_beim_naechsten_empfang_nicht_wiederholt`.
+**F33 Hooks run only when a receive changes the registry; a failed hook is never retried by sync.** Fixed in #49. Confirmed (test). A device pulls a registry with a new reserve, `registry.receive` writes it (`gateway/registry.py:278`), `reserve_hook` fails, report `hooks: failed`. Next pull: `now == previous`, no hook (`gateway/device_sync.py:351`). The reserve arrives only with the 6 h self-check (`gateway/devices_cli.py:751`), and only if the daemon runs new code (F31). herdr and Conductor hooks have no repair. Same pattern in `receive_account`: a failed reserve after enrolment is journaled only if a journal is passed (`gateway/device_sync.py:255-264`); `pull` passes none (`gateway/device_sync.py:484`), and the next receive returns before the reserve (`gateway/device_sync.py:244-246`). Repro: `Abgleich.test_F33_ein_fehlgeschlagener_reserve_hook_wird_beim_naechsten_empfang_nicht_wiederholt`.
 
-**F34 Receiver errors do not reach the caller.** Confirmed (test). `push` checks only the exit code of `receive-registry` (`gateway/device_sync.py:415`, `gateway/device_sync.py:453`); the report with `failed` and `hooks` (`gateway/devices_cli.py:207-210`) is dropped. `merge_from` drops its own report (`gateway/device_sync.py:443`). The puller drops the result of `pull` entirely (`gateway/readings.py:229-232`). `device sync` shows `ok` when the other device did not set the reserve or did not remove an account. Repro: `Abgleich.test_F34_push_meldet_ok_obwohl_der_empfaenger_hook_und_entfernung_als_fehlgeschlagen_meldet`.
+**F34 Receiver errors do not reach the caller.** Fixed in #49. Confirmed (test). `push` checks only the exit code of `receive-registry` (`gateway/device_sync.py:415`, `gateway/device_sync.py:453`); the report with `failed` and `hooks` (`gateway/devices_cli.py:207-210`) is dropped. `merge_from` drops its own report (`gateway/device_sync.py:443`). The puller drops the result of `pull` entirely (`gateway/readings.py:229-232`). `device sync` shows `ok` when the other device did not set the reserve or did not remove an account. Repro: `Abgleich.test_F34_push_meldet_ok_obwohl_der_empfaenger_hook_und_entfernung_als_fehlgeschlagen_meldet`.
 
-**F35 A device on an older release rejects the whole registry once a newer release writes a new field.** Confirmed (test, observed when a field was added). `registry.keys` raises on any unknown field (`gateway/registry.py:52-54`, account fields `gateway/registry.py:25-26`); `receive_registry` aborts before writing (`gateway/device_sync.py:304-305`). Tombstones, new devices and token sync stop until the old device is updated; the puller stays silent (F34), and because of F30 the old release is not visible either. `config.json` is just as strict (`gateway/account_metadata.py:52`): an old daemon after `update` without restart (F31) would reject a config with a new field when it rereads it. Possible. Repro: `Abgleich.test_F35_ein_neues_feld_eines_neueren_geraets_blockiert_den_ganzen_empfang`.
+**F35 A device on an older release rejects the whole registry once a newer release writes a new field.** Fixed in #51. Confirmed (test, observed when a field was added). `registry.keys` raises on any unknown field (`gateway/registry.py:52-54`, account fields `gateway/registry.py:25-26`); `receive_registry` aborts before writing (`gateway/device_sync.py:304-305`). Tombstones, new devices and token sync stop until the old device is updated; the puller stays silent (F34), and because of F30 the old release is not visible either. `config.json` is just as strict (`gateway/account_metadata.py:52`): an old daemon after `update` without restart (F31) would reject a config with a new field when it rereads it. Possible. Repro: `Abgleich.test_F35_ein_neues_feld_eines_neueren_geraets_blockiert_den_ganzen_empfang`.
 
-**F39 When two devices change the same row separately, the higher generation wins, not the later change; the loser's hook silently rewrites its config.** Possible. Both at g = 9; device A changes two other rows and then a reserve (row g = 12); later device B changes the same reserve (g = 10). On the next sync device A's value wins (`gateway/registry.py:233`, `gateway/registry.py:239`) and `reserve_hook` rewrites device B's config (`gateway/accounts_cli.py:438-444`) without output. Needs the puller off or a long outage.
+**F39 When two devices change the same row separately, the higher generation wins, not the later change; the loser's hook silently rewrites its config.** Report only, unchanged (#49). Possible. Both at g = 9; device A changes two other rows and then a reserve (row g = 12); later device B changes the same reserve (g = 10). On the next sync device A's value wins (`gateway/registry.py:233`, `gateway/registry.py:239`) and `reserve_hook` rewrites device B's config (`gateway/accounts_cli.py:438-444`) without output. Needs the puller off or a long outage.
 
 **Risk**: high. F32 to F35 together explain why a config change does not arrive on the other device and nobody notices. The merge is explicit and correct; the flow needs a hook state per device with "pending" and a report up to the caller.
 
@@ -567,46 +568,46 @@ Runtime (A1 to A11):
 |---|---|---|---|---|---|
 | 1 | F1 | With an exhausted pool, interactive sessions and the Conductor got the weekly-limit 429 and hung in the dialog; gateway and client hook did not wait | A1, A2 | journal and usage history of one incident; `test_F1_*` | fixed in #35 |
 | 2 | F17 | The Conductor was never woken for an empty pool (about 27 h standstill without alert) | A8 | `conductor-alerts.json`, wake log; `test_F17_*` | fixed in #35 |
-| 3 | F11 | Brake waits end after 600 s at the client; the 3 h cap is never reached (8.7 h chain); 54 % of the journal is `brake_wait` | A4 | `brake-waits`, journal | open |
-| 4 | F3 | Released waits bypass admission; more than 32 requests up, interactive requests get 503 | A2, A4 | `test_F3_*` | open |
-| 5 | F13 | The Conductor unit runs old code for days after an update; fixes silently do not apply | A6 | service journal, process list | open |
+| 3 | F11 | Brake waits end after 600 s at the client; the 3 h cap is never reached (8.7 h chain); 54 % of the journal is `brake_wait` | A4 | `brake-waits`, journal | fixed in #54 |
+| 4 | F3 | Released waits bypass admission; more than 32 requests up, interactive requests get 503 | A2, A4 | `test_F3_*` | fixed in #54 |
+| 5 | F13 | The Conductor unit runs old code for days after an update; fixes silently do not apply | A6 | service journal, process list | fixed in #53 |
 | 6 | F2 | Brake stage computed against a reset that is too early; stage too low, wrong time in the alert | A1, A4 | usage history `resetAt`; `test_F2_*` | fixed in #35 |
-| 7 | F9 | When an organization is blocked, the second account's 403 reaches Claude Code and the account stays in the pool | A3 | `test_F9_*` | open |
-| 8 | F8 | Lost block: the account stays paused until a service restart, without reason or alert | A3 | `test_F8_*` (forced interleaving) | open |
-| 9 | F18 | The same block wakes the Conductor every six hours | A8 | wake log; `test_F18_*` | open |
-| 10 | F4 | Every 400 of background agents goes up twice; the journal reports `cache_fallback` wrongly | A2 | `test_F4_*` | open |
+| 7 | F9 | When an organization is blocked, the second account's 403 reaches Claude Code and the account stays in the pool | A3 | `test_F9_*` | fixed in #55 |
+| 8 | F8 | Lost block: the account stays paused until a service restart, without reason or alert | A3 | `test_F8_*` (forced interleaving) | fixed in #55 |
+| 9 | F18 | The same block wakes the Conductor every six hours | A8 | wake log; `test_F18_*` | fixed in #55 |
+| 10 | F4 | Every 400 of background agents goes up twice; the journal reports `cache_fallback` wrongly | A2 | `test_F4_*` | fixed in #50 |
 
 Devices, install, cockpit (A12 to A19):
 
 | Rank | F | Effect | Automaton | Evidence | Status |
 |---|---|---|---|---|---|
-| 1 | F32 | A reserve never reaches the other device; the output says that device syncs itself | A13, A16 | config and registry; `test_F32_*` | open |
+| 1 | F32 | A reserve never reaches the other device; the output says that device syncs itself | A13, A16 | config and registry; `test_F32_*` | fixed in #52 |
 | 2 | F30 | A device on an old release shows green on the board | A15 | device-check cache; `test_F30_*` | open |
 | 3 | F31 | After `update` the daemon runs old code with a green light | A12 | code path, two manual restarts | open |
-| 4 | F33 | A failed hook is never retried by sync (reserve up to 6 h, herdr and Conductor never) | A13 | `test_F33_*` | open |
-| 5 | F34 | `device sync` and the puller report ok despite receiver errors | A13 | `test_F34_*` | open |
-| 6 | F35 | A new registry field stops sync to older devices entirely | A13 | `test_F35_*` | open |
+| 4 | F33 | A failed hook is never retried by sync (reserve up to 6 h, herdr and Conductor never) | A13 | `test_F33_*` | fixed in #49 |
+| 5 | F34 | `device sync` and the puller report ok despite receiver errors | A13 | `test_F34_*` | fixed in #49 |
+| 6 | F35 | A new registry field stops sync to older devices entirely | A13 | `test_F35_*` | fixed in #51 |
 | 7 | F36 | A stopped or crashed pool shows `service ok` and green | A15 | `test_F36_*` | open |
 | 8 | F38 | `device remove` leaves tunnel units that restart forever, with no way to retry | A17 | code path | open |
 | 9 | F42 | 1.5 GB of old releases, growing with each update | A12 | `ls`, `du` | open |
 | 10 | F37 | A device without a pool is only amber | A15 | `test_F37_*` | open |
 
-Possible, not confirmed: F5, F6, F7, F10, F12, F14, F15, F16, F19, F20, F21, F22, F39, F40, F41, F43, F44, F45.
+Possible, not confirmed: F6, F7, F12, F14, F15 (not fixed), F16, F19, F20, F21, F22, F39 (report only), F40, F41, F43, F44, F45.
 
 ## Fix groups
 
 | Group | Bugs | Issue | Owner decision |
 |---|---|---|---|
 | [G1](#g1-one-takes-work-predicate) | F1, F2, F17 (F5 moved to G2) | [#47](https://github.com/justusaugust/claude-pool/issues/47) (closed) | no |
-| [G2](#g2-brake-waits-as-a-chain-with-re-admission) | F3, F11, F5 | [#36](https://github.com/justusaugust/claude-pool/issues/36) | yes |
-| [G3](#g3-explicit-block-automaton-with-probe) | F8, F9, F18, F10 | [#37](https://github.com/justusaugust/claude-pool/issues/37) | no |
-| [G4](#g4-retry-a-400-only-for-own-rewrites) | F4 | [#38](https://github.com/justusaugust/claude-pool/issues/38) | no |
-| [G5](#g5-make-the-running-service-version-visible) | F13, F15 | [#39](https://github.com/justusaugust/claude-pool/issues/39) | yes |
-| [G6](#g6-sync-with-feedback-and-retry) | F33, F34, F39 | [#40](https://github.com/justusaugust/claude-pool/issues/40) | no |
-| [G7](#g7-reserve-per-subscription-on-all-devices) | F32 | [#41](https://github.com/justusaugust/claude-pool/issues/41) | yes |
+| [G2](#g2-brake-waits-as-a-chain-with-re-admission) | F3, F11, F5 | [#36](https://github.com/justusaugust/claude-pool/issues/36) (closed, done in #54) | yes |
+| [G3](#g3-explicit-block-automaton-with-probe) | F8, F9, F18, F10 | [#37](https://github.com/justusaugust/claude-pool/issues/37) (closed, done in #55) | no |
+| [G4](#g4-retry-a-400-only-for-own-rewrites) | F4 (short-form retry remains) | [#38](https://github.com/justusaugust/claude-pool/issues/38) (closed, done in #50) | no |
+| [G5](#g5-make-the-running-service-version-visible) | F13 (F15 not fixed) | [#39](https://github.com/justusaugust/claude-pool/issues/39) (closed, done in #53) | yes |
+| [G6](#g6-sync-with-feedback-and-retry) | F33, F34 (F39 report only) | [#40](https://github.com/justusaugust/claude-pool/issues/40) (closed, done in #49) | no |
+| [G7](#g7-reserve-per-subscription-on-all-devices) | F32 | [#41](https://github.com/justusaugust/claude-pool/issues/41) (closed, done in #52) | yes |
 | [G8](#g8-version-against-reference-and-running-code) | F30, F31, F37 | [#42](https://github.com/justusaugust/claude-pool/issues/42) | no |
 | [G9](#g9-service-state-from-the-response-not-the-unit) | F36 | [#43](https://github.com/justusaugust/claude-pool/issues/43) | no |
-| [G10](#g10-forward-compatible-registry) | F35 | [#44](https://github.com/justusaugust/claude-pool/issues/44) | yes |
+| [G10](#g10-forward-compatible-registry) | F35 | [#44](https://github.com/justusaugust/claude-pool/issues/44) (closed, done in #51) | yes |
 | [G11](#g11-drop-a-device-only-after-cleanup) | F38 | [#45](https://github.com/justusaugust/claude-pool/issues/45) | no |
 | [G12](#g12-leftovers-and-cleanup) | F40, F41, F42, F43, F44 | [#46](https://github.com/justusaugust/claude-pool/issues/46) | no |
 
@@ -678,3 +679,11 @@ Builds on G5.
 ## Changes
 
 - G1 (F1, F2, F17), fixed by #35, merged into `main` as 92bf795: the shared check `routing.holds` (window rejected, full or at the hard reserve cap, plus Shunt's `capped`) is used by `telemetry.capacity`, `brake.returns_at` and `brake.standstill`; `bridge.read_accounts` keeps `capped` and `cappedFable`. New invariant: an account at its hard reserve cap counts as exhausted for the quota wait, the brake and the alert, as it does in Shunt. Tests: `tests/test_capacity_reserve.py` (red on the previous `main`, green after). Live on one device. F5 stays open and moves to G2.
+- G2 (F3, F11, F5), fixed by #54, 2026-11-09: a released brake wait and the quota wait call `readmit` and take a request slot only under the `admit` limits; brake waits of one session and class form a chain (`CHAIN_GAP` 5 min) and the 3 h cap counts from its start. Tests in `gateway/test_bridge.py`: `test_a_released_wait_goes_up_only_when_a_request_slot_is_free`, `test_a_wait_sent_again_after_the_client_gave_up_continues_its_chain_to_the_cap`, `test_a_wait_after_the_idle_gap_starts_a_new_chain`, `test_a_quota_wait_takes_no_request_slot`.
+- G3 (F8, F9, F18, F10), fixed by #55, 2026-11-09: `blocked[name].state` is `blocked` or `probing`; `block_account`, `release_blocks` and Cockpit `pause`/`resume` run under `block_lock`; a probing account stays until its first answer below 400; a block pauses all pool accounts of the same organization. Tests in `gateway/test_bridge.py`: `test_a_block_that_lands_while_its_release_runs_survives`, `test_a_refusal_blocks_every_pool_account_of_the_same_organization`, `test_a_second_refused_account_is_blocked_too_and_a_third_one_answers`, `test_a_probe_refused_again_keeps_one_silent_block_and_only_an_answered_probe_ends_it`, `test_resuming_a_blocked_account_by_hand_starts_its_probe`.
+- G4 (F4), fixed by #50, 2026-11-09: the one-hour cache fallback runs only when the 400 names `cache_control` or `ttl`; other 400s go to the client once, without a journal entry. Remainder: the short-form label retry still fires on any 400. Tests: `test_another_400_reaches_the_client_once_and_unretried`, `test_a_refused_one_hour_cache_is_sent_once_more_as_the_agent_sent_it`.
+- G5 (F13), fixed by #53, 2026-11-09: the pool daemon and the Conductor service record their release; `claude-pool doctor`, `device check` and `update` report a service that runs old code. `update` restarts nothing. F15 is not fixed. Tests: `tests/test_running_release.py`.
+- G6 (F33, F34), fixed by #49, 2026-11-09: failed hooks are kept in `pending-hooks.json` and retried on every sync and receive; `push`, `pull` and `merge_from` pass on failures; the puller journals `registry_sync_failed`. F39 stays report only, unchanged. Tests: `test_a_failed_hook_is_retried_on_the_next_sync_until_it_succeeds`, `test_push_reports_what_the_receiver_could_not_do`, `test_push_accepts_the_reply_of_an_older_peer_without_a_report`, `test_a_failed_registry_pull_is_journaled`.
+- G7 (F32, small variant), fixed by #52, 2026-11-09: reserves stay per device; `account reserve` says so when there is no registry row, the device status reports reserves, and `device check` shows differences. Tests: reserve output ("only on this device"), status reports reserve, differing reserves give a difference line, equal or unreported give none.
+- G10 (F35), fixed by #51, 2026-11-09: unknown top-level, device, account, tombstone and conductor fields are kept and written back; on merge an unknown top-level field comes from the higher generation. Token checks, format rules and the 256 KiB limit stay. Tests: unknown fields survive validate, merge, receive and save; rule violations, tokens in unknown fields and oversize are still rejected.
+- Remaining: F15 (G5), the short-form retry (G4), F39 (report only). Open groups: G8, G9, G11, G12.
