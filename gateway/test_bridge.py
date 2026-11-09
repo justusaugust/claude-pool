@@ -876,6 +876,88 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(self.waits()[-1]['end'], 'capped')
         self.assertIn('brake_wait_capped', [r['code'] for r in self.bridge.journal.snapshot()])
 
+    def test_a_released_wait_goes_up_only_when_a_request_slot_is_free(self):
+        self.bridge.max_requests, self.bridge.main_reserve = 1, 0
+        self.background()
+        with self.braking(1):
+            waiting = self.open_stream(self.tool_turn())
+            self.assertIn(b'event: ping', waiting.read1(256))
+            self.hold = True
+            other = threading.Thread(target=lambda: self.call('/v1/messages', self.MESSAGE, extra_headers={'x-claude-code-session-id': 'interactive'}))
+            other.start()
+            self.assertTrue(self.entered.wait(3), 'the interactive request holds the only slot')
+            self.stage = 0
+            self.assertTrue(self.until(lambda: not self.bridge.hold.on), 'the hold goes off')
+            self.assertFalse(self.until(lambda: len(self.preferred) == 2, .3), 'the released wait does not bypass admission')
+            with self.bridge.lock: self.assertEqual(len(self.bridge.active()), 1)
+            self.release.set()
+            body = waiting.read(); other.join(5)
+        self.assertIn(b'message_stop', body)
+        self.assertEqual(len(self.preferred), 2)
+        self.assertEqual(self.waits()[-1]['end'], 'released')
+
+    def stream_closed(self, response):
+        """The client gives up on a wait, as Claude Code does after about 600 s."""
+        response.close(); self.stream_conn.close()
+        self.assertTrue(self.until(lambda: not self.bridge.requests))
+
+    def recorded(self):
+        """Counts journal records as they are made (the journal itself merges equal rows within 30 s)."""
+        return patch.object(self.bridge.journal, 'record', wraps=self.bridge.journal.record)
+
+    @staticmethod
+    def count(record, code):
+        return [c.args[0] for c in record.call_args_list].count(code)
+
+    def test_a_wait_sent_again_after_the_client_gave_up_continues_its_chain_to_the_cap(self):
+        self.background()
+        with self.braking(2), self.recorded() as record:
+            self.bridge.brake_max_wait = .5
+            first = self.open_stream(self.tool_turn())
+            self.assertIn(b'event: ping', first.read1(256))
+            threading.Event().wait(.3)
+            self.stream_closed(first)
+            started = time.monotonic()
+            status, body = self.call('/v1/messages', self.tool_turn())
+            elapsed = time.monotonic() - started
+        self.assertIn(b'message_stop', body)
+        self.assertLess(elapsed, .4, 'the second wait counts from the start of the first')
+        first_wait, second_wait = self.waits()
+        self.assertEqual((first_wait['end'], second_wait['end']), ('cancelled', 'capped'))
+        self.assertEqual(first_wait['chain'], second_wait['chain'])
+        self.assertEqual(self.count(record, 'brake_wait'), 1, 'one journal entry per chain')
+
+    def test_a_wait_after_the_idle_gap_starts_a_new_chain(self):
+        self.background()
+        with self.braking(2), self.recorded() as record:
+            self.bridge.brake_chain_gap = .1
+            for pause in (0, .2):
+                threading.Event().wait(pause)
+                response = self.open_stream(self.tool_turn())
+                self.assertIn(b'event: ping', response.read1(256))
+                self.stream_closed(response)
+        first_wait, second_wait = self.waits()
+        self.assertNotEqual(first_wait['chain'], second_wait['chain'])
+        self.assertGreaterEqual(second_wait['chain'], first_wait['at'])
+        self.assertEqual(self.count(record, 'brake_wait'), 2)
+
+    def test_a_quota_wait_takes_no_request_slot(self):
+        self.bridge.max_requests, self.bridge.main_reserve = 1, 0
+        self.statuses = [429]
+        back = threading.Event()
+        def capacity_fixture(accounts, model, now):
+            return {'state': 'ready' if back.is_set() else 'quota_wait', 'nextResetAt': now + 100, 'checkedAt': now}
+        with patch('bridge.capacity', side_effect=capacity_fixture):
+            waiting = self.open_stream(self.MESSAGE, session='quota')
+            self.assertIn(b'event: ping', waiting.read1(256))
+            status, body = self.call('/v1/messages', self.MESSAGE, extra_headers={'x-claude-code-session-id': 'interactive'})
+            self.assertEqual(status, 200, 'the quota wait leaves the only slot free')
+            self.assertIn(b'message_stop', body)
+            back.set()
+            self.assertIn(b'message_stop', waiting.read())
+        self.assertEqual(len(self.inputs), 3)
+        self.assertTrue(self.until(lambda: not self.bridge.requests))
+
     def test_the_owner_and_automatic_turns_and_the_hold_survive_a_restart(self):
         self.background()
         self.call('/v1/messages', self.turn('Weiter so.'), extra_headers={'x-claude-code-session-id': 'owned'})

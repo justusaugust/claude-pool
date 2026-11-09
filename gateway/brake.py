@@ -20,7 +20,8 @@ CLASSES = {'subagent', 'workflow'}
 WINDOWS = ('fiveHour', 'sevenDay')  # the all-model windows the brake counts
 INTERACTIVE = 90 * 60   # seconds a session counts as interactive after a message from a person
 RELEASE = 15 * 60       # seconds the brake must stay off in a row before background work goes again (the stage flickers)
-MAX_WAIT = 3 * 3600     # seconds one request waits at most; then it goes and the journal records it
+MAX_WAIT = 3 * 3600     # seconds a chain of waits (one session and class) lasts at most; then it goes and the journal records it
+CHAIN_GAP = 5 * 60      # seconds a chain stays open after its last wait ended without going (the client gave up and sends again)
 # $ per million tokens: input, output, cache read; a cache write costs 1.25 x input for five minutes, 2 x input for an hour
 # (API list prices, October 2026). Sonnet 5.5 cache reads cost 0.10 since 7 October (0.05 x input), Sonnet 5 stays at 0.20.
 PRICES = [('fable', (10, 50, .25)), ('mythos', (10, 50, .25)), ('opus-5-5', (4, 20, .2)), ('opus', (5, 25, .5)),
@@ -138,10 +139,11 @@ def ledger_line(at, session, project, cls, model, account, usage, braked=False, 
             **({'brakeWaitSeconds': round(waited)} if waited else {}), **({'short_label': True} if short_label else {})}
 
 
-def wait_line(at, since, session, project, cls, reason, end):
-    """One finished brake wait (times in ms): released, capped, cancelled, draining or failed. Never content."""
+def wait_line(at, since, session, project, cls, reason, end, chain=None):
+    """One finished brake wait (times in ms): released, capped, cancelled, draining or failed; `chain` is the start of its
+    chain (one session and class), the same for every wait that continued it. Never content."""
     return {'at': at, 'since': since, 'seconds': round(max(0, at - since) / 1000), 'session': session, 'project': project or '',
-            'class': cls, 'reason': reason, 'end': end}
+            'class': cls, 'reason': reason, 'end': end, **({'chain': chain} if chain is not None else {})}
 
 
 def wait_summary(path):
