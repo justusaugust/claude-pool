@@ -332,6 +332,24 @@ class DeviceSyncTests(unittest.TestCase):
             self.assertEqual(device_sync.sync_all(remotes=Mock()), {})
         self.assertIn('no name', out.getvalue())
 
+    def test_a_registry_with_fields_from_a_newer_version_is_received_and_kept(self):
+        self.devices(MAC, VPS, accounts=[ROW])
+        value = registry.load(self.reg)
+        ipad = {'name': 'ipad', 'platform': 'darwin', 'roles': [], 'addedAt': 3, 'generation': 9, 'futureDevice': 1}
+        incoming = {**value, 'generation': 9, 'futureTop': 'x', 'devices': value['devices'] + [ipad],
+                    'accounts': [{**ROW, 'generation': 9, 'futureAccount': 1}]}
+        device_sync.receive_registry(json.dumps(incoming).encode())
+        saved = registry.load(self.reg)
+        self.assertEqual(registry.device(saved, 'ipad')['futureDevice'], 1)
+        self.assertEqual(saved['futureTop'], 'x')
+        self.assertEqual(saved['accounts'][0]['futureAccount'], 1)
+
+    def test_a_registry_that_breaks_a_known_rule_is_still_rejected(self):
+        value = registry.load(self.reg)
+        for bad in [{**value, 'futureTop': fixture_token()}, {**value, 'devices': [{**MAC, 'name': 'Bad Name', 'futureDevice': 1}]}]:
+            with self.assertRaises(ValueError): device_sync.receive_registry(json.dumps(bad).encode())
+        with self.assertRaises(ValueError): device_sync.receive_registry(b' ' * (registry.LIMIT + 1))
+
     def newer(self, accounts, generation=5, fingerprint=None):
         """The registry another device wrote after removing every account not in `accounts` (its tombstones name the
         fingerprint of the token this device holds, or `fingerprint`)."""
@@ -461,6 +479,41 @@ class DeviceSyncTests(unittest.TestCase):
         report = device_sync.receive_registry(self.newer([]))
         fine.assert_called_once()
         self.assertTrue(report['hooks']['boom'].startswith('failed')); self.assertEqual(report['hooks']['fine'], 'ok')
+
+    def test_a_failed_hook_is_retried_on_the_next_sync_until_it_succeeds(self):
+        self.devices(MAC, VPS)
+        calls = []
+        def flaky(now):
+            calls.append(1)
+            if len(calls) < 3: raise RuntimeError('no')
+        device_sync.INTEGRATION_HOOKS[:] = [flaky]
+        self.assertTrue(device_sync.receive_registry(self.newer([]))['hooks']['flaky'].startswith('failed'))
+        down = lambda target: FakeRemote('vps', lambda argv, stdin: Completed(255, b'', b''))
+        device_sync.sync_all(down)  # the registry is unchanged, the hook still runs
+        self.assertEqual(len(calls), 2)
+        device_sync.sync_all(down)
+        self.assertEqual(len(calls), 3)
+        device_sync.sync_all(down)
+        self.assertEqual(len(calls), 3)
+
+    def test_push_reports_what_the_receiver_could_not_do(self):
+        self.devices(MAC, VPS)
+        def handler(argv, stdin):
+            if argv[2] == 'status': return Completed(0, json.dumps({'accounts': [], 'registryHash': 'other'}).encode(), b'')
+            if argv[2] == 'registry': return Completed(0, json.dumps(registry.load(self.reg)).encode(), b'')
+            report = {'failed': {'team': 'it is the last account on this device'}, 'hooks': {'reserve_hook': 'failed: OSError'}}
+            return Completed(0, json.dumps(report).encode(), b'')
+        result = device_sync.push(FakeRemote('vps', handler))
+        self.assertTrue(result.startswith('failed: '))
+        self.assertIn('last account', result); self.assertIn('reserve_hook', result)
+
+    def test_push_accepts_the_reply_of_an_older_peer_without_a_report(self):
+        self.devices(MAC, VPS)
+        def handler(argv, stdin):
+            if argv[2] == 'status': return Completed(0, json.dumps({'accounts': [], 'registryHash': 'other'}).encode(), b'')
+            if argv[2] == 'registry': return Completed(0, json.dumps(registry.load(self.reg)).encode(), b'')
+            return Completed(0, b'', b'')
+        self.assertEqual(device_sync.push(FakeRemote('vps', handler)), 'ok')
 
     def switch_setup(self):
         self.devices(MAC, VPS, accounts=[ROW])
