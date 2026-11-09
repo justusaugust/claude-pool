@@ -171,12 +171,75 @@ class BridgeTests(unittest.TestCase):
         again.release_blocks(until - 1)
         self.assertTrue(self.paused['team'])
         again.release_blocks(until)
-        self.assertEqual((self.paused['team'], again.blocked), (False, {}))
+        self.assertEqual((self.paused['team'], again.blocked['team']['state']), (False, 'probing'))
         self.assertIn('account_unblocked', [r['code'] for r in again.journal.snapshot()])
         self.paused['gmail'] = True
         again.paused_names.add('gmail'); again.blocked['gmail'] = {'until': 0, 'code': 'oauth_not_allowed_for_organization'}
         again.release_blocks(1)
-        self.assertEqual((self.paused['gmail'], again.blocked), (True, {}))
+        self.assertEqual((self.paused['gmail'], 'gmail' in again.blocked), (True, False))
+    def test_a_block_that_lands_while_its_release_runs_survives(self):
+        b, code, late = self.bridge, 'oauth_not_allowed_for_organization', []
+        b.blocked['team'] = {'until': 0, 'code': code}
+        self.paused['team'] = True
+        real = b.admin
+        def admin(path='/admin/api/pool', body=None, timeout=3):
+            result = real(path, body, timeout)
+            if body == {'paused': False} and path.endswith('/team'):
+                # Forced interleaving: right after the resume, a request Shunt gives to team gets the 403 again.
+                late.append(threading.Thread(target=b.block_account, args=('team', code)))
+                late[0].start(); late[0].join(.5)
+            return result
+        with patch.object(b, 'admin', side_effect=admin): b.release_blocks(now=1)
+        late[0].join(5)
+        self.assertTrue(self.paused['team'], 'Shunt keeps team paused')
+        self.assertIn('team', b.blocked, 'the new block is lost: nothing ever resumes team')
+        self.assertEqual(b.blocked['team'].get('state', 'blocked'), 'blocked')
+        self.assertGreater(b.blocked['team']['until'], time.time() * 1000)
+    def test_a_refusal_blocks_every_pool_account_of_the_same_organization(self):
+        import types
+        self.paused['ops'] = False
+        self.bridge.native_auth = types.SimpleNamespace(identities={('user-a', 'org-shared'): 'team', ('user-b', 'org-shared'): 'gmail',
+                                                                    ('user-c', 'org-other'): 'ops'})
+        self.honor_pauses, self.default_account = True, 'team'
+        self.statuses, self.bodies = [403], [self.BLOCKED]
+        status, _ = self.side_request()
+        self.assertEqual((status, self.preferred), (200, ['team', 'ops']))
+        self.assertEqual((self.paused, sorted(self.bridge.blocked)), ({'gmail': True, 'team': True, 'ops': False}, ['gmail', 'team']))
+    def test_a_second_refused_account_is_blocked_too_and_a_third_one_answers(self):
+        self.paused['ops'] = False
+        self.honor_pauses, self.default_account = True, 'team'
+        self.statuses, self.bodies = [403, 403], [self.BLOCKED, self.BLOCKED]
+        status, _ = self.side_request()
+        self.assertEqual((status, self.preferred), (200, ['team', 'gmail', 'ops']))
+        self.assertEqual(sorted(self.bridge.blocked), ['gmail', 'team'])
+    def test_a_probe_refused_again_keeps_one_silent_block_and_only_an_answered_probe_ends_it(self):
+        from conductor_alerts import Alerts
+        clock, wake = [time.time()], Path(self.temp.name) / 'wake.log'
+        alerts = Alerts(wake, Path(self.temp.name) / 'alerts.json', clock=lambda: clock[0])
+        def check():
+            self.bridge.accounts()
+            with patch.object(self.bridge, 'brake_info', return_value={}): alerts.check(self.bridge)
+        self.honor_pauses, self.default_account = True, 'team'
+        self.statuses, self.bodies = [403], [self.BLOCKED]
+        self.side_request(); check()
+        for refused in [True, False]:
+            clock[0] += 6 * 3600
+            self.bridge.release_blocks(self.bridge.blocked['team']['until'])
+            check()
+            if refused: self.statuses, self.bodies = [403], [self.BLOCKED]
+            self.assertEqual(self.side_request()[0], 200)
+            check()
+        lines = [line.split(' pool gesperrt ')[1].split(':')[0] for line in wake.read_text().splitlines() if ' pool gesperrt ' in line]
+        self.assertEqual(lines, ['an conductor', 'vorbei'])
+        self.assertEqual((self.preferred, self.bridge.blocked), (['team', 'gmail', 'team', 'gmail', 'team'], {}))
+    def test_resuming_a_blocked_account_by_hand_starts_its_probe(self):
+        self.honor_pauses, self.default_account = True, 'team'
+        self.statuses, self.bodies = [403], [self.BLOCKED]
+        self.side_request()
+        self.call('/cockpit/test-session', {'action': 'resume', 'account': 'team'})
+        self.assertEqual((self.paused['team'], self.bridge.blocked['team'].get('state')), (False, 'probing'))
+        self.side_request()
+        self.assertEqual(self.bridge.blocked, {}, 'the answered probe ends the block')
     def test_a_subagent_stays_on_the_account_it_was_first_routed_to_while_that_account_is_ready(self):
         self.default_account = 'team'      # Shunt's own choice for the agent's first request
         self.subagent(agent='steady')
