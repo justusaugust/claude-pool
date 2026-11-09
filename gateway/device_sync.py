@@ -127,7 +127,9 @@ def build_version():
 
 
 def account_rows():
-    members, rows = set(config_names()), []
+    from account_metadata import load
+    reserves = {row['name']: row for row in load(settings.CONFIG).get('accounts', [])}
+    members, rows = set(reserves), []
     names = set(members) | {p.stem for p in settings.LONG_LIVED.glob('*.json') if not p.stem.startswith('.')}
     # A long-lived store file with no membership and no replica is listed too (`stray`): it may be the only copy.
     strays = {p.stem for p in settings.STORES.glob('*.json') if not p.stem.startswith('.') and p.stem not in names
@@ -144,6 +146,7 @@ def account_rows():
                    'servingKind': None, 'userId': _text(value.get('shuntAccountUuid')),
                    'organizationId': _text(value.get('shuntOrganizationUuid'))}
             if name in strays: row['stray'] = True
+            if name in members: row['reserve'] = list(accounts_cli.reserve_of(reserves.get(name, {})))
             if name in members and store.exists() and not store.is_symlink():
                 try:
                     served = read_private(store)
