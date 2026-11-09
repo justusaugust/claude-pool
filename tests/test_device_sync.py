@@ -480,6 +480,41 @@ class DeviceSyncTests(unittest.TestCase):
         fine.assert_called_once()
         self.assertTrue(report['hooks']['boom'].startswith('failed')); self.assertEqual(report['hooks']['fine'], 'ok')
 
+    def test_a_failed_hook_is_retried_on_the_next_sync_until_it_succeeds(self):
+        self.devices(MAC, VPS)
+        calls = []
+        def flaky(now):
+            calls.append(1)
+            if len(calls) < 3: raise RuntimeError('no')
+        device_sync.INTEGRATION_HOOKS[:] = [flaky]
+        self.assertTrue(device_sync.receive_registry(self.newer([]))['hooks']['flaky'].startswith('failed'))
+        down = lambda target: FakeRemote('vps', lambda argv, stdin: Completed(255, b'', b''))
+        device_sync.sync_all(down)  # the registry is unchanged, the hook still runs
+        self.assertEqual(len(calls), 2)
+        device_sync.sync_all(down)
+        self.assertEqual(len(calls), 3)
+        device_sync.sync_all(down)
+        self.assertEqual(len(calls), 3)
+
+    def test_push_reports_what_the_receiver_could_not_do(self):
+        self.devices(MAC, VPS)
+        def handler(argv, stdin):
+            if argv[2] == 'status': return Completed(0, json.dumps({'accounts': [], 'registryHash': 'other'}).encode(), b'')
+            if argv[2] == 'registry': return Completed(0, json.dumps(registry.load(self.reg)).encode(), b'')
+            report = {'failed': {'team': 'it is the last account on this device'}, 'hooks': {'reserve_hook': 'failed: OSError'}}
+            return Completed(0, json.dumps(report).encode(), b'')
+        result = device_sync.push(FakeRemote('vps', handler))
+        self.assertTrue(result.startswith('failed: '))
+        self.assertIn('last account', result); self.assertIn('reserve_hook', result)
+
+    def test_push_accepts_the_reply_of_an_older_peer_without_a_report(self):
+        self.devices(MAC, VPS)
+        def handler(argv, stdin):
+            if argv[2] == 'status': return Completed(0, json.dumps({'accounts': [], 'registryHash': 'other'}).encode(), b'')
+            if argv[2] == 'registry': return Completed(0, json.dumps(registry.load(self.reg)).encode(), b'')
+            return Completed(0, b'', b'')
+        self.assertEqual(device_sync.push(FakeRemote('vps', handler)), 'ok')
+
     def switch_setup(self):
         self.devices(MAC, VPS, accounts=[ROW])
         refreshable_file(self.stores, 'team', 'user-a', 'team-a')
