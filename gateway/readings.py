@@ -228,7 +228,8 @@ class Puller:
         if self.successes % self.registry_every == 0:
             try:
                 import device_sync
-                device_sync.pull(remote)
+                result = device_sync.pull(remote)
+                if result != 'ok': self.journal.record('registry_sync_failed', reason=result.split(':')[0][:40])
             except Exception: pass  # sync reports its own problems
         return True
 

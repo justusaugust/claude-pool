@@ -118,11 +118,21 @@ class BridgeTests(unittest.TestCase):
         plain = b'{"model": "claude-opus-5-5", "stream": true, "messages": [{"role": "user", "content": "x"}]}'
         self.call('/v1/messages', plain, extra_headers=sub)
         self.assertEqual(self.inputs[-1], plain, 'nothing to change: the bytes stay as sent')
+    @staticmethod
+    def refusal(message):
+        return json.dumps({'type': 'error', 'error': {'type': 'invalid_request_error', 'message': message}}).encode()
+    def test_another_400_reaches_the_client_once_and_unretried(self):
+        too_long = self.refusal('prompt is too long: 1000001 tokens > 1000000 maximum')
+        self.statuses, self.bodies = [400, 400], [too_long, too_long]
+        status, body = self.call('/v1/messages', json.dumps(self.cached()).encode(), extra_headers={'x-claude-code-request-class': 'subagent', 'x-claude-code-agent-id': 'long'})
+        self.assertEqual((status, len(self.inputs)), (400, 1))
+        self.assertNotIn('cache_fallback', [row['code'] for row in self.bridge.journal.snapshot()])
     def test_a_refused_one_hour_cache_is_sent_once_more_as_the_agent_sent_it(self):
-        self.statuses = [400]
+        self.statuses, self.bodies = [400, 200], [self.refusal('system.0.cache_control.ttl: extended TTL is not allowed here'), b'{}']
         raw = json.dumps(self.cached()).encode()
         status, _ = self.call('/v1/messages', raw, extra_headers={'x-claude-code-request-class': 'subagent', 'x-claude-code-agent-id': 'refused'})
         self.assertEqual(status, 200)
+        self.assertEqual(len(self.inputs), 2)
         self.assertEqual(json.loads(self.inputs[-2])['system'][0]['cache_control'], {'type': 'ephemeral', 'ttl': '1h'})
         self.assertEqual(self.inputs[-1], raw)
         self.assertIn('cache_fallback', [row['code'] for row in self.bridge.journal.snapshot()])

@@ -47,6 +47,14 @@ def blocked_code(head):
     return code if code in BLOCKED_CODES else None
 
 
+def refused_cache(head):
+    """Whether a 400 names the cache rewrite (cache_control or ttl), read from the start of its body."""
+    try: error = json.loads(head).get('error')
+    except (ValueError, AttributeError, UnicodeDecodeError): return False
+    message = error.get('message') if isinstance(error, dict) else None
+    return isinstance(message, str) and ('cache_control' in message or 'ttl' in message.lower())
+
+
 def number(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
@@ -1030,8 +1038,8 @@ class Handler(BaseHTTPRequestHandler):
             lease['progress'] = time.monotonic()
             account = response.getheader('x-shunt-account')
             self.server.note_outcome(response.status, account)
-            if (hour_cache or short) and response.status == 400:
-                # Refused before any output: send it once more exactly as the agent sent it.
+            if response.status == 400 and (short or (hour_cache and refused_cache(response.peek(4096)))):
+                # Refused before any output: send it once more exactly as the agent sent it. Any other 400 goes up as it is.
                 response.read(); response.close(); conn.close()
                 self.server.journal.record('cache_fallback' if hour_cache else 'short_label_fallback', account=account)
                 if short: self.server.label_counted('refused')
