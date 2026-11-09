@@ -449,7 +449,7 @@ class InstallTests(ServiceBase):
                 mock.patch.object(device_sync, 'switch_pending', return_value=[]):
             value = device_sync.status()
         self.assertIn('conductor', value)
-        self.assertEqual(set(value['conductor']), {'installed', 'running', 'ready', 'fresh', 'duplicates', 'adoptSessionId'})
+        self.assertEqual(set(value['conductor']), {'installed', 'running', 'ready', 'fresh', 'duplicates', 'adoptSessionId', 'version', 'currentVersion'})
         self.assertFalse(value['conductor']['running'])
         with mock.patch.object(conductor, 'read_state', side_effect=RuntimeError('Credential must be your private 0600 file')):
             self.assertEqual(conductor.status()['error'], 'RuntimeError')

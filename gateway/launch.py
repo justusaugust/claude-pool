@@ -30,6 +30,7 @@ from native_auth import NativeAuth
 import service
 from validation import render as validation_view
 
+import running_release
 from settings import HERE, RUNTIME, STORES, LONG_LIVED, NATIVE_CLAUDE, CONFIG, BASE_URL, GATEWAY_PORT, BACKEND_PORT, backend_config, connection_ts, SHARED_READINGS, LONG_LIVED_PROBES, ALIASES, private_directory, CONDUCTOR_HOME
 from conductor_alerts import Alerts
 ROOT = HERE.parent
@@ -185,7 +186,7 @@ def daemon(client, admin):
         process = subprocess.Popen([str(binary), "--config", str(cfg), "run"], env=env,
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
-            atomic_write(RUNTIME / "owner.json", json.dumps({"daemon": os.getpid(), "backend": process.pid, "managed": os.environ.get("POOL_MANAGED") == "1"}))
+            atomic_write(RUNTIME / "owner.json", json.dumps({"daemon": os.getpid(), "backend": process.pid, "managed": os.environ.get("POOL_MANAGED") == "1", "release": running_release.running()}))
         except OSError:
             process.terminate()
             try: process.wait(timeout=5)
@@ -693,12 +694,15 @@ def main():
         elif claude_args[0] == 'history':
             print(history(json.loads(request(client, path="/pool/overview"))))
         elif claude_args[0] == 'doctor':
+            import running_release
+            old = running_release.stale()
             value = json.loads(request(client, path='/pool/diagnostics'))
             health = value['health']
             print(f"Claude pool · {health['supervisor']} · backend {health['backend']} · {health['activeRequests']}/{health['requestLimit']} requests")
             print('Metadata storage: ' + ('needs attention' if health['storageError'] else 'ready'))
             for incident in value['incidents'][:10]: print('  ' + incident['message'])
-            if long_lived_report(): raise SystemExit(1)
+            for unit in old: print('  fail ' + running_release.line(unit) + ' · fix: ' + unit[3])
+            if long_lived_report() or old: raise SystemExit(1)
         else:
             print(validation_view(json.loads(request(client, path='/pool/validation'))))
         return

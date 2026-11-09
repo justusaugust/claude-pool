@@ -29,4 +29,13 @@ def cli(argv, here):
         try: subprocess.run([sys.executable, str(source / 'install.py'), '--bootstrap', '--prefix', str(root)], check=True)
         except subprocess.SubprocessError:
             raise RuntimeError('Update did not finish. Running tasks were not restarted; rerun claude-pool update to retry.') from None
+    report()
     return 0
+
+
+def report():
+    """After the install: name each running unit that still runs the previous release. Nothing is restarted."""
+    try:
+        import running_release
+        for unit in running_release.stale(): print('Note: ' + running_release.line(unit))
+    except Exception: pass
