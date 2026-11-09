@@ -30,6 +30,7 @@ import device_sync
 import managed_block
 from private_files import read_private, write_private
 import registry
+import running_release
 from remote import Local, Remote, remote_command
 import service
 import settings
@@ -211,6 +212,7 @@ def serve_service():
     for number in (signal.SIGTERM, signal.SIGINT): signal.signal(number, lambda *_: stop.set())
     queue = threading.Thread(target=conductor_tools.deliver_until, args=(stop,), name='conductor-queue', daemon=True)
     waker = threading.Thread(target=conductor_inbox.waker_until, args=(stop,), name='conductor-waker', daemon=True)
+    _update(settings.CONDUCTOR_STATE, servicePid=os.getpid(), version=running_release.running() or DELETE)
     queue.start(); waker.start()
     try: serve(settings.NATIVE_CLAUDE, Path.cwd(), stop=stop)
     finally:
@@ -427,7 +429,7 @@ def status():
         listing = processes()
         found = duplicates(listing, own)
         return {'installed': installed, 'running': own is not None, 'ready': own is not None and bool(record.get('ready')),
-                'fresh': bool(record.get('fresh')), 'duplicates': found, 'adoptSessionId': adoptable(listing, found)}
+                'fresh': bool(record.get('fresh')), 'version': record.get('version'), 'currentVersion': running_release.current(), 'duplicates': found, 'adoptSessionId': adoptable(listing, found)}
     except Exception as error:
         return {'error': type(error).__name__}
 
@@ -475,6 +477,10 @@ def check(statuses, value):
                     remote_command(str(_target(value, device) or device), 'claude-pool device conductor install --restart'))
     if here.get('platform') == 'linux' and here.get('linger') is False:
         return Step(STEP, 'failed', 'stops when ' + device + ' logs out (linger is off)', 'claude-pool device add ' + str(_target(value, device) or device))
+    old, now = parts[device].get('version'), parts[device].get('currentVersion')
+    if old and now and old != now:
+        return Step(STEP, 'failed', running_release.describe(running_release.CONDUCTOR, old, now),
+                    remote_command(str(_target(value, device) or device), running_release.RESTART[running_release.CONDUCTOR]))
     if parts[device].get('fresh'):
         return Step(STEP, 'manual', 'ready on ' + device + ' in a new conversation; the old one could not be reattached',
                     'Open the new Conductor Claude conversation in the Claude app (Code, environment of ' + device + ').')

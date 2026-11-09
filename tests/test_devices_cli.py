@@ -228,6 +228,13 @@ class InternalVerbTests(DeviceCliBase):
             self.assertIsNone(team['servingFingerprint'])
             SecretWatch(fixture_token()).text(out)
 
+    def test_status_reports_each_members_reserve(self):
+        self.devices(MAC, VPS, accounts=[TEAM]); long_lived_file(self.directory, 'team')
+        self.config.write_text(json.dumps({'accounts': [{'name': 'team', 'label': 'Team', 'reserveAt': 60, 'reserveHours': [6, 24],
+                                                         'reserveTimezone': 'Europe/Stockholm', 'reserveSoft': True}]}))
+        team = next(r for r in json.loads(self.run_cli(['status'])[1])['accounts'] if r['name'] == 'team')
+        self.assertEqual(team['reserve'], [60, [6, 24], 'Europe/Stockholm', True])
+
     def test_registry_prints_the_registry(self):
         self.devices(MAC, VPS, accounts=[TEAM])
         code, out, _ = self.run_cli(['registry'])
@@ -736,6 +743,7 @@ class Machine:
             rows.append({'name': n, 'kind': r.get('kind', 'long-lived'), 'fingerprint': r['fingerprint'], 'expiresAt': None,
                          'active': r.get('active', True), 'servingFingerprint': r['fingerprint'],
                          'servingKind': 'refreshable' if n in self.refreshable else r.get('kind', 'long-lived')})
+            if 'reserve' in r: rows[-1]['reserve'] = r['reserve']
             if n in self.uuids: rows[-1].update(userId=self.uuids[n][0], organizationId=self.uuids[n][1])
         known = self.registry or registry.EMPTY()
         return {'name': self.self_name, 'version': self.version, 'platform': self.platform, 'service': self.service,
@@ -1296,6 +1304,24 @@ class CheckTests(OrchestrationBase):
         with patch.object(accounts_cli, 'reserve_hook', side_effect=apply):
             code, out, err = self.cli('check', 'mac')
         self.assertNotRegex(out, r'failed +accounts')
+
+    def reserve_on_both(self, here, there):
+        self.config.write_text(json.dumps({'accounts': [{'name': 'team', 'label': 'Team', **here}]}))
+        long_lived_file(self.directory, 'team')
+        if there is not None: self.vps.accounts['team']['reserve'] = there
+        return self.cli('check', 'vps')
+
+    def test_check_names_a_reserve_that_differs_between_devices(self):
+        code, out, _ = self.reserve_on_both({'reserveAt': 50}, [70, None, None, False])
+        self.assertEqual(code, 2)
+        self.assertIn('team reserve 50 % here, 70 % on vps', out)
+
+    def test_check_is_silent_when_the_reserves_are_equal_or_the_peer_reports_none(self):
+        for here, there in [({'reserveAt': 50}, [50, None, None, False]), ({}, [0, None, None, False]), ({'reserveAt': 50}, None)]:
+            with self.subTest(here=here, there=there):
+                self.vps.accounts['team'].pop('reserve', None)
+                code, out, err = self.reserve_on_both(here, there)
+                self.assertNotIn('reserve', out, out + err)
 
     def test_check_json_reports_every_device(self):
         code, out, err = self.cli('check', '--json')

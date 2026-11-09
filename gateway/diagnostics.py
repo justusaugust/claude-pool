@@ -33,6 +33,7 @@ CODES = {
     'request_idle_timeout': 'Response stalled; connection closed',
     'history_index_rebuilt': 'History index rebuilt from the preserved archive',
     'readings_sync_failed': 'Shared usage readings could not be fetched',
+    'registry_sync_failed': 'The device registry could not be synced',
     'reserve_not_applied': 'A reserve from the device registry could not be applied',
     'storage_failed': 'Recovery metadata could not be saved',
     'account_blocked': 'Anthropic refuses this whole account (an organization setting); paused for six hours',

@@ -103,7 +103,7 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(registry.load(self.path), merged)
 
     def test_receive_rejects_invalid_values(self):
-        with self.assertRaises(ValueError): registry.receive({**gen(5), 'extra': 1}, self.path)
+        with self.assertRaises(ValueError): registry.receive({**gen(5), 'generation': -1}, self.path)
 
     def test_force_puts_this_list_above_every_peer_and_tombstones_rows_only_peers_have(self):
         registry.update(lambda v: (v['devices'].append(MAC), v['accounts'].append(ENTRY)), self.path)
@@ -123,11 +123,28 @@ class RegistryTests(unittest.TestCase):
         self.assertIsNone(registry.diverged(gen(5), gen(5)))
         self.assertIsNone(registry.diverged(gen(5, devices=[MAC]), gen(6, devices=[VPS])))
 
-    def test_rejects_token_like_values_and_unknown_fields(self):
+    def test_rejects_token_like_values(self):
         with self.assertRaises(ValueError): registry.update(lambda v: v['accounts'].append({**ENTRY, 'label': fixture_token()}), self.path)
-        with self.assertRaises(ValueError): registry.update(lambda v: v['accounts'].append({**ENTRY, 'token': 'x'}), self.path)
-        with self.assertRaises(ValueError): registry.update(lambda v: v.update(extra=1), self.path)
+        with self.assertRaises(ValueError): registry.update(lambda v: v['accounts'].append({**ENTRY, 'future': fixture_token()}), self.path)
+        with self.assertRaises(ValueError): registry.update(lambda v: v.update(future=[fixture_token()]), self.path)
+        with self.assertRaises(ValueError): registry.update(lambda v: v['devices'].append({**MAC, 'name': 'Bad Name', 'future': 1}), self.path)
         self.assertFalse(self.path.exists())
+
+    def test_unknown_fields_from_a_newer_version_are_kept_through_merge_and_save(self):
+        newer = gen(5, devices=[{**MAC, 'futureDevice': {'a': 1}}], accounts=[{**ENTRY, 'futureAccount': 2, 'generation': 5}], futureTop=['x'])
+        self.assertEqual(registry.validate(copy.deepcopy(newer)), newer)
+        merged = registry.merge(gen(3, devices=[VPS]), newer)
+        self.assertEqual(merged['futureTop'], ['x'])
+        self.assertEqual(registry.merge(newer, gen(3, devices=[VPS])), merged)
+        self.assertEqual(registry.merge(merged, merged), merged)
+        self.assertEqual(registry.device(merged, 'mac')['futureDevice'], {'a': 1})
+        self.assertEqual(merged['accounts'][0]['futureAccount'], 2)
+        registry.receive(newer, self.path)
+        value = registry.update(lambda v: v['devices'].append(VPS), self.path)
+        self.assertEqual(value['futureTop'], ['x'])
+        self.assertEqual(registry.load(self.path)['futureTop'], ['x'])
+        self.assertEqual(registry.device(registry.load(self.path), 'mac')['futureDevice'], {'a': 1})
+        self.assertEqual(registry.load(self.path)['accounts'][0]['futureAccount'], 2)
 
     def test_load_rejects_token_like_file_and_oversize_file(self):
         self.path.write_text(json.dumps({**gen(1), 'accounts': [{**ENTRY, 'email': fixture_token()}]})); self.path.chmod(0o600)
