@@ -147,6 +147,16 @@ class PullTests(unittest.TestCase):
         self.assertEqual(self.remotes['alex@vps'].calls[0][0], ['.local/bin/claude-pool', 'device', 'readings'])
         self.assertEqual(readings.load_shared(self.path)['device'], 'vps')
 
+    def test_a_failed_registry_pull_is_journaled(self):
+        self.add({'name': 'mac', 'ssh': None, 'platform': 'darwin', 'roles': [], 'addedAt': 0}, self.owner_row)
+        def handler(argv, stdin):
+            if argv[2] == 'readings': return Completed(0, json.dumps(shared()).encode(), b'')
+            return Completed(1, b'', b'boom')
+        puller = readings.Puller(self.path, self.journal, lambda target: FakeRemote(target, handler), registry_every=1)
+        self.assertTrue(puller.run_once())
+        self.assertEqual(self.journal.codes, ['registry_sync_failed'])
+        self.assertIn('registry_sync_failed', diagnostics.CODES)
+
     def test_pull_failure_records_an_incident_once_and_overview_still_answers(self):
         self.add({'name': 'mac', 'ssh': None, 'platform': 'darwin', 'roles': [], 'addedAt': 0}, self.owner_row)
         puller = self.make(lambda argv, stdin: Completed(255, b'', b'boom'))
