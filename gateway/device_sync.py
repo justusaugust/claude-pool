@@ -348,12 +348,53 @@ def receive_registry(data, overview=None, native_identity=None, elsewhere=()):
         except Busy: report['kept_busy'].append(name)
         except Exception as error:
             report['failed'][name] = type(error).__name__ + ': ' + str(error)
-    if now != previous:
-        for hook in list(INTEGRATION_HOOKS):
-            label = getattr(hook, '__name__', repr(hook))
-            try: hook(now); report['hooks'][label] = 'ok'
-            except Exception as error: report['hooks'][label] = 'failed: ' + type(error).__name__
+    report['hooks'] = run_hooks(now, None if now != previous else pending_hooks())
     return report
+
+
+def pending_path(): return settings.REGISTRY.with_name('pending-hooks.json')
+
+
+def pending_hooks():
+    try: value = read_private(pending_path())
+    except (OSError, ValueError, RuntimeError): return set()
+    labels = value.get('pending')
+    return {label for label in labels if isinstance(label, str)} if isinstance(labels, list) else set()
+
+
+def run_hooks(now, only=None):
+    """Run the integration hooks (all, or only the labels in `only`) and remember the failed ones in a state file next to the
+    registry, so the next sync runs them again until they succeed."""
+    results, pending = {}, pending_hooks() if only is not None else set()
+    for hook in list(INTEGRATION_HOOKS):
+        label = getattr(hook, '__name__', repr(hook))
+        if only is not None and label not in only: continue
+        try: hook(now); results[label] = 'ok'; pending.discard(label)
+        except Exception as error: results[label] = 'failed: ' + type(error).__name__; pending.add(label)
+    if only is not None or pending or pending_path().exists():
+        try: write_private(pending_path(), json.dumps({'pending': sorted(pending)}))
+        except OSError: pass
+    return results
+
+
+def retry_hooks():
+    """Hooks that failed on an earlier receive run again; the registry need not have changed."""
+    only = pending_hooks()
+    return run_hooks(registry.load(), only) if only else {}
+
+
+def problems(report, side):
+    """What a receive report says went wrong, as short sentences. Replies of older versions carry no report: no problems."""
+    if not isinstance(report, dict): return []
+    found = [str(text) for text in (report.get('failed') or {}).values()] if isinstance(report.get('failed'), dict) else []
+    hooks = report.get('hooks') if isinstance(report.get('hooks'), dict) else {}
+    found += [label + ' hook ' + str(result) for label, result in sorted(hooks.items()) if str(result).startswith('failed')]
+    return [side + ': ' + text for text in found]
+
+
+def peer_report(output):
+    try: return json.loads(output)
+    except (ValueError, TypeError): return None
 
 
 def _uuids_of(name):
@@ -440,17 +481,18 @@ def held_fingerprints(theirs):
 
 def merge_from(remote, theirs):
     """Fetch the peer's registry and merge it here first, so what is pushed back already holds the peer's changes."""
-    receive_registry(peer(remote, 'registry'), elsewhere=held_fingerprints(theirs))
+    return receive_registry(peer(remote, 'registry'), elsewhere=held_fingerprints(theirs))
 
 
 def push(remote):
     def work():
+        found = []
         theirs = peer_status(remote)
         if theirs.get('registryHash') != registry.digest(registry.load()):
-            merge_from(remote, theirs)
+            found += problems(merge_from(remote, theirs), 'here')
             known = registry.load()
             if theirs.get('registryHash') != registry.digest(known):
-                peer(remote, 'receive-registry', stdin=json.dumps(known).encode())
+                found += problems(peer_report(peer(remote, 'receive-registry', stdin=json.dumps(known).encode())), remote.name)
         known, mine = registry.load(), account_rows()
         for row in known['accounts']:
             here = local_name(row, mine) or row['name']
@@ -463,13 +505,14 @@ def push(remote):
             there = registry.local_name(row, theirs['accounts'])
             if there is not None and theirs['accounts'][there].get('fingerprint') == mine_fp: continue
             peer(remote, 'receive-account', row['name'], stdin=data)  # the receiver keeps it under its own name
+        if found: raise Failed('; '.join(found))
     return guarded(work, remote.name)
 
 
 def pull(remote):
     def work():
         theirs = peer_status(remote)
-        merge_from(remote, theirs)
+        found = problems(merge_from(remote, theirs), 'here')
         mine = account_rows()
         offered = {name: row for name, row in theirs['accounts'].items()
                    if row.get('kind') == 'long-lived' and not row.get('stray') and NAME.fullmatch(name)}
@@ -482,6 +525,7 @@ def pull(remote):
             here = local_name(probe, mine) or entry['name']
             if NAME.fullmatch(here) and _long_lived_at(replica(here)) == row.get('fingerprint'): continue
             receive_account(entry['name'], peer(remote, 'send-account', there))
+        if found: raise Failed('; '.join(found))
     return guarded(work, remote.name)
 
 
@@ -498,6 +542,7 @@ def sync_all(remotes=Remote):
     if me is None:
         print('This device has no name in the registry yet, so nothing was synced.')
         return {}
+    retry_hooks()
     for row in known['devices']:
         if row['name'] == me: continue
         if not row.get('ssh'): results[row['name']] = 'skipped: no ssh target from this device (it syncs with this one itself)'; continue
