@@ -332,6 +332,24 @@ class DeviceSyncTests(unittest.TestCase):
             self.assertEqual(device_sync.sync_all(remotes=Mock()), {})
         self.assertIn('no name', out.getvalue())
 
+    def test_a_registry_with_fields_from_a_newer_version_is_received_and_kept(self):
+        self.devices(MAC, VPS, accounts=[ROW])
+        value = registry.load(self.reg)
+        ipad = {'name': 'ipad', 'platform': 'darwin', 'roles': [], 'addedAt': 3, 'generation': 9, 'futureDevice': 1}
+        incoming = {**value, 'generation': 9, 'futureTop': 'x', 'devices': value['devices'] + [ipad],
+                    'accounts': [{**ROW, 'generation': 9, 'futureAccount': 1}]}
+        device_sync.receive_registry(json.dumps(incoming).encode())
+        saved = registry.load(self.reg)
+        self.assertEqual(registry.device(saved, 'ipad')['futureDevice'], 1)
+        self.assertEqual(saved['futureTop'], 'x')
+        self.assertEqual(saved['accounts'][0]['futureAccount'], 1)
+
+    def test_a_registry_that_breaks_a_known_rule_is_still_rejected(self):
+        value = registry.load(self.reg)
+        for bad in [{**value, 'futureTop': fixture_token()}, {**value, 'devices': [{**MAC, 'name': 'Bad Name', 'futureDevice': 1}]}]:
+            with self.assertRaises(ValueError): device_sync.receive_registry(json.dumps(bad).encode())
+        with self.assertRaises(ValueError): device_sync.receive_registry(b' ' * (registry.LIMIT + 1))
+
     def newer(self, accounts, generation=5, fingerprint=None):
         """The registry another device wrote after removing every account not in `accounts` (its tombstones name the
         fingerprint of the token this device holds, or `fingerprint`)."""
