@@ -264,13 +264,20 @@ class ReserveTests(unittest.TestCase):
         self.assertNotIn('reserveAt', self.row('team'))
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit): self.run_cli('reserve', 'team')
 
+    def test_a_reserve_on_an_account_with_a_registry_row_does_not_say_device_only(self):
+        registry.update(lambda v: v['accounts'].append({'name': 'team', 'email': 'a@b.de'}), self.reg)
+        code, out = self.run_cli('reserve', 'team', '--at', '85', on_change=lambda: {})
+        self.assertEqual(code, 0); self.assertNotIn('only on this device', out)
+
     def test_cli_messages_and_sync(self):
         calls = []
         code, out = self.run_cli('reserve', 'team', '--at', '85', on_change=lambda: calls.append(1) or {})
         self.assertEqual(code, 0)
-        self.assertEqual(out, 'Reserved AI Værk Team from 85%: last choice, and no new pool work at or above 85% of its 5-hour or weekly limit.\n')
+        self.assertEqual(out, 'Reserved AI Værk Team from 85%: last choice, and no new pool work at or above 85% of its 5-hour or weekly limit.'
+                                  ' This applies only on this device: the account has no registry row, so no other device gets it.\n')
         code, out = self.run_cli('reserve', 'team', '--off', on_change=lambda: calls.append(1) or {})
-        self.assertEqual(out, 'AI Værk Team is no longer reserved.\n')
+        self.assertEqual(out, 'AI Værk Team is no longer reserved. This applies only on this device: the account has no registry row, so no other device gets it.\n')
+        self.assertIn('only on this device', out)
         self.assertEqual(len(calls), 2)
 
     def test_reserve_syncs_through_the_registry(self):

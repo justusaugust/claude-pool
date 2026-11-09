@@ -408,6 +408,13 @@ def reserve(config, binary, paths, env, name, pct, *, hours=None, timezone=None,
         except ValueError: pass  # an unreadable registry never undoes a reserve that is already applied
 
 
+def _without_registry_row(env, name, registry_path):
+    """True when a reserve on `name` cannot follow the registry to other devices because the account has no registry row."""
+    if registry_path is False: return False
+    try: return registry.entry_for(registry.load(registry_path), member_identity(env.get('SHUNT_CLAUDE_ACCOUNTS_DIR'), name)) is None
+    except ValueError: return False
+
+
 def member_identity(stores, name):
     """A config member as a status-style row: name and the UUIDs of its pool store file (none when it is unreadable)."""
     row = {'name': name, 'active': True}
@@ -1069,12 +1076,13 @@ def run_cli(argv, *, config, stores, binary, runtime, backend_source=None, backe
         reserve(config, binary, paths, env, args.name, None if args.off else args.at, hours=args.hours, timezone=args.timezone,
                 soft=args.soft, registry_path=registry_path)
         label = row.get('label', row['name'])
-        if args.off: print(label + ' is no longer reserved.')
+        local = ' This applies only on this device: the account has no registry row, so no other device gets it.' if _without_registry_row(env, args.name, registry_path) else ''
+        if args.off: print(label + ' is no longer reserved.' + local)
         else:
             hours = ' from %02d:00 to %02d:00 %s' % (args.hours[0], args.hours[1], args.timezone) if args.hours else ''
             print('Reserved ' + label + ' from ' + str(args.at) + '%' + hours + ': last choice, and no new pool work at or above '
                   + str(args.at) + '% of its 5-hour or weekly limit' + (' while another account can take it' if args.soft else '') + '.'
-                  + (' Outside those hours it is used like any other account.' if args.hours else ''))
+                  + (' Outside those hours it is used like any other account.' if args.hours else '') + local)
         return 0
     if args.command == 'list':
         for row in load(config).get('accounts', []):

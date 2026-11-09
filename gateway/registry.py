@@ -51,7 +51,7 @@ def no_tokens(value):
 
 def keys(row, allowed, what):
     if not isinstance(row, dict): raise ValueError(what + ' must be an object')
-    if set(row) - allowed: raise ValueError('Unknown ' + what + ' field: ' + ', '.join(sorted(set(row) - allowed)))
+    # Fields this version does not know come from a newer one: kept, ignored, written back unchanged (never a rejection).
 
 
 def check_device(row):
@@ -122,7 +122,7 @@ def validate(value):
     entry = value.get('conductor')
     if entry is not None:
         keys(entry, CONDUCTOR_KEYS, 'conductor')
-        if set(entry) != CONDUCTOR_KEYS or any(not isinstance(item, str) for item in entry.values()): raise ValueError('conductor needs device, email, organization and cwd as text')
+        if not CONDUCTOR_KEYS <= set(entry) or any(not isinstance(entry[key], str) for key in CONDUCTOR_KEYS): raise ValueError('conductor needs device, email, organization and cwd as text')
     no_tokens(value)
     return value
 
@@ -248,6 +248,8 @@ def merge(local, incoming):
         key = (row['kind'], row['name'])
         if key not in tombs or (row['generation'], digest(row)) > (tombs[key]['generation'], digest(tombs[key])): tombs[key] = row
     out = {'version': 1, 'generation': max(a['generation'], b['generation']), 'updatedAt': max(a['updatedAt'], b['updatedAt'])}
+    for field in sorted(set(a) | set(b)):  # top-level fields only a newer version knows: the one from the higher generation wins
+        if field not in TOP: out[field] = max([(v['generation'], digest(v[field]), v[field]) for v in (a, b) if field in v], key=lambda c: c[:2])[2]
     for kind, field in KINDS.items():
         rows = []
         for name, row in _pick(a[field] + b[field]).items():
