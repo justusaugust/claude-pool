@@ -39,6 +39,7 @@ LONG_LIVED_PROBES = RUNTIME / 'long-lived-probes.json'  # 0600 last probe of eac
 SHARED_READINGS = RUNTIME / 'shared-readings.json'  # usage readings pulled from the usage owner
 CONDUCTOR_HOME = '~/projects/conductor'  # the Conductor's working directory: its CLAUDE.md (with the managed device block), journal.md, bin/, board/
 CONDUCTOR_STATE = RUNTIME / 'conductor.json'  # 0600 supervisor state of Conductor Claude: pid, readiness, session id
+CONDUCTOR_SETTINGS = CONFIG.parent / 'conductor-settings.json'  # optional Claude Code settings of the Conductor only (model, autoCompactWindow)
 NATIVE_CLAUDE = str(Path(OPTIONS.get('native_claude', shutil.which('claude') or Path.home() / '.local/bin/claude')).expanduser().absolute())
 GATEWAY_PORT = OPTIONS.get('gateway_port', 18341)
 BACKEND_PORT = OPTIONS.get('backend_port', 18340)

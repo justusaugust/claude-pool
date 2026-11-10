@@ -141,6 +141,14 @@ ssh <ssh-target> .local/bin/claude-pool device conductor uninstall
 
 `install` is safe to rerun and reattaches the one conversation with `--session-id`; after three quick failures it starts a fresh conversation. `--session-id` adopts a Conductor you started by hand in herdr session `conductor`: stop that one first, then run the install line `check` prints. `--fresh` starts a new conversation. `--restart` restarts only the Conductor service, never the pool.
 
+The Conductor can have its own Claude Code settings, for example a cheaper model and an earlier compaction than your other sessions. Put them in `conductor-settings.json` next to the pool configuration (`~/.config/claude-pool/`):
+
+```json
+{"model": "opus[1m]", "autoCompactEnabled": true, "autoCompactWindow": 200000}
+```
+
+The service passes the file to Remote Control with `--settings` while it exists. With `--settings`, Remote Control no longer turns auto-compact on by itself, so name it in the file. Remote Control reads it once per start, so run `install --restart` after you change it. The Conductor reads its whole conversation on every wake-up, so a smaller window lowers the cost of each one.
+
 If `check` says `running on <device> but not connected to Remote Control`, turn Remote Control on in the Claude app, wait two minutes (the service retries by itself), then run `claude-pool device check <name>`. If it still says not connected, run `ssh <ssh-target> .local/bin/claude-pool device conductor install --restart`.
 
 What Conductor Claude calls to see and act (bounded, redacted output):

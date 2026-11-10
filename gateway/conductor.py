@@ -8,6 +8,7 @@ custom gateway). Facts from the live Conductor (2026-10-17, controller, read-onl
   `Conductor Claude · <dir> · ...` and `Single session · exits when complete`;
 - the output names the conversation as `https://claude.ai/code/session_<id>`; its `cse_` id has the same `<id>`;
 - an untrusted directory prompts `Trust <dir>? [y/N]`.
+- `--settings <file>` is accepted together with `--session-id` (2.1.322); a missing file ends the start with an error.
 The supervisor keeps the child's output only in a bounded in-memory ring and stores only the `cse_` id (never the URL)."""
 import fcntl
 import json
@@ -146,24 +147,29 @@ def _update(path, **changes):
     return value
 
 
-def _command(native, session):
-    if session: return [native, 'remote-control', '--session-id', session, '--permission-mode', 'auto']
-    return [native, *ARGV]
+def _command(native, session, own=None):
+    """`own` is the Conductor's own settings file (model, compaction window); it is passed only while it exists."""
+    extra = ['--settings', str(own)] if own and Path(own).is_file() else []
+    if session: return [native, 'remote-control', '--session-id', session, '--permission-mode', 'auto', *extra]
+    return [native, *ARGV, *extra]
 
 
-def serve(native, cwd, state=None, spawn=PtyChild, sleep=None, stop=None, clock=time.monotonic):
+def serve(native, cwd, state=None, spawn=PtyChild, sleep=None, stop=None, clock=time.monotonic, own=None):
     """Supervise Conductor Claude until `stop` is set: reattach the recorded conversation, restart with backoff.
     The recorded session is read from the state file before every start, so `install --session-id` takes effect at the next one.
+    So is the optional settings file `own` (default `conductor-settings.json` next to the pool configuration): Remote Control
+    reads it once per start, so a change needs `claude-pool device conductor install --restart`.
     Only after three quick reattach failures in a row (under 30 s, never ready) does a new conversation start; the old id is kept
     as `previousSessionId` and `fresh` is set until a later reattach of the new id is ready."""
     state = Path(state or settings.CONDUCTOR_STATE)
+    own = own or settings.CONDUCTOR_SETTINGS
     stop = stop or threading.Event()
     sleep = sleep or stop.wait
     cwd = Path(cwd)
     backoff, failures, restarts, last = BACKOFF_START, 0, 0, read_state(state).get('lastExit')
     while not stop.is_set():
         session = read_state(state).get('sessionId')
-        child = spawn(_command(native, session), {**native_env(os.environ), conductor_inbox.MARK: '1'}, cwd)
+        child = spawn(_command(native, session, own), {**native_env(os.environ), conductor_inbox.MARK: '1'}, cwd)
         started, ready, known = clock(), False, session
         _update(state, pid=child.pid, startedAt=int(time.time()), ready=False, restarts=restarts, lastExit=last)
         ring, prompt = Ring(), ''
