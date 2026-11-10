@@ -614,7 +614,7 @@ def main():
     if sys.argv[1:] == ['--version']:
         raise SystemExit(subprocess.call([NATIVE_CLAUDE, *sys.argv[1:]]))
     if sys.argv[1:] == ['help']:
-        print('claude-pool [account-alias] [Claude arguments]\nCommands: update, usage [--once], history, forecast-check, doctor, account add <email>, account list, account remove <name> [--wait], account rename <old> <new> [--wait], account reserve <name> --at <pct>|--off, login <name>, device add|check|remove|list|sync|switch|conductor (details: claude-pool help device, claude-pool help account), phone, respawn <id>, conductor snapshot|events|tell|journal\nUpdates: claude update = Claude Code; claude-pool update or claude pool update = Claude Pool\nService: --start, --stop\nSetup: ' + str(ROOT / 'docs/SETUP.md'))
+        print('claude-pool [account-alias] [Claude arguments]\nCommands: update, usage [--once], history, forecast-check, doctor, account add <email>, account list, account remove <name> [--wait], account rename <old> <new> [--wait], account reserve <name> --at <pct>|--off, login <name>, device add|check|remove|list|sync|switch|conductor (details: claude-pool help device, claude-pool help account), phone, respawn <id>, conductor snapshot|events|tell|urgent|usage|inbox|journal\nUpdates: claude update = Claude Code; claude-pool update or claude pool update = Claude Pool\nService: --start, --stop\nSetup: ' + str(ROOT / 'docs/SETUP.md'))
         return
     if len(sys.argv) > 1 and sys.argv[1] == 'phone':
         from control_main import cli

@@ -111,6 +111,8 @@ class LedgerTests(unittest.TestCase):
         self.assertAlmostEqual(usd('claude-sonnet-5-5', usage), 2 + 1 + 0.1, msg='cache reads 0.05x input since 7 Oct 2026')
         self.assertAlmostEqual(usd('claude-sonnet-5', usage), 2 + 1 + 0.2)
         self.assertAlmostEqual(usd('claude-fable-5-1', usage), 10 + 5 + 0.25)
+        self.assertAlmostEqual(usd('claude-fable-5-2', usage), 8 + 4 + 0.2, msg='Fable 5.2 costs less than Fable 5.1')
+        self.assertAlmostEqual(usd('claude-fable-5-2[1m]', usage), 8 + 4 + 0.2)
 
     def test_usd_prices_one_hour_cache_writes_at_twice_input_and_five_minute_writes_at_one_and_a_quarter(self):
         usage = {'cache_creation_input_tokens': 3000000,
