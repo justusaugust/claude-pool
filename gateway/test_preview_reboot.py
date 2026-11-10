@@ -47,8 +47,16 @@ def quick_wait(sysm, host, port, seconds=4.0):
     return sysm.can_connect(host, port)
 
 
+def sockets(fake):
+    return sorted(p.name for p in fake.unit_dir().glob("*.socket")) if fake.unit_dir().exists() else []
+
+
 def age(fake):
     """Turn every preview into what an older version left behind: transient units (systemd-run), no unit files."""
+    for path in list(fake.unit_dir().glob("*.socket")):  # the older versions had no socket units
+        fake.active.pop(path.name, None)
+        fake.enabled.discard(path.name)
+        path.unlink()
     for path in list(fake.unit_dir().glob("*.service")):
         unit = next(u for u in list(fake.active) + [path.stem, path.name] if fake.unit_path(u) == path)
         if unit in fake.active:
@@ -82,41 +90,49 @@ class Base(unittest.TestCase):
 
 
 class UnitFileTests(Base):
-    def test_a_port_preview_is_an_enabled_unit_file_running_the_same_proxy(self):
+    def test_a_port_preview_is_an_enabled_socket_unit_starting_the_same_proxy_on_demand(self):
         fake = tpf.FakeSystem(operator=False)
         code, out, err = self.main(["5173", "--name", "app"], fake)
         self.assertEqual(code, 0, err)
         self.assertEqual(out.strip(), f"http://{TS_NAME}:5173")
         self.assertEqual(unit_files(fake), ["preview-5173.service"])
+        self.assertEqual(sockets(fake), ["preview-5173.socket"])
         text = unit_text(fake, "preview-5173.service")
         self.assertEqual(text.splitlines()[0], pv.UNIT_MARKER)
-        self.assertEqual(values(text, "WantedBy"), ["default.target"])
+        self.assertEqual(values(text, "WantedBy"), [])  # the socket starts it; the service is not enabled itself
+        sock = unit_text(fake, "preview-5173.socket")
+        self.assertEqual(values(sock, "ListenStream"), [f"{TS_IP}:5173"])
+        self.assertEqual(values(sock, "WantedBy"), ["sockets.target"])
         self.assertEqual(values(text, "Description"), ["preview 5173: app"])
-        for key, value in (("Restart", "on-failure"), ("RestartSec", "2"), ("RestartPreventExitStatus", "78"),
-                           ("StartLimitIntervalSec", "0"), ("Environment", "PYTHONUNBUFFERED=1")):
+        for key, value in (("Type", "notify"), ("Restart", "on-failure"), ("RestartSec", "2"),
+                           ("RestartPreventExitStatus", "78"), ("StartLimitIntervalSec", "0"),
+                           ("Environment", "PYTHONUNBUFFERED=1")):
             self.assertEqual(values(text, key), [value], key)
         cmd = tpf.exec_start(text)
         self.assertEqual(cmd[:4], ["/usr/bin/python3", "-I", pv.self_path(), "_serve"])
-        self.assertEqual((opt(cmd, "--listen"), opt(cmd, "--target"), opt(cmd, "--public-url")),
-                         (f"{TS_IP}:5173", "5173", f"http://{TS_NAME}:5173"))
+        self.assertEqual((opt(cmd, "--listen"), opt(cmd, "--target"), opt(cmd, "--public-url"), opt(cmd, "--idle")),
+                         (f"{TS_IP}:5173", "5173", f"http://{TS_NAME}:5173", str(pv.IDLE_SECONDS)))
         self.assertEqual(fake.active["preview-5173"], (TS_IP, 5173))
-        self.assertEqual(fake.enabled, {"preview-5173"})
+        self.assertEqual(fake.enabled, {"preview-5173.socket"})
         commands = fake.argvs()
-        reload, enable, start = (commands.index(["systemctl", "--user", verb, *rest]) for verb, *rest in
-                                 (["daemon-reload"], ["enable", "preview-5173"], ["start", "preview-5173"]))
+        reload, enable, start_socket, start = (commands.index(["systemctl", "--user", verb, *rest]) for verb, *rest in
+                                               (["daemon-reload"], ["enable", "preview-5173.socket"],
+                                                ["start", "preview-5173.socket"], ["start", "preview-5173"]))
         self.assertLess(reload, enable)
-        self.assertLess(enable, start)
+        self.assertLess(enable, start_socket)
+        self.assertLess(start_socket, start)
 
     def test_the_https_proxy_listens_on_loopback_behind_a_persistent_serve_entry(self):
         fake = tpf.FakeSystem(operator=True, serve_allowed=True)
         self.assertEqual(self.main(["5173"], fake)[0], 0)
         cmd = tpf.exec_start(unit_text(fake, "preview-5173.service"))
         self.assertTrue(opt(cmd, "--listen").startswith("127.0.0.1:"))
+        self.assertEqual(values(unit_text(fake, "preview-5173.socket"), "ListenStream"), [opt(cmd, "--listen")])
         [serve] = [a for a in fake.argvs() if a[:2] == ["tailscale", "serve"] and "--https=5173" in a and a[-1] != "off"]
         self.assertIn("--bg", serve)  # tailscaled keeps --bg serve config across a restart and a reboot
         self.assertEqual(fake.serve[5173], "http://" + opt(cmd, "--listen"))
 
-    def test_a_file_share_has_two_enabled_unit_files_bound_to_loopback(self):
+    def test_a_file_share_has_two_on_demand_units_with_sockets_bound_to_loopback(self):
         fake = tpf.FakeSystem(operator=True, serve_allowed=True)
         code, out, err = self.main(["file", str(self.folder)], fake)
         self.assertEqual(code, 0, err)
@@ -124,9 +140,11 @@ class UnitFileTests(Base):
         self.assertEqual(unit_files(fake), [f"preview-{port}.service", f"preview-file-{port}.service"])
         server = tpf.exec_start(unit_text(fake, f"preview-file-{port}.service"))
         self.assertEqual(server, ["/usr/bin/python3", "-I", pv.self_path(), "_serve-file", "--root", str(self.folder),
-                                  "--port", str(port)])
-        self.assertEqual(values(unit_text(fake, f"preview-file-{port}.service"), "WantedBy"), ["default.target"])
-        self.assertEqual(fake.enabled, {f"preview-{port}", f"preview-file-{port}.service"})
+                                  "--port", str(port), "--idle", str(pv.IDLE_SECONDS)])
+        self.assertEqual(sockets(fake), [f"preview-{port}.socket", f"preview-file-{port}.socket"])
+        self.assertEqual(values(unit_text(fake, f"preview-file-{port}.socket"), "ListenStream"), [f"127.0.0.1:{port}"])
+        self.assertEqual(values(unit_text(fake, f"preview-file-{port}.service"), "WantedBy"), [])
+        self.assertEqual(fake.enabled, {f"preview-{port}.socket", f"preview-file-{port}.socket"})
         self.assertTrue(opt(tpf.exec_start(unit_text(fake, f"preview-{port}.service")), "--listen").startswith("127.0.0.1:"))
 
     def test_cua_shares_are_unit_files_that_keep_the_owner_gate(self):
@@ -150,7 +168,10 @@ class UnitFileTests(Base):
         self.assertEqual(code, 0, err)
         text = unit_text(fake, "preview-5173.service")
         self.assertEqual(values(text, "ExecStartPre"), [])
-        self.assertEqual([l for l in text.splitlines() if l.startswith("[")], ["[Unit]", "[Service]", "[Install]"])
+        self.assertEqual([l for l in text.splitlines() if l.startswith("[")], ["[Unit]", "[Service]"])
+        self.assertEqual([l for l in unit_text(fake, "preview-5173.socket").splitlines() if l.startswith("[")],
+                         ["[Unit]", "[Socket]", "[Install]"])
+        self.assertEqual(values(unit_text(fake, "preview-5173.socket"), "ExecStartPre"), [])
         [description] = values(text, "Description")
         self.assertNotRegex(description.replace("%%", ""), "%")
         self.assertFalse(description.endswith("\\"))
@@ -199,12 +220,16 @@ class StopTests(Base):
         wants = fake.unit_dir() / "default.target.wants"
         wants.mkdir()
         (wants / "other.service").symlink_to(fake.unit_dir() / "other.service")
-        code, _, _ = self.main(["stop", "--all"], fake)
+        fake.commands.clear()  # starting a preview disables its plain unit first; only what the stop does counts here
+        code, _, _ = self.main(["stop", "--all", "--everyone"], fake)
         self.assertEqual(code, 0)
         self.assertEqual(unit_files(fake), ["other.service", "preview-9999.service"])
+        self.assertEqual(sockets(fake), [])
         self.assertEqual([p.name for p in wants.iterdir()], ["other.service"])
         self.assertEqual(sorted(map(tuple, systemctl(fake, "disable"))),
-                         sorted([("preview-5173",), (f"preview-{port}",), (f"preview-file-{port}.service",)]))
+                         sorted([("preview-5173",), ("preview-5173.socket",), (f"preview-{port}",),
+                                 (f"preview-{port}.socket",), (f"preview-file-{port}.service",),
+                                 (f"preview-file-{port}.socket",)]))
         self.assertEqual((fake.enabled, fake.active), (set(), {}))
         self.assertEqual(fake.argvs()[-1], ["systemctl", "--user", "daemon-reload"])
 
@@ -212,7 +237,7 @@ class StopTests(Base):
         fake = tpf.FakeSystem(operator=False)
         self.main(["5173"], fake)
         (Path(os.environ["PREVIEW_STATE_DIR"]) / "5173.json").unlink()  # the unit stays, enabled, with no record
-        code, out, err = self.main(["stop", "--all"], fake)
+        code, out, err = self.main(["stop", "--all", "--everyone"], fake)
         self.assertEqual(code, 0, err)
         self.assertEqual(unit_files(fake), [])
         self.assertIn(["preview-5173.service"], systemctl(fake, "disable"))
@@ -223,7 +248,7 @@ class StopTests(Base):
                 self.run(["systemctl", "--user", "stop", unit])  # stopped, but the file and its enablement stay
         fake = Stuck(operator=False)
         self.main(["5173"], fake)
-        code, out, err = self.main(["stop", "--all"], fake)
+        code, out, err = self.main(["stop", "--all", "--everyone"], fake)
         self.assertEqual(code, 1)
         self.assertIn("preview-5173.service", err)
         self.assertEqual(unit_files(fake), ["preview-5173.service"])
@@ -234,7 +259,8 @@ class StopTests(Base):
         self.main(["8000"], fake)
         self.assertEqual(self.main(["stop", "5173"], fake)[0], 0)
         self.assertEqual(unit_files(fake), ["preview-8000.service"])
-        self.assertEqual(fake.enabled, {"preview-8000"})
+        self.assertEqual(fake.enabled, {"preview-8000.socket"})
+        self.assertEqual(sockets(fake), ["preview-8000.socket"])
 
     def test_stop_cua_removes_the_index_and_every_space_unit(self):
         fake = tpc.CuaSystem(operator=True, serve_allowed=True)
@@ -245,8 +271,11 @@ class StopTests(Base):
 
     def test_a_proxy_that_never_comes_up_leaves_no_unit_file(self):
         class Dead(tpf.FakeSystem):
-            def listen_for(self, unit, cmd):
-                return None if "_serve" in cmd else super().listen_for(unit, cmd)
+            def run(self, argv, timeout=30):  # a Type=notify service that cannot come up: its start fails
+                if argv[:3] == ["systemctl", "--user", "start"] and not argv[-1].endswith(".socket"):
+                    self.commands.append(list(argv))
+                    return pv.subprocess.CompletedProcess(argv, 1, "", "service did not report ready")
+                return super().run(argv, timeout)
 
         fake = Dead(operator=False)
         with mock.patch.object(pv, "wait_listening", quick_wait):
@@ -287,7 +316,8 @@ class AdoptTests(Base):
         self.assertEqual((code, out, self.links()), (0, link, before), err)
         port = int(link.strip().rsplit(":", 1)[1])
         self.assertEqual(unit_files(fake), [f"preview-{port}.service", f"preview-file-{port}.service"])
-        self.assertEqual(fake.enabled, {f"preview-{port}", f"preview-file-{port}.service"})
+        self.assertEqual(sockets(fake), [f"preview-{port}.socket", f"preview-file-{port}.socket"])
+        self.assertEqual(fake.enabled, {f"preview-{port}.socket", f"preview-file-{port}.socket"})
 
     def test_rerunning_cua_adopts_the_index_and_every_space(self):
         fake = tpc.CuaSystem(operator=True, serve_allowed=True)
@@ -318,7 +348,8 @@ class RestoreTests(Base):
         self.assertEqual(code, 0, err)
         port = self.file_port
         self.assertEqual(unit_files(fake), sorted(["preview-5173.service", f"preview-{port}.service", f"preview-file-{port}.service"]))
-        self.assertEqual(fake.enabled, {"preview-5173", f"preview-{port}", f"preview-file-{port}.service"})
+        self.assertEqual(sockets(fake), sorted(["preview-5173.socket", f"preview-{port}.socket", f"preview-file-{port}.socket"]))
+        self.assertEqual(fake.enabled, {"preview-5173.socket", f"preview-{port}.socket", f"preview-file-{port}.socket"})
         self.assertEqual((self.links(), fake.serve), (before, serve))
         self.assertFalse([a for a in fake.argvs()[mark:] if a[:2] == ["tailscale", "serve"] and a[2] != "status"])
         self.assertIn("5173", out)
@@ -369,8 +400,12 @@ class RestoreTests(Base):
 
     def test_restore_reports_a_unit_that_does_not_come_up(self):
         class Dead(tpf.FakeSystem):
-            def listen_for(self, unit, cmd):
-                return None if "_serve-file" in cmd and self.dead else super().listen_for(unit, cmd)
+            def run(self, argv, timeout=30):  # the file server's service cannot report ready
+                if self.dead and argv[:3] == ["systemctl", "--user", "start"] and argv[-1].startswith("preview-file-") \
+                        and not argv[-1].endswith(".socket"):
+                    self.commands.append(list(argv))
+                    return pv.subprocess.CompletedProcess(argv, 1, "", "service did not report ready")
+                return super().run(argv, timeout)
 
         fake = Dead(operator=False)
         fake.dead = False
@@ -428,7 +463,7 @@ class LegacyViewerTests(Base):
         return fake, key
 
     def test_every_cua_owning_command_stops_the_old_viewer_and_drops_its_key(self):
-        for argv in (["stop", "--all"], ["stop", "cua"], ["restore"], ["cua"]):
+        for argv in (["stop", "--all", "--everyone"], ["stop", "cua"], ["restore"], ["cua"]):
             with self.subTest(argv=argv):
                 self.setUp()
                 fake, key = self.legacy()
@@ -443,7 +478,7 @@ class LegacyViewerTests(Base):
 
     def test_nothing_happens_without_the_old_viewer(self):
         fake = tpc.CuaSystem(operator=True, serve_allowed=True)
-        self.main(["stop", "--all"], fake)
+        self.main(["stop", "--all", "--everyone"], fake)
         self.assertNotIn(["preview-cua-viewer.service"], systemctl(fake, "stop"))
 
 

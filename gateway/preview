@@ -6,10 +6,14 @@ Tests: preview_test.py next to this file (python3 -m unittest from that director
 """
 
 import argparse
-import asyncio
 import bisect
 import codecs
+import contextlib
+import datetime
+import email.utils
 import errno
+import fcntl
+import functools
 import html
 import io
 import ipaddress
@@ -29,7 +33,23 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "1.1"
+
+class _Lazy:
+    """A module imported at its first use. asyncio costs ~45 ms at every start, and only the proxy (_serve) uses it."""
+
+    def __init__(self, name):
+        self._name = name
+
+    def __getattr__(self, attr):
+        import importlib
+        module = importlib.import_module(self._name)
+        globals()[self._name] = module
+        return getattr(module, attr)
+
+
+asyncio = _Lazy("asyncio")
+
+VERSION = "1.2"
 UNIT_PREFIX = "preview-"
 RESERVED_PORTS = {22, 80, 443}
 TAILNET_NETS = (ipaddress.ip_network("100.64.0.0/10"), ipaddress.ip_network("fd7a:115c:a1e0::/48"))
@@ -39,6 +59,10 @@ CUA_UNIT = "preview-cua-index.service"
 LEGACY_CUA_UNIT = "preview-cua-viewer.service"  # `cua viewer` of two earlier releases: a transient unit plus a key file
 CUA_SPACE_PORTS = range(18501, 18600)  # one share per Cua desktop (Space)
 CUA_LABEL = "Cua desktops"
+IDLE_SECONDS = 600  # an on-demand server stops after this long without an open connection; its socket keeps the port
+IDLE_ARGS = ["--idle", str(IDLE_SECONDS)]
+SD_LISTEN_FDS_START = 3  # the first socket systemd passes (socket activation)
+OPENED_EVERY = 60  # seconds: the proxy records a person opening the preview at most this often
 
 HELP = """\
 Open a web server that runs on this VPS (localhost) on the user's Mac and iPhone with one link.
@@ -47,6 +71,7 @@ WHEN TO USE
   Every time you start or change a web frontend or any HTTP server a human should look at
   (Vite, Next.js, Astro, php -S, python -m http.server, Storybook, ...). Give the user the
   printed link instead of screenshots. The link only works on devices in the Tailscale tailnet.
+  A static HTML page or folder needs no server of its own: preview file <path>
 
 HOW
   1. Start the dev server bound to 127.0.0.1 (never 0.0.0.0; that would expose it publicly):
@@ -57,22 +82,27 @@ HOW
      It prints one line with the link, plus a short note. Send that link to the user.
   3. When the work is done: preview stop 5173
 
-  To share a file or folder instead (a Markdown report, screenshots, a PDF):
-       preview file docs/report.md        or        preview file screenshots/
+  To share a file or folder instead (an HTML page or site, a Markdown report, screenshots, a PDF):
+       preview file site/        or        preview file docs/report.md
 
 COMMANDS
   preview <port> [--name LABEL]   expose 127.0.0.1:<port> to the tailnet and print the link.
                                   Safe to run again (same link; also upgrades HTTP to HTTPS
                                   once Tailscale Serve is allowed). Works before the server is up.
-  preview file <path> [--name LABEL]
+  preview file <path> [--name LABEL] [--behalten]
                                   share one file or one folder read-only and print the link.
-                                  Markdown opens as a readable page (add ?raw=1 for the source),
-                                  images and PDFs open in the browser, other text shows as plain
-                                  text, everything else downloads. Dotfiles and dot folders
+                                  HTML files (.html, .htm) open as pages with their own inline
+                                  scripts and styles, local CSS, JS, fonts and images, and from
+                                  outside only Google Fonts; a folder opens its index.html, otherwise
+                                  a file list. Markdown opens as a readable page (add ?raw=1 for the
+                                  source), images and PDFs open in the browser, other text shows as
+                                  plain text, everything else downloads. Dotfiles and dot folders
                                   (.env, .git, ~/.ssh, ...) are never served, nor anything a
                                   symlink points to outside the shared folder; / and the home
                                   folder itself are refused. Safe to run again (same path, same
-                                  link). File shares use ports 18400-18499.
+                                  link). File shares use ports 18400-18499; when all are taken, the
+                                  oldest share ends to make room and the output names it. --behalten
+                                  pins a share so it is never ended that way (also on a running one).
   preview cua [--name LABEL]      one link to every Cua desktop this VPS knows (cua spaces ls), to see
                                   and operate them from the iPhone. The link opens a list of the desktops
                                   (served on 127.0.0.1:18500 by preview-cua-index.service); tapping one
@@ -89,12 +119,13 @@ COMMANDS
   preview stop <port>|<path>|cua  stop one preview or file share (a dev server keeps running), or the
                                   Cua desktops list and every desktop share. A folder named only with digits,
                                   or named cua: write ./2026 or ./cua
-  preview stop --all              stop every preview, file share and Cua share this tool created (nothing else)
+  preview stop --all              stop the previews and file shares this session created (others stay)
+  preview stop --all --everyone   stop every preview, file share and Cua share this tool created (nothing else)
   preview doctor                  which backend is available, how to enable HTTPS, and whether every
                                   preview comes back after a reboot
-  preview restore                 make every preview this tool knows come back after a reboot (for previews
-                                  an older version started; preview doctor says when). Same ports, same links.
-                                  Safe to run again.
+  preview restore [<port>]        make every preview this tool knows (or the one on <port>) come back after a
+                                  reboot and start on demand (for previews an older version started; preview
+                                  doctor says when). Same ports, same links. Safe to run again.
 
 BACKENDS (chosen automatically)
   https  Tailscale Serve: https://<vps>.<tailnet>.ts.net:<port>, needs the operator setting.
@@ -109,8 +140,14 @@ BACKENDS (chosen automatically)
   reloads itself every few seconds. Ports 22, 80 and 443 are refused (system services).
   A file share adds one more unit, preview-file-<port>.service: a read-only file server bound
   to 127.0.0.1 only, which the proxy above exposes like any other port.
-  Previews survive a reboot: every unit is a file in ~/.config/systemd/user, enabled and started, and
-  the Tailscale Serve entry is kept by tailscaled; preview stop disables and deletes exactly those files.
+  Previews start on demand and survive a reboot: a socket unit (preview-<port>.socket, for a file share
+  also preview-file-<port>.socket) in ~/.config/systemd/user is enabled, keeps the port open and starts
+  the server at the first connection; the server stops after 10 minutes without an open connection
+  (WebSockets and streams count as open) and starts again at the next request. preview list shows it as
+  idle. Cua desktops shares run all the time. The Tailscale Serve entry is kept by tailscaled; preview
+  stop disables and deletes exactly those files. preview list --json also says who made a preview
+  (created_by: herdr session and agent) and when a person last opened it through its link (opened_at,
+  Unix seconds; counted since observed_since); requests from this machine itself do not count.
   Tests: python3 -m unittest preview_test (in ~/.local/bin).
 """
 
@@ -348,6 +385,22 @@ def plain_answer(status, text, extra=b""):
 FORBIDDEN = plain_answer(b"403 Forbidden", "This link is only for the owner of this machine.\n")
 
 
+def local_address(text):
+    """True when this machine has the address (its tailnet IPv4 or IPv6, loopback): a request that came from here."""
+    try:
+        ip = ipaddress.ip_address(text.strip("[]"))
+    except ValueError:
+        return False
+    if ip.is_loopback:
+        return True
+    with socket.socket(socket.AF_INET6 if ip.version == 6 else socket.AF_INET, socket.SOCK_STREAM) as probe:
+        try:
+            probe.bind((str(ip), 0))
+            return True
+        except OSError:
+            return False
+
+
 def split_host(value):
     """(host, port or None) of a Host header value, lower case, without a trailing dot; None when it is not one."""
     try:
@@ -362,8 +415,11 @@ def split_host(value):
 
 class Proxy:
     def __init__(self, target_port, public_base=None, target_hosts=("127.0.0.1", "::1"), tailnet_ip=None, listen_port=None,
-                 upstream_host=None, upstream_port=None, owner_login=None):
+                 upstream_host=None, upstream_port=None, owner_login=None, state_file=None, listen=None):
         self.target_port = target_port  # the share's port (its link); the server behind it is upstream_host:upstream_port
+        # opened_at: the state file of this preview (only the record whose listen address is this proxy's is updated)
+        self.state_file, self.listen, self.own_ip = state_file, listen, tailnet_ip
+        self.opened_noted = None
         self.upstream_port = upstream_port or target_port
         host = upstream_host or "localhost"
         self.upstream = (f"[{host}]" if ":" in host else host) + f":{self.upstream_port}"
@@ -404,6 +460,22 @@ class Proxy:
         logins = [v for n, v in headers if n.lower() == b"tailscale-user-login"]
         return len(logins) == 1 and logins[0] == self.owner_login
 
+    def note_open(self, headers):
+        """A person opened the preview: Tailscale Serve sent the request with their identity (Tailscale-User-Login),
+        and not from this machine itself (an agent checking the link). Records the time as opened_at in the state file,
+        at most once a minute, in a worker thread, so the request never waits for it. The login is not stored."""
+        if self.state_file is None or header(headers, "tailscale-user-login") is None:
+            return
+        forwarded = header(headers, "x-forwarded-for")  # Tailscale Serve: the address the request came from
+        source = forwarded.split(b",")[0].strip().decode("latin-1") if forwarded else ""
+        if source and (source == self.own_ip or local_address(source)):
+            return
+        now = time.monotonic()
+        if self.opened_noted is not None and now - self.opened_noted < OPENED_EVERY:
+            return
+        self.opened_noted = now
+        asyncio.get_running_loop().run_in_executor(None, record_opened, self.state_file, self.listen, int(time.time()))
+
     async def connect_upstream(self):
         last = None
         for host in self.target_hosts:
@@ -429,6 +501,7 @@ class Proxy:
                 cwriter.write(FORBIDDEN)  # nothing reaches the server behind this share
                 await cwriter.drain()
                 return
+            self.note_open(split_head(head)[1])  # also when the server behind it is down
             try:
                 ureader, uwriter = await self.connect_upstream()
             except OSError:
@@ -467,6 +540,7 @@ class Proxy:
                         await cwriter.drain()
                     break
                 method = start.split(b" ", 1)[0].upper()
+                self.note_open(headers)
                 headers = rewrite_request(headers, self.target_host_header, peer_ip)
                 upgrade = b"upgrade" in header_tokens(headers, "connection") and header(headers, "upgrade") is not None
                 pending.put_nowait(method)
@@ -543,6 +617,146 @@ async def start_proxy_server(listen_host, listen_port, proxy):
     return await asyncio.start_server(proxy.handle, listen_host, listen_port, limit=1 << 20, reuse_address=True)
 
 
+# On demand (socket activation): the unit's .socket keeps the port open; systemd starts the server at a connection and
+# hands it the listening socket as fd 3. The server stops after --idle seconds without an open connection; connections
+# that come while it starts or stops wait in the socket's queue for the next start.
+
+def inherited_socket(environ=None, pid=None, fd=None):
+    """The listening socket systemd passed this process (LISTEN_PID is this process, LISTEN_FDS >= 1), or None, so the
+    server binds as before. The variables are removed, so no child process takes them for its own."""
+    environ = os.environ if environ is None else environ
+    fd = SD_LISTEN_FDS_START if fd is None else fd
+    try:
+        mine = int(environ.get("LISTEN_PID", "")) == (os.getpid() if pid is None else pid)
+        count = int(environ.get("LISTEN_FDS", ""))
+    except ValueError:
+        return None
+    if not mine or count < 1:
+        return None
+    for name in ("LISTEN_PID", "LISTEN_FDS", "LISTEN_FDNAMES"):
+        environ.pop(name, None)
+    os.set_inheritable(fd, False)
+    sock = socket.socket(fileno=fd)
+    if sock.type != socket.SOCK_STREAM or not sock.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN):
+        sock.close()
+        raise OSError(errno.EINVAL, "the socket from systemd is not a listening TCP socket")
+    return sock
+
+
+def check_inherited(sock, host, port):
+    """The bind-address guarantee for a socket systemd bound: exactly the address this server was told to listen on."""
+    got_host, got_port = sock.getsockname()[:2]
+    check_listen_host(got_host)
+    if ipaddress.ip_address(got_host) != ipaddress.ip_address(host.strip("[]")) or got_port != port:
+        raise UnsafeListenAddress(f"the socket from systemd listens on {got_host}:{got_port}, not {host}:{port}")
+
+
+def sd_notify(message):
+    """Tell systemd how the unit is doing (READY=1 for Type=notify); does nothing outside systemd."""
+    addr = os.environ.get("NOTIFY_SOCKET", "")
+    if not addr or addr[0] not in "/@":
+        return False
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
+            s.sendto(message.encode(), "\0" + addr[1:] if addr[0] == "@" else addr)
+        return True
+    except OSError:
+        return False
+
+
+class IdleCount:
+    """Open connections, and for how long none has been (0 while one is open)."""
+
+    def __init__(self, clock=time.monotonic):
+        self.clock, self.lock, self.open, self.since = clock, threading.Lock(), 0, clock()
+
+    def opened(self):
+        with self.lock:
+            self.open += 1
+
+    def closed(self):
+        with self.lock:
+            self.open -= 1
+            self.since = self.clock()
+
+    def idle_for(self):
+        with self.lock:
+            return 0.0 if self.open > 0 else self.clock() - self.since
+
+
+class OnDemandServer:
+    """Serves `handle` on a listening socket from systemd and counts the open connections. Accepting and counting happen
+    in one step, so stopping when idle never drops a connection: one not accepted yet waits in the socket's queue, and
+    systemd starts the server again for it. WebSockets and streams are open connections, so they keep it running."""
+
+    def __init__(self, sock, handle, limit=1 << 20):
+        self.sock, self.handle, self.limit = sock, handle, limit
+        self.idle = IdleCount()
+        self.loop, self.closed, self.idled = None, False, False
+        # The connections' tasks, held until done: the loop keeps tasks only weakly, and a stream's protocol holds its
+        # reader weakly, so a connection waiting on a read is otherwise garbage, and collecting it drops the request.
+        self.tasks = set()
+
+    def start(self):
+        self.loop = asyncio.get_running_loop()
+        self.sock.setblocking(False)
+        self.loop.add_reader(self.sock.fileno(), self._accept)
+
+    def _accept(self):
+        for _ in range(64):
+            try:
+                conn, _ = self.sock.accept()
+            except (BlockingIOError, InterruptedError):
+                return
+            except OSError as e:
+                if e.errno in (errno.EMFILE, errno.ENFILE, errno.ENOBUFS, errno.ENOMEM):  # out of descriptors: wait a second
+                    self.loop.remove_reader(self.sock.fileno())
+                    self.loop.call_later(1.0, self._resume)
+                return
+            self.idle.opened()
+            task = self.loop.create_task(self._serve(conn))
+            self.tasks.add(task)
+            task.add_done_callback(self.tasks.discard)
+
+    def _resume(self):
+        if not self.closed:
+            self.loop.add_reader(self.sock.fileno(), self._accept)
+
+    async def _serve(self, conn):
+        try:
+            try:
+                reader, writer = await asyncio.open_connection(sock=conn, limit=self.limit)
+            except OSError:
+                conn.close()
+                return
+            try:
+                await self.handle(reader, writer)
+            finally:
+                writer.close()
+        finally:
+            self.idle.closed()
+
+    async def stop_when_idle(self, seconds, stop):
+        while not self.closed:
+            left = seconds - self.idle.idle_for()
+            if left <= 0:
+                self.idled = True
+                self.close()  # in the same step as the check: nothing is accepted after it
+                stop.set()
+                return
+            await asyncio.sleep(left)
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        try:
+            self.loop.remove_reader(self.sock.fileno())
+        except (ValueError, OSError):
+            pass
+        self.sock.close()
+
+
 def cmd_serve(args):
     host, port = parse_hostport(args.listen)
     try:
@@ -563,22 +777,45 @@ def cmd_serve(args):
             print("preview: a Cua share needs --owner-login, --upstream-host (loopback or tailnet) and --upstream-port, "
                   "and listens on 127.0.0.1 only", file=sys.stderr)
             return EXIT_CONFIG
+    try:
+        sock = inherited_socket()
+        if sock is not None:
+            check_inherited(sock, host, port)
+    except (OSError, UnsafeListenAddress) as e:
+        print(f"preview: cannot use the socket from systemd: {e}", file=sys.stderr)
+        return EXIT_CONFIG
     proxy = Proxy(args.target, args.public_url, tailnet_ip=args.tailnet_ip, listen_port=port,
-                  upstream_host=args.upstream_host, upstream_port=args.upstream_port, owner_login=args.owner_login)
+                  upstream_host=args.upstream_host, upstream_port=args.upstream_port, owner_login=args.owner_login,
+                  state_file=state_dir() / f"{args.target}.json", listen=args.listen)
 
     async def main():
-        try:
-            server = await start_proxy_server(host, port, proxy)
-        except OSError as e:
-            print(f"preview: cannot listen on {host}:{port}: {e.strerror or e}", file=sys.stderr)
-            # After a reboot the unit can start before tailscale0 has its address: exit so systemd tries again.
-            return 1 if address_missing(host) else EXIT_CONFIG
+        if sock is not None:
+            server = OnDemandServer(sock, proxy.handle)
+            server.start()
+        else:
+            try:
+                server = await start_proxy_server(host, port, proxy)
+            except OSError as e:
+                print(f"preview: cannot listen on {host}:{port}: {e.strerror or e}", file=sys.stderr)
+                # After a reboot the unit can start before tailscale0 has its address: exit so systemd tries again.
+                return 1 if address_missing(host) else EXIT_CONFIG
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, stop.set)
-        print(f"preview: {host}:{port} -> localhost:{args.target}" + (f" ({args.public_url})" if args.public_url else ""), flush=True)
+        on_demand = f" (socket from systemd, stops after {args.idle:g} s idle)" if sock is not None and args.idle else ""
+        print(f"preview: {host}:{port} -> localhost:{args.target}" + (f" ({args.public_url})" if args.public_url else "")
+              + on_demand, flush=True)
+        sd_notify("READY=1")
+        if on_demand:
+            idler = loop.create_task(server.stop_when_idle(args.idle, stop))  # held while main waits (tasks are weak)
         await stop.wait()
+        if sock is not None:
+            server.close()
+            if server.idled:
+                print(f"preview: no connection for {args.idle:g} s; the socket starts this proxy again at the next one",
+                      flush=True)
+            return 0
         server.close()
         if hasattr(server, "close_clients"):  # Python 3.13: do not wait for idle keep-alive clients
             server.close_clients()
@@ -593,10 +830,23 @@ def cmd_serve(args):
 # ---------------------------------------------------------------------------
 
 FILE_PORTS = range(18400, 18500)
+SHARE_PORTS = range(FILE_PORTS.start, CUA_SPACE_PORTS.stop)  # file shares and Cua desktops; never a proxy's own port
 FILE_UNIT_PREFIX = "preview-file-"
 HTML_CSP = ("default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; "
-            "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+            "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")  # the folder list and Markdown pages
+# Shared .html/.htm files run their own inline and local scripts, styles, fonts and images, plus Google Fonts.
+# connect-src and img-src stay 'self': a page script cannot send requests to the previews on other ports of this host.
+PAGE_CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline'; "
+            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; "
+            "img-src 'self' data: blob:; media-src 'self' data: blob:; connect-src 'self'; object-src 'none'; "
+            "base-uri 'self'; form-action 'self'; frame-src 'self'; frame-ancestors 'self'")
+PAGE_EXTS = {".html", ".htm"}
 OTHER_CSP = "sandbox"
+# Page assets keep OTHER_CSP but get their real type: with nosniff, browsers refuse a stylesheet or script sent as text/plain.
+ASSET_TYPES = {".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8",
+               ".mjs": "text/javascript; charset=utf-8", ".json": "application/json", ".svg": "image/svg+xml",
+               ".woff2": "font/woff2", ".woff": "font/woff", ".ttf": "font/ttf", ".otf": "font/otf",
+               ".ico": "image/vnd.microsoft.icon", ".avif": "image/avif", ".mp4": "video/mp4", ".webm": "video/webm"}
 INLINE_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
                 ".webp": "image/webp", ".pdf": "application/pdf"}
 MARKDOWN_EXTS = {".md", ".markdown"}
@@ -689,6 +939,45 @@ def content_disposition(kind, name):
     if fallback != name:
         value += "; filename*=UTF-8''" + urllib.parse.quote(name, safe="")
     return value
+
+
+_BYTE_RANGE = re.compile(r"\s*([0-9]*)-([0-9]*)\s*")
+
+
+def byte_range(value, size):
+    """The one byte range a Range header asks for in a file of `size` bytes: (first, last), "unsatisfiable" when no
+    byte of the file is in it, or None to ignore the header (another unit, several ranges, a malformed range)."""
+    unit, sep, spec = value.partition("=")
+    m = _BYTE_RANGE.fullmatch(spec)
+    if not sep or unit.strip().lower() != "bytes" or not m or not (m[1] or m[2]):
+        return None
+    try:
+        first, last = (int(m[1]) if m[1] else None), (int(m[2]) if m[2] else None)
+    except ValueError:  # more digits than int() takes
+        return None
+    if first is None:  # the last `last` bytes
+        return (max(size - last, 0), size - 1) if last and size else "unsatisfiable"
+    if last is not None and last < first:
+        return None
+    if first >= size:
+        return "unsatisfiable"
+    return first, size - 1 if last is None else min(last, size - 1)
+
+
+def if_range_ok(value, etag, modified):
+    """True when If-Range (None: not sent) names this version of the file: its strong ETag or its Last-Modified."""
+    if value is None:
+        return True
+    value = value.strip()
+    if value.startswith('"'):
+        return value == etag
+    try:
+        when = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError, OverflowError):
+        return False  # a weak ETag (W/"...") or no date
+    if when.tzinfo is None:  # an asctime date has no zone; HTTP dates are GMT
+        when = when.replace(tzinfo=datetime.timezone.utc)
+    return when == email.utils.parsedate_to_datetime(modified)
 
 
 PAGE_CSS = """
@@ -1109,6 +1398,8 @@ def make_file_handler(root, quiet=False):
     class FileHandler(BaseHTTPRequestHandler):
         server_version = "preview"
         sys_version = ""
+        protocol_version = "HTTP/1.1"  # keep-alive: a video's range requests reuse one connection
+        timeout = 60  # an idle keep-alive connection ends, so the server can still stop when idle
 
         def __getattr__(self, name):
             if name.startswith("do_"):
@@ -1119,11 +1410,13 @@ def make_file_handler(root, quiet=False):
             if not quiet:
                 super().log_message(format, *args)
 
-        def send_error(self, code, message=None, explain=None):
+        def send_error(self, code, message=None, explain=None):  # a request it could not parse: the rest is unknown
+            self.close_connection = True
             phrase = self.responses.get(code, ("Error",))[0]
             self.send_bytes(code, "text/plain; charset=utf-8", f"{code} {phrase}\n".encode(), OTHER_CSP)
 
         def not_allowed(self):
+            self.close_connection = True  # its body, if any, is never read
             self.send_bytes(405, "text/plain; charset=utf-8", b"Only GET and HEAD are allowed.\n", OTHER_CSP,
                             [("Allow", "GET, HEAD")])
 
@@ -1138,6 +1431,8 @@ def make_file_handler(root, quiet=False):
             self.send_header("Content-Security-Policy", csp)
             self.send_header("Referrer-Policy", "no-referrer")
             self.send_header("Cache-Control", "no-cache")
+            if self.close_connection:
+                self.send_header("Connection", "close")
             for name, value in extra:
                 self.send_header(name, value)
             self.end_headers()
@@ -1148,11 +1443,20 @@ def make_file_handler(root, quiet=False):
                 self.wfile.write(body)
 
         def do_GET(self):
-            path, _, query = self.path.partition("?")
+            length = self.headers.get("Content-Length")
+            if self.headers.get("Transfer-Encoding") is not None or (length is not None and length.strip() != "0"):
+                self.close_connection = True  # its body is never read, so it must not be taken for the next request
+            path, _, query = self.path.split("#", 1)[0].partition("?")
             target = resolve_request(root, single, path)
             if target is None:
                 return self.not_found()
             if target.is_dir():
+                if not path.endswith("/"):  # so relative links in its index.html resolve inside the folder
+                    location = "/" + path.lstrip("/\\") + "/" + ("?" + query if query else "")  # never //host or /\host
+                    return self.send_bytes(301, "text/plain; charset=utf-8", b"", OTHER_CSP, [("Location", location)])
+                page = resolve_request(root, single, path + "index.html")  # the same checks as any request
+                if page is not None and page.is_file():
+                    return self.send_file(page, query)
                 return self.send_bytes(200, "text/html; charset=utf-8", index_page(root, target).encode(), HTML_CSP)
             self.send_file(target, query)
 
@@ -1173,9 +1477,13 @@ def make_file_handler(root, quiet=False):
                 if ext in MARKDOWN_EXTS and not raw and st.st_size <= MARKDOWN_RENDER_LIMIT:
                     text = f.read(MARKDOWN_RENDER_LIMIT + 1).decode("utf-8", "replace")
                     return self.send_bytes(200, "text/html; charset=utf-8", render_markdown(text, name).encode(), HTML_CSP)
-                extra = []
-                if ext in MARKDOWN_EXTS:
+                extra, csp = [], OTHER_CSP
+                if ext in PAGE_EXTS:
+                    ctype, csp = "text/html; charset=utf-8", PAGE_CSP
+                elif ext in MARKDOWN_EXTS:
                     ctype = "text/plain; charset=utf-8"
+                elif ext in ASSET_TYPES:
+                    ctype = ASSET_TYPES[ext]
                 elif ext in INLINE_TYPES:
                     ctype = INLINE_TYPES[ext]
                     extra.append(("Content-Disposition", content_disposition("inline", name)))
@@ -1187,11 +1495,26 @@ def make_file_handler(root, quiet=False):
                     else:
                         ctype = "application/octet-stream"
                         extra.append(("Content-Disposition", content_disposition("attachment", name)))
-                self.start(200, ctype, st.st_size, OTHER_CSP, extra)
+                # Byte ranges let a video start before it is loaded and seek; the ETag keeps a resumed range on one version.
+                etag = f'"{st.st_size:x}-{st.st_mtime_ns:x}"'
+                modified = email.utils.formatdate(st.st_mtime, usegmt=True)
+                extra += [("Accept-Ranges", "bytes"), ("ETag", etag), ("Last-Modified", modified)]
+                code, first, last = 200, 0, st.st_size - 1
+                wanted = self.headers.get("Range")
+                if wanted is not None and if_range_ok(self.headers.get("If-Range"), etag, modified):
+                    part = byte_range(wanted, st.st_size)
+                    if part == "unsatisfiable":
+                        return self.send_bytes(416, "text/plain; charset=utf-8", b"Range not satisfiable.\n", OTHER_CSP,
+                                               [("Content-Range", f"bytes */{st.st_size}")])
+                    if part is not None:
+                        code, (first, last) = 206, part
+                        extra.append(("Content-Range", f"bytes {first}-{last}/{st.st_size}"))
+                self.start(code, ctype, last - first + 1, csp, extra)
                 if self.command == "HEAD":
                     return
-                left = st.st_size
+                left = last - first + 1
                 try:
+                    f.seek(first)
                     while left > 0:
                         data = f.read(min(CHUNK, left))
                         if not data:  # the file shrank: the promised length cannot be met, so end the connection
@@ -1199,10 +1522,49 @@ def make_file_handler(root, quiet=False):
                             break
                         self.wfile.write(data)
                         left -= len(data)
-                except (BrokenPipeError, ConnectionResetError):
+                except OSError:  # the client left, or stopped reading for `timeout` seconds
                     self.close_connection = True
 
     return FileHandler
+
+
+class IdleStop(Exception):
+    """The file server had no open connection for its --idle time."""
+
+
+class FileServer(ThreadingHTTPServer):
+    """The file share's server. With a listening socket from systemd (`sock`) it does not bind, counts open connections
+    (counted where it accepts them) and stops after `idle` seconds without one."""
+    daemon_threads = True
+
+    def __init__(self, address, handler, sock=None, idle=None):
+        self.idle_count, self.idle = IdleCount(), idle
+        if sock is None:
+            super().__init__(address, handler)
+            return
+        super().__init__(address, handler, bind_and_activate=False)
+        self.socket.close()
+        self.socket = sock
+        self.server_address = sock.getsockname()[:2]
+        self.server_name, self.server_port = self.server_address
+
+    def process_request(self, request, client_address):
+        self.idle_count.opened()
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self.idle_count.closed()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.idle_count.closed()
+
+    def service_actions(self):  # in serve_forever's loop, between accepts
+        if self.idle is not None and self.idle_count.idle_for() >= self.idle:
+            raise IdleStop()
 
 
 def cmd_serve_file(args):
@@ -1216,16 +1578,27 @@ def cmd_serve_file(args):
         return EXIT_CONFIG
     host = check_listen_host("127.0.0.1")  # the file server is never reachable except through the preview proxy
     try:
-        server = ThreadingHTTPServer((host, args.port), make_file_handler(root))
+        sock = inherited_socket()
+        if sock is not None:
+            check_inherited(sock, host, args.port)
+    except (OSError, UnsafeListenAddress) as e:
+        print(f"preview: cannot use the socket from systemd: {e}", file=sys.stderr)
+        return EXIT_CONFIG
+    idle = args.idle if sock is not None else None  # without systemd's socket nothing would start it again
+    try:
+        server = FileServer((host, args.port), make_file_handler(root), sock=sock, idle=idle)
     except OSError as e:
         print(f"preview: cannot listen on {host}:{args.port}: {e.strerror or e}", file=sys.stderr)
         return EXIT_CONFIG
-    server.daemon_threads = True
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: threading.Thread(target=server.shutdown, daemon=True).start())
-    print(f"preview: serving {root} read-only on {host}:{args.port}", flush=True)
+    print(f"preview: serving {root} read-only on {host}:{args.port}"
+          + (f" (socket from systemd, stops after {idle:g} s idle)" if idle else ""), flush=True)
+    sd_notify("READY=1")
     try:
         server.serve_forever()
+    except IdleStop:
+        print(f"preview: no connection for {idle:g} s; the socket starts this server again at the next one", flush=True)
     finally:
         server.server_close()
     return 0
@@ -1427,7 +1800,7 @@ def cmd_cua_index(args):
 # ---------------------------------------------------------------------------
 
 UNIT_MARKER = "# Written by preview; `preview stop` disables and deletes this file."
-UNIT_NAME = re.compile(r"preview-(?:\d{1,5}|file-\d{1,5}|cua-index)(?:\.service)?")
+UNIT_NAME = re.compile(r"preview-(?:\d{1,5}|file-\d{1,5})(?:\.service|\.socket)?|preview-cua-index(?:\.service)?")
 _SYSTEMD_PLAIN = re.compile(r"[A-Za-z0-9_./:@,+=-]+")
 
 
@@ -1440,14 +1813,37 @@ def systemd_word(arg):
     return '"' + arg.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%").replace("$", "$$") + '"'
 
 
-def unit_file_text(description, argv):
-    """The unit file of one preview unit: the same command and restart rules the transient units had, plus [Install]."""
-    description = printable(description).strip().rstrip("\\").strip().replace("%", "%%") or "preview"
+def unit_description(description):
+    return printable(description).strip().rstrip("\\").strip().replace("%", "%%") or "preview"
+
+
+def socket_of(unit):
+    """The socket unit that starts a preview unit on demand: preview-5173 -> preview-5173.socket."""
+    return (unit[:-len(".service")] if unit.endswith(".service") else unit) + ".socket"
+
+
+def unit_file_text(description, argv, on_demand=False):
+    """The unit file of one preview unit: the same command and restart rules the transient units had, plus [Install].
+    On demand, its socket unit (socket_file_text) is what is enabled and starts it, so it has no [Install] of its own;
+    it tells systemd when it is ready (Type=notify), so `systemctl start` fails when the server cannot come up."""
+    ready = ["Type=notify", "TimeoutStartSec=30"] if on_demand else []
+    install = [] if on_demand else ["[Install]", "WantedBy=default.target", ""]
     return "\n".join([
-        UNIT_MARKER, "[Unit]", f"Description={description}", "StartLimitIntervalSec=0", "",
-        "[Service]", "ExecStart=" + " ".join(systemd_word(arg) for arg in argv), "Restart=on-failure", "RestartSec=2",
-        f"RestartPreventExitStatus={EXIT_CONFIG}", "Environment=PYTHONUNBUFFERED=1", "",
-        "[Install]", "WantedBy=default.target", ""])
+        UNIT_MARKER, "[Unit]", f"Description={unit_description(description)}", "StartLimitIntervalSec=0", "",
+        "[Service]", *ready, "ExecStart=" + " ".join(systemd_word(arg) for arg in argv), "Restart=on-failure",
+        "RestartSec=2", f"RestartPreventExitStatus={EXIT_CONFIG}", "Environment=PYTHONUNBUFFERED=1", "", *install])
+
+
+def socket_file_text(description, listen):
+    """The socket unit of an on-demand preview unit: it listens on `listen` (loopback or the tailnet IP only, the same
+    guarantee as for any proxy) from boot on and starts the service of the same name at the first connection."""
+    host, port = parse_hostport(listen)
+    host = check_listen_host(host)
+    lines = [UNIT_MARKER, "[Unit]", f"Description={unit_description(description)}", "",
+             "[Socket]", "ListenStream=" + (f"[{host}]:{port}" if ":" in host else f"{host}:{port}"), "Accept=no"]
+    if not ipaddress.ip_address(host).is_loopback:
+        lines.append("FreeBind=yes")  # after a reboot the tailnet IP exists only once tailscaled is up
+    return "\n".join(lines + ["", "[Install]", "WantedBy=sockets.target", ""])
 
 
 # ---------------------------------------------------------------------------
@@ -1458,17 +1854,65 @@ class TailnetUnknown(RuntimeError):
     """Tailscale did not report this machine's tailnet name and IP."""
 
 
+READ_ONLY = (("tailscale", "status"), ("tailscale", "serve", "status"), ("tailscale", "debug", "prefs"), ("ss",),
+             ("systemctl", "--user", "is-active"), ("systemctl", "--user", "list-units"))
+PREFETCH_THREADS = 6
+
+
 class System:
     def __init__(self):
         self._ts = None
+        self._memo, self._memo_lock = {}, threading.Lock()  # answers of the read-only queries of this command
 
     def run(self, argv, timeout=30):
+        """A read-only query (READ_ONLY) runs once per command, later calls get its answer; any other command may
+        change what they say and clears them. Nothing polls through here: waiting loops use can_connect."""
+        key = tuple(argv)
+        read_only = any(key[:len(p)] == p for p in READ_ONLY)
+        with self._memo_lock:
+            if not read_only:
+                self._memo.clear()
+            elif key in self._memo:
+                return self._memo[key]
+        r = self._run(argv, timeout)
+        if read_only:
+            self._remember(argv, r)
+        return r
+
+    def _remember(self, argv, result):
+        with self._memo_lock:
+            self._memo[tuple(argv)] = result
+
+    def _run(self, argv, timeout):
         try:
             return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
         except FileNotFoundError:
             return subprocess.CompletedProcess(argv, 127, "", f"{argv[0]}: not found")
         except subprocess.TimeoutExpired:
             return subprocess.CompletedProcess(argv, 124, "", f"{argv[0]}: timed out")
+
+    def prefetch(self, *queries):
+        """Ask independent read-only queries (functions without arguments) at once, in at most PREFETCH_THREADS threads,
+        and return when all have answered, so the calls after it are answered from the memo. Only read-only queries:
+        nothing else runs meanwhile. An error is ignored here; the caller's own call meets it and reports it as before."""
+        todo, lock = list(queries), threading.Lock()
+
+        def worker():
+            while True:
+                with lock:
+                    if not todo:
+                        return
+                    query = todo.pop()
+                try:
+                    query()
+                except Exception:
+                    pass
+
+        threads = [threading.Thread(target=worker, daemon=True) for _ in range(min(len(todo), PREFETCH_THREADS))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
 
     def tailnet(self):
         """(tailnet IPv4, MagicDNS name) of this machine; TailnetUnknown when Tailscale cannot say (never a guess)."""
@@ -1525,14 +1969,26 @@ class System:
         return op == current_user()
 
     def serve_ports(self):
-        """Ports that have a Tailscale Serve entry (anyone's)."""
+        """Ports that have a Tailscale Serve entry (anyone's), or None when Tailscale could not say."""
+        targets = self.serve_targets()
+        return None if targets is None else set(targets)
+
+    def serve_targets(self):
+        """{port: where its Tailscale Serve entry leads ("http://127.0.0.1:<port>", "" for anything but a proxy at /)}
+        for every entry (anyone's), or None when Tailscale could not say: never an empty guess."""
         r = self.run(["tailscale", "serve", "status", "--json"], timeout=10)
         if r.returncode != 0:
-            return set()
+            return None
         try:
-            return {int(p) for p in (json.loads(r.stdout or "{}").get("TCP") or {})}
-        except (ValueError, AttributeError):
-            return set()
+            config = json.loads(r.stdout or "{}")
+            targets = {int(p): "" for p in (config.get("TCP") or {})}
+            for host, web in (config.get("Web") or {}).items():
+                port = int(host.rsplit(":", 1)[1])
+                if port in targets:
+                    targets[port] = ((web.get("Handlers") or {}).get("/") or {}).get("Proxy") or ""
+            return targets
+        except (ValueError, AttributeError, IndexError, TypeError):
+            return None
 
     def serve_add(self, port, internal_port):
         r = self.run(["tailscale", "serve", "--bg", "--yes", f"--https={port}", f"http://127.0.0.1:{internal_port}"], timeout=30)
@@ -1547,22 +2003,46 @@ class System:
         return (r.stdout or "").strip() or "unknown"
 
     def unit_states(self, units):
-        """{unit: state} for many units in one systemctl call (is-active prints one line per unit, in order)."""
+        """{unit: state} for many units in one systemctl call: is-active prints one line per unit, in order; for more
+        than 8 preview units list-units, which lists all of them at once (is-active with 334 names: 60 ms). Later
+        unit_state calls for these units are answered from the memo."""
         units = list(dict.fromkeys(u for u in units if isinstance(u, str)))
         if not units:
             return {}
-        r = self.run(["systemctl", "--user", "is-active", *units], timeout=30)
-        lines = (r.stdout or "").splitlines()
-        if len(lines) != len(units):
-            return {u: self.unit_state(u) for u in units}
-        return {u: line.strip() or "unknown" for u, line in zip(units, lines)}
+        states = self._listed_states(units) if len(units) > 8 else None
+        if states is None:
+            r = self.run(["systemctl", "--user", "is-active", *units], timeout=30)
+            lines = (r.stdout or "").splitlines()
+            if len(lines) != len(units):
+                return {u: self.unit_state(u) for u in units}
+            states = {u: line.strip() or "unknown" for u, line in zip(units, lines)}
+        for unit, state in states.items():
+            argv = ["systemctl", "--user", "is-active", unit]
+            self._remember(argv, subprocess.CompletedProcess(argv, 0 if state == "active" else 3, state + "\n", ""))
+        return states
+
+    def _listed_states(self, units):
+        """unit_states from one `systemctl --user list-units` of the preview units, or None when it cannot say (another
+        unit, no JSON). A unit systemd has not loaded is not listed and is inactive, as is-active says."""
+        if not all(u.startswith(UNIT_PREFIX) and (u.endswith((".service", ".socket")) or "." not in u) for u in units):
+            return None
+        r = self.run(["systemctl", "--user", "list-units", "--all", "-o", "json", UNIT_PREFIX + "*"], timeout=30)
+        if r.returncode != 0:
+            return None
+        try:
+            listed = {row["unit"]: row["active"] for row in json.loads(r.stdout)}
+        except (ValueError, TypeError, KeyError):
+            return None
+        if not all(isinstance(state, str) and state for state in listed.values()):
+            return None
+        return {u: listed.get(u if "." in u else u + ".service", "inactive") for u in units}
 
     def unit_dir(self):
         """Where the systemd user manager reads unit files (it does not see this shell's XDG_CONFIG_HOME)."""
         return Path.home() / ".config" / "systemd" / "user"
 
     def unit_path(self, unit):
-        return self.unit_dir() / (unit if unit.endswith(".service") else unit + ".service")
+        return self.unit_dir() / (unit if unit.endswith((".service", ".socket")) else unit + ".service")
 
     def has_unit_file(self, unit):
         """True when the unit is a regular file this tool wrote (its first line is UNIT_MARKER)."""
@@ -1585,66 +2065,116 @@ class System:
             return []
         return sorted(name for name in names if self.has_unit_file(name))
 
-    def unit_start(self, unit, description, argv):
-        """Write the unit file, enable and start it, so the preview comes back after a reboot. A unit an older version
-        started with systemd-run (transient) is stopped first; the file then takes its place with the same command."""
+    def unit_comes_back(self, unit):
+        """True when a unit file this tool wrote brings `unit` back after a reboot: its socket unit (on demand), or its
+        own [Install] section."""
+        if not self.has_unit_file(unit):
+            return False
+        if not unit.endswith(".socket") and self.has_unit_file(socket_of(unit)):
+            return True
         try:
-            text = unit_file_text(description, argv)
-        except ValueError as e:
-            return False, str(e)
+            return "\n[Install]\n" in self.unit_path(unit).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return False
+
+    def unit_start(self, unit, description, argv, listen=None):
+        """Write the unit file, enable and start it, so the preview comes back after a reboot. A unit an older version
+        started with systemd-run (transient) is stopped first; the file then takes its place with the same command.
+        With `listen` (HOST:PORT) the unit starts on demand: its socket unit preview-….socket listens there, enabled,
+        and starts the service (not enabled itself) at a connection. The service is started once here as well, so a
+        server that cannot come up fails now. Without `listen`, a socket this tool wrote for the unit is removed."""
         if not UNIT_NAME.fullmatch(unit):
             return False, f"refusing to manage {printable(unit)!r}: not a preview unit"
-        path = self.unit_path(unit)
-        if (path.exists() or path.is_symlink()) and not self.has_unit_file(unit):
-            return False, f"{path} exists and was not written by preview; remove or rename it"
-        self.run(["systemctl", "--user", "stop", unit], timeout=20)
-        self.run(["systemctl", "--user", "reset-failed", unit], timeout=10)
+        sock = socket_of(unit)
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_name(f".{path.name}.tmp")
-            tmp.write_text(text)
-            tmp.chmod(0o644)
-            tmp.replace(path)
+            files = {unit: unit_file_text(description, argv, on_demand=listen is not None)}
+            if listen is not None:
+                files[sock] = socket_file_text(description, listen)
+        except ValueError as e:
+            return False, str(e)
+        for name in files:
+            path = self.unit_path(name)
+            if (path.exists() or path.is_symlink()) and not self.has_unit_file(name):
+                return False, f"{path} exists and was not written by preview; remove or rename it"
+        old_socket = self.has_unit_file(sock)
+        with_socket = listen is not None or old_socket
+        if with_socket:
+            self.run(["systemctl", "--user", "stop", sock], timeout=20)  # first: it would start the service again
+        self.run(["systemctl", "--user", "stop", unit], timeout=20)
+        if listen is not None:  # a plain unit file of an earlier release was enabled itself; on demand only its socket is
+            self.run(["systemctl", "--user", "disable", unit], timeout=20)
+        elif old_socket:
+            self.run(["systemctl", "--user", "disable", sock], timeout=20)
+        for name in ([sock] if with_socket else []) + [unit]:
+            self.run(["systemctl", "--user", "reset-failed", name], timeout=10)
+        path = self.unit_path(unit)
+        try:
+            for name, text in files.items():
+                path = self.unit_path(name)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = path.with_name(f".{path.name}.tmp")
+                tmp.write_text(text)
+                tmp.chmod(0o644)
+                tmp.replace(path)
+            if listen is None and old_socket:
+                path = self.unit_path(sock)
+                path.unlink(missing_ok=True)
         except OSError as e:
             return False, f"cannot write {path}: {e.strerror or e}"
         self.run(["systemctl", "--user", "daemon-reload"], timeout=30)
+        steps = [("enable", sock), ("start", sock), ("start", unit)] if listen is not None else [("enable", unit), ("start", unit)]
         why = ""
-        for verb in ("enable", "start"):
-            r = self.run(["systemctl", "--user", verb, unit], timeout=30)
+        for verb, name in steps:
+            r = self.run(["systemctl", "--user", verb, name], timeout=45 if verb == "start" else 30)
             if r.returncode != 0:
-                why = (r.stderr or r.stdout).strip() or f"systemctl --user {verb} {unit} failed"
+                why = (r.stderr or r.stdout).strip() or f"systemctl --user {verb} {name} failed"
                 break
         else:
-            r = self.run(["systemctl", "--user", "show", "-p", "FragmentPath", "--value", unit], timeout=10)
-            loaded = (r.stdout or "").strip()
-            if not loaded or os.path.realpath(loaded) != os.path.realpath(path):
-                why = f"systemd runs {unit} from {printable(loaded) or 'no file'}, not from {path}"
+            for name in files:
+                r = self.run(["systemctl", "--user", "show", "-p", "FragmentPath", "--value", name], timeout=10)
+                loaded = (r.stdout or "").strip()
+                if not loaded or os.path.realpath(loaded) != os.path.realpath(self.unit_path(name)):
+                    why = f"systemd runs {name} from {printable(loaded) or 'no file'}, not from {self.unit_path(name)}"
+                    break
         if why:
             self.unit_stop(unit)  # no half-made unit stays enabled
             return False, why
         return True, ""
 
     def unit_stop(self, unit):
-        """Stop a preview unit; when it is a unit file this tool wrote, also disable and delete that file (nothing else)."""
-        ours = self.has_unit_file(unit)
-        if ours:
-            self.run(["systemctl", "--user", "disable", unit], timeout=20)
-        self.run(["systemctl", "--user", "stop", unit], timeout=20)
-        self.run(["systemctl", "--user", "reset-failed", unit], timeout=10)
-        if ours:
+        """Stop a preview unit, and first the socket that would start it again; for the unit files this tool wrote, also
+        disable and delete them (nothing else)."""
+        names = [unit]
+        if not unit.endswith(".socket") and UNIT_NAME.fullmatch(socket_of(unit)):
+            names.insert(0, socket_of(unit))
+        ours = [name for name in names if self.has_unit_file(name)]
+        for name in ours:
+            self.run(["systemctl", "--user", "disable", name], timeout=20)
+        for name in names:
+            self.run(["systemctl", "--user", "stop", name], timeout=20)
+            self.run(["systemctl", "--user", "reset-failed", name], timeout=10)
+        for name in ours:
             try:
-                self.unit_path(unit).unlink()
+                self.unit_path(name).unlink()
             except FileNotFoundError:
                 pass
+        if ours:
             self.run(["systemctl", "--user", "daemon-reload"], timeout=30)
 
     def unit_log(self, unit, lines=5):
         r = self.run(["journalctl", "--user", "-u", unit, "-n", str(lines), "--no-pager", "-o", "cat"], timeout=10)
         return (r.stdout or "").strip()
 
+    def listen_addresses(self, port):
+        """Addresses of the TCP listeners on a port. Without process names: ss -p reads every process (~40 ms)."""
+        return [addr for addr, _ in self._listening(["ss", "-Hltn", f"sport = :{port}"])]
+
     def listeners(self, port):
         """[(address, process)] of TCP listeners on a port."""
-        r = self.run(["ss", "-Hltnp", f"sport = :{port}"], timeout=10)
+        return self._listening(["ss", "-Hltnp", f"sport = :{port}"])
+
+    def _listening(self, argv):
+        r = self.run(argv, timeout=10)
         out = []
         for line in (r.stdout or "").splitlines():
             cols = line.split()
@@ -1662,10 +2192,34 @@ class System:
         except OSError:
             return False
 
-    def free_local_port(self):
+    def free_local_port(self, avoid=()):
+        """A free loopback port for a proxy, never one of SHARE_PORTS (a file share or Cua desktop needs it later) or of
+        `avoid` (the ports of recorded previews, whose dev server may be down just now). The ports turned down stay
+        bound until one fits, so the kernel offers another each time."""
+        held = []
+        try:
+            while len(held) < 100:
+                s = socket.socket()
+                held.append(s)
+                s.bind(("127.0.0.1", 0))
+                port = s.getsockname()[1]
+                if port not in SHARE_PORTS and port not in avoid:
+                    return port
+            raise OSError(f"no free loopback port outside {SHARE_PORTS.start}-{SHARE_PORTS.stop - 1}")
+        finally:
+            for s in held:
+                s.close()
+
+    def can_bind(self, port):
+        """A socket can listen on 127.0.0.1:<port> now. Without SO_REUSEADDR, so a port that a connection holds as its
+        source port, open or in TIME_WAIT, counts as taken: ss -l does not show it, but systemd's socket cannot bind it."""
         with socket.socket() as s:
-            s.bind(("127.0.0.1", 0))
-            return s.getsockname()[1]
+            try:
+                s.bind(("127.0.0.1", port))
+                s.listen()
+                return True
+            except OSError:
+                return False
 
     def sleep(self, seconds):
         time.sleep(seconds)
@@ -1709,19 +2263,106 @@ def load_state(port):
         return None
 
 
+@contextlib.contextmanager
+def state_lock(d):
+    """The state folder's lock: the proxies write opened_at into the same files this command writes."""
+    with open(Path(d) / ".lock", "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+
+
+class Busy(RuntimeError):
+    """Another preview command kept the flow lock too long."""
+
+
+FLOW_WAIT = 60  # seconds a command waits for another one that creates or stops previews
+_flow = threading.local()
+
+
+@contextlib.contextmanager
+def flow_lock():
+    """One create or stop at a time (preview <port>, file, cua, stop, restore), from reading the records to the last
+    write, so two agents never act on the same port or record in between. Held again in the same thread (preview file
+    runs preview <port>) without waiting; the proxies' opened_at writes keep their own short .lock."""
+    if getattr(_flow, "held", False):
+        yield
+        return
+    d = state_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    with open(d / ".flow.lock", "a") as f:
+        deadline = time.monotonic() + FLOW_WAIT
+        while True:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    raise Busy(f"another preview command has been creating or stopping previews for {FLOW_WAIT} s; "
+                               f"try again")
+                time.sleep(0.1)
+        _flow.held = True
+        try:
+            yield
+        finally:
+            _flow.held = False
+
+
+def one_flow(command):
+    @functools.wraps(command)
+    def run(*args, **kwargs):
+        with flow_lock():
+            return command(*args, **kwargs)
+    return run
+
+
+def unix_time(value):
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
 def save_state(entry):
     d = state_dir()
     d.mkdir(parents=True, exist_ok=True)
-    tmp = d / f".{entry['port']}.json.tmp"
-    tmp.write_text(json.dumps(entry, indent=2) + "\n")
-    tmp.replace(d / f"{entry['port']}.json")
+    path = d / f"{entry['port']}.json"
+    with state_lock(d):
+        try:  # what a proxy recorded since this command read the file: the latest open, the first time it was observed
+            disk = json.loads(path.read_text())
+        except (OSError, ValueError):
+            disk = None
+        if isinstance(disk, dict):
+            for name, pick in (("opened_at", max), ("observed_since", min)):
+                values = [v for v in (unix_time(entry.get(name)), unix_time(disk.get(name))) if v]
+                if values:
+                    entry[name] = pick(values)
+        tmp = d / f".{entry['port']}.json.tmp"
+        tmp.write_text(json.dumps(entry, indent=2) + "\n")
+        tmp.replace(path)
 
 
 def drop_state(port):
+    d = state_dir()
     try:
-        (state_dir() / f"{port}.json").unlink()
+        with state_lock(d):
+            (d / f"{port}.json").unlink()
     except FileNotFoundError:
         pass
+
+
+def record_opened(path, listen, when):
+    """Set opened_at in a preview's state file (run by its proxy). Only an existing record whose listen address is this
+    proxy's, and never back in time; atomic (temporary file, then rename). False when nothing was written."""
+    path = Path(path)
+    try:
+        with state_lock(path.parent):
+            entry = json.loads(path.read_text())
+            if not isinstance(entry, dict) or entry.get("listen") != listen or (unix_time(entry.get("opened_at")) or 0) >= when:
+                return False
+            entry["opened_at"] = when
+            tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(entry, indent=2) + "\n")
+            tmp.replace(path)
+            return True
+    except (OSError, ValueError):
+        return False
 
 
 def all_states():
@@ -1748,7 +2389,43 @@ def links(sysm, port):
     return f"https://{name}:{port}", f"http://{name}:{port}"
 
 
-def target_listening(sysm, port):
+UP = ("active", "idle", "activating")  # unit_status of an on-demand unit that serves (running, asleep, starting)
+
+
+def on_demand_ok(entry):
+    """Every preview starts on demand except the Cua desktops shares, which keep running all the time."""
+    return entry.get("kind") not in ("cua", "cua-space")
+
+
+def unit_status(sysm, unit, states=None):
+    """'active' (running), 'idle' (on demand and asleep: its socket listens and starts it at the next connection), or
+    systemd's word for anything else ('failed', 'inactive', ...); when its socket does not listen, 'socket <state>'.
+    `states` (from unit_states) saves the systemctl calls."""
+    get = lambda name: (states or {}).get(name) or sysm.unit_state(name)
+    state = get(unit)
+    if not sysm.has_unit_file(socket_of(unit)):
+        return state
+    sock = get(socket_of(unit))
+    if sock != "active":
+        return f"socket {sock}"
+    return "idle" if state in ("inactive", "deactivating") else state
+
+
+def server_up(sysm, unit, host, port, states=None):
+    """A preview unit's server is there: running and listening, or (on demand) asleep behind its listening socket. An
+    on-demand unit gets no test connection: it would start the server, and the socket accepts it even when the server
+    cannot start."""
+    if sysm.has_unit_file(socket_of(unit)):
+        return unit_status(sysm, unit, states) in UP
+    return sysm.unit_state(unit) == "active" and sysm.can_connect(host, port, timeout=0.5)
+
+
+def target_listening(sysm, port, states=None):
+    """Something answers on localhost:<port>. For a file share whose server starts on demand, systemd says so instead
+    (see server_up)."""
+    file_unit = f"{FILE_UNIT_PREFIX}{port}.service"
+    if port in FILE_PORTS and sysm.has_unit_file(socket_of(file_unit)):
+        return unit_status(sysm, file_unit, states) in UP
     return sysm.can_connect("127.0.0.1", port) or sysm.can_connect("::1", port)
 
 
@@ -1778,8 +2455,9 @@ def wait_listening(sysm, host, port, seconds=4.0):
     return False
 
 
-def proxy_argv(sysm, entry):
-    """The proxy command for a recorded preview; a Cua share always keeps its owner gate (ValueError when it cannot)."""
+def proxy_argv(sysm, entry, on_demand=False):
+    """The proxy command for a recorded preview (on demand: it stops when idle); a Cua share always keeps its owner gate
+    (ValueError when it cannot)."""
     argv = ["/usr/bin/python3", "-I", self_path(), "_serve", "--listen", entry["listen"],
             "--target", str(entry["port"]), "--public-url", entry["link"], "--tailnet-ip", sysm.tailnet()[0]]
     if cua_unit_of(entry):
@@ -1790,17 +2468,19 @@ def proxy_argv(sysm, entry):
     elif entry.get("kind") in ("cua", "cua-space"):
         raise ValueError("its Cua share record is incomplete, so it would start without the owner gate; "
                          "run preview cua again")
-    return argv
+    return argv + (IDLE_ARGS if on_demand else [])
 
 
 def start_unit(sysm, entry):
     unit = entry["unit"]
     host, lport = parse_hostport(entry["listen"])
+    on_demand = on_demand_ok(entry)
     try:
-        argv = proxy_argv(sysm, entry)
+        argv = proxy_argv(sysm, entry, on_demand)
     except ValueError as e:
         return False, str(e)
-    ok, err = sysm.unit_start(unit, f"preview {entry['port']}: {entry['label']}", argv)
+    ok, err = sysm.unit_start(unit, f"preview {entry['port']}: {entry['label']}", argv,
+                              listen=entry["listen"] if on_demand else None)
     if not ok:
         return False, err or "systemd-run failed"
     if not wait_listening(sysm, host, lport):
@@ -1810,15 +2490,27 @@ def start_unit(sysm, entry):
     return True, ""
 
 
+def serve_state(entry, targets):
+    """Where an HTTPS preview's Tailscale Serve entry leads: "ok" (to its proxy), "missing", "elsewhere", or "unknown"
+    (`targets` None: Tailscale could not say); None for an HTTP preview, which has no entry."""
+    if entry.get("backend") != "https":
+        return None
+    if targets is None:
+        return "unknown"
+    if entry["port"] not in targets:
+        return "missing"
+    return "ok" if targets[entry["port"]].rstrip("/") == f"http://{entry['listen']}" else "elsewhere"
+
+
 def entry_healthy(sysm, entry):
-    if sysm.unit_state(entry["unit"]) != "active":
+    """No create or stop left its record half done (status), its proxy serves (running, or asleep behind its socket),
+    and an HTTPS preview's Tailscale Serve entry leads to that proxy."""
+    if entry.get("status"):
         return False
     host, lport = parse_hostport(entry["listen"])
-    if not sysm.can_connect(host, lport, timeout=0.5):
+    if not server_up(sysm, entry["unit"], host, lport):
         return False
-    if entry["backend"] == "https" and entry["port"] not in sysm.serve_ports():
-        return False
-    return True
+    return serve_state(entry, sysm.serve_targets() if entry["backend"] == "https" else None) in (None, "ok")
 
 
 def note_for(entry, listening, sysm=None):
@@ -1838,28 +2530,83 @@ def note_for(entry, listening, sysm=None):
     return "  " + " ".join(parts)
 
 
+def created_by():
+    """The herdr session and agent this command runs in, or None when neither is known."""
+    found = {key: printable(os.environ.get(var, "")).strip()[:80] or None
+             for key, var in (("session", "HERDR_SESSION"), ("agent", "CONDUCTOR_AGENT"))}
+    return found if any(found.values()) else None
+
+
+def owner_key():
+    """Who `stop --all` treats as the caller: the herdr pane (one agent, subagents inherit it), prefixed by its herdr
+    session. None when the pane is unknown."""
+    pane = printable(os.environ.get("HERDR_PANE_ID", "")).strip()[:80]
+    if not pane:
+        return None
+    session = printable(os.environ.get("HERDR_SESSION", "")).strip()[:80]
+    return f"{session}/{pane}" if session else pane
+
+
+def tracking(existing, now):
+    """created_by, observed_since (and opened_at) of a new record. A preview made again on its port keeps its record's:
+    the same link, the same preview."""
+    if existing is None:
+        return {"created_by": created_by(), "owner": owner_key(), "observed_since": now}
+    out = {"created_by": existing.get("created_by"), "owner": existing.get("owner"),
+           "observed_since": unix_time(existing.get("observed_since")) or now}
+    if unix_time(existing.get("opened_at")):
+        out["opened_at"] = existing["opened_at"]
+    return out
+
+
+SERVE_UNKNOWN = ("tailscale serve status did not answer, so preview cannot tell which ports Tailscale Serve uses; "
+                 "nothing changed. Try again once it answers")
+SHARE_FIELDS = ("path", "kind", "file_unit", "behalten")  # a file share's; rebuilding its proxy keeps them
+
+
+def serve_left(port, why):
+    return printable(f"preview: Tailscale could not remove the Serve entry of port {port} ({why or 'no reason given'}); "
+                     f"its record stays, and preview stop {port} removes both once Tailscale answers")
+
+
 def backend_choice(operator, forced):
     """'https' when cmd_start tries Tailscale Serve first, 'http' when it goes straight to the tailnet-IP proxy."""
     return "https" if forced != "http" and (operator is not False or forced == "https") else "http"
 
 
-def cmd_start(sysm, port, label=None, out=None, err=None, cua=None):
-    """`cua` is set only by cmd_cua: the Cua share's fields (owner login, viewer unit); it is HTTPS or nothing."""
+def ask_ahead(sysm, port, existing, guess_label_too=False):
+    """The read-only queries a run for this port asks, all at once (System.prefetch)."""
+    names = [n for u in entry_units(existing) if isinstance(u, str) for n in (u, socket_of(u))] if existing else []
+    sysm.prefetch(sysm.tailnet, sysm.serve_ports, sysm.operator_ok,
+                  *([lambda: sysm.listen_addresses(port)] if port is not None else []),
+                  *([lambda: sysm.unit_states(names)] if names else []),
+                  *([lambda: sysm.listeners(port)] if guess_label_too else []))
+
+
+@one_flow
+def cmd_start(sysm, port, label=None, out=None, err=None, cua=None, share=None):
+    """`cua` is set only by cmd_cua: the Cua share's fields (owner login, viewer unit); it is HTTPS or nothing. `share`
+    only by cmd_file: the file share's SHARE_FIELDS, in its record from the first write on."""
     out, err = out or sys.stdout, err or sys.stderr
+    existing = load_state(port)
+    ask_ahead(sysm, port, existing, guess_label_too=not (label or (existing or {}).get("label")))
     ts_ip, _ = sysm.tailnet()
     https_link, http_link = links(sysm, port)
-    existing = load_state(port)
     if cua is None and existing and existing.get("kind") in ("cua", "cua-space"):
         print(f"preview: port {port} is the Cua desktops share; run preview cua again, or preview stop cua first", file=err)
         return 1
 
-    exposed = [a for a, _ in sysm.listeners(port) if wildcard_or_public(a, ts_ip)]
+    exposed = [a for a in sysm.listen_addresses(port) if wildcard_or_public(a, ts_ip)]
     if exposed:
         print(f"preview: something on this VPS already listens on {exposed[0]}:{port}, which includes the public "
               f"internet. Restart the dev server bound to 127.0.0.1 (for example --host 127.0.0.1), then run "
               f"preview {port} again.", file=err)
         return 1
-    others_serve = sysm.serve_ports() - ({port} if existing and existing.get("backend") == "https" else set())
+    serve = sysm.serve_ports()
+    if serve is None:
+        print(f"preview: {SERVE_UNKNOWN}", file=err)
+        return 1
+    others_serve = serve - ({port} if existing and existing.get("backend") == "https" else set())
     if port in others_serve:
         print(f"preview: Tailscale Serve already uses port {port} for something else; pick another port.", file=err)
         return 1
@@ -1872,8 +2619,8 @@ def cmd_start(sysm, port, label=None, out=None, err=None, cua=None):
     if existing and same_share and entry_healthy(sysm, existing):
         upgrade = existing["backend"] == "http" and operator is True and forced != "http"
         if not upgrade:
-            changed = label != existing.get("label")
-            existing["label"] = label
+            changed = label != existing.get("label") or any(existing.get(k) != v for k, v in (share or {}).items())
+            existing.update(label=label, **(share or {}))
             if not existing.get("persistent"):  # an older version's transient unit: same port, listen and link, as a file
                 started, msg = start_unit(sysm, existing)
                 if not started:
@@ -1886,23 +2633,34 @@ def cmd_start(sysm, port, label=None, out=None, err=None, cua=None):
             print(note_for(existing, target_listening(sysm, port), sysm), file=err)
             return 0
     if existing:
-        stop_entry(sysm, existing, quiet=True)
+        stopped, why = stop_entry(sysm, existing, quiet=True)
+        if not stopped:
+            print(serve_left(port, why), file=err)
+            return 1
 
     entry = None
     serve_error = ""
+    now = int(time.time())
+    kept = {k: existing[k] for k in SHARE_FIELDS if k in existing} if existing else {}  # a file share stays one
     if backend_choice(operator, forced) == "https":
-        internal = sysm.free_local_port()
+        internal = sysm.free_local_port(avoid={e.get("port") for e in all_states()})
+        entry = {"port": port, "label": label, "backend": "https", "link": https_link,
+                 "listen": f"127.0.0.1:{internal}", "unit": f"{UNIT_PREFIX}{port}", "created": now,
+                 **tracking(existing, now), **kept, **(share or {}), **(cua or {}), "status": "creating"}
+        save_state(entry)  # before any effect: what a run that ends early set up, the next run or stop removes
         ok, serve_error = sysm.serve_add(port, internal)
         if ok:
-            entry = {"port": port, "label": label, "backend": "https", "link": https_link,
-                     "listen": f"127.0.0.1:{internal}", "unit": f"{UNIT_PREFIX}{port}", "created": int(time.time()),
-                     **(cua or {})}
             started, msg = start_unit(sysm, entry)
             if not started:
-                sysm.serve_remove(port)
                 print(f"preview: could not start the proxy for port {port}: {msg}", file=err)
+                stopped, why = stop_entry(sysm, entry)
+                if not stopped:
+                    print(serve_left(port, why), file=err)
                 return 1
             entry["persistent"] = True
+        else:
+            drop_state(port)
+            entry = None
     if entry is None:
         if cua is not None:  # the login gate only holds behind Tailscale Serve; never fall back to HTTP for this share
             print(f"preview: the Cua desktops link needs HTTPS through Tailscale Serve, which is not available here "
@@ -1912,12 +2670,16 @@ def cmd_start(sysm, port, label=None, out=None, err=None, cua=None):
             print(f"preview: Tailscale Serve is not available: {serve_error or 'not permitted'}", file=err)
             return 1
         entry = {"port": port, "label": label, "backend": "http", "link": http_link,
-                 "listen": f"{ts_ip}:{port}", "unit": f"{UNIT_PREFIX}{port}", "created": int(time.time())}
+                 "listen": f"{ts_ip}:{port}", "unit": f"{UNIT_PREFIX}{port}", "created": now, **tracking(existing, now),
+                 **kept, **(share or {}), "status": "creating"}
+        save_state(entry)
         started, msg = start_unit(sysm, entry)
         if not started:
+            drop_state(port)
             print(f"preview: could not start the proxy for port {port}: {msg}", file=err)
             return 1
         entry["persistent"] = True
+    del entry["status"]
     save_state(entry)
     print(entry["link"], file=out)
     print(note_for(entry, target_listening(sysm, port), sysm), file=err)
@@ -1925,10 +2687,24 @@ def cmd_start(sysm, port, label=None, out=None, err=None, cua=None):
 
 
 def stop_entry(sysm, entry, quiet=False):
-    sysm.unit_stop(entry["unit"])
+    """Remove an HTTPS preview's Tailscale Serve entry, stop its proxy, drop its record: (True, ""). When Tailscale
+    cannot remove the entry, nothing else changes: (False, why). The record says "stopping" meanwhile, so a stop that
+    ends early is finished by the next run or stop."""
+    before = entry.get("status")
+    entry["status"] = "stopping"
+    save_state(entry)
     if entry.get("backend") == "https":
-        sysm.serve_remove(entry["port"])
+        ok, why = sysm.serve_remove(entry["port"])
+        left = None if ok else sysm.serve_ports()
+        if not ok and (left is None or entry["port"] in left):  # an entry that is gone already is fine
+            entry.pop("status")
+            if before:
+                entry["status"] = before
+            save_state(entry)
+            return False, why
+    sysm.unit_stop(entry["unit"])
     drop_state(entry["port"])
+    return True, ""
 
 
 def file_unit_of(entry):
@@ -1974,19 +2750,28 @@ def stop_legacy_viewer(sysm, out):
 
 
 def stop_share(sysm, entry):
-    """Stop a preview, and for a file share also its file server, for the Cua desktops index also its server."""
-    stop_entry(sysm, entry)
-    if file_unit_of(entry):
+    """Stop a preview, and for a file share also its file server, for the Cua desktops index also its server; (ok, why)
+    of stop_entry, and when it failed nothing is stopped."""
+    ok, why = stop_entry(sysm, entry)
+    if ok and file_unit_of(entry):
         sysm.unit_stop(file_unit_of(entry))
-    if cua_unit_of(entry):
+    if ok and cua_unit_of(entry):
         sysm.unit_stop(CUA_UNIT)
+    return ok, why
+
+
+def stop_and_say(sysm, entry, out, err):
+    ok, why = stop_share(sysm, entry)
+    print(stopped_line(entry) if ok else serve_left(entry["port"], why), file=out if ok else err)
+    return ok
 
 
 def stopped_line(entry):
     return printable(f"stopped {entry['port']} ({entry['label']}" + (f", {entry['path']})" if entry.get("path") else ")"))
 
 
-def cmd_stop(sysm, port=None, all_=False, out=None, err=None, path=None, cua=False):
+@one_flow
+def cmd_stop(sysm, port=None, all_=False, out=None, err=None, path=None, cua=False, everyone=False):
     out, err = out or sys.stdout, err or sys.stderr
     if cua:
         legacy = stop_legacy_viewer(sysm, out)
@@ -1999,28 +2784,43 @@ def cmd_stop(sysm, port=None, all_=False, out=None, err=None, path=None, cua=Fal
                 return 0
             print("preview: no Cua desktops share running (see preview list)", file=err)
             return 1
-        for entry in entries:
-            stop_share(sysm, entry)
-            print(stopped_line(entry), file=out)
-        return 0
+        failed = [entry for entry in entries if not stop_and_say(sysm, entry, out, err)]
+        return 1 if failed else 0
+    if all_ and not everyone:
+        key = owner_key()
+        if key is None:
+            print("preview: cannot tell which session this is (HERDR_PANE_ID is not set), so --all would not know "
+                  "which previews are yours. Stop one by port, or use: preview stop --all --everyone", file=err)
+            return 1
+        everything = all_states()
+        entries = [e for e in everything if e.get("owner") == key]
+        failed = [e for e in entries if not stop_and_say(sysm, e, out, err)]
+        skipped = len(everything) - len(entries)
+        if not entries:
+            print("no previews of this session running", file=out)
+        if skipped:
+            print(f"kept {skipped} preview{'s' if skipped != 1 else ''} of other sessions or from before sessions were "
+                  f"recorded; preview stop --all --everyone stops those too", file=out)
+        return 1 if failed else 0
     if all_:
         legacy = stop_legacy_viewer(sysm, out)
         entries = all_states()
-        for e in entries:
-            stop_share(sysm, e)
-            print(stopped_line(e), file=out)
-        orphans = sysm.own_unit_files()  # written by this tool, but their record is gone: they would come back at boot
+        failed = [e for e in entries if not stop_and_say(sysm, e, out, err)]
+        kept = {name.removesuffix(".service") for e in failed for u in entry_units(e) if isinstance(u, str)
+                for name in (u, socket_of(u))}  # a preview whose stop failed still runs, and its record names them
+        own = lambda: [u for u in sysm.own_unit_files() if u.removesuffix(".service") not in kept]
+        orphans = own()  # written by this tool, but their record is gone: they would come back at boot
         for unit in orphans:
             sysm.unit_stop(unit)
             print(printable(f"stopped {unit} (no preview recorded it)"), file=out)
         if not entries and not orphans and not legacy:
             print("no previews running", file=out)
-        left = sysm.own_unit_files()
+        left = own()
         if left:
             print(printable(f"preview: could not remove {', '.join(left)}; they would start again after a reboot. "
                             f"Check: systemctl --user status {left[0]}"), file=err)
             return 1
-        return 0
+        return 1 if failed else 0
     if path is not None:
         wanted = {os.path.abspath(os.path.expanduser(path))}
         try:
@@ -2036,28 +2836,33 @@ def cmd_stop(sysm, port=None, all_=False, out=None, err=None, path=None, cua=Fal
         if not entry:
             print(f"preview: no preview on port {port} (see preview list)", file=err)
             return 1
-    stop_share(sysm, entry)
-    print(stopped_line(entry), file=out)
-    return 0
+    return 0 if stop_and_say(sysm, entry, out, err) else 1
+
+
+def free_share_port(sysm, ports, taken):
+    """The first of `ports` that is not taken, has no listener and can be bound now (F8: a connection's port can not)."""
+    return next((p for p in ports if p not in taken and not sysm.listen_addresses(p) and not target_listening(sysm, p)
+                 and sysm.can_bind(p)), None)
 
 
 def pick_file_port(sysm):
-    taken = {e.get("port") for e in all_states()} | sysm.serve_ports()
-    for port in FILE_PORTS:
-        if port in taken or sysm.listeners(port) or target_listening(sysm, port):
-            continue
-        return port
-    return None
+    serve = sysm.serve_ports()
+    if serve is None:
+        raise FileShareRefused(SERVE_UNKNOWN)
+    return free_share_port(sysm, FILE_PORTS, {e.get("port") for e in all_states()} | serve)
 
 
 def plan_file_share(sysm, path, label=None):
     """What `preview file <path>` will do, without starting anything."""
     root = check_share_root(path)
     existing = next((e for e in all_states() if e.get("path") == str(root)), None)
+    ask_ahead(sysm, existing["port"] if existing else None, existing)
     port = existing["port"] if existing else pick_file_port(sysm)
-    if port is None:
+    ends = oldest_share() if port is None else None
+    if port is None and ends is None:
         raise FileShareRefused(f"no free port in {FILE_PORTS.start}-{FILE_PORTS.stop - 1} for file shares; "
-                               f"stop one first (preview list)")
+                               f"stop one first (preview list). Shares pinned with --behalten are never ended to make room")
+    port = ends["port"] if ends else port
     operator, forced = sysm.operator_ok(), os.environ.get("PREVIEW_BACKEND", "")
     backend = backend_choice(operator, forced)
     if existing and entry_healthy(sysm, existing):
@@ -2067,7 +2872,15 @@ def plan_file_share(sysm, path, label=None):
     return {"path": str(root), "kind": "folder" if root.is_dir() else "file", "port": port, "label": label,
             "serve": ("127.0.0.1", port), "unit": f"{FILE_UNIT_PREFIX}{port}.service", "proxy_unit": f"{UNIT_PREFIX}{port}",
             "backend": backend, "reuse": existing is not None, "persistent": bool(existing and existing.get("persistent")),
-            "argv": file_server_argv(root, port)}
+            "argv": file_server_argv(root, port), "ends": ends}
+
+
+def oldest_share():
+    """The file share a new one ends when all FILE_PORTS are taken: the oldest by `created`; never one pinned with
+    --behalten, one a create or stop left half done (status), or a preview that is not a file share."""
+    shares = [e for e in all_states() if e.get("port") in FILE_PORTS and file_unit_of(e) and e.get("path")
+              and e.get("behalten") is not True and not e.get("status")]
+    return min(shares, key=lambda e: unix_time(e.get("created")) or 0, default=None)
 
 
 def file_server_argv(root, port):
@@ -2082,7 +2895,8 @@ def file_plan(argv, sysm):
     return plan_file_share(sysm, a.path, a.name)
 
 
-def cmd_file(sysm, path, label=None, out=None, err=None):
+@one_flow
+def cmd_file(sysm, path, label=None, out=None, err=None, keep=False):
     out, err = out or sys.stdout, err or sys.stderr
     try:
         plan = plan_file_share(sysm, path, label)
@@ -2091,21 +2905,30 @@ def cmd_file(sysm, path, label=None, out=None, err=None):
         return 1
     port, unit = plan["port"], plan["unit"]
     host, lport = plan["serve"]
-    if not (plan["persistent"] and sysm.unit_state(unit) == "active" and sysm.can_connect(host, lport)):
-        ok, msg = sysm.unit_start(unit, f"preview file {port}: {plan['label']}", plan["argv"])
+    old = plan["ends"]
+    if old:  # every port is taken: end the oldest share as preview stop does, and take its port
+        ok, why = stop_share(sysm, old)
+        if not ok:
+            print(serve_left(old["port"], why), file=err)
+            return 1
+        print(printable(f"  Ended the oldest file share to free its port: {old['port']} ({old['label']}, {old['path']}). "
+                        f"Pin a share to keep it: preview file <path> --behalten"), file=err)
+    if not (plan["persistent"] and server_up(sysm, unit, host, lport)):
+        ok, msg = sysm.unit_start(unit, f"preview file {port}: {plan['label']}", plan["argv"] + IDLE_ARGS,
+                                  listen=f"{host}:{lport}")
         if ok and not wait_listening(sysm, host, lport):
             ok, msg = False, sysm.unit_log(unit) or f"file server did not start listening on {host}:{lport}"
         if not ok:
             sysm.unit_stop(unit)
             print(f"preview: could not start the file server for {plan['path']}: {msg or 'systemd-run failed'}", file=err)
             return 1
-    code = cmd_start(sysm, port, plan["label"], out=out, err=err)
+    code = cmd_start(sysm, port, plan["label"], out=out, err=err,
+                     share={"path": plan["path"], "kind": plan["kind"], "file_unit": unit,
+                            **({"behalten": True} if keep else {})})
     if code != 0:
-        sysm.unit_stop(unit)
+        if (load_state(port) or {}).get("file_unit") != unit:  # a record that names it keeps it for its next stop
+            sysm.unit_stop(unit)
         return code
-    entry = load_state(port) or {}
-    entry.update(path=plan["path"], kind=plan["kind"], file_unit=unit)
-    save_state(entry)
     print(f"  Shares {plan['path']} read-only. Stop: preview stop {shlex.quote(plan['path'])}", file=err)
     return 0
 
@@ -2113,15 +2936,21 @@ def cmd_file(sysm, path, label=None, out=None, err=None):
 def cmd_list(sysm, as_json=False, out=None):
     out = out or sys.stdout
     entries = all_states()
-    states = sysm.unit_states([u for e in entries for u in entry_units(e)])  # one systemctl call for every unit shown
-    state = lambda unit: states.get(unit) or sysm.unit_state(unit)
+    names = [name for e in entries for u in entry_units(e) if isinstance(u, str) for name in (u, socket_of(u))]
+    states = sysm.unit_states(names)  # one systemctl call; no test connection to a server that starts on demand
+    targets = sysm.serve_targets() if any(e.get("backend") == "https" for e in entries) else None
     rows = []
     for e in entries:
-        row = {**e, "target_listening": target_listening(sysm, e["port"]), "proxy": state(e["unit"])}
+        row = {**e, "target_listening": target_listening(sysm, e["port"], states),
+               "proxy": unit_status(sysm, e["unit"], states), "serve": serve_state(e, targets)}
+        for name in ("opened_at", "observed_since"):
+            row[name] = unix_time(e.get(name))
+        row["created_by"] = e.get("created_by") if isinstance(e.get("created_by"), dict) else None
         if file_unit_of(e):
-            row["file_server"] = state(file_unit_of(e))
+            row["file_server"] = unit_status(sysm, file_unit_of(e), states)
+            row["behalten"] = e.get("behalten") is True
         if cua_unit_of(e):
-            row["index"] = state(CUA_UNIT)
+            row["index"] = unit_status(sysm, CUA_UNIT, states)
         rows.append(row)
     if as_json:
         print(json.dumps(rows, indent=2), file=out)
@@ -2133,7 +2962,8 @@ def cmd_list(sysm, as_json=False, out=None):
     for r in rows:
         table.append((str(r["port"]), printable(r["label"]), r["backend"],
                       "listening" if r["target_listening"] else "not listening", r["proxy"], r["link"],
-                      printable(r.get("path", "") or (f"index {r['index']}" if "index" in r else "")
+                      printable((r.get("path") or "") + (" (behalten)" if r.get("behalten") else "")
+                                or (f"index {r['index']}" if "index" in r else "")
                                 or (f"space {r['space_id']}" if cua_space_of(r) else ""))))
     widths = [max(len(row[i]) for row in table) for i in range(len(table[0]))]
     for row in table:
@@ -2172,7 +3002,9 @@ def cmd_doctor(sysm, out=None):
     linger = sysm.run(["loginctl", "show-user", user, "-p", "Linger", "--value"], timeout=10).stdout.strip()
     print(f"linger         {linger or 'unknown'} (yes = previews keep running after logout)", file=out)
     print(f"previews       {len(all_states())} open (preview list)", file=out)
+    broken_line(sysm, out)
     persistence_line(sysm, out)
+    on_demand_line(sysm, out)
     login, share = sysm.owner_login(), load_state(CUA_PORT)
     if not sysm.cua_path():
         print("cua desktops   cua is not installed, so preview cua cannot run (install Cua, check cua --version)", file=out)
@@ -2187,14 +3019,29 @@ def cmd_doctor(sysm, out=None):
     return 0
 
 
+def broken_line(sysm, out):
+    """doctor: previews whose Tailscale Serve entry does not lead to their proxy, or whose create or stop did not finish."""
+    entries = all_states()
+    targets = sysm.serve_targets() if any(e.get("backend") == "https" for e in entries) else {}
+    if targets is None:
+        print(f"serve entries  unknown ({SERVE_UNKNOWN.split(',')[0]})", file=out)
+        return
+    broken = [f"{e['port']} ({e['status'] if e.get('status') else 'serve ' + serve_state(e, targets)})" for e in entries
+              if e.get("status") or serve_state(e, targets) not in (None, "ok")]
+    if broken:
+        print(printable(f"broken         {', '.join(broken)}; fix: preview <port> again for each, or preview stop <port>"),
+              file=out)
+
+
 def entry_units(entry):
     """Every unit a recorded preview runs: its proxy, plus the file server or the Cua desktops index."""
     return [entry.get("unit")] + [u for u in (file_unit_of(entry), cua_unit_of(entry)) if u]
 
 
 def transient_previews(sysm):
-    """Recorded previews with a unit that is not a unit file (an older version started it with systemd-run)."""
-    return [e for e in all_states() if not all(sysm.has_unit_file(u) for u in entry_units(e))]
+    """Recorded previews with a unit that would not come back after a reboot (an older version started it with
+    systemd-run, or an on-demand unit lost its socket)."""
+    return [e for e in all_states() if not all(isinstance(u, str) and sysm.unit_comes_back(u) for u in entry_units(e))]
 
 
 def persistence_line(sysm, out):
@@ -2206,40 +3053,93 @@ def persistence_line(sysm, out):
         print("persistent     yes (every preview comes back after a reboot)", file=out)
 
 
+def sleeps(sysm, entry):
+    """True when every unit of a recorded preview starts on demand (has its socket unit)."""
+    return all(isinstance(u, str) and sysm.has_unit_file(socket_of(u)) for u in entry_units(entry))
+
+
+def on_demand_line(sysm, out):
+    entries = [e for e in all_states() if on_demand_ok(e)]
+    if not entries:
+        return
+    asleep = sum(1 for e in entries if sleeps(sysm, e))
+    rest = len(entries) - asleep
+    print(f"on demand      {asleep} of {len(entries)} previews start at the first request and stop after "
+          f"{IDLE_SECONDS // 60} idle minutes" + (f"; {rest} run all the time (fix: preview restore)" if rest else ""),
+          file=out)
+
+
 def unit_specs(sysm, entry):
-    """[(unit, description, argv, (host, port), seconds)] to rebuild a recorded preview's units, file server or index
-    first. ValueError (or KeyError, TypeError) when the record cannot be trusted to rebuild them."""
+    """[{unit, description, argv, listen, wait: (host, port), seconds}] to rebuild a recorded preview's units, file server
+    or index first. `argv` runs the unit all the time; with `listen`, it may start on demand instead (argv + IDLE_ARGS
+    behind a socket on `listen`). ValueError (or KeyError, TypeError) when the record cannot be trusted to rebuild them."""
     port = entry["port"]
     if not isinstance(port, int) or entry["unit"] != f"{UNIT_PREFIX}{port}":
         raise ValueError("its record does not name its own unit")
     host, lport = parse_hostport(entry["listen"])
     check_listen_host(host)
     label = entry.get("label") or f"port {port}"
+    on_demand = on_demand_ok(entry)
     specs = []
     if file_unit_of(entry):
         root = check_share_root(entry["path"])
         if str(root) != entry["path"]:
             raise ValueError(f"{entry['path']} now resolves to {root}; run preview file again")
-        specs.append((file_unit_of(entry), f"preview file {port}: {label}", file_server_argv(root, port),
-                      ("127.0.0.1", port), 4.0))
+        specs.append({"unit": file_unit_of(entry), "description": f"preview file {port}: {label}",
+                      "argv": file_server_argv(root, port), "listen": f"127.0.0.1:{port}" if on_demand else None,
+                      "wait": ("127.0.0.1", port), "seconds": 4.0})
     if cua_unit_of(entry):
         cua = sysm.cua_path()
         if not cua:
             raise ValueError("cua is not installed (install it from github.com/trycua/cua, then check cua --version)")
-        specs.append((CUA_UNIT, "preview cua: Cua desktops index", cua_index_argv(sysm, cua), ("127.0.0.1", CUA_PORT), 20.0))
-    specs.append((entry["unit"], f"preview {port}: {label}", proxy_argv(sysm, entry), (host, lport), 4.0))
+        specs.append({"unit": CUA_UNIT, "description": "preview cua: Cua desktops index", "argv": cua_index_argv(sysm, cua),
+                      "listen": None, "wait": ("127.0.0.1", CUA_PORT), "seconds": 20.0})
+    specs.append({"unit": entry["unit"], "description": f"preview {port}: {label}", "argv": proxy_argv(sysm, entry),
+                  "listen": entry["listen"] if on_demand else None, "wait": (host, lport), "seconds": 4.0})
     return specs
 
 
-def cmd_restore(sysm, out=None, err=None):
-    """Give every recorded preview without a unit file one (stop the transient unit, write, enable, start). Ports and
-    links stay as recorded; the Tailscale Serve entries are kept by tailscaled and not touched."""
+def units_to_restore(sysm, entry):
+    """The units of a recorded preview that restore (re)writes: those that would not come back after a reboot, and
+    those that could start on demand but still run all the time. Cua desktops shares only ever get the first."""
+    todo = []
+    for unit in entry_units(entry):
+        if not isinstance(unit, str) or not sysm.unit_comes_back(unit):
+            todo.append(unit)
+        elif on_demand_ok(entry) and unit != CUA_UNIT and not sysm.has_unit_file(socket_of(unit)):
+            todo.append(unit)
+    return todo
+
+
+def start_spec(sysm, spec, on_demand):
+    unit, (host, lport) = spec["unit"], spec["wait"]
+    argv = spec["argv"] + (IDLE_ARGS if on_demand else [])
+    ok, msg = sysm.unit_start(unit, spec["description"], argv, listen=spec["listen"] if on_demand else None)
+    if ok and not (wait_up(sysm, host, lport, spec["seconds"]) if unit == CUA_UNIT
+                   else wait_listening(sysm, host, lport, spec["seconds"])):
+        ok, msg = False, sysm.unit_log(unit) or f"it did not come up on {host}:{lport}"
+    return ok, msg
+
+
+@one_flow
+def cmd_restore(sysm, out=None, err=None, port=None):
+    """Give every recorded preview (or the one on `port`) unit files that bring it back after a reboot, and let it start
+    on demand (all but the Cua desktops shares): stop the old unit, write, enable, start. A unit that cannot start on
+    demand runs all the time as before. Ports and links stay as recorded; the Tailscale Serve entries are kept by
+    tailscaled and not touched. Only the units recorded in this tool's state are touched; safe to run again."""
     out, err = out or sys.stdout, err or sys.stderr
-    stop_legacy_viewer(sysm, out)  # it would hold the index port that the Cua share comes back on
+    entries = all_states()
+    if port is not None:
+        entries = [e for e in entries if e.get("port") == port]
+        if not entries:
+            print(f"preview: no preview on port {port} (see preview list)", file=err)
+            return 1
+    if port is None or port == CUA_PORT:
+        stop_legacy_viewer(sysm, out)  # it would hold the index port that the Cua share comes back on
     restored, failed = 0, 0
-    for entry in all_states():
-        missing = [u for u in entry_units(entry) if not sysm.has_unit_file(u)]
-        if not missing:
+    for entry in entries:
+        todo = units_to_restore(sysm, entry)
+        if not todo:
             continue
         what = printable(f"{entry.get('port')} ({entry.get('label')})")
         try:
@@ -2248,22 +3148,32 @@ def cmd_restore(sysm, out=None, err=None):
             print(f"preview: could not restore {what}: {printable(e)}", file=err)
             failed += 1
             continue
-        for unit, description, argv, (host, lport), seconds in specs:
-            if unit not in missing:
+        plain = []  # (unit, why) of units that could not start on demand and run all the time as before
+        for spec in specs:
+            if spec["unit"] not in todo:
                 continue
-            ok, msg = sysm.unit_start(unit, description, argv)
-            if ok and not (wait_up(sysm, host, lport, seconds) if unit == CUA_UNIT else wait_listening(sysm, host, lport, seconds)):
-                ok, msg = False, sysm.unit_log(unit) or f"it did not come up on {host}:{lport}"
+            ok, msg = start_spec(sysm, spec, on_demand=spec["listen"] is not None)
+            if not ok and spec["listen"] is not None:
+                why = msg
+                ok, msg = start_spec(sysm, spec, on_demand=False)
+                if ok:
+                    plain.append((spec["unit"], why))
             if not ok:
-                sysm.unit_stop(unit)
-                print(f"preview: could not restore {what}: {unit}: {printable(msg) or 'systemctl failed'}", file=err)
+                sysm.unit_stop(spec["unit"])
+                print(f"preview: could not restore {what}: {spec['unit']}: {printable(msg) or 'systemctl failed'}", file=err)
                 failed += 1
                 break
         else:
             entry["persistent"] = True
+            entry.setdefault("observed_since", int(time.time()))  # its proxy now records when a person opens it
             save_state(entry)
             restored += 1
-            print(f"restored {what}: comes back after a reboot, link {entry['link']}", file=out)
+            for unit, why in plain:
+                print(f"preview: {what}: {unit} could not start on demand ({printable(why) or 'systemctl failed'}); "
+                      f"it runs all the time as before", file=err)
+            failed += bool(plain)
+            how = "starts at the first request, " if on_demand_ok(entry) and not plain else ""
+            print(f"restored {what}: {how}comes back after a reboot, link {entry['link']}", file=out)
     if not restored and not failed:
         print("nothing to restore: every preview already comes back after a reboot", file=out)
     return 1 if failed else 0
@@ -2305,11 +3215,13 @@ def cua_plan(sysm, label=None):
     ids = {space["id"] for space in found}
     stale = [e for sid, e in known.items() if sid not in ids]
     stale_ports = {e["port"] for e in stale}
-    taken = ({e.get("port") for e in states} | sysm.serve_ports()) - stale_ports
+    serve = sysm.serve_ports()
+    if serve is None:
+        raise CuaRefused(SERVE_UNKNOWN)
+    taken = ({e.get("port") for e in states} | serve) - stale_ports
     spaces, unplaced = [], []
     for space in found:
-        port = known[space["id"]]["port"] if space["id"] in known else next(
-            (p for p in CUA_SPACE_PORTS if p not in taken and not sysm.listeners(p) and not target_listening(sysm, p)), None)
+        port = known[space["id"]]["port"] if space["id"] in known else free_share_port(sysm, CUA_SPACE_PORTS, taken)
         if port is None:
             unplaced.append(space["name"])
             continue
@@ -2327,6 +3239,7 @@ def cua_index_argv(sysm, cua):
             "--public-host", sysm.tailnet()[1], "--state-dir", str(state_dir())]
 
 
+@one_flow
 def cmd_cua(sysm, label=None, out=None, err=None):
     out, err = out or sys.stdout, err or sys.stderr
     stop_legacy_viewer(sysm, err)  # it holds 127.0.0.1:18500 until a reboot; stdout stays the one link
@@ -2338,7 +3251,7 @@ def cmd_cua(sysm, label=None, out=None, err=None):
     host, lport = plan["serve"]
     active = sysm.unit_state(CUA_UNIT) == "active"
     if not (plan["persistent"] and active and sysm.can_connect(host, lport)):
-        if not active and (sysm.listeners(lport) or target_listening(sysm, lport)):
+        if not active and (sysm.listen_addresses(lport) or target_listening(sysm, lport)):
             print(f"preview: something else already listens on port {lport}; stop it, then run preview cua again", file=err)
             return 1
         ok, msg = sysm.unit_start(CUA_UNIT, "preview cua: Cua desktops index", plan["argv"])
@@ -2354,9 +3267,11 @@ def cmd_cua(sysm, label=None, out=None, err=None):
     if code != 0:
         sysm.unit_stop(CUA_UNIT)
         return code
-    for entry in plan["stale"]:  # Spaces cua no longer lists
-        stop_share(sysm, entry)
     failed = []
+    for entry in plan["stale"]:  # Spaces cua no longer lists
+        ok, why = stop_share(sysm, entry)
+        if not ok:
+            failed.append(serve_left(entry["port"], why).removeprefix("preview: "))
     for space in plan["spaces"]:
         quiet_out, why = io.StringIO(), io.StringIO()
         share = {"kind": "cua-space", "space_id": space["id"], "space_name": space["name"],
@@ -2387,6 +3302,16 @@ def build_parser():
     return p
 
 
+def idle_seconds(value):
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"not a number of seconds: {value!r}")
+    if not 0 < seconds <= 86400:
+        raise argparse.ArgumentTypeError(f"idle time out of range (0-86400 s): {value}")
+    return seconds
+
+
 def parse(argv):
     """Small hand-rolled dispatcher so `preview 5173` works without a subcommand word."""
     parser = build_parser()
@@ -2403,10 +3328,13 @@ def parse(argv):
         return "list", a
     if cmd == "stop":
         sp = argparse.ArgumentParser(prog="preview stop",
-                                     usage="preview stop <port> | preview stop <path> | preview stop cua | preview stop --all")
+                                     usage="preview stop <port> | preview stop <path> | preview stop cua | preview stop --all [--everyone]")
         sp.add_argument("target", nargs="?", metavar="port|path")
-        sp.add_argument("--all", action="store_true", help="stop every preview created by this tool")
+        sp.add_argument("--all", action="store_true", help="stop the previews created by this session")
+        sp.add_argument("--everyone", action="store_true", help="with --all: stop every preview this tool created")
         a = sp.parse_args(argv[1:])
+        if a.everyone and not a.all:
+            sp.error("--everyone only goes with --all")
         if (a.target is not None) == bool(a.all):
             sp.error("give exactly one of <port>, <path> or --all")
         a.port = a.path = None
@@ -2422,9 +3350,10 @@ def parse(argv):
             a.path = a.target
         return "stop", a
     if cmd == "file":
-        sp = argparse.ArgumentParser(prog="preview file", usage="preview file <path> [--name LABEL]")
+        sp = argparse.ArgumentParser(prog="preview file", usage="preview file <path> [--name LABEL] [--behalten]")
         sp.add_argument("path")
         sp.add_argument("--name", "--label", dest="name", help="short label shown in preview list")
+        sp.add_argument("--behalten", action="store_true", help="never end this share to make room for a new one")
         return "file", sp.parse_args(argv[1:])
     if cmd == "cua":
         sp = argparse.ArgumentParser(prog="preview cua", usage="preview cua [--name LABEL]")
@@ -2441,13 +3370,15 @@ def parse(argv):
         sp = argparse.ArgumentParser(prog="preview _serve-file")
         sp.add_argument("--root", required=True)
         sp.add_argument("--port", required=True, type=int)
+        sp.add_argument("--idle", type=idle_seconds, help="with a socket from systemd: stop after this many seconds idle")
         return "_serve-file", sp.parse_args(argv[1:])
     if cmd == "doctor":
         argparse.ArgumentParser(prog="preview doctor").parse_args(argv[1:])
         return "doctor", None
     if cmd == "restore":
-        argparse.ArgumentParser(prog="preview restore").parse_args(argv[1:])
-        return "restore", None
+        sp = argparse.ArgumentParser(prog="preview restore", usage="preview restore [<port>]")
+        sp.add_argument("port", nargs="?", type=check_port)
+        return "restore", sp.parse_args(argv[1:])
     if cmd == "_serve":
         sp = argparse.ArgumentParser(prog="preview _serve")
         sp.add_argument("--listen", required=True)
@@ -2457,6 +3388,7 @@ def parse(argv):
         sp.add_argument("--upstream-host")
         sp.add_argument("--upstream-port", type=int)
         sp.add_argument("--owner-login")
+        sp.add_argument("--idle", type=idle_seconds, help="with a socket from systemd: stop after this many seconds idle")
         return "_serve", sp.parse_args(argv[1:])
     if cmd == "start":
         argv = argv[1:]
@@ -2477,7 +3409,7 @@ def main(argv=None, sysm=None):
     sysm = sysm or System()
     try:
         return run_command(cmd, a, sysm)
-    except TailnetUnknown as e:
+    except (TailnetUnknown, Busy) as e:
         print(f"preview: {e}", file=sys.stderr)
         return 1
 
@@ -2486,15 +3418,15 @@ def run_command(cmd, a, sysm):
     if cmd == "list":
         return cmd_list(sysm, a.json)
     if cmd == "stop":
-        return cmd_stop(sysm, a.port, a.all, path=a.path, cua=a.cua)
+        return cmd_stop(sysm, a.port, a.all, path=a.path, cua=a.cua, everyone=a.everyone)
     if cmd == "file":
-        return cmd_file(sysm, a.path, a.name)
+        return cmd_file(sysm, a.path, a.name, keep=a.behalten)
     if cmd == "cua":
         return cmd_cua(sysm, a.name)
     if cmd == "doctor":
         return cmd_doctor(sysm)
     if cmd == "restore":
-        return cmd_restore(sysm)
+        return cmd_restore(sysm, port=a.port)
     return cmd_start(sysm, a.port, a.name)
 
 

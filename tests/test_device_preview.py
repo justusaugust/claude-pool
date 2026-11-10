@@ -20,7 +20,7 @@ import device_sync
 from fakes import FakeRemote
 from remote import Completed
 
-TOOL_SHA = '7c4ee5eac82f3024e2d2840803ec7d622b45f2f473994df9bba74f69a41725de'
+TOOL_SHA = 'b30f8c9d3cf499788a40059e2eeca1b777a784dc0ad5f94b922d047c89c46c5d'
 PREVIOUS_SHA = 'b3e645e7ba9750057b68c12f7dd518d19ff792a98062eeea857115b194358d94'  # the copy live on the VPS
 FIRST_FILE_SHARE_SHA = '89c880b1411939c7996239273e28aa51399a1dca1cd56e387754e82e235faabe'  # Task 16's first release
 BEFORE_HOST_CHECK_SHA = '7894d83a893ab63cc07ec07244b910ae8fce1949b080ba355a3b08f6e3903efd'  # the release before the Host check
@@ -30,6 +30,7 @@ VIEWER_COOKIE_SHA = '27adcbcf4e189571c911730040e606e5a961a81debe3080d62bf9d8551b
 BEFORE_REBOOT_SHA = 'c4aaac57cf0bb23e4a64d91e2435d638d87bab1dfb66f14e2102a51a079198f5'  # one Cua link; transient units
 FIRST_PERSISTENT_SHA = '8cba203c1f2566ec033d47dc39189c7dbf0643fc68fd619720f8a19c1bc4c0d0'  # persistent units; fixed fallback name
 BEFORE_ONE_LIST_CALL_SHA = '816678a1f5c50db711feac2a813d7e1cf3c409d0d20d290023040324ba97b79d'  # list: systemctl per unit
+BEFORE_ON_DEMAND_SHA = '7c4ee5eac82f3024e2d2840803ec7d622b45f2f473994df9bba74f69a41725de'  # one list call; always running
 OTHER_SHA = '0' * 64
 RUN = 'cd "$HOME" && exec .local/bin/preview "$@"'
 DOCTOR_HTTPS = 'tailnet name   box.ts.net\nbackend        https (Tailscale Serve is allowed for this user)\n'
@@ -130,7 +131,8 @@ class InstallTests(unittest.TestCase):
 
     def test_known_previous_copy_is_updated_in_place(self):
         self.assertEqual(device_preview.KNOWN_PREVIOUS, {PREVIOUS_SHA, FIRST_FILE_SHARE_SHA, BEFORE_HOST_CHECK_SHA, BEFORE_CUA_SHA, FIRST_CUA_SHA,
-                                                         VIEWER_COOKIE_SHA, BEFORE_REBOOT_SHA, FIRST_PERSISTENT_SHA, BEFORE_ONE_LIST_CALL_SHA})
+                                                         VIEWER_COOKIE_SHA, BEFORE_REBOOT_SHA, FIRST_PERSISTENT_SHA, BEFORE_ONE_LIST_CALL_SHA,
+                                                         BEFORE_ON_DEMAND_SHA})
         remote = device(target_sha=PREVIOUS_SHA)
         step = device_preview.install(remote)
         self.assertEqual((step.status, step.detail), ('ok', 'updated'))
@@ -147,6 +149,10 @@ class InstallTests(unittest.TestCase):
 
     def test_the_release_that_listed_with_one_systemctl_call_per_unit_is_updated_too(self):
         self.assertEqual(device_preview.install(device(target_sha=BEFORE_ONE_LIST_CALL_SHA)).detail, 'updated')
+
+    def test_the_release_whose_previews_ran_all_the_time_is_updated_too(self):
+        self.assertNotEqual(TOOL_SHA, BEFORE_ON_DEMAND_SHA)
+        self.assertEqual(device_preview.install(device(target_sha=BEFORE_ON_DEMAND_SHA)).detail, 'updated')
 
     def test_the_release_with_transient_units_is_updated_too(self):
         self.assertNotEqual(TOOL_SHA, BEFORE_REBOOT_SHA)
@@ -414,8 +420,9 @@ class ToolSafetyTests(unittest.TestCase):
             def operator_ok(self): return False
             def serve_ports(self): return set()
             def listeners(self, port): return []
+            def listen_addresses(self, port): return []
             def unit_state(self, unit): return 'inactive'
-            def unit_start(self, unit, desc, argv): self.started.append(argv[argv.index('--listen') + 1]); return True, ''
+            def unit_start(self, unit, desc, argv, listen=None): self.started.append(argv[argv.index('--listen') + 1]); return True, ''
             def unit_stop(self, unit): pass
             def unit_log(self, unit, lines=5): return ''
             def can_connect(self, host, port, timeout=0.5): return True

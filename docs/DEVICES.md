@@ -149,6 +149,8 @@ The Conductor can have its own Claude Code settings, for example a cheaper model
 
 The service passes the file to Remote Control with `--settings` while it exists. With `--settings`, Remote Control no longer turns auto-compact on by itself, so name it in the file. Remote Control reads it once per start, so run `install --restart` after you change it. The Conductor reads its whole conversation on every wake-up, so a smaller window lowers the cost of each one.
 
+A reattached conversation keeps its own model: Remote Control starts it with the model it last used, and that takes precedence over `model` in this file. To change the model of the running Conductor, type `/model` in its conversation.
+
 If `check` says `running on <device> but not connected to Remote Control`, turn Remote Control on in the Claude app, wait two minutes (the service retries by itself), then run `claude-pool device check <name>`. If it still says not connected, run `ssh <ssh-target> .local/bin/claude-pool device conductor install --restart`.
 
 What Conductor Claude calls to see and act (bounded, redacted output):

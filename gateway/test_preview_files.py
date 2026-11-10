@@ -4,6 +4,7 @@ The file server runs for real on 127.0.0.1:0 (stdlib ThreadingHTTPServer). Every
 Tailscale goes through a stand-in System that records argv and never runs a command.
 """
 
+import asyncio
 import contextlib
 import http.client
 import importlib.machinery
@@ -11,9 +12,12 @@ import importlib.util
 import io
 import json
 import os
+import socket
 import tempfile
 import threading
+import time
 import unittest
+import weakref
 from pathlib import Path
 from unittest import mock
 
@@ -48,6 +52,7 @@ class FakeSystem(pv.System):
         self.busy = set()  # ports something else already listens on (127.0.0.1)
         self.next_free = 41000
         self._units = tempfile.TemporaryDirectory()
+        weakref.finalize(self, self._units.cleanup)  # no ResourceWarning on stderr when a test drops the fake
 
     def unit_dir(self):
         return Path(self._units.name) / "systemd" / "user"
@@ -59,7 +64,7 @@ class FakeSystem(pv.System):
         return [cmd for _, cmd in self.started if word in cmd]
 
     def unit_path(self, unit):
-        return self.unit_dir() / (unit if unit.endswith(".service") else unit + ".service")
+        return self.unit_dir() / (unit if unit.endswith((".service", ".socket")) else unit + ".service")
 
     def listen_for(self, unit, cmd):
         """Where a started unit listens, or None when it never comes up."""
@@ -79,11 +84,14 @@ class FakeSystem(pv.System):
             raise AssertionError("previews must be unit files, never systemd-run: " + " ".join(argv))
         if argv[:2] == ["systemctl", "--user"]:
             verb, unit = argv[2], argv[-1] if len(argv) > 3 else ""
+            if verb == "list-units":  # the batch listing: cannot say, so the caller asks is-active
+                return done("", 1)
             if verb == "stop":
                 self.active.pop(unit, None)
                 self.transient.pop(unit, None)
             if verb == "is-active":
-                return done("active\n" if unit in self.active else "inactive\n", 0 if unit in self.active else 3)
+                states = ["active" if u in self.active else "inactive" for u in argv[3:]]
+                return done("".join(s + "\n" for s in states), 0 if all(s == "active" for s in states) else 3)
             if verb == "enable":
                 if not self.unit_path(unit).exists():
                     return done("", 1)
@@ -98,6 +106,10 @@ class FakeSystem(pv.System):
                 path = self.unit_path(unit)
                 if unit in self.active or not path.exists():
                     return done("", 0 if unit in self.active else 5)
+                if unit.endswith(".socket"):  # a socket unit listens where its ListenStream= says
+                    [line] = [l for l in path.read_text().splitlines() if l.startswith("ListenStream=")]
+                    self.active[unit] = pv.parse_hostport(line.split("=", 1)[1])
+                    return done()
                 cmd = exec_start(path.read_text())
                 self.started.append((unit, cmd))
                 listen = self.listen_for(unit, cmd)
@@ -129,12 +141,23 @@ class FakeSystem(pv.System):
             out.append(("127.0.0.1", "node"))
         return out
 
+    def serve_targets(self):
+        return dict(self.serve)
+
+    def listen_addresses(self, port):
+        return [addr for addr, _ in self.listeners(port)]
+
     def can_connect(self, host, port, timeout=0.5):
         return (host, port) in self.active.values() or (port in self.busy and host in ("127.0.0.1", "::1"))
 
-    def free_local_port(self):
+    def free_local_port(self, avoid=()):
         self.next_free += 1
+        while self.next_free in avoid or self.next_free in self.busy:
+            self.next_free += 1
         return self.next_free
+
+    def can_bind(self, port):
+        return port not in self.busy
 
     def sleep(self, seconds):
         pass
@@ -361,7 +384,7 @@ class ServerTests(unittest.TestCase):
         self.assertIn('href="/sub/"', body)
         self.assertIn('&quot;x&quot;', body)
         self.assertLess(body.index('a.pdf'), body.index('notes.md'))
-        sub = get(self.folder_server, '/sub').read().decode()
+        sub = get(self.folder_server, '/sub/').read().decode()
         self.assertIn('href="/sub/deep.txt"', sub)
         self.assertNotIn('.git', sub)
 
@@ -378,7 +401,7 @@ class ServerTests(unittest.TestCase):
         txt = get(self.folder_server, '/plain.txt')
         self.assertEqual(txt.headers['Content-Type'], 'text/plain; charset=utf-8')
         html = get(self.folder_server, '/page.html')
-        self.assertEqual(html.headers['Content-Type'], 'text/plain; charset=utf-8')  # never rendered as HTML
+        self.assertEqual(html.headers['Content-Type'], 'text/html; charset=utf-8')  # an HTML file opens as a page
         binary = get(self.folder_server, '/data.bin')
         self.assertEqual(binary.headers['Content-Type'], 'application/octet-stream')
         self.assertTrue(binary.headers['Content-Disposition'].startswith('attachment'))
@@ -428,9 +451,14 @@ class ServerTests(unittest.TestCase):
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         real = os.fstat
-        def bigger(fd):  # the file shrank after its size was read
-            st = real(fd)
-            return os.stat_result((st.st_mode, *tuple(st)[1:6], st.st_size + 5000, *tuple(st)[7:]))
+        class Bigger:  # the file shrank after its size was read: it claims 5000 bytes more than it has
+            def __init__(self, st):
+                self.st = st
+            st_size = property(lambda self: self.st.st_size + 5000)
+            def __getattr__(self, name):
+                return getattr(self.st, name)
+        def bigger(fd):
+            return Bigger(real(fd))
         conn = http.client.HTTPConnection('127.0.0.1', server.server_address[1], timeout=3)
         with mock.patch.object(pv.os, 'fstat', bigger):
             conn.request('GET', '/data.bin')
@@ -504,14 +532,14 @@ class FileCommandTests(unittest.TestCase):
                 self.assertEqual(fake.active[plan['unit']], ('127.0.0.1', plan['port']))
                 file_run = fake.runs('_serve-file')[0]
                 self.assertIn(str(self.folder), file_run)
-                quiet(pv.main, ['stop', '--all'], sysm=fake)
+                quiet(pv.main, ['stop', '--all', '--everyone'], sysm=fake)
 
     def test_file_share_on_the_http_backend_binds_only_loopback_and_the_tailnet_ip(self):
         fake = FakeSystem(operator=False)
         code, out, _ = self.main(['file', str(self.folder / 'notes.md')], fake)
         self.assertEqual(code, 0)
         port = int(out.strip().rsplit(':', 1)[1])
-        self.assertEqual(sorted(fake.active.values()), [('100.101.102.103', port), ('127.0.0.1', port)])
+        self.assertEqual(sorted(set(fake.active.values())), [('100.101.102.103', port), ('127.0.0.1', port)])
         self.assertEqual(out.strip(), f'http://{TS_NAME}:{port}')
 
     def test_same_path_reuses_its_port(self):
@@ -529,10 +557,12 @@ class FileCommandTests(unittest.TestCase):
         fake = FakeSystem(operator=False)
         _, out, _ = self.main(['file', str(self.folder)], fake)
         port = int(out.strip().rsplit(':', 1)[1])
-        del fake.active[f'preview-file-{port}.service']
+        for unit in (f'preview-file-{port}.service', f'preview-file-{port}.socket'):  # the server starts on demand
+            del fake.active[unit]
         code, again, _ = self.main(['file', str(self.folder)], fake)
         self.assertEqual((code, again), (0, out))
         self.assertIn(f'preview-file-{port}.service', fake.active)
+        self.assertIn(f'preview-file-{port}.socket', fake.active)
 
     def test_busy_ports_are_skipped(self):
         fake = FakeSystem(operator=False)
@@ -572,7 +602,7 @@ class FileCommandTests(unittest.TestCase):
         self.assertEqual(fake.active, {})
         self.main(['file', str(self.folder)], fake)
         self.main(['file', str(self.folder / 'notes.md')], fake)
-        self.assertEqual(self.main(['stop', '--all'], fake)[0], 0)
+        self.assertEqual(self.main(['stop', '--all', '--everyone'], fake)[0], 0)
         self.assertEqual(fake.active, {})
         self.assertEqual(pv.all_states(), [])
 
@@ -646,6 +676,326 @@ class FileCommandTests(unittest.TestCase):
             pv.parse(['--help'])
         self.assertIn('preview file <path>', out.getvalue())
         self.assertIn('preview stop <port>|<path>', out.getvalue())
+
+
+
+# ---------------------------------------------------------------------------
+# File shares: the real file server (make_file_handler) on 127.0.0.1
+# ---------------------------------------------------------------------------
+
+PAGE = ('<!doctype html><html><head><meta charset="utf-8"><style>b{color:red}</style>'
+        '<link rel="stylesheet" href="style.css"></head><body><b>Seite</b><script>document.title="ok"</script></body></html>')
+
+
+class FileShare:
+    """make_file_handler for one folder or file, served on a free loopback port in a thread."""
+
+    def __init__(self, root):
+        self.server = pv.ThreadingHTTPServer(("127.0.0.1", 0), pv.make_file_handler(root, quiet=True))
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def get(self, path, method="GET", headers=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        try:
+            conn.request(method, path, headers=headers or {})
+            r = conn.getresponse()
+            return r.status, {k.lower(): v for k, v in r.getheaders()}, r.read()
+        finally:
+            conn.close()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def csp(value):
+    return {d.split()[0]: d.split()[1:] for d in value.split(";") if d.strip()}
+
+
+class FileShareTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.root = self.base / "share"
+        (self.root / "sub").mkdir(parents=True)
+        (self.root / "plain").mkdir()
+        (self.root / "index.html").write_text(PAGE)
+        (self.root / "seite.htm").write_text("<!doctype html><p>htm</p>")
+        (self.root / "sub" / "index.html").write_text("<!doctype html><p>sub</p>")
+        (self.root / "plain" / "a.txt").write_text("a")
+        (self.root / "style.css").write_text("b{color:blue}")
+        (self.root / "app.js").write_text("console.log(1)")
+        (self.root / "app.mjs").write_text("export {}")
+        (self.root / "logo.svg").write_text('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>')
+        (self.root / "font.woff2").write_bytes(b"wOF2\x00\x01\x00\x00")
+        (self.root / "notiz.txt").write_text("nur Text")
+        (self.root / ".env").write_text("SECRET=1")
+        (self.base / "draussen.html").write_text("<p>draussen</p>")
+        (self.root / "raus.html").symlink_to(self.base / "draussen.html")
+        self.share = FileShare(self.root)
+
+    def tearDown(self):
+        self.share.close()
+        self.tmp.cleanup()
+
+    def test_html_file_is_a_page(self):
+        for path, body in (("/seite.htm", b"<!doctype html><p>htm</p>"), ("/index.html", PAGE.encode())):
+            status, h, got = self.share.get(path)
+            self.assertEqual(status, 200, path)
+            self.assertTrue(h["content-type"].startswith("text/html"), (path, h["content-type"]))
+            self.assertEqual(got, body, path)
+            self.assertNotIn("sandbox", csp(h["content-security-policy"]), path)
+            self.assertEqual(h["x-content-type-options"], "nosniff")
+
+    def test_html_csp_allows_inline_code_and_google_fonts_only(self):
+        d = csp(self.share.get("/index.html")[1]["content-security-policy"])
+        self.assertIn("'unsafe-inline'", d["script-src"])
+        self.assertIn("'unsafe-inline'", d["style-src"])
+        self.assertIn("https://fonts.googleapis.com", d["style-src"])
+        self.assertIn("https://fonts.gstatic.com", d["font-src"])
+        for directive in ("default-src", "script-src", "style-src", "font-src", "img-src", "connect-src"):
+            self.assertFalse({"*", "http:", "https:"} & set(d.get(directive, [])), directive)
+        self.assertFalse({"data:", "blob:"} & set(d["script-src"]))
+        self.assertTrue(set(d["connect-src"]) <= {"'self'", "'none'"}, d["connect-src"])
+        self.assertEqual(d["object-src"], ["'none'"])
+        self.assertIn("frame-ancestors", d)
+        self.assertNotIn("*", d["frame-ancestors"])
+
+    def test_folder_root_opens_index_html(self):
+        status, h, body = self.share.get("/")
+        self.assertEqual((status, body), (200, PAGE.encode()))
+        self.assertTrue(h["content-type"].startswith("text/html"))
+        self.assertIn("'unsafe-inline'", csp(h["content-security-policy"])["script-src"])
+        status, h, body = self.share.get("/", method="HEAD")
+        self.assertEqual((status, body, h["content-length"]), (200, b"", str(len(PAGE.encode()))))
+
+    def test_subfolder_index_and_slash_redirect(self):
+        self.assertEqual(self.share.get("/sub/")[2], b"<!doctype html><p>sub</p>")
+        status, h, _ = self.share.get("/sub")
+        self.assertEqual((status, h.get("location")), (301, "/sub/"))
+
+    def test_folder_without_index_still_lists(self):
+        status, h, body = self.share.get("/plain/")
+        self.assertEqual(status, 200)
+        self.assertTrue(h["content-type"].startswith("text/html"))
+        self.assertIn(b"a.txt", body)
+
+    def test_page_assets_have_their_types(self):
+        for path, ctype in (("/style.css", "text/css"), ("/app.js", "text/javascript"), ("/app.mjs", "text/javascript"),
+                            ("/font.woff2", "font/woff2"), ("/logo.svg", "image/svg+xml")):
+            status, h, _ = self.share.get(path)
+            self.assertEqual(status, 200, path)
+            self.assertEqual(h["content-type"].split(";")[0], ctype, path)
+            self.assertEqual(h["x-content-type-options"], "nosniff", path)
+        self.assertIn("sandbox", csp(self.share.get("/logo.svg")[1]["content-security-policy"]))
+
+    def test_other_text_stays_plain(self):
+        status, h, body = self.share.get("/notiz.txt")
+        self.assertEqual((status, body), (200, b"nur Text"))
+        self.assertTrue(h["content-type"].startswith("text/plain"))
+        self.assertIn("sandbox", csp(h["content-security-policy"]))
+
+    def test_protections_stay(self):
+        self.assertEqual(self.share.get("/.env")[0], 404)
+        self.assertEqual(self.share.get("/raus.html")[0], 404)
+        other = self.base / "other"
+        other.mkdir()
+        (other / "index.html").symlink_to(self.base / "draussen.html")
+        share = FileShare(other)
+        try:
+            status, _, body = share.get("/")
+            self.assertNotIn(b"draussen", body)
+        finally:
+            share.close()
+        hidden = self.base / ".versteckt"
+        hidden.mkdir()
+        (hidden / "index.html").write_text(PAGE)
+        for bad in (Path.home(), Path("/"), hidden, hidden / "index.html"):
+            with self.assertRaises(pv.FileShareRefused, msg=str(bad)):
+                pv.check_share_root(bad)
+
+    def test_single_html_file_share_is_a_page(self):
+        share = FileShare(self.root / "seite.htm")
+        try:
+            for path in ("/", "/seite.htm"):
+                status, h, body = share.get(path)
+                self.assertEqual((status, body), (200, b"<!doctype html><p>htm</p>"), path)
+                self.assertTrue(h["content-type"].startswith("text/html"), path)
+        finally:
+            share.close()
+
+    def test_help_says_html_opens_as_a_page(self):
+        self.assertIn(".html", pv.HELP)
+        self.assertIn("index.html", pv.HELP)
+
+@contextlib.contextmanager
+def patched(obj, **attrs):
+    old = {k: getattr(obj, k) for k in attrs}
+    for k, v in attrs.items():
+        setattr(obj, k, v)
+    try:
+        yield
+    finally:
+        for k, v in old.items():
+            setattr(obj, k, v)
+
+
+
+# ---------------------------------------------------------------------------
+# File shares: byte ranges (videos start playing at once and can seek) and keep-alive
+# ---------------------------------------------------------------------------
+
+CLIP = bytes(range(256)) * 40  # 10240 bytes
+
+
+class FileRangeTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name) / "share"
+        self.root.mkdir()
+        (self.root / "clip.mp4").write_bytes(CLIP)
+        (self.root / "notiz.md").write_text("# Titel\n\nText\n")
+        self.share = FileShare(self.root)
+
+    def tearDown(self):
+        self.share.close()
+        self.tmp.cleanup()
+
+    def ranged(self, spec, **extra):
+        return self.share.get("/clip.mp4", headers={"Range": spec, **extra})
+
+    def test_a_full_answer_offers_ranges_and_validators(self):
+        status, h, body = self.share.get("/clip.mp4")
+        self.assertEqual((status, body), (200, CLIP))
+        self.assertEqual(h["accept-ranges"], "bytes")
+        self.assertTrue(h["etag"].startswith('"'), h["etag"])  # strong, so If-Range can use it
+        self.assertIn("last-modified", h)
+        status, h, body = self.share.get("/clip.mp4", method="HEAD")
+        self.assertEqual((status, body, h["accept-ranges"], h["content-length"]), (200, b"", "bytes", str(len(CLIP))))
+
+    def test_a_range_answers_206_with_only_those_bytes(self):
+        n = len(CLIP)
+        for spec, first, last in (("bytes=0-99", 0, 99), ("bytes=100-", 100, n - 1), ("bytes=-240", n - 240, n - 1),
+                                  ("bytes=10000-99999", 10000, n - 1), ("bytes=0-0", 0, 0), ("Bytes=5-9", 5, 9)):
+            status, h, body = self.ranged(spec)
+            self.assertEqual(status, 206, spec)
+            self.assertEqual(h["content-range"], f"bytes {first}-{last}/{n}", spec)
+            self.assertEqual(h["content-length"], str(last - first + 1), spec)
+            self.assertEqual(body, CLIP[first:last + 1], spec)
+            self.assertEqual(h["content-type"], "video/mp4", spec)
+            self.assertEqual(h["accept-ranges"], "bytes", spec)
+
+    def test_a_range_past_the_end_answers_416(self):
+        for spec in (f"bytes={len(CLIP)}-", "bytes=99999-100000", "bytes=-0"):
+            status, h, body = self.ranged(spec)
+            self.assertEqual(status, 416, spec)
+            self.assertEqual(h["content-range"], f"bytes */{len(CLIP)}", spec)
+
+    def test_a_range_it_cannot_use_is_ignored(self):
+        for spec in ("bytes=0-1,5-6", "items=0-1", "bytes=9-2", "bytes=x-y", "bytes=", "bytes=--5"):
+            status, h, body = self.ranged(spec)
+            self.assertEqual((status, body), (200, CLIP), spec)
+            self.assertNotIn("content-range", h, spec)
+
+    def test_if_range_serves_the_range_only_for_the_same_file(self):
+        h = self.share.get("/clip.mp4", method="HEAD")[1]
+        self.assertEqual(self.ranged("bytes=0-9", **{"If-Range": h["etag"]})[0], 206)
+        self.assertEqual(self.ranged("bytes=0-9", **{"If-Range": h["last-modified"]})[0], 206)
+        status, _, body = self.ranged("bytes=0-9", **{"If-Range": '"anders"'})
+        self.assertEqual((status, body), (200, CLIP))
+        status, _, body = self.ranged("bytes=0-9", **{"If-Range": "W/" + h["etag"]})  # weak never matches
+        self.assertEqual((status, body), (200, CLIP))
+        status, _, body = self.ranged("bytes=0-9", **{"If-Range": "Mon, 01 Jan 2001 00:00:00 GMT"})
+        self.assertEqual((status, body), (200, CLIP))
+
+    def test_a_changed_file_gets_a_new_etag(self):
+        before = self.share.get("/clip.mp4", method="HEAD")[1]["etag"]
+        (self.root / "clip.mp4").write_bytes(CLIP + b"x")
+        os.utime(self.root / "clip.mp4", ns=(time.time_ns() + 5 * 10**9,) * 2)
+        after = self.share.get("/clip.mp4", method="HEAD")[1]["etag"]
+        self.assertNotEqual(before, after)
+        self.assertEqual(self.ranged("bytes=0-9", **{"If-Range": before})[0], 200)
+
+    def test_rendered_pages_ignore_ranges(self):
+        status, h, body = self.share.get("/notiz.md", headers={"Range": "bytes=0-3"})
+        self.assertEqual(status, 200)
+        self.assertTrue(h["content-type"].startswith("text/html"))
+        self.assertNotIn("content-range", h)
+
+    def test_one_connection_carries_several_requests(self):
+        conn = http.client.HTTPConnection("127.0.0.1", self.share.port, timeout=5)
+        try:
+            seen = []
+            for spec in ("bytes=0-99", "bytes=100-199", None):
+                conn.request("GET", "/clip.mp4", headers={"Range": spec} if spec else {})
+                r = conn.getresponse()
+                seen.append((r.version, r.status, r.read()))
+                self.assertIsNotNone(conn.sock, "the server closed the connection after one answer")
+            self.assertEqual(seen, [(11, 206, CLIP[:100]), (11, 206, CLIP[100:200]), (11, 200, CLIP)])
+        finally:
+            conn.close()
+
+    def test_connection_close_and_idle_connections_end(self):
+        conn = http.client.HTTPConnection("127.0.0.1", self.share.port, timeout=5)
+        try:
+            conn.request("GET", "/clip.mp4", headers={"Connection": "close"})
+            r = conn.getresponse()
+            self.assertEqual(r.read(), CLIP)
+            self.assertTrue(r.will_close)
+        finally:
+            conn.close()
+        handler = self.share.server.RequestHandlerClass
+        self.assertIsNotNone(handler.timeout, "an idle keep-alive connection would hold a thread and the idle stop forever")
+        self.assertLessEqual(handler.timeout, 120)
+        with patched(handler, timeout=0.5):
+            s = socket.create_connection(("127.0.0.1", self.share.port), timeout=5)
+            try:
+                s.sendall(b"HEAD /clip.mp4 HTTP/1.1\r\nHost: x\r\n\r\n")
+                got = b""
+                while b"\r\n\r\n" not in got:
+                    got += s.recv(4096)
+                time.sleep(1.5)
+                self.assertEqual(s.recv(4096), b"", "the idle connection is still open")
+            finally:
+                s.close()
+
+
+class FileRangeProxyTests(unittest.IsolatedAsyncioTestCase):
+    """The preview proxy in front of the file server, as tailscale serve reaches it."""
+
+    async def asyncSetUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name) / "share"
+        root.mkdir()
+        (root / "clip.mp4").write_bytes(CLIP)
+        self.share = FileShare(root)
+        self.proxy_server = await pv.start_proxy_server("127.0.0.1", 0, pv.Proxy(self.share.port, f"http://{TS_NAME}"))
+        self.pport = self.proxy_server.sockets[0].getsockname()[1]
+
+    async def asyncTearDown(self):
+        self.proxy_server.close()
+        await self.proxy_server.wait_closed()
+        self.share.close()
+        self.tmp.cleanup()
+
+    async def test_ranges_pass_the_proxy_on_one_connection(self):
+        r, w = await asyncio.open_connection("127.0.0.1", self.pport)
+        try:
+            got = []
+            for spec in (b"bytes=0-99", b"bytes=-100"):
+                w.write(b"GET /clip.mp4 HTTP/1.1\r\nHost: " + TS_NAME.encode() + b"\r\nRange: " + spec + b"\r\n\r\n")
+                await w.drain()
+                head = await asyncio.wait_for(pv.read_head(r), 5)
+                self.assertIsNotNone(head, "the connection ended after one answer")
+                start, headers = pv.split_head(head)
+                kind, n = pv.body_length(headers)
+                self.assertEqual(kind, "length")
+                got.append((start.split(b" ")[1], pv.header(headers, "content-range"), await r.readexactly(n)))
+            self.assertEqual(got, [(b"206", f"bytes 0-99/{len(CLIP)}".encode(), CLIP[:100]),
+                                   (b"206", f"bytes {len(CLIP) - 100}-{len(CLIP) - 1}/{len(CLIP)}".encode(), CLIP[-100:])])
+        finally:
+            w.close()
 
 
 if __name__ == "__main__":

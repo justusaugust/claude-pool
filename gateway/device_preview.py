@@ -24,7 +24,8 @@ LINUX_ONLY = 'preview runs its proxy as a systemd user unit; Linux only for now'
 # key as a query parameter), then `preview cua` on `cua viewer` with its cookie (both installed on the VPS), then the
 # one-link `preview cua` whose units were transient (systemd-run), so a reboot dropped every preview, then the first
 # release with persistent units (fell back to a fixed machine name when `tailscale status` failed), then the release whose
-# `preview list` asked systemctl once per unit.
+# `preview list` asked systemctl once per unit, then the release before previews that
+# start on demand and stop when idle, in which file shares still served HTML files as plain text.
 KNOWN_PREVIOUS = {'b3e645e7ba9750057b68c12f7dd518d19ff792a98062eeea857115b194358d94',
                   '89c880b1411939c7996239273e28aa51399a1dca1cd56e387754e82e235faabe',
                   '7894d83a893ab63cc07ec07244b910ae8fce1949b080ba355a3b08f6e3903efd',
@@ -33,7 +34,8 @@ KNOWN_PREVIOUS = {'b3e645e7ba9750057b68c12f7dd518d19ff792a98062eeea857115b194358
                   '27adcbcf4e189571c911730040e606e5a961a81debe3080d62bf9d8551b489aa',
                   'c4aaac57cf0bb23e4a64d91e2435d638d87bab1dfb66f14e2102a51a079198f5',
                   '8cba203c1f2566ec033d47dc39189c7dbf0643fc68fd619720f8a19c1bc4c0d0',
-                  '816678a1f5c50db711feac2a813d7e1cf3c409d0d20d290023040324ba97b79d'}
+                  '816678a1f5c50db711feac2a813d7e1cf3c409d0d20d290023040324ba97b79d',
+                  '7c4ee5eac82f3024e2d2840803ec7d622b45f2f473994df9bba74f69a41725de'}
 # Run on the device when `preview doctor` says previews would not come back after a reboot (made by an older release).
 RESTORE = 'preview restore'
 STOP_ALL = 'preview stop --all'
