@@ -89,12 +89,12 @@ class ServeBase(unittest.TestCase):
             return real(path, data)
         patcher = mock.patch.object(conductor, 'write_private', side_effect=record); patcher.start(); self.addCleanup(patcher.stop)
 
-    def serve(self, *runs, env=None):
+    def serve(self, *runs, env=None, own=None):
         self.stop.clear()
         spawner = Spawner(runs, self.stop, self.clock)
         with mock.patch.dict(os.environ, env or {}, clear=False):
             conductor.serve('/opt/claude', self.cwd, state=self.state, spawn=spawner, sleep=self.sleeps.append, stop=self.stop,
-                            clock=self.clock)
+                            clock=self.clock, own=own or self.root / 'no-settings.json')
         return spawner.children
 
 
@@ -107,6 +107,16 @@ class ServeTests(ServeBase):
         self.assertEqual(spawned.cwd, self.cwd)
         for key in SCRUBBED: self.assertNotIn(key, spawned.env)
         self.assertEqual(spawned.env['LANG'], 'C.UTF-8')
+
+    def test_serve_passes_the_conductor_settings_file_only_while_it_exists(self):
+        own = self.root / 'conductor-settings.json'
+        plain = self.serve(([b'Connected\r\n'], 0), own=own)[0]
+        self.assertNotIn('--settings', plain.argv)
+        own.write_text('{"model": "opus"}')
+        self.assertEqual(self.serve(([b'Connected\r\n'], 0), own=own)[0].argv, ['/opt/claude', *conductor.ARGV, '--settings', str(own)])
+        conductor._update(self.state, sessionId='cse_abc')
+        self.assertEqual(self.serve(([b'Single session\r\n'], 0), own=own)[0].argv,
+                         ['/opt/claude', 'remote-control', '--session-id', 'cse_abc', '--permission-mode', 'auto', '--settings', str(own)])
 
     def test_serve_restarts_with_backoff_and_reports_ready_only_after_the_ready_line(self):
         children = self.serve(([b'starting\r\n'], 1), ([b'starting\r\n'], 1), ([b'starting\r\n'], 1),
