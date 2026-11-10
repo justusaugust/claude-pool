@@ -200,7 +200,7 @@ class CuaCommandTests(unittest.TestCase):
         self.assertIn("preview stop 18500", err)
         self.assertNotIn("preview-cua-index.service", fake.active)
         fake = self.https()
-        self.main(["stop", "--all"], fake)
+        self.main(["stop", "--all", "--everyone"], fake)
         self.assertEqual(self.main(["18501"], fake)[0], 0)
         self.main(["cua"], fake)
         self.assertEqual(self.space_ports(), {VPS_DESKTOP["id"]: 18502, MAC["id"]: 18503})
@@ -240,7 +240,7 @@ class CuaCommandTests(unittest.TestCase):
                 self.assertIn(key, row)
 
     def test_stop_cua_and_stop_all_remove_the_index_and_every_space(self):
-        for argv in (["stop", "cua"], ["stop", "--all"]):
+        for argv in (["stop", "cua"], ["stop", "--all", "--everyone"]):
             with self.subTest(argv=argv):
                 fake = self.https()
                 self.main(["cua"], fake)
@@ -253,7 +253,7 @@ class CuaCommandTests(unittest.TestCase):
                 if argv[1] == "cua":
                     self.assertEqual(set(fake.serve), {5173})
                     self.assertEqual([e["port"] for e in pv.all_states()], [5173])
-                    self.main(["stop", "--all"], fake)
+                    self.main(["stop", "--all", "--everyone"], fake)
                 self.assertEqual((fake.active, fake.serve, pv.all_states()), ({}, {}, []))
         code, _, err = self.main(["stop", "cua"], self.https())
         self.assertEqual(code, 1)
