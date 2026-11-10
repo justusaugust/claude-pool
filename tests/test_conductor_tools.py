@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import os
+import re
 from pathlib import Path
 import signal
 import stat
@@ -871,6 +872,18 @@ class CliTests(ToolsBase):
         with mock.patch.object(launch.sys, 'argv', ['claude-pool', '--help']), contextlib.redirect_stdout(io.StringIO()) as out:
             launch.main()
         self.assertIn('conductor snapshot', out.getvalue())
+
+    def test_both_help_texts_name_every_conductor_command(self):
+        import devices_cli, launch
+        with mock.patch.object(launch.sys, 'argv', ['claude-pool', '--help']), contextlib.redirect_stdout(io.StringIO()) as out:
+            launch.main()
+        with contextlib.redirect_stdout(io.StringIO()) as real, self.assertRaises(SystemExit):
+            ct.cli(['--help'])
+        commands = real.getvalue().split('{', 1)[1].split('}', 1)[0].split(',')
+        self.assertIn('inbox', commands)
+        for text in (out.getvalue(), devices_cli.DEVICE_HELP):
+            listed = re.search(r'conductor (snapshot[a-z|]*)', text).group(1).split('|')
+            self.assertEqual(sorted(listed), sorted(commands))
 
     def test_cli_dispatch_runs_journal_snapshot_and_tell(self):
         import launch

@@ -23,9 +23,12 @@ RELEASE = 15 * 60       # seconds the brake must stay off in a row before backgr
 MAX_WAIT = 3 * 3600     # seconds a chain of waits (one session and class) lasts at most; then it goes and the journal records it
 CHAIN_GAP = 5 * 60      # seconds a chain stays open after its last wait ended without going (the client gave up and sends again)
 # $ per million tokens: input, output, cache read; a cache write costs 1.25 x input for five minutes, 2 x input for an hour
-# (API list prices, October 2026). Sonnet 5.5 cache reads cost 0.10 since 7 October (0.05 x input), Sonnet 5 stays at 0.20.
-PRICES = [('fable', (10, 50, .25)), ('mythos', (10, 50, .25)), ('opus-5-5', (4, 20, .2)), ('opus', (5, 25, .5)),
+# (API list prices, November 2026). Sonnet 5.5 cache reads cost 0.10 since 7 October (0.05 x input), Sonnet 5 stays at 0.20.
+# Fable 5.2 costs 8/40/0.20; earlier Fable models stay at 10/50/0.25. The first key found in the model name wins.
+PRICES = [('fable-5-2', (8, 40, .2)), ('fable', (10, 50, .25)), ('mythos', (10, 50, .25)), ('opus-5-5', (4, 20, .2)), ('opus', (5, 25, .5)),
           ('sonnet-5-5', (2, 10, .1)), ('sonnet-5', (2, 10, .2)), ('sonnet', (3, 15, .3)), ('haiku-5-5', (.1, .5, .01)), ('haiku', (1, 5, .1))]
+
+DEFAULT_PRICE = dict(PRICES)['opus-5-5']   # a model the table does not know
 
 
 def returns_at(account, now):
@@ -118,7 +121,7 @@ def tokens(usage, key):
 
 def usd(model, usage):
     """API-price equivalent; cache writes the usage does not split by TTL count as five-minute writes."""
-    price = next((p for key, p in PRICES if key in (model or '')), PRICES[2][1])
+    price = next((p for key, p in PRICES if key in (model or '')), DEFAULT_PRICE)
     written = usage.get('cache_creation')
     hour, five = tokens(written, 'ephemeral_1h_input_tokens'), tokens(written, 'ephemeral_5m_input_tokens')
     five += max(0, tokens(usage, 'cache_creation_input_tokens') - hour - five)
