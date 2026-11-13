@@ -3,8 +3,11 @@ import re
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+import conductor_alerts
 from conductor_alerts import Alerts, LINE
+from remote import Completed
 
 NOW = 1900000000
 H = 3600
@@ -113,3 +116,118 @@ class AlertTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+DAY = 86400
+
+
+class Journal:
+    def __init__(self): self.rows = []
+    def record(self, code, **details): self.rows.append((code, details))
+
+
+class SignInTests(unittest.TestCase):
+    """Sign-in alerts are one episode per account; a device that is not the Conductor's delivers every line to it."""
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.clock, self.server, self.journal = Clock(), FakeServer(), Journal()
+        self.sent, self.up = [], True
+        self.alerts = Alerts(self.root / 'conductor' / 'state' / 'wake.log', self.root / 'alerts.json', clock=self.clock,
+                             device=lambda: 'laptop', route=lambda: self.send, journal=self.journal)
+
+    def send(self, text, key):
+        if not self.up: return False
+        self.sent.append((text, key)); return True
+
+    def fail(self, *labels, status='reauthenticate'):
+        names = {l.lower(): status for l in labels}
+        self.server.last_accounts = [self.server.account(l, status=names.get(l.lower(), 'ready')) for l in ['Intern', 'Team', 'Gmail', 'Ops']]
+
+    def test_replay_one_account_fails_and_two_days_later_three_more_each_line_reaches_the_conductor(self):
+        self.fail('Intern'); self.alerts.check(self.server)
+        self.clock.now += 2 * DAY
+        self.fail('Intern', 'Team', 'Gmail', 'Ops'); self.alerts.check(self.server)
+        self.clock.now += 30; self.alerts.check(self.server)
+        texts = [t for t, _ in self.sent if ' pool anmeldung an conductor: ' in t]
+        self.assertEqual(len(texts), 4)
+        for text, label, name in zip(texts, ['Intern', 'Team', 'Gmail', 'Ops'], ['intern', 'team', 'gmail', 'ops']):
+            self.assertTrue(LINE.fullmatch(text), text)
+            for part in ['laptop', 'Konto ' + label, 'claude-pool login ' + name]: self.assertIn(part, text)
+        self.assertEqual(len({key for _, key in self.sent}), len(self.sent))
+
+    def test_each_account_has_its_own_quiet_window_and_its_own_end_line(self):
+        self.fail('Intern'); self.alerts.check(self.server)
+        self.clock.now += 600; self.fail('Intern', 'Team'); self.alerts.check(self.server)
+        self.assertEqual(sum(' pool anmeldung an conductor: ' in t for t, _ in self.sent), 2)
+        self.clock.now += 600; self.fail('Team'); self.alerts.check(self.server)
+        ends = [t for t, _ in self.sent if ' pool anmeldung vorbei: ' in t]
+        self.assertEqual(len(ends), 1); self.assertIn('Intern', ends[0]); self.assertIn('laptop', ends[0])
+
+    def test_a_failed_delivery_is_retried_while_the_alert_is_active_and_journaled(self):
+        self.up = False
+        self.fail('Intern'); self.alerts.check(self.server)
+        self.assertEqual(self.sent, [])
+        self.assertEqual([c for c, _ in self.journal.rows if c == 'alert_forward_failed'], ['alert_forward_failed'])
+        self.up = True
+        self.clock.now += 3600; self.alerts.check(self.server)
+        self.assertEqual(len(self.sent), 1)
+        self.clock.now += 3600; self.alerts.check(self.server)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_every_kind_is_delivered_with_the_device_name(self):
+        self.alerts.update('bremse', True, 'Bremse Stufe 2', 'Bremse unter Stufe 2')
+        (text, _), = self.sent
+        self.assertTrue(LINE.fullmatch(text)); self.assertIn('pool bremse an conductor: ', text); self.assertIn('laptop', text)
+        self.assertFalse((self.root / 'conductor').exists())
+
+    def test_the_journal_records_when_an_account_needs_sign_in_and_when_it_is_valid_again(self):
+        self.fail('Team'); self.alerts.check(self.server)
+        self.fail(); self.clock.now += 30; self.alerts.check(self.server)
+        self.assertEqual([r for r in self.journal.rows if r[0].startswith('account_')],
+                         [('account_needs_login', {'account': 'team'}), ('account_login_valid', {'account': 'team'})])
+
+    def test_nothing_is_delivered_without_a_route_and_the_line_goes_to_the_local_file_as_before(self):
+        (self.root / 'conductor' / 'state').mkdir(parents=True)
+        alerts = Alerts(self.root / 'conductor' / 'state' / 'wake.log', self.root / 'a2.json', clock=self.clock, route=lambda: None)
+        alerts.update('bremse', True, 'Bremse Stufe 2', 'Bremse unter Stufe 2')
+        self.assertEqual(self.sent, [])
+        self.assertEqual(len((self.root / 'conductor' / 'state' / 'wake.log').read_text().splitlines()), 1)
+
+
+class RouteTests(unittest.TestCase):
+    """The route is the Conductor's inbox over the registry's ssh target; it exists only on another device."""
+    def setUp(self):
+        self.calls, self.result = [], Completed(0, b'queued', b'')
+        outer = self
+        class Fake:
+            def __init__(self, target): self.target = target
+            def pool(self, *args, **kw): outer.calls.append((self.target, args, kw)); return outer.result
+        self.fake = Fake
+        self.value = {'devices': [{'name': 'laptop', 'ssh': 'me@laptop'}, {'name': 'vps', 'ssh': 'me@vps'}], 'accounts': [],
+                      'conductor': {'device': 'laptop'}}
+
+    def route(self, me='vps', value='default'):
+        value = self.value if value == 'default' else value
+        with patch('registry.load', return_value=value), patch('registry.self_name', return_value=me):
+            return conductor_alerts.conductor_route(remote=self.fake)()
+
+    def test_another_device_sends_through_the_conductors_inbox_with_a_bounded_timeout(self):
+        send = self.route()
+        self.assertTrue(send('line text', 'pool-anmeldung-x'))
+        (target, args, kw), = self.calls
+        self.assertEqual((target, args), ('me@laptop', ('conductor', 'inbox', 'add', '--key', 'pool-anmeldung-x', 'line text')))
+        self.assertLessEqual(kw['timeout'], 30)
+
+    def test_a_failed_or_crashing_transport_returns_false(self):
+        send = self.route(); self.result = Completed(255, b'', b'timed out')
+        self.assertFalse(send('t', 'k'))
+        self.fake.pool = lambda *a, **k: (_ for _ in ()).throw(ValueError('x'))
+        self.assertFalse(send('t', 'k'))
+
+    def test_the_conductor_device_itself_a_missing_conductor_or_registry_has_no_route(self):
+        self.assertIsNone(self.route(me='laptop'))
+        self.assertIsNone(self.route(value={**self.value, 'conductor': None}))
+        self.assertIsNone(self.route(me=None))
+        with patch('registry.load', side_effect=ValueError('x')), patch('registry.self_name', return_value='vps'):
+            self.assertIsNone(conductor_alerts.conductor_route(remote=self.fake)())
