@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'gateway'))
@@ -101,6 +102,13 @@ class WaitReasonGatewayTests(unittest.TestCase):
         self.assertEqual((code, answer['state']), (200, 'quota_wait'))
         self.assertTrue(answer['message'].startswith('Pool waits for quota · spent-b week limit reached until '), answer['message'])
         self.assertEqual([hold['label'] for hold in answer['holds']][:1], ['spent-b'])
+
+    def test_a_wait_text_that_cannot_be_written_leaves_the_wait_standing(self):
+        self.scenario()
+        with patch('bridge.wait_text', side_effect=OverflowError('timestamp out of range')):
+            code, body = self.call('/pool/capacity?model=claude-opus-5-5')
+        answer = json.loads(body)
+        self.assertEqual((code, answer['state'], answer.get('message')), (200, 'quota_wait', None))
 
     def test_a_ready_pool_sends_no_wait_text(self):
         code, body = self.call('/pool/capacity?model=claude-opus-5-5')
