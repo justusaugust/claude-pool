@@ -25,7 +25,7 @@ import short_label
 import memory
 import readings
 from native_auth import NativeAuthUnavailable
-from telemetry import fable_windows, capacity
+from telemetry import fable_windows, capacity, wait_text
 from private_files import atomic_write, link_replace
 
 from settings import LABELS, CONFIG
@@ -901,6 +901,7 @@ class Handler(BaseHTTPRequestHandler):
                     # Long polling uses no inference admission slot or model traffic.
                     self.server.monitor_stop.wait(delay)
                     state = capacity(self.server.accounts(since=time.monotonic()), model, int(time.time() * 1000))
+                if state['state'] == 'quota_wait': state['message'] = wait_text(state, model, state['checkedAt'])
                 self.answer(200, state)
             except (OSError, ValueError, RuntimeError, http.client.HTTPException):
                 self.answer(503, {'error': 'Quota availability could not be confirmed'})
