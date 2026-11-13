@@ -32,7 +32,7 @@ from validation import render as validation_view
 
 import running_release
 from settings import HERE, RUNTIME, STORES, LONG_LIVED, NATIVE_CLAUDE, CONFIG, BASE_URL, GATEWAY_PORT, BACKEND_PORT, backend_config, connection_ts, SHARED_READINGS, LONG_LIVED_PROBES, ALIASES, private_directory, CONDUCTOR_HOME
-from conductor_alerts import Alerts
+from conductor_alerts import Alerts, conductor_route
 ROOT = HERE.parent
 HEALTH_INTERVAL = 10
 INSTALLATION = service.receipt(ROOT)
@@ -217,7 +217,8 @@ def daemon(client, admin):
                     stop.wait(.25)
             raise RuntimeError("Shunt did not become ready")
         wait_ready(gateway)
-        alerts = Alerts(Path(CONDUCTOR_HOME).expanduser() / 'state' / 'wake.log', RUNTIME / 'conductor-alerts.json')
+        alerts = Alerts(Path(CONDUCTOR_HOME).expanduser() / 'state' / 'wake.log', RUNTIME / 'conductor-alerts.json',
+                        device=registry.self_name, route=conductor_route(), journal=server.journal)
         def supervise():
             nonlocal gateway
             delay, next_probe, next_sample, next_alert, next_prune = .5, time.monotonic(), time.monotonic() + 30, time.monotonic() + 30, time.monotonic() + 600

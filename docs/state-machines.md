@@ -261,9 +261,9 @@ Evidence for the cycle: the journal shows `account_unblocked` followed one to tw
 
 ## A8 Conductor alerts (explicit)
 
-**Location**: `update` `gateway/conductor_alerts.py:41-55`, `check` `gateway/conductor_alerts.py:57-85`, tick 30 s in the pool daemon `gateway/launch.py:241-244`. State `conductor-alerts.json` per kind (`active`, `announced`, `woke`), output to the Conductor wake log.
+**Location**: `update` `gateway/conductor_alerts.py:41-55`, `check` `gateway/conductor_alerts.py:57-85`, tick 30 s in the pool daemon `gateway/launch.py:241-244`. State `conductor-alerts.json` per kind, `anmeldung` per account (`active`, `announced`, `owed`, `woke`), output to the Conductor wake log, or to the Conductor device's inbox from another device.
 
-**States** per kind (`backend`, `konten-limit`, `anmeldung`, `gesperrt`, `bremse`): inactive; active and announced; active and silent.
+**States** per kind (`backend`, `konten-limit`, `anmeldung` per account, `gesperrt`, `bremse`): inactive; active and announced; active and silent.
 
 **Invariants**: I1 At most one wake per kind per hour (`QUIET`, `gateway/conductor_alerts.py:18`, `gateway/conductor_alerts.py:46`). I2 An announced state ends with exactly one `vorbei` line (`gateway/conductor_alerts.py:51-52`). I3 Every state that needs the Conductor is reported, in particular a pool without a usable account (`konten-limit`). I4 `vorbei` means the cause is gone.
 

@@ -168,6 +168,8 @@ claude-pool conductor journal add|show|prune  # append-only journal
 
 The Conductor service delivers queued tasks: every 20 s it prompts each idle or done agent with its oldest queued task and adds a `conductor-event delivered|orphaned|undeliverable <session>/<agent> <task>` line to the journal. While a `claude-pool conductor events` watcher runs, the watcher delivers instead and prints those lines. A task whose prompt fails three times is dropped as `undeliverable`; a task whose agent is gone is reported once as `orphaned`, delivered if the agent comes back, and dropped a day after it was queued. While herdr cannot list the agents, a task stays as it is.
 
+The pool also tells the Conductor when it needs it: backend down, no account able to answer, an account that needs a new login, an account Anthropic refuses and brake stage 2. A sign-in alert is one line per account, once, naming the device, the account and the command to run there (`claude-pool login <name>`), and one line when the account is valid again; each change also goes into the pool's diagnostics journal (`account_needs_login`, `account_login_valid`). On the Conductor device the lines go into the Conductor's `wake.log`. Every other device with a registry sends them to the Conductor device over ssh with `claude-pool conductor inbox add`, so that device needs no newer version. A line that could not be sent (`alert_forward_failed` in the journal) is retried every five minutes while the problem lasts.
+
 `snapshot --json` also carries what the Conductor Board shows at a glance, so the board never works these facts out itself:
 
 - `generatedAt`: when the snapshot was taken (ms).
