@@ -8,6 +8,7 @@ import signal
 import sys
 import tempfile
 import unittest
+import urllib.error
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'gateway'))
@@ -200,6 +201,60 @@ with os.fdopen(fd,'w') as f:json.dump({'claudeAiOauth':{'accessToken':'a','refre
         value = setup.tomllib.loads(setup.add_membership(text, 'operations'))
         self.assertEqual(value['providers']['other']['accounts'], [])
         self.assertEqual(value['providers']['anthropic']['accounts'], [{'name':'operations'}])
+
+    def answers(self,*replies):
+        """An opener for the identity request: an int replies with that HTTP error, anything else with that profile body."""
+        queue=list(replies)
+        class Reply:
+            def __init__(self,body):self.body=body
+            def __enter__(self):return self
+            def __exit__(self,*exc):return False
+            def read(self,n=-1):return json.dumps(self.body).encode()
+        class Opener:
+            def open(opener,request,timeout=None):
+                reply=queue.pop(0)
+                if isinstance(reply,int):raise urllib.error.HTTPError(request.full_url,reply,'fixture',{},None)
+                return Reply(reply)
+        return patch.object(setup.urllib.request,'build_opener',return_value=Opener())
+
+    def profile_body(self):
+        return {'account':{'uuid':'user-a','email':'operations@example.test'},'organization':{'uuid':'team-a','name':'Example Team','organization_type':'claude_team'}}
+
+    def new_login(self,token='fresh-access'):
+        def fake(binary,stores,name,label):
+            p=Path(stores)/(name+'.json')
+            p.write_text(json.dumps({'claudeAiOauth':{'accessToken':token,'refreshToken':'fresh-refresh'},'shuntAccountUuid':'user-a','shuntOrganizationUuid':'team-a'}));p.chmod(0o600)
+        return patch.object(setup,'login',side_effect=fake)
+
+    def test_rejected_saved_login_is_retired_and_replaced_by_a_new_browser_login(self):
+        saved=self.stored();old=saved.read_bytes()
+        with self.answers(401,self.profile_body()),self.new_login() as login:
+            code,out=self.run_cli()
+        self.assertEqual(code,0);login.assert_called_once()
+        self.assertIn('HTTP 401',out);self.assertIn('4/4',out)
+        self.assertIn('fresh-access',saved.read_text())
+        kept=list((self.stores/'.retired').glob('operations-*.json'))
+        self.assertEqual([k.read_bytes() for k in kept],[old])
+        self.assertEqual([r['name'] for r in json.loads(self.config.read_text())['accounts']],['operations'])
+
+    def test_a_second_401_right_after_a_fresh_login_is_an_error_without_a_loop(self):
+        self.stored()
+        with self.answers(401,401),self.new_login() as login:
+            with self.assertRaisesRegex(RuntimeError,'HTTP 401'):self.run_cli()
+        login.assert_called_once()
+        self.assertEqual(json.loads(self.config.read_text())['accounts'],[])
+
+    def test_other_identity_failures_keep_the_saved_login_and_never_open_the_browser(self):
+        saved=self.stored();old=saved.read_bytes()
+        with self.answers(500),self.new_login() as login:
+            with self.assertRaisesRegex(RuntimeError,'HTTP 500'):self.run_cli()
+        login.assert_not_called();self.assertEqual(saved.read_bytes(),old);self.assertFalse((self.stores/'.retired').exists())
+
+    def test_cancelled_new_login_keeps_the_rejected_one_in_retired_and_says_how_to_rerun(self):
+        old=self.stored().read_bytes()
+        with self.answers(401),patch.object(setup,'login',side_effect=RuntimeError('Authorization did not complete.')):
+            with self.assertRaisesRegex(RuntimeError,r'\.retired.*(rerun|again)'):self.run_cli()
+        self.assertEqual([k.read_bytes() for k in (self.stores/'.retired').glob('operations-*.json')],[old])
 
     def test_invalid_identity_and_credential_shapes_fail_cleanly(self):
         for data in ([], {'account':[], 'organization':{}}, {'account':{}, 'organization':None}):
