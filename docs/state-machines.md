@@ -38,7 +38,7 @@ Line numbers refer to `main` at 92bf795 (after #35). The repro tests named below
 | Shunt `available` | `backend/shunt.patch:254-265` | selection in Shunt | yes (`capped` excludes) |
 | `routing.eligible`, `open_quota` | `gateway/routing.py:96-103` | `choose`, agent account | yes (`reserve_blocked`) |
 | `routing.holds` (new in #35) | `gateway/routing.py:77-93` | shared by the three below | yes (hard reserve and Shunt `capped`) |
-| `telemetry.capacity` | `gateway/telemetry.py:61-73` | quota wait in gateway and client hook, alert `konten-limit` | yes since #35 (before: no, F1) |
+| `telemetry.capacity` | `gateway/telemetry.py:62-84` | quota wait in gateway and client hook, alert `konten-limit` | yes since #35 (before: no, F1) |
 | `brake.standstill` | `gateway/brake.py:49-55` | brake "no ready account" | yes |
 | `brake.returns_at` | `gateway/brake.py:30-36` | brake stage, next reset | yes since #35 (before: no, F2) |
 

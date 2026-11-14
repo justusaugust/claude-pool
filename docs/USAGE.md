@@ -72,7 +72,7 @@ Claude Code's labeler sends the agent's whole transcript (often 400–520k token
 
 Confirmed quota exhaustion is distinct from a missing reading, authentication failure or network outage. Confirmed weekly limits remain blocking until their known reset even if the utilization percentage is absent. Fable-only weekly limits do not block Opus.
 
-When every usable account is confirmed exhausted, the same model step may wait and continue when capacity returns. If exhaustion races with that preflight, a rejected streaming request can wait with SSE pings and resend identical bytes before model output begins. Cancellation releases it. The gateway never replays partial model output or completed tools; Native owns its normal error/retry flow.
+When every usable account is confirmed exhausted, the same model step may wait and continue when capacity returns. If exhaustion races with that preflight, a rejected streaming request can wait with SSE pings and resend identical bytes before model output begins. Cancellation releases it. The wait line names each held account, the limit that holds it and when it returns (`Team Fable week 47% (reserved from 40%) until Tue 10:00`), then how many accounts need sign-in or are paused. When only the Fable week holds, it adds `other models have quota (/model)`. The gateway never replays partial model output or completed tools; Native owns its normal error/retry flow.
 
 Background handoff and respawn keep Native conversation history and selected model/effort. Targeted respawn is an explicit restart of that worker. Continuation checks recorded state, avoids blindly repeating completed actions and stops at missing approvals. Unknown delivery is never automatically resent.
 

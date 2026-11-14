@@ -31,6 +31,10 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs): return None
 
 
+class Rejected(RuntimeError):
+    """The identity endpoint answered HTTP 401: the bearer in the saved login is dead."""
+
+
 def credential(path):
     value = read_private(path)
     kind(value)
@@ -54,7 +58,8 @@ def profile(path):
         if len(raw) > 262144: raise RuntimeError('Identity response exceeded its size limit')
         data = json.loads(raw)
     except urllib.error.HTTPError as error:
-        raise RuntimeError(f'Identity verification returned HTTP {error.code}. Login is saved; rerun this command to retry.') from None
+        raise (Rejected if error.code == 401 else RuntimeError)(
+            f'Identity verification returned HTTP {error.code}. Login is saved; rerun this command to retry.') from None
     except (OSError, ValueError):
         raise RuntimeError('Identity check unavailable. Login is saved; rerun this command to retry.') from None
     return identity(data, stored)
@@ -93,7 +98,8 @@ def long_lived_identity(value, stores, lookup):
         try: other = credential(path)
         except (OSError, ValueError, RuntimeError): continue
         if kind(other) == 'refreshable' and (other.get('shuntAccountUuid'), other.get('shuntOrganizationUuid')) == ids:
-            return profile(path)
+            try: return profile(path)
+            except Rejected: continue  # a dead local grant says nothing about the identity: ask the usage owner
     info = lookup(*ids)
     if info is None: raise RuntimeError(OWNER_NEEDED)
     if not isinstance(info, dict) or any(not isinstance(info.get(key), str) or not info[key] for key in IDENTITY_KEYS):
@@ -465,6 +471,19 @@ def register_local(entry, info):
     import settings
     paths, env = local_paths_env(settings.RUNTIME, settings.STORES)
     register(settings.CONFIG, settings.STORES, settings.HERE / 'bin/shunt', paths, entry, info, env)
+
+
+def renew_login(binary, stores, name, entry, email, error):
+    """The saved refreshable login was rejected (HTTP 401): move it into stores/.retired (never delete it), sign in through the
+    browser and verify the new login. A failed or cancelled sign-in leaves the old login in .retired."""
+    retired = Path(stores) / '.retired'
+    print(str(error).split('. ')[0] + '. Keeping the rejected login in ' + str(retired) + ' and opening browser authorization for a new one.', flush=True)
+    retire(stores, retired, name)  # the second folder never holds a store file: only the refreshable grant moves
+    try: login(binary, stores, name, entry['label'] + ' — ' + email)
+    except RuntimeError as failure:
+        raise RuntimeError(str(failure).rstrip('.') + '. The rejected login is kept in ' + str(retired) + '; rerun this command to sign in again.') from None
+    print('2/4 · Verifying the new login', flush=True)
+    return profile(Path(stores) / (name + '.json'))
 
 
 def readiness(overview, entry, name, email, long):
@@ -1118,13 +1137,22 @@ def run_cli(argv, *, config, stores, binary, runtime, backend_source=None, backe
                                      backend_source=backend_source, backend_env=backend_env, overview=overview,
                                      directory=directory, registry_path=registry_path, self_path=self_path, lookup=lookup)
         path = stores / (name + '.json')
-        print('1/4 · ' + ('Using saved login' if path.exists() else 'Opening browser authorization'), flush=True)
-        if not path.exists() and not path.is_symlink(): login(binary, stores, name, entry['label'] + ' — ' + email)
+        saved = path.exists()
+        print('1/4 · ' + ('Using saved login' if saved else 'Opening browser authorization'), flush=True)
+        if not saved and not path.is_symlink(): login(binary, stores, name, entry['label'] + ' — ' + email)
         print('2/4 · Verifying account and organization', flush=True)
-        info = profile(path); verify_expected(info, email, args.organization)
+        renewed = False
+        try: info = profile(path)
+        except Rejected as error:
+            if not saved: raise
+            info, renewed = renew_login(binary, stores, name, entry, email, error), True
+        verify_expected(info, email, args.organization)
         print(info['email'] + ' · ' + info['organization'] + ' · ' + info['plan'], flush=True)
         entry['plan'] = info['plan']
         print('3/4 · Registering account and shortcut', flush=True)
         paths, env = local_paths_env(runtime, stores, backend_source, backend_env)
         register(config, stores, binary, paths, entry, info, env)
-        return readiness(overview, entry, name, email, False)
+        code = readiness(overview, entry, name, email, False)
+        # The backend reads the store file on every request (no cache, no restart): the new login serves from the next one.
+        if renewed: print('The running pool reads the new login with its next request; no restart is needed. A leftover "reauthenticate" clears once that request succeeds.')
+        return code

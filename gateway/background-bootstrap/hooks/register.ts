@@ -49,7 +49,7 @@ async function connect($: EngineInterface, interactive: boolean): Promise<boolea
   return true
 }
 
-type Capacity = { state: 'ready' | 'quota_wait' | 'unavailable'; nextResetAt: number | null }
+type Capacity = { state: 'ready' | 'quota_wait' | 'unavailable'; nextResetAt: number | null; message?: string }
 type QuotaEngine = { fs: { read(path: string): Promise<string> }; http: Pick<EngineInterface['http'], 'fetch'>; ui: Pick<EngineInterface['ui'], 'status'> }
 
 async function capacity($: QuotaEngine, model: string, wait: boolean, signal: AbortSignal): Promise<Capacity | null> {
@@ -83,7 +83,8 @@ export async function waitForQuota($: QuotaEngine, model: string, signal: AbortS
   try {
     while (state?.state === 'quota_wait') {
       waited = true
-      await $.ui.status('Pool quota exhausted · automatically continues when capacity returns · Esc to cancel')
+      const reason = typeof state.message === 'string' && /^[^\u0000-\u001f\u007f]{1,400}$/.test(state.message) ? state.message : null
+      await $.ui.status(reason === null ? 'Pool quota exhausted · automatically continues when capacity returns · Esc to cancel' : reason + ' · automatically continues · Esc to cancel')
       state = await capacity($, model, true, signal)
     }
     signal.throwIfAborted()

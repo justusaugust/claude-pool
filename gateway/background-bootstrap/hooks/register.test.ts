@@ -126,6 +126,31 @@ describe('background pool bootstrap', () => {
     expect(status[0]).toContain('automatically continues')
     expect(status[status.length - 1]).toBeUndefined()
   })
+  test('the quota wait shows the account, limit and time the gateway reports', async () => {
+    const status: (string | undefined)[] = []
+    const later = 'Pool waits for quota · Solo 5h limit reached until 23:55'
+    const answers = [{ state: 'quota_wait', nextResetAt: null, message: later }, { state: 'ready', nextResetAt: null }]
+    const api: Parameters<typeof waitForQuota>[0] = {
+      fs: { read: async () => 'x'.repeat(48) },
+      ui: { status: async text => { status.push(text) } },
+      http: { fetch: async () => ({ ok: true, status: 200, headers: {}, text: JSON.stringify(answers.shift()) }) },
+    }
+    const first = 'Pool waits for Fable quota · Team Fable week 47% (reserved from 40%) until Tue 10:00 · other models have quota (/model)'
+    expect(await waitForQuota(api, 'claude-fable-5-2', new AbortController().signal, { state: 'quota_wait', nextResetAt: null, message: first })).toBe(true)
+    expect(status).toEqual([first + ' · automatically continues · Esc to cancel', later + ' · automatically continues · Esc to cancel', undefined])
+  })
+  test('a missing or unusable wait text keeps the plain message', async () => {
+    for (const message of [undefined, 42, '', 'x'.repeat(401), 'colour \u001b[31m', 'two\nlines']) {
+      const status: (string | undefined)[] = []
+      const api: Parameters<typeof waitForQuota>[0] = {
+        fs: { read: async () => 'x'.repeat(48) },
+        ui: { status: async text => { status.push(text) } },
+        http: { fetch: async () => ({ ok: true, status: 200, headers: {}, text: JSON.stringify({ state: 'ready', nextResetAt: null }) }) },
+      }
+      await waitForQuota(api, 'claude-opus-5-5', new AbortController().signal, { state: 'quota_wait', nextResetAt: null, message } as never)
+      expect(status[0]).toBe('Pool quota exhausted · automatically continues when capacity returns · Esc to cancel')
+    }
+  })
   test('future suites get local worker caps without a global gate', async ($, on) => {
     on('env.get', ($, e) => ({ value: e.name === 'SHELL' ? '/bin/zsh' : undefined }))
     on('process.run', ($, e) => ({ value: { exitCode: 0, stdout: JSON.stringify({ command: 'export CLAUDE_POOL_SUITE_LIMITS=2 CARGO_BUILD_JOBS=2\n' + e.init?.stdin }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
