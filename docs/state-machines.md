@@ -261,20 +261,21 @@ Evidence for the cycle: the journal shows `account_unblocked` followed one to tw
 
 ## A8 Conductor alerts (explicit)
 
-**Location**: `update` `gateway/conductor_alerts.py:41-55`, `check` `gateway/conductor_alerts.py:57-85`, tick 30 s in the pool daemon `gateway/launch.py:241-244`. State `conductor-alerts.json` per kind, `anmeldung` per account (`active`, `announced`, `owed`, `woke`), output to the Conductor wake log, or to the Conductor device's inbox from another device.
+**Location**: `update` `gateway/conductor_alerts.py:104-126`, `check` `gateway/conductor_alerts.py:141-167`, tick 30 s in the pool daemon `gateway/launch.py:241-244`. State `conductor-alerts.json` per kind, `anmeldung` per account (`active`, `announced`, `since`, `woke`, `tried`), output to the Conductor wake log; another device sends a start to the Conductor device's inbox and an end to its wake log (`conductor inbox note`).
 
 **States** per kind (`backend`, `konten-limit`, `anmeldung` per account, `gesperrt`, `bremse`): inactive; active and announced; active and silent.
 
-**Invariants**: I1 At most one wake per kind per hour (`QUIET`, `gateway/conductor_alerts.py:18`, `gateway/conductor_alerts.py:46`). I2 An announced state ends with exactly one `vorbei` line (`gateway/conductor_alerts.py:51-52`). I3 Every state that needs the Conductor is reported, in particular a pool without a usable account (`konten-limit`). I4 `vorbei` means the cause is gone.
+**Invariants**: I1 At most one wake per kind per hour (`QUIET`), for `bremse` per six hours (`BRAKE_QUIET`) and only after ten minutes at stage 2 (`BRAKE_HOLD`, `gateway/conductor_alerts.py:28-30`, `gateway/conductor_alerts.py:114`). I2 An announced state ends with exactly one `vorbei` line (`gateway/conductor_alerts.py:51-52`). I3 Every state that needs the Conductor is reported, in particular a pool without a usable account (`konten-limit`). I4 `vorbei` means the cause is gone. I5 A `vorbei` line never wakes, from any device.
 
 **Transition table**
 
 | State | Event | Condition | Next state | Location |
 |---|---|---|---|---|
-| inactive | check | active, last wake ≥ 1 h ago | active, announced, line `an conductor` | `gateway/conductor_alerts.py:45-49` |
-| inactive | check | active, last wake < 1 h ago | active, silent | `gateway/conductor_alerts.py:46` |
-| active, announced | check | no longer active | inactive, line `vorbei` | `gateway/conductor_alerts.py:50-53` |
-| active, silent | check | no longer active | inactive, no line | `gateway/conductor_alerts.py:50-53` |
+| inactive | check | active, lasted `hold`, last wake ≥ `quiet` ago | active, announced, line `an conductor` | `gateway/conductor_alerts.py:113-119` |
+| inactive | check | active, shorter than `hold` or last wake < `quiet` ago | active, silent | `gateway/conductor_alerts.py:113-119` |
+| active, silent | check | still active, lasted `hold`, last wake ≥ `quiet` ago | active, announced, line `an conductor` | `gateway/conductor_alerts.py:114-118` |
+| active, announced | check | no longer active | inactive, line `vorbei` | `gateway/conductor_alerts.py:120-123` |
+| active, silent | check | no longer active | inactive, no line | `gateway/conductor_alerts.py:120-123` |
 | `konten-limit` | check | `capacity(...)` ≠ `ready` | active | `gateway/conductor_alerts.py:63-70` |
 | `gesperrt` | check | `server.blocked` not empty | active | `gateway/conductor_alerts.py:74-81` |
 
@@ -284,7 +285,9 @@ Evidence for the cycle: the journal shows `account_unblocked` followed one to tw
 
 **F18 `gesperrt` ends and starts again on every probe; the same block wakes the Conductor every six hours.** Fixed in #55. Confirmed. `release_blocks` empties `blocked` for the probe (A3), `check` reads that as the end (`vorbei`), a minute later the first 403 blocks again, and since the last wake was 6 h ago it wakes again. I4 violated; I1 formally kept. Evidence: wake log pairs `vorbei` and `an` one minute apart, four times in one day, each followed by a Conductor wake with the same text. Repro: `KontoLage.test_F18_gesperrt_endet_und_beginnt_bei_jedem_neuen_versuch`.
 
-**F19 A state that began silently is never reported later, even if it lasts hours.** Possible. `gateway/conductor_alerts.py:46` decides `announced` only on the start edge.
+**F19 A state that began silently is never reported later, even if it lasts hours.** Fixed with F46: `update` decides on every reading, so a silent state is told when its quiet window ends.
+
+**F46 A brake that crosses stage 2 for minutes wakes the Conductor on every crossing, and from another device every `vorbei` wakes it too.** Confirmed; fixed. The forecast moves across the stage 2 line for 1 to 15 minutes at a time; each crossing more than an hour after the last was a wake, and another device sent the end through the inbox, which wakes. I5 violated. Evidence: three episodes of 1, 15 and 6 minutes on one morning gave six wakes; five episodes of 1 to 7 minutes on the Conductor device gave five. Repro: `BrakeFlutterTests` in `gateway/test_conductor_alerts.py`.
 
 **Risk**: high before #35, because F17 disabled the only alert for an empty pool. With G1 merged, the remaining work is the probe phase for `gesperrt` (G3).
 
@@ -592,7 +595,7 @@ Devices, install, cockpit (A12 to A19):
 | 9 | F42 | 1.5 GB of old releases, growing with each update | A12 | `ls`, `du` | open |
 | 10 | F37 | A device without a pool is only amber | A15 | `test_F37_*` | open |
 
-Possible, not confirmed: F6, F7, F12, F14, F15 (not fixed), F16, F19, F20, F21, F22, F39 (report only), F40, F41, F43, F44, F45.
+Possible, not confirmed: F6, F7, F12, F14, F15 (not fixed), F16, F20, F21, F22, F39 (report only), F40, F41, F43, F44, F45.
 
 ## Fix groups
 
