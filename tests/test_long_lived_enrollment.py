@@ -128,6 +128,28 @@ class LongLivedEnrollmentTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn('operations@example.test · Example Team · Team Premium', out)
 
+    def test_long_lived_enrollment_asks_the_usage_owner_when_the_local_grant_is_rejected(self):
+        staged = self.staged()
+        refreshable_file(self.stores, 'team-own', 'user-a', 'team-a')
+        lookup = Mock(return_value=self.info())
+        rejected = setup.urllib.error.HTTPError('https://example.test', 401, 'fixture', {}, None)
+        with patch.object(setup.urllib.request, 'build_opener') as opener:
+            opener.return_value.open.side_effect = rejected
+            code, out = self.run_cli('--long-lived', '--from-file', str(staged), lookup=lookup)
+        lookup.assert_called_once_with('user-a', 'team-a')
+        self.assertEqual(code, 0)
+
+    def test_long_lived_enrollment_still_fails_when_the_local_grant_answers_another_error(self):
+        staged = self.staged()
+        refreshable_file(self.stores, 'team-own', 'user-a', 'team-a')
+        lookup = Mock(return_value=self.info())
+        failure = setup.urllib.error.HTTPError('https://example.test', 500, 'fixture', {}, None)
+        with patch.object(setup.urllib.request, 'build_opener') as opener:
+            opener.return_value.open.side_effect = failure
+            with self.assertRaisesRegex(RuntimeError, 'HTTP 500'):
+                self.run_cli('--long-lived', '--from-file', str(staged), lookup=lookup)
+        lookup.assert_not_called()
+
     def test_long_lived_enrollment_asks_the_usage_owner_when_no_local_grant(self):
         staged = self.staged()
         lookup = Mock(return_value=self.info())

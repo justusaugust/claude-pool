@@ -50,6 +50,8 @@ Start with `claude-pool device check`; each problem has a `fix:` line. See [devi
 
 **`reauthenticate` on every device.** A long-lived token was revoked or expired. Run `claude-pool account add <email> --long-lived --replace --name <name>` on the device that first enrolled the account (it holds the old token and has a browser), then `claude-pool device sync`.
 
+**`reauthenticate` on one device.** A refreshable login saved there was rejected (HTTP 401). Run `claude-pool login <name>` on that device: it keeps the rejected login in the credential folder's `.retired`, opens the browser for a new one and registers it. The running pool uses it with its next request, no restart needed.
+
 **Usage readings are not fresh on a device.** Readings are pulled from the usage owner over SSH by the pool service, which cannot answer a password prompt. Make `ssh -o BatchMode=yes <owner> true` work from that device.
 
 **Services stop when I log out of a Linux device.** Linger is off. A root user runs `sudo loginctl enable-linger <user>` once; `device add` only prints it.
