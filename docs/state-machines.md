@@ -271,7 +271,7 @@ Evidence for the cycle: the journal shows `account_unblocked` followed one to tw
 
 | State | Event | Condition | Next state | Location |
 |---|---|---|---|---|
-| inactive | check | active, lasted `hold`, last wake ≥ `quiet` ago | active, announced, line `an conductor` | `gateway/conductor_alerts.py:113-119` |
+| inactive | check | active, lasted `hold`, last wake ≥ `quiet` ago | active, announced, line `an conductor` | `gateway/conductor_alerts.py:112-118` |
 | inactive | check | active, shorter than `hold` or last wake < `quiet` ago | active, silent | `gateway/conductor_alerts.py:113-119` |
 | active, silent | check | still active, lasted `hold`, last wake ≥ `quiet` ago | active, announced, line `an conductor` | `gateway/conductor_alerts.py:114-118` |
 | active, announced | check | no longer active | inactive, line `vorbei` | `gateway/conductor_alerts.py:120-123` |
