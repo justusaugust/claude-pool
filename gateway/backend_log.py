@@ -16,8 +16,9 @@ def open_log(path):
     return fd
 
 
-def spawn(command, env, path, popen=subprocess.Popen):
+def spawn(command, env, path, popen=None):
     """Start the backend with stderr in the log file; without a writable file it runs as before, with no log."""
+    popen = popen or subprocess.Popen   # looked up per call, so a test that replaces Popen never starts a real backend
     try: fd = open_log(path)
     except OSError: return popen(command, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try: return popen(command, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=fd)
