@@ -50,7 +50,7 @@ Start with `claude-pool device check`; each problem has a `fix:` line. See [devi
 
 **`reauthenticate` on every device.** A long-lived token was revoked or expired. Run `claude-pool account add <email> --long-lived --replace --name <name>` on the device that first enrolled the account (it holds the old token and has a browser), then `claude-pool device sync`.
 
-**`reauthenticate` on one device.** A refreshable login saved there was rejected (HTTP 401). Run `claude-pool login <name>` on that device: it keeps the rejected login in the credential folder's `.retired`, opens the browser for a new one and registers it. The running pool uses it with its next request, no restart needed.
+**`reauthenticate` on one device.** A refreshable login saved there was rejected (HTTP 401). Run `claude-pool login <name>` on that device: it keeps the rejected login in the credential folder's `.retired`, opens the browser for a new one and registers it. The running pool uses it with its next request, no restart needed. To see why the provider refused it, read `backend.log` in the pool's state folder (0600, at most 4 MB plus `backend.log.1`): the backend writes its warnings there, for example a refresh the provider answered with `invalid_grant` or a 401 after a refresh. The file holds no token and no request or response body.
 
 **Usage readings are not fresh on a device.** Readings are pulled from the usage owner over SSH by the pool service, which cannot answer a password prompt. Make `ssh -o BatchMode=yes <owner> true` work from that device.
 

@@ -33,6 +33,7 @@ from validation import render as validation_view
 
 import running_release
 from settings import HERE, RUNTIME, STORES, LONG_LIVED, NATIVE_CLAUDE, CONFIG, BASE_URL, GATEWAY_PORT, BACKEND_PORT, backend_config, connection_ts, SHARED_READINGS, LONG_LIVED_PROBES, ALIASES, private_directory, CONDUCTOR_HOME
+import backend_log
 from conductor_alerts import Alerts, conductor_route
 ROOT = HERE.parent
 HEALTH_INTERVAL = 10
@@ -168,7 +169,7 @@ def request(client, method="GET", path="/health", body=None):
 def backend_env(environ, client, admin):
     # Shunt also frees large request bodies on many threads; two arenas keep that memory reusable.
     return {'MALLOC_ARENA_MAX': '2', **environ, 'POOL_CLIENT_TOKENS': 'cockpit:' + client, 'POOL_ADMIN_TOKENS': 'cockpit:' + admin,
-            'SHUNT_CLAUDE_ACCOUNTS_DIR': str(STORES), 'RUST_LOG': 'error'}
+            'SHUNT_CLAUDE_ACCOUNTS_DIR': str(STORES), 'RUST_LOG': 'error,shunt=warn'}  # warnings say why a login was refused
 
 
 def daemon(client, admin):
@@ -184,8 +185,7 @@ def daemon(client, admin):
     if not binary.exists():
         raise RuntimeError("The packaged Shunt binary is missing")
     def start_backend():
-        process = subprocess.Popen([str(binary), "--config", str(cfg), "run"], env=env,
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        process = backend_log.spawn([str(binary), "--config", str(cfg), "run"], env, RUNTIME / 'backend.log')
         try:
             atomic_write(RUNTIME / "owner.json", json.dumps({"daemon": os.getpid(), "backend": process.pid, "managed": os.environ.get("POOL_MANAGED") == "1", "release": running_release.running()}))
         except OSError:
@@ -241,6 +241,7 @@ def daemon(client, admin):
                     # What ended sessions left in the agents' scratch folders (disk and the old /tmp place), after three quiet days.
                     try: scratch.prune([p for p in [scratch.agent_tmpdir({}), Path(tempfile.gettempdir())] if p], scratch.live_sessions(), time.time())
                     except OSError: pass
+                    backend_log.trim(RUNTIME / 'backend.log')
                     next_prune = now + 3600
                 if now >= next_alert:
                     # Backend down, no account left, a login needed or brake stage 2: one line in the Conductor's wake.log.
