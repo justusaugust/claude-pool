@@ -22,6 +22,7 @@ import tempfile
 from views import usage, history
 
 from bridge import PoolBridge, atomic_write
+import long_lived
 import memory
 import readings
 import registry
@@ -223,6 +224,7 @@ def daemon(client, admin):
             nonlocal gateway
             delay, next_probe, next_sample, next_alert, next_prune = .5, time.monotonic(), time.monotonic() + 30, time.monotonic() + 30, time.monotonic() + 600
             next_check, checking, next_window = time.monotonic() + SELF_CHECK_FIRST, None, time.monotonic()
+            next_expiry = time.monotonic() + 60
             while not stop.wait(.5):
                 now = time.monotonic()
                 if now >= next_window:
@@ -244,6 +246,12 @@ def daemon(client, admin):
                     # Backend down, no account left, a login needed or brake stage 2: one line in the Conductor's wake.log.
                     try: alerts.check(server)
                     except (OSError, RuntimeError, ValueError, KeyError, TypeError, http.client.HTTPException): pass
+                    if now >= next_expiry:
+                        # A long-lived token with a month or a week left: the Conductor hears it once per stage and account.
+                        try: alerts.expiry(long_lived.expiring(STORES, LONG_LIVED, int(time.time() * 1000)),
+                                           {r.get('name'): r.get('label') for r in server.last_accounts or []})
+                        except (OSError, RuntimeError, ValueError, KeyError, TypeError): pass
+                        next_expiry = now + 3600
                     # The brake hold samples with it, so its 15 minutes of calm count in real time, not only when a request comes.
                     try: server.brake_hold()
                     except (OSError, RuntimeError, ValueError, KeyError, TypeError, http.client.HTTPException): pass
