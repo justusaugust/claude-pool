@@ -6,7 +6,8 @@ wakes. Arts:
 backend (three failed probes, agents get 503), konten-limit (no account can answer), anmeldung (one account needs a new
 login: an episode, a line and a quiet window per account, naming this device and the `claude-pool login` to run there),
 gesperrt (Anthropic refuses an account, the pool paused it) and bremse (brake stage 2, which comes and goes with the forecast:
-it wakes only once it has lasted BRAKE_HOLD seconds, at most once in BRAKE_QUIET seconds). Nothing is written when the Conductor
+it wakes only once it has lasted BRAKE_HOLD seconds, at most once in BRAKE_QUIET seconds) and ablauf (a long-lived token
+runs out: one wake per account with 30 days left, one more with 7 days left). Nothing is written when the Conductor
 folder has no state directory.
 A device that is not the Conductor's delivers each start to the Conductor's inbox over ssh instead (`conductor_route`) and each
 end to its wake.log (`conductor inbox note`); an episode counts as announced only once delivered, a failed delivery is retried
@@ -22,12 +23,14 @@ import time
 import registry
 from private_files import read_private, write_private
 from remote import Remote
+from long_lived import FAIL_DAYS
 from telemetry import capacity
 
 LINE = re.compile(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d{4} pool [a-z-]+ (an conductor|vorbei): [^\n]{1,300}')
 QUIET = 3600            # seconds between two wakes of the same episode (art, or art and account)
 BRAKE_HOLD = 600        # seconds brake stage 2 must last before it wakes: the forecast crosses the line for minutes at a time
 BRAKE_QUIET = 6 * 3600  # seconds between two brake wakes: the cause (too few accounts carry the load) does not change within hours
+EXPIRY_QUIET = 86400    # seconds between two wakes for the same stage of one running-out token
 RETRY = 300             # seconds between two tries to deliver a line to the Conductor device
 SEND_TIMEOUT = 20
 SENTENCE = 300
@@ -137,6 +140,28 @@ class Alerts:
             self.update('anmeldung', active, 'Konto ' + label + ' braucht eine neue Anmeldung' + dev + ': claude-pool login ' + name
                         + (' dort ausführen' if me else ' ausführen'), 'Konto ' + label + dev + ' wieder angemeldet', key)
             if active != was: self._record('account_needs_login' if active else 'account_login_valid', account=name)
+
+    def expiry(self, rows, labels=None):
+        """Long-lived tokens that run out (`long_lived.expiring`): per account one wake when WARN_DAYS are left and one more
+        when FAIL_DAYS are left, and one routine line once the token is renewed."""
+        by_name, first, second = {r['name']: r for r in rows}, 'ablauf:frist:', 'ablauf:bald:'
+        known = {k.split(':', 2)[2] for k in self.state if k.startswith((first, second))}
+        for name in sorted({*by_name, *known}):
+            r, label = by_name.get(name), (labels or {}).get(name) or name
+            soon, start = bool(r) and r['days'] <= FAIL_DAYS, ''
+            if r:
+                left = int(r['days'])
+                when = ('ist abgelaufen' if r['days'] <= 0 else 'läuft am ' + time.strftime('%d.%m.%Y', time.localtime(r['expiresAt'] / 1000))
+                        + ' ab, noch ' + str(left) + (' Tag' if left == 1 else ' Tage'))
+                start = 'Konto ' + label + ': Jahres-Token ' + when + '. Auf der Anmeldeseite erneuern'
+            end = 'Konto ' + label + ': Jahres-Token erneuert'
+            if soon and not (self.state.get(first + name) or {}).get('active'):
+                # First seen with FAIL_DAYS or fewer left: the nearer stage speaks for both.
+                self.state[first + name] = {'active': True, 'announced': True, 'since': self.clock(), 'woke': self.clock()}
+            else: self.update('ablauf', bool(r), start, end, first + name, quiet=EXPIRY_QUIET)
+            if not soon and second + name in self.state:
+                self.state[second + name] = {**self.state[second + name], 'announced': False}   # the renewal is said once, by the first stage
+            self.update('ablauf', soon, start, end, second + name, quiet=EXPIRY_QUIET)
 
     def check(self, server):
         """Read the pool's own view: backend health, the last account sample and the brake stage."""
