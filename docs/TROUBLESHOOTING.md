@@ -20,6 +20,8 @@
 
 **The banner says API Usage Billing or connectors disappear.** Start with the explicit `claude-pool` launcher. It retains Native OAuth and removes conflicting API-key/auth-token/provider overrides in its child environment. Bare/safe modes disable required integration. Do not add a fake API key or copy tokens into shell configuration. Verify the intended Native account with `claude-native auth status`.
 
+**An account shows the plan of another account, or `account remove` says it is the Native login although it is not.** A sign-in for that name came back as a subscription that another name already serves. `account add` refuses such a sign-in and puts the old login back. A name that holds a second copy from an older version is removed with `claude-pool account remove <name>`: the subscription, its registry row and the Native login stay with the first name. The second login is kept in the `.retired` folder.
+
 **An artifact is not found after a switch.** Compare the Native login, not just the serving account in Cockpit. A changed Native login may lack access to the original owner's artifact. Restore the intended login deliberately or use its original owner session; inference routing cannot transfer it.
 
 **The Artifact or connector tool is missing entirely.** Check Native feature availability, organization policy and any environment settings that disable feature-flag evaluation or nonessential traffic. Tool discovery can also be asynchronous. Changing the inference account does not authorize a missing connector or override Native feature policy.

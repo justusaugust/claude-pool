@@ -196,6 +196,41 @@ class RemoveTests(unittest.TestCase):
                                                   registry.load(self.reg), self.stores))
         profile.assert_not_called()
 
+    def test_a_second_name_for_a_connected_subscription_goes_without_touching_the_first(self):
+        # Replay: `spare` ended up holding a login of the subscription that `team` serves, which is also the Native login.
+        refreshable_file(self.stores, 'spare', 'user-t', 'org-t')
+        team = [(self.stores / 'team.json').read_bytes(), (self.long_lived / 'team.json').read_bytes(), registry.account(registry.load(self.reg), 'team')]
+        code, out = self.remove('spare', native_identity=lambda: {'email': 'team@x.de', 'organization': 'Team B'})
+        self.assertEqual(code, 0)
+        self.assertEqual(self.members(), ['operations', 'team'])
+        self.assertEqual([row['name'] for row in json.loads(self.config.read_text())['accounts']], ['operations', 'team'])
+        self.assertEqual([(self.stores / 'team.json').read_bytes(), (self.long_lived / 'team.json').read_bytes(),
+                          registry.account(registry.load(self.reg), 'team')], team, 'the subscription stays connected as team, on every device')
+        self.assertEqual(len(list((self.stores / '.retired').glob('spare-*.json'))), 1)
+        self.assertNotIn('Other devices drop it', out)
+
+    def test_the_only_name_of_the_native_subscription_still_cannot_go(self):
+        registry.update(lambda value: value.update(accounts=[r for r in value['accounts'] if r['name'] != 'team']), self.reg)
+        refreshable_file(self.stores, 'spare', 'user-t', 'org-t')
+        (self.stores / 'team.json').unlink(); (self.long_lived / 'team.json').unlink()
+        info = {'email': 'team@x.de', 'organization': 'Team B', 'plan': 'Team', 'userId': 'user-t', 'organizationId': 'org-t'}
+        with patch.object(setup, 'profile', return_value=info), self.assertRaisesRegex(RuntimeError, 'Native login'):
+            self.remove('spare', native_identity=lambda: {'email': 'team@x.de', 'organization': 'Team B'})
+
+    def test_a_dead_login_goes_when_the_native_login_is_another_connected_account(self):
+        # Replay: a subscription that ended. Its login is rejected, so its identity cannot be asked any more.
+        dead = setup.Rejected('The saved login was rejected.')
+        with patch.object(setup, 'profile', side_effect=dead):
+            code, _ = self.remove('spare', native_identity=lambda: {'email': 'ops@x.de', 'organization': 'Team A'})
+        self.assertEqual((code, self.members()), (0, ['operations', 'team']))
+
+    def test_a_dead_login_stays_when_no_connected_account_is_the_native_login(self):
+        before = self.snapshot()
+        with patch.object(setup, 'profile', side_effect=setup.Rejected('The saved login was rejected.')):
+            for native in ({'email': 'spare@x.de', 'organization': 'Spare Org'}, {'email': 'ops@x.de', 'organization': ''}):
+                with self.assertRaisesRegex(RuntimeError, 'Could not check'): self.remove('spare', native_identity=lambda: native)
+        self.assertEqual(self.snapshot(), before)
+
     def test_remove_keeps_refreshable_grant_aside_and_deletes_long_lived_replica(self):
         original_bytes = (self.stores / 'operations.json').read_bytes()
         self.assertEqual(self.remove('operations')[0], 0)
