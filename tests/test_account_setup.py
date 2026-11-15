@@ -237,6 +237,22 @@ with os.fdopen(fd,'w') as f:json.dump({'claudeAiOauth':{'accessToken':'a','refre
         self.assertEqual([k.read_bytes() for k in kept],[old])
         self.assertEqual([r['name'] for r in json.loads(self.config.read_text())['accounts']],['operations'])
 
+    def test_a_login_keeps_the_accounts_reserve_and_other_settings(self):
+        # `claude-pool login <name>` on an account that is reserved: the config row was replaced by name, label and alias,
+        # so the reserve was gone and the account became a first choice.
+        row={'name':'operations','label':'Ops','alias':'ops','reserveAt':90,'reserveHours':[6,24],'reserveTimezone':'Europe/Berlin','reserveSoft':True}
+        self.config.write_text(json.dumps({'accounts':[row]}))
+        self.stored();plan=setup.identity(self.profile_body(),json.loads((self.stores/'operations.json').read_text()))['plan']
+        with self.answers(self.profile_body()):
+            code,_=self.run_cli()
+        self.assertEqual(code,0)
+        self.assertEqual(json.loads(self.config.read_text())['accounts'],[{**row,'plan':plan}])
+        self.stored()
+        with self.answers(401,self.profile_body()),self.new_login():
+            code,_=self.run_cli()
+        self.assertEqual(code,0)
+        self.assertEqual(json.loads(self.config.read_text())['accounts'],[{**row,'plan':plan}])
+
     def test_a_second_401_right_after_a_fresh_login_is_an_error_without_a_loop(self):
         self.stored()
         with self.answers(401,401),self.new_login() as login:

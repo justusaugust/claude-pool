@@ -261,7 +261,8 @@ def register(config, stores, binary, paths, entry, info, env):
         rows = value.setdefault('accounts', [])
         refuse_duplicate(rows, stores, entry['name'], info)
         old = next((r for r in rows if r['name'] == entry['name']), None)
-        if old: rows[rows.index(old)] = entry
+        # A login renews the credential, not the account: its reserve and every other setting of the row stay.
+        if old: rows[rows.index(old)] = {**old, **entry}
         else: rows.append(entry)
     apply_change(config, binary, paths, env, change, lambda text: add_membership(text, entry['name']),
                  rejected='Backend rejected enrollment; live membership is unchanged')
