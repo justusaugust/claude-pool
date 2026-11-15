@@ -926,6 +926,10 @@ def inbox_cli(args):
     if args.verb == 'add':
         print('queued for the Conductor' if conductor_inbox.add(' '.join(args.text), key=args.key) else 'already queued in the last ten minutes')
         return 0
+    if args.verb == 'note':
+        import conductor_alerts
+        taken = conductor_alerts.note(' '.join(args.text), Path(settings.CONDUCTOR_HOME).expanduser() / 'state' / 'wake.log')
+        print('noted, the Conductor is not woken' if taken else 'not a `pool <art> vorbei` line'); return 0 if taken else 2
     if args.verb == 'wait': return conductor_inbox.wait()
     if args.verb == 'install':
         entry = shutil.which('claude-pool') or str(Path.home() / '.local/bin/claude-pool')
@@ -966,6 +970,8 @@ def cli(argv):
     boxes = box.add_subparsers(dest='verb', required=True)
     put = boxes.add_parser('add', help='queue one event; the Conductor gets it at its next wake'); put.add_argument('text', nargs='+')
     put.add_argument('--key', help='the same key wakes only once in ten minutes')
+    quiet = boxes.add_parser('note', help="append the end line of a pool alert from another device to the Conductor's wake.log; does not wake")
+    quiet.add_argument('text', nargs='+')
     boxes.add_parser('wait', help="hook command in the Conductor's session (asyncRewake): delivers queued events and wakes it")
     state = boxes.add_parser('status'); state.add_argument('--json', action='store_true')
     boxes.add_parser('install', help="add the waiting hooks to the Conductor folder's .claude/settings.local.json")
