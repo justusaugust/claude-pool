@@ -101,6 +101,7 @@ class AlertTests(unittest.TestCase):
                                      self.server.account('Gmail', status='reauthenticate')]
         self.server.stage = {'stage': 2, 'ratio': .3, 'resetAt': (NOW + 2 * H) * 1000}
         self.clock.now += 30; self.alerts.check(self.server)
+        self.clock.now += conductor_alerts.BRAKE_HOLD; self.alerts.check(self.server)   # the brake tells only once it has lasted
         kinds = [re.match(r'\S+ pool (\S+) (an conductor|vorbei):', l).group(1, 2) for l in self.lines()]
         self.assertEqual(kinds, [('backend', 'an conductor'), ('backend', 'vorbei'), ('konten-limit', 'an conductor'),
                                  ('anmeldung', 'an conductor'), ('bremse', 'an conductor')])
@@ -136,7 +137,7 @@ class SignInTests(unittest.TestCase):
         self.alerts = Alerts(self.root / 'conductor' / 'state' / 'wake.log', self.root / 'alerts.json', clock=self.clock,
                              device=lambda: 'laptop', route=lambda: self.send, journal=self.journal)
 
-    def send(self, text, key):
+    def send(self, text, key, wake=True):
         if not self.up: return False
         self.sent.append((text, key)); return True
 
@@ -195,6 +196,81 @@ class SignInTests(unittest.TestCase):
         self.assertEqual(len((self.root / 'conductor' / 'state' / 'wake.log').read_text().splitlines()), 1)
 
 
+class BrakeFlutterTests(unittest.TestCase):
+    """Brake stage 2 that comes and goes within minutes: one wake when it lasts, none for a blip, and an end never wakes."""
+    START = 'Bremse Stufe 2'
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        (self.root / 'conductor' / 'state').mkdir(parents=True)
+        self.wake = self.root / 'conductor' / 'state' / 'wake.log'
+        self.clock, self.server, self.woke, self.routine = Clock(), FakeServer(), [], []
+
+    def alerts(self, remote):
+        def send(text, key, wake=True):
+            (self.woke if wake else self.routine).append(text); return True
+        return Alerts(self.wake, self.root / 'alerts.json', clock=self.clock, device=lambda: 'laptop',
+                      route=(lambda: send) if remote else (lambda: None))
+
+    def run_day(self, alerts, episodes, until, start=0):
+        """`episodes`: (start minute, minutes at stage 2). The daemon checks every 30 seconds from minute `start` to `until`."""
+        for tick in range(start * 2, until * 2 + 1):
+            minute = tick / 2
+            self.clock.now = NOW + tick * 30
+            on = any(start <= minute < start + length for start, length in episodes)
+            self.server.stage = {'stage': 2 if on else 1, 'ratio': .4, 'resetAt': (NOW + 5 * H) * 1000}
+            alerts.check(self.server)
+
+    def lines(self):
+        return [l.split(' pool ', 1)[1] for l in self.wake.read_text().splitlines()] if self.wake.exists() else []
+
+    def test_replay_three_short_episodes_on_another_device_wake_the_conductor_once(self):
+        # A morning as observed: stage 2 for 1, 15 and 6 minutes, hours apart. It used to send six lines, each one a wake.
+        self.run_day(self.alerts(remote=True), [(0, 1), (231, 15), (376, 6)], until=400)
+        self.assertEqual(len(self.woke), 1, self.woke)
+        self.assertIn('pool bremse an conductor: Gerät laptop: Bremse Stufe 2', self.woke[0])
+        self.assertEqual([t.split(' pool ', 1)[1] for t in self.routine], ['bremse vorbei: Gerät laptop: Bremse unter Stufe 2'])
+
+    def test_the_wake_comes_once_stage_two_has_lasted_ten_minutes(self):
+        alerts = self.alerts(remote=False)
+        self.run_day(alerts, [(0, 30)], until=9)
+        self.assertEqual(self.lines(), [])
+        self.run_day(alerts, [(0, 30)], until=11, start=9)
+        self.assertEqual(len(self.lines()), 1); self.assertIn('bremse an conductor: Bremse Stufe 2', self.lines()[0])
+
+    def test_replay_five_blips_on_the_conductors_device_write_nothing(self):
+        self.run_day(self.alerts(remote=False), [(0, 7), (159, 1), (275, 4), (335, 2), (582, 7)], until=600)
+        self.assertEqual(self.lines(), [])
+
+    def test_a_second_lasting_episode_within_six_hours_stays_quiet_and_a_later_one_wakes(self):
+        alerts = self.alerts(remote=False)
+        self.run_day(alerts, [(0, 20), (120, 20), (400, 20)], until=430)
+        self.assertEqual([l.split(':')[0] for l in self.lines()],
+                         ['bremse an conductor', 'bremse vorbei', 'bremse an conductor', 'bremse vorbei'])
+
+    def test_a_stage_two_that_began_in_the_quiet_window_and_still_lasts_wakes_when_the_window_ends(self):
+        alerts = self.alerts(remote=False)
+        self.run_day(alerts, [(0, 20), (120, 400)], until=368)   # the first wake was in minute 10, the window ends in minute 370
+        self.assertEqual(len(self.lines()), 2)
+        self.run_day(alerts, [(0, 20), (120, 400)], until=371, start=368)
+        self.assertEqual([l.split(':')[0] for l in self.lines()], ['bremse an conductor', 'bremse vorbei', 'bremse an conductor'])
+
+    def test_a_daemon_restart_keeps_counting_the_same_ten_minutes(self):
+        self.run_day(self.alerts(remote=False), [(0, 30)], until=6)
+        fresh = self.alerts(remote=False)
+        for tick in range(13, 23):
+            self.clock.now = NOW + tick * 30; fresh.check(self.server)
+        self.assertEqual(len(self.lines()), 1)
+
+    def test_other_kinds_still_wake_at_once(self):
+        alerts = self.alerts(remote=True)
+        alerts.update('backend', True, 'Backend gestört', 'Backend antwortet wieder')
+        self.assertEqual(len(self.woke), 1)
+        self.clock.now += 60; alerts.update('backend', False, 'Backend gestört', 'Backend antwortet wieder')
+        self.assertEqual((len(self.woke), len(self.routine)), (1, 1))
+
+
 class RouteTests(unittest.TestCase):
     """The route is the Conductor's inbox over the registry's ssh target; it exists only on another device."""
     def setUp(self):
@@ -219,6 +295,12 @@ class RouteTests(unittest.TestCase):
         self.assertEqual((target, args), ('me@laptop', ('conductor', 'inbox', 'add', '--key', 'pool-anmeldung-x', 'line text')))
         self.assertLessEqual(kw['timeout'], 30)
 
+    def test_an_end_line_goes_to_the_conductors_wake_log_and_not_through_the_inbox(self):
+        self.assertTrue(self.route()('2030-03-17T18:46:40+0100 pool bremse vorbei: Gerät vps: Bremse unter Stufe 2', 'pool-bremse-vorbei', wake=False))
+        (target, args, kw), = self.calls
+        self.assertEqual((target, args[:3]), ('me@laptop', ('conductor', 'inbox', 'note')))
+        self.assertNotIn('add', args); self.assertLessEqual(kw['timeout'], 30)
+
     def test_a_failed_or_crashing_transport_returns_false(self):
         send = self.route(); self.result = Completed(255, b'', b'timed out')
         self.assertFalse(send('t', 'k'))
@@ -231,3 +313,37 @@ class RouteTests(unittest.TestCase):
         self.assertIsNone(self.route(me=None))
         with patch('registry.load', side_effect=ValueError('x')), patch('registry.self_name', return_value='vps'):
             self.assertIsNone(conductor_alerts.conductor_route(remote=self.fake)())
+
+
+class NoteTests(unittest.TestCase):
+    """`conductor inbox note` is the receiving end for end lines of another device: one routine line in the wake.log, no inbox entry."""
+    END = '2030-03-17T18:46:40+0100 pool bremse vorbei: Gerät laptop: Bremse unter Stufe 2'
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name) / 'conductor'
+        (self.home / 'state').mkdir(parents=True)
+        self.wake = self.home / 'state' / 'wake.log'
+
+    def test_an_end_line_is_appended_with_private_mode(self):
+        self.assertTrue(conductor_alerts.note(self.END, self.wake))
+        self.assertEqual(self.wake.read_text(), self.END + '\n')
+        self.assertEqual(self.wake.stat().st_mode & 0o777, 0o600)
+
+    def test_a_start_line_or_other_text_is_refused_and_nothing_is_written(self):
+        for text in [self.END.replace(' vorbei: ', ' an conductor: '), 'board ergebnis x an conductor: y', self.END + ' x' * 200, '']:
+            self.assertFalse(conductor_alerts.note(text, self.wake), text)
+        self.assertFalse(self.wake.exists())
+
+    def test_without_a_conductor_folder_the_line_is_taken_and_dropped(self):
+        self.assertTrue(conductor_alerts.note(self.END, Path(self.tmp.name) / 'missing' / 'state' / 'wake.log'))
+        self.assertFalse((Path(self.tmp.name) / 'missing').exists())
+
+    def test_the_command_writes_the_line_and_queues_nothing(self):
+        import conductor_inbox, conductor_tools
+        with patch.object(conductor_tools.settings, 'CONDUCTOR_HOME', str(self.home)), \
+                patch.object(conductor_inbox, 'add', side_effect=AssertionError('an end must not reach the inbox')), \
+                patch('builtins.print'):
+            self.assertEqual(conductor_tools.cli(['inbox', 'note', *self.END.split()]), 0)
+            self.assertEqual(conductor_tools.cli(['inbox', 'note', 'pool', 'bremse', 'an', 'conductor:', 'x']), 2)
+        self.assertEqual(self.wake.read_text().splitlines(), [self.END])

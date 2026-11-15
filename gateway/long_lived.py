@@ -91,6 +91,25 @@ def switch_pending(stores, directory, value, self_name):
 WARN_DAYS, FAIL_DAYS = 30, 7
 
 
+def expiring(stores, directory, now_ms, within_days=WARN_DAYS):
+    """Long-lived tokens on this device with at most `within_days` left, one row per account name. The token the device
+    serves counts before a synced copy of the same name: that is the one whose end stops the account here."""
+    rows, seen = [], set()
+    for folder in (Path(stores), Path(directory)):
+        if not folder.is_dir(): continue
+        for path in sorted(folder.glob('*.json')):
+            name = path.stem
+            if name.startswith('.') or name in seen or path.is_symlink(): continue
+            try:
+                value = read_private(path)
+                if kind(value) != 'long-lived': continue
+            except (OSError, ValueError, RuntimeError): continue
+            seen.add(name)
+            left = days_left(value, now_ms)
+            if left is not None and left <= within_days: rows.append({'name': name, 'expiresAt': expires_at_ms(value), 'days': left})
+    return sorted(rows, key=lambda row: row['name'])
+
+
 def _finding(level, account, message, fix=None):
     return {'level': level, 'account': account, 'message': message, 'fix': fix}
 
