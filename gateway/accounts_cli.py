@@ -487,6 +487,17 @@ def renew_login(binary, stores, name, entry, email, error):
     return profile(Path(stores) / (name + '.json'))
 
 
+def put_back(stores, name, before):
+    """Undo a renewed sign-in that was refused: move the new login into stores/.retired and return the login that
+    `renew_login` moved there (the one file that was not in `before`). Leaves everything as it is when that is not one file."""
+    retired = Path(stores) / '.retired'
+    old = sorted(set(retired.glob(name + '-*.json')) - set(before))
+    if len(old) != 1: return
+    retire(stores, retired, name)
+    path = Path(stores) / (name + '.json')
+    if not path.exists() and not path.is_symlink(): os.replace(old[0], path)
+
+
 def readiness(overview, entry, name, email, long):
     print('4/4 · Checking the running pool', flush=True)
     if not overview:
@@ -700,13 +711,16 @@ def remove_account(name, wait, *, config, stores, binary, runtime, backend_sourc
     rows = load(config).get('accounts', [])
     row = next((r for r in rows if r['name'] == name), None)
     known = registry.load(registry_path)
-    entry = registry.account(known, name)
+    entry, twin = registry.account(known, name), None
     if entry is None:
         # This machine may hold the subscription under its own name; its registry row (enrolled elsewhere) is found by
         # UUIDs, so the removal reaches every device instead of coming back with the next sync.
         try: mine = _account_ids(stores, directory, name)
         except (OSError, ValueError, RuntimeError): mine = {}
-        if mine: entry = registry.entry_for(known, {'name': name, **mine})
+        # Unless another connected name holds the same subscription: then this name is a second copy, and the
+        # subscription, its registry row and the Native login it may be all stay with that name.
+        twin = next((r for r in rows if r['name'] != name and mine and _ids_or_none(stores, directory, r['name']) == mine), None)
+        if mine and twin is None: entry = registry.entry_for(known, {'name': name, **mine})
     files = [stores / (name + '.json'), directory / (name + '.json')]
     if row is None and entry is None and not any(p.exists() or p.is_symlink() for p in files):
         raise RuntimeError('No account named ' + name + ' is connected (see claude-pool account list)')
@@ -719,7 +733,9 @@ def remove_account(name, wait, *, config, stores, binary, runtime, backend_sourc
     with (stores / ('.' + name + '.add.lock')).open('a') as lock:
         try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError: raise RuntimeError('This account has a connection in progress; nothing was removed') from None
-        if matches_native(native_identity() if native_identity else None, name, {'accounts': [{**entry, 'name': name}] if entry else []}, stores):
+        native = native_identity() if native_identity and twin is None else None
+        if native and entry is None and _native_elsewhere(native, name, rows, known, stores, directory): native = None
+        if matches_native(native, name, {'accounts': [{**entry, 'name': name}] if entry else []}, stores):
             raise RuntimeError(label + ' is the Native login of this machine and must stay connected. '
                                'Sign Native in with another connected account first (claude-native auth login). Nothing was removed.')
         if overview:
@@ -902,6 +918,25 @@ def _rename_files(old, new, stores, directory, undo):
     for path in (s_old, l_old):
         if path.exists() or path.is_symlink(): raise RuntimeError(str(path) + ' is still there after the move')
     return lines, staged
+
+
+def _ids_or_none(stores, directory, name):
+    try: return _account_ids(stores, directory, name) or None
+    except (OSError, ValueError, RuntimeError): return None
+
+
+def _native_elsewhere(native, name, rows, known, stores, directory):
+    """Whether another connected account is the Native login beyond doubt: its registry row names the same email and the
+    same organization. Then `name` is not, and its own login need not be asked (a login that has ended cannot answer)."""
+    theirs = normalized(native.get('organization') or '')
+    if not theirs: return False
+    for row in rows:
+        if row['name'] == name: continue
+        mine = _ids_or_none(stores, directory, row['name'])
+        entry = registry.entry_for(known, {'name': row['name'], **mine}) if mine else registry.account(known, row['name'])
+        if (entry and entry.get('email') and normalized(entry['email']) == normalized(native['email'])
+                and normalized(entry.get('organization') or '') == theirs): return True
+    return False
 
 
 def _account_ids(stores, directory, name):
@@ -1146,13 +1181,20 @@ def run_cli(argv, *, config, stores, binary, runtime, backend_source=None, backe
         try: info = profile(path)
         except Rejected as error:
             if not saved: raise
+            before = set((stores / '.retired').glob(name + '-*.json'))
             info, renewed = renew_login(binary, stores, name, entry, email, error), True
-        verify_expected(info, email, args.organization)
-        print(info['email'] + ' · ' + info['organization'] + ' · ' + info['plan'], flush=True)
-        entry['plan'] = info['plan']
-        print('3/4 · Registering account and shortcut', flush=True)
-        paths, env = local_paths_env(runtime, stores, backend_source, backend_env)
-        register(config, stores, binary, paths, entry, info, env)
+        try:
+            verify_expected(info, email, args.organization)
+            print(info['email'] + ' · ' + info['organization'] + ' · ' + info['plan'], flush=True)
+            entry['plan'] = info['plan']
+            print('3/4 · Registering account and shortcut', flush=True)
+            paths, env = local_paths_env(runtime, stores, backend_source, backend_env)
+            register(config, stores, binary, paths, entry, info, env)
+        except RuntimeError:
+            # The new sign-in was for another account, or for a subscription another name already serves: this name
+            # gets its own login back, and the refused one is kept aside like every other login.
+            if renewed: put_back(stores, name, before)
+            raise
         code = readiness(overview, entry, name, email, False)
         # The backend reads the store file on every request (no cache, no restart): the new login serves from the next one.
         if renewed: print('The running pool reads the new login with its next request; no restart is needed. A leftover "reauthenticate" clears once that request succeeds.')

@@ -137,6 +137,35 @@ with os.fdopen(fd,'w') as f:json.dump({'claudeAiOauth':{'accessToken':'a','refre
             with self.assertRaisesRegex(RuntimeError,'Selected organization'):self.run_cli('--organization','Example Team')
         self.assertEqual(json.loads(self.config.read_text())['accounts'],[])
 
+    def renewed_as(self, user, org):
+        """The saved login of `operations` is rejected; the browser sign-in that follows comes back as another identity."""
+        self.stored('operations', 'user-old', 'team-old'); self.stored('team')
+        rows = [{'name': 'operations', 'label': 'Operations', 'reserveAt': 90}, {'name': 'team', 'label': 'Team'}]
+        self.config.write_text(json.dumps({'accounts': rows}))
+        old = (self.stores/'operations.json').read_bytes()
+        answers = [setup.Rejected('The saved login was rejected. Sign in again.'), {**self.info(), 'userId': user, 'organizationId': org}]
+        def profile(path):
+            answer = answers.pop(0)
+            if isinstance(answer, Exception): raise answer
+            return answer
+        return rows, old, patch.object(setup, 'profile', side_effect=profile), patch.object(setup, 'login', side_effect=lambda *a: self.stored('operations', user, org))
+
+    def test_a_renewed_login_that_is_another_connected_subscription_puts_the_old_login_back(self):
+        # Replay: an account whose plan had ended was signed in again; the browser came back as the team subscription.
+        rows, old, profile, login = self.renewed_as('user-a', 'team-a')
+        with profile, login, self.assertRaisesRegex(RuntimeError, 'already connected as Team'): self.run_cli()
+        self.assertEqual((self.stores/'operations.json').read_bytes(), old, 'the name holds its own login again, not a second copy of Team')
+        aside = [json.loads(p.read_text())['shuntAccountUuid'] for p in (self.stores/'.retired').glob('operations-*.json')]
+        self.assertEqual(aside, ['user-a'], 'the login that was refused is kept aside, never deleted')
+        self.assertEqual(json.loads(self.config.read_text())['accounts'], rows)
+
+    def test_a_renewed_login_for_another_address_puts_the_old_login_back(self):
+        rows, old, profile, login = self.renewed_as('user-x', 'team-x')
+        with patch.object(setup, 'verify_expected', side_effect=RuntimeError('Signed in as someone else. Nothing was enrolled.')):
+            with profile, login, self.assertRaisesRegex(RuntimeError, 'Signed in as'): self.run_cli()
+        self.assertEqual((self.stores/'operations.json').read_bytes(), old)
+        self.assertEqual(json.loads(self.config.read_text())['accounts'], rows)
+
     def test_duplicate_real_identity_does_not_create_more_capacity(self):
         self.stored();self.stored('existing')
         self.config.write_text(json.dumps({'accounts':[{'name':'existing','label':'Existing'}]}))
