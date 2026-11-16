@@ -88,6 +88,19 @@ class RoutingTests(unittest.TestCase):
         def broken(): raise OSError('pool did not answer')
         self.assertFalse(routing.wait_idle(broken, 'ops', False))
 
+    def test_a_wait_says_what_it_waits_for_once_per_change(self):
+        def broken(): raise OSError('timed out')
+        own = {'health': {'activeRequests': 1}, 'sessions': [{'busy': True, 'account': 'ops'}]}
+        loose = {'health': {'activeRequests': 2}, 'sessions': [{'busy': True, 'account': 'gmail'}]}
+        answers = iter([broken, lambda: own, lambda: own, lambda: loose, lambda: {'sessions': []}])
+        said = []
+        self.assertTrue(routing.wait_idle(lambda: next(answers)(), 'ops', True, sleep=lambda s: None, clock=lambda: 0, say=said.append))
+        self.assertEqual(said, ['the pool did not answer (OSError)', 'it is still serving a request (1 session)',
+                                '1 running request belongs to no main session and may be on it'])
+        said = []
+        self.assertFalse(routing.wait_idle(lambda: {'health': {'activeRequests': 3}, 'sessions': []}, None, False, say=said.append))
+        self.assertEqual(said, ['3 running requests'])
+
 
 class NativeStatusTests(unittest.TestCase):
     def test_parse_auth_status_reads_email_and_organization(self):
@@ -167,10 +180,30 @@ class RemoveTests(unittest.TestCase):
         overview = lambda: {'sessions': [{'busy': True, 'account': 'operations'}]}
         with patch.object(setup.routing, 'wait_idle', return_value=True) as wait:
             self.assertEqual(self.remove(overview=overview, wait=True)[0], 0)
-        wait.assert_called_once_with(overview, 'operations', True)
+        self.assertEqual(wait.call_args.args, (overview, 'operations', True))
         before = self.snapshot()
         with patch.object(setup.routing, 'wait_idle', return_value=False):
             with self.assertRaisesRegex(RuntimeError, 'still serving'): self.remove('spare', overview=overview, wait=True)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_a_wait_that_does_not_end_names_what_held_it(self):
+        # A removal waited 30 minutes on a pool with idle stretches and ended with "still serving a request (or the pool
+        # did not answer)": nothing said which of the two it was, or that requests of no session were counted.
+        loose = lambda: {'health': {'activeRequests': 1}, 'accounts': [], 'sessions': []}
+        before = self.snapshot()
+        with self.assertRaises(RuntimeError) as error: self.remove(overview=loose)
+        self.assertEqual(str(error.exception), 'Operations was not removed: 1 running request belongs to no main session and may '
+                         'be on it. Nothing was changed. Rerun with --wait to remove it once idle.')
+        def silent(): raise OSError('timed out')
+        def never(overview, account, wait, say=None):
+            for reason in ('the pool did not answer (OSError)', 'it is still serving a request (1 session)'): say(reason)
+            return False
+        lines = []
+        with patch.object(setup.routing, 'wait_idle', never), patch.object(setup, 'print', lambda *a, **k: lines.append(a[0]), create=True):
+            with self.assertRaises(RuntimeError) as error: self.remove(overview=silent, wait=True)
+        self.assertEqual(str(error.exception), 'Operations was not removed after 30 minutes: it is still serving a request (1 session). '
+                         'Nothing was changed. Rerun when it is idle.')
+        self.assertEqual(lines[1:], ['  the pool did not answer (OSError)', '  it is still serving a request (1 session)'])
         self.assertEqual(self.snapshot(), before)
 
     def test_remove_refuses_the_native_login_identity(self):
