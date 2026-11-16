@@ -22,6 +22,8 @@
 
 **An account shows the plan of another account, or `account remove` says it is the Native login although it is not.** A sign-in for that name came back as a subscription that another name already serves. `account add` refuses such a sign-in and puts the old login back. A name that holds a second copy from an older version is removed with `claude-pool account remove <name>`: the subscription, its registry row and the Native login stay with the first name. The second login is kept in the `.retired` folder.
 
+**`account remove --wait` or `account rename --wait` keeps waiting.** The lines under the waiting message say what holds it: a session of that account with a running request, running requests that belong to no main session (they may be on any account, so they hold every account), or a pool that did not answer. The final message repeats the last reason. Without `--wait` the command answers at once.
+
 **An artifact is not found after a switch.** Compare the Native login, not just the serving account in Cockpit. A changed Native login may lack access to the original owner's artifact. Restore the intended login deliberately or use its original owner session; inference routing cannot transfer it.
 
 **The Artifact or connector tool is missing entirely.** Check Native feature availability, organization policy and any environment settings that disable feature-flag evaluation or nonessential traffic. Tool discovery can also be asynchronous. Changing the inference account does not authorize a missing connector or override Native feature policy.

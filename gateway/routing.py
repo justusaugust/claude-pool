@@ -147,22 +147,38 @@ def session_rows(sessions, now):
     return sorted(rows, key=lambda r: (not r['busy'], -r['lastRequestAt']))
 
 
-def in_flight(overview, account=None):
-    """True while the pool serves a request: any request at all, or one that may be served by `account`.
+def held_by(overview, account=None):
+    """Why the pool (or `account`) does not count as idle, in words for the person who waits; None when it is idle.
     Only main requests with a session id become busy rows; a request the rows do not account for may be on any account."""
     active = (overview.get('health') or {}).get('activeRequests', 0)
     busy = [row for row in overview.get('sessions', []) if row.get('busy')]
-    if account is None: return active > 0 or bool(busy)
-    return any(row.get('account') == account for row in busy) or active > len(busy)
+    plural = lambda n, word: str(n) + ' ' + word + ('' if n == 1 else 's')
+    if account is None:
+        if busy: return plural(len(busy), 'session') + ' with a running request'
+        return plural(active, 'running request') if active > 0 else None
+    mine = sum(row.get('account') == account for row in busy)
+    if mine: return 'it is still serving a request (' + plural(mine, 'session') + ')'
+    loose = active - len(busy)
+    if loose > 0: return plural(loose, 'running request') + (' belongs' if loose == 1 else ' belong') + ' to no main session and may be on it'
+    return None
 
 
-def wait_idle(overview, account, wait, sleep=time.sleep, clock=time.monotonic, interval=5, limit=1800):
-    """True once nothing (or nothing on `account`) is in flight. Polls only with `wait`; an unreadable overview is never idle."""
-    deadline = clock() + limit if wait else None
+def in_flight(overview, account=None):
+    """True while the pool serves a request: any request at all, or one that may be served by `account`."""
+    return held_by(overview, account) is not None
+
+
+def wait_idle(overview, account, wait, sleep=time.sleep, clock=time.monotonic, interval=5, limit=1800, say=None):
+    """True once nothing (or nothing on `account`) is in flight. Polls only with `wait`; an unreadable overview is never idle.
+    `say` hears what holds the wait (held_by, or that the pool did not answer), once per change."""
+    deadline, last = clock() + limit if wait else None, None
     while True:
-        try:
-            if not in_flight(overview(), account): return True
-        except (OSError, ValueError, RuntimeError, AttributeError, TypeError): pass
+        try: reason = held_by(overview(), account)
+        except (OSError, ValueError, RuntimeError, AttributeError, TypeError) as error:
+            reason = 'the pool did not answer (' + type(error).__name__ + ')'
+        if reason is None: return True
+        if say and reason != last: say(reason)
+        last = reason
         if not wait or clock() >= deadline: return False
         sleep(interval)
 

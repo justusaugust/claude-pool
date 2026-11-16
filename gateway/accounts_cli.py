@@ -705,6 +705,20 @@ def matches_native(native, name, value, stores):
     return not theirs or not ours or theirs == ours
 
 
+def _held(wait):
+    """Hears what holds a wait for an idle account (routing.wait_idle): keeps the last reason and, while waiting, prints each."""
+    def say(reason):
+        say.last = reason
+        if wait: print('  ' + reason, flush=True)
+    say.last = None
+    return say
+
+
+def _not_idle(label, done, held, wait):
+    return (label + ' was not ' + done + (' after 30 minutes' if wait else '') + ': '
+            + (held.last or 'it is still serving a request (or the pool did not answer)') + '. Nothing was changed. ')
+
+
 def remove_account(name, wait, *, config, stores, binary, runtime, backend_source, backend_env, overview,
                    directory, registry_path, native_identity):
     if not re.fullmatch('[a-z0-9-]{1,80}', name): raise RuntimeError('Usage: claude-pool account remove <name> [--wait]')
@@ -740,9 +754,8 @@ def remove_account(name, wait, *, config, stores, binary, runtime, backend_sourc
                                'Sign Native in with another connected account first (claude-native auth login). Nothing was removed.')
         if overview:
             if wait: print('Waiting for ' + label + ' to finish its running requests…', flush=True)
-            if not routing.wait_idle(overview, name, wait):
-                raise RuntimeError(label + ' is still serving a request' + (' after 30 minutes' if wait else '')
-                                   + ' (or the pool did not answer); nothing was removed. '
+            if not routing.wait_idle(overview, name, wait, say=(held := _held(wait))):
+                raise RuntimeError(_not_idle(label, 'removed', held, wait)
                                    + ('Rerun when it is idle.' if wait else 'Rerun with --wait to remove it once idle.'))
         kept = any(p.exists() and stored_kind(p) != 'long-lived' for p in files)
         paths, env = local_paths_env(runtime, stores, backend_source, backend_env)
@@ -990,9 +1003,8 @@ def rename_account(old, new, wait, *, config, stores, binary, runtime, backend_s
         stopped = False
         if overview is not None:
             if wait: print('Waiting for ' + label + ' to finish its running requests…', flush=True)
-            if not routing.wait_idle(overview, old, wait):
-                raise RuntimeError(label + ' is still serving a request' + (' after 30 minutes' if wait else '')
-                                   + ' (or the pool did not answer); nothing was renamed. '
+            if not routing.wait_idle(overview, old, wait, say=(held := _held(wait))):
+                raise RuntimeError(_not_idle(label, 'renamed', held, wait)
                                    + ('Rerun when it is idle.' if wait else 'Rerun with --wait to rename it once idle.'))
             # The running pool takes the new name only through a restart, which would cut every other running request.
             if not routing.wait_idle(overview, None, wait):
