@@ -147,6 +147,15 @@ def session_rows(sessions, now):
     return sorted(rows, key=lambda r: (not r['busy'], -r['lastRequestAt']))
 
 
+def no_five_hour(account):
+    """This account has no five-hour limit to count: it has a week reading and no five-hour window, status or reset.
+    Claude sends every window an account has with each response, and since November 2026 the largest Max plan has only
+    weekly ones. A five-hour window that ran out reads the same until the next response; no five-hour limit holds then either.
+    An account without any reading says nothing yet."""
+    signal = (account.get('quotaLimits') or {}).get('fiveHour') or {}
+    return bool(account.get('sevenDay')) and not account.get('fiveHour') and not signal.get('status') and not signal.get('resetsAt')
+
+
 def held_by(overview, account=None):
     """Why the pool (or `account`) does not count as idle, in words for the person who waits; None when it is idle.
     Only main requests with a session id become busy rows; a request the rows do not account for may be on any account."""

@@ -30,7 +30,7 @@ VPS = {'name': 'vps', 'ssh': 'alex@vps', 'platform': 'linux', 'roles': ['usage']
 PI = {'name': 'pi', 'ssh': 'alex@pi', 'platform': 'linux', 'roles': [], 'addedAt': 3}
 MACHINE_KEYS = {'name', 'platform', 'self', 'reachable', 'poolRunning', 'versionMatches', 'light', 'code', 'reason', 'fix', 'checkedAt'}
 CODE = r'^(ok|unreachable|pool-stopped|version-mismatch|never-checked|not-checkable|(failed|missing|manual):[a-z-]+)$'
-ACCOUNT_KEYS = {'name', 'label', 'alias', 'registryName', 'fiveHourPct', 'weekPct', 'fableWeekPct', 'resetsAt', 'reserveAt',
+ACCOUNT_KEYS = {'name', 'label', 'alias', 'registryName', 'fiveHourPct', 'weekPct', 'fableWeekPct', 'noFiveHour', 'resetsAt', 'reserveAt',
                 'reserveHours', 'reserveTimezone', 'reserveSoft', 'reserveText', 'kind', 'expiresAt', 'status'}
 
 OVERVIEW = {
@@ -368,12 +368,12 @@ class AccountTests(BoardBase):
     def test_accounts_come_from_the_usage_overview(self):
         team, personal = self.snap()['accounts']
         self.assertEqual(team, {'name': 'team', 'label': 'AI Værk Team', 'alias': 'team', 'registryName': 'ai-vaerk-team-premium',
-                                'fiveHourPct': 42.4, 'weekPct': 61.0, 'fableWeekPct': 12.0,
+                                'fiveHourPct': 42.4, 'weekPct': 61.0, 'fableWeekPct': 12.0, 'noFiveHour': False,
                                 'resetsAt': {'fiveHour': 1_800_009_000_000, 'week': 1_800_400_000_000, 'fableWeek': None},
                                 'reserveAt': 85, 'reserveHours': None, 'reserveTimezone': None, 'reserveSoft': None,
                                 'reserveText': 'reserved from 85%', 'kind': 'long-lived', 'expiresAt': 1_830_000_000_000, 'status': 'ready', 'agents': 2})
         self.assertEqual(personal, {'name': 'personal', 'label': 'Personal', 'alias': 'p', 'registryName': None,
-                                    'fiveHourPct': 100.0, 'weekPct': None, 'fableWeekPct': None,
+                                    'fiveHourPct': 100.0, 'weekPct': None, 'fableWeekPct': None, 'noFiveHour': False,
                                     'resetsAt': {'fiveHour': 1_800_001_000_000, 'week': None, 'fableWeek': None},
                                     'reserveAt': None, 'reserveHours': None, 'reserveTimezone': None, 'reserveSoft': None,
                                     'reserveText': None, 'kind': 'refreshable', 'expiresAt': None, 'status': 'limited', 'agents': 1})

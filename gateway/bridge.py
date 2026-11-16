@@ -364,7 +364,7 @@ class PoolBridge(ThreadingHTTPServer):
                              "quotaLimits": {key: {"status": source.get("status_" + suffix), "resetsAt": source.get("reset_" + suffix) * 1000 if source.get("reset_" + suffix) else None}
                                              for key, suffix in [('fiveHour', '5h'), ('sevenDay', '7d'), ('fableWeekly', '7d_oi')]},
                              "fiveHour": window("5h"), "sevenDay": window("7d"), "fableWeekly": fable.get((provider['provider'], source['name'], source['account_ref'])), "status": status,
-                             "plan": source.get("plan"), "seenAt": (source.get("observed_at_5h") or 0) * 1000,
+                             "plan": source.get("plan"), "seenAt": (source.get("observed_at_5h") or source.get("observed_at_7d") or 0) * 1000,  # an account without a five-hour window is seen by its week
                              "paused": source.get("paused", False), "cooldownSeconds": source.get("cooldown_secs_remaining", 0) or 0,
                              "capped": bool(source.get("capped")), "cappedFable": bool(source.get("capped_fable"))})
         if self.shared_readings: readings.merge(rows, readings.load_shared(self.shared_readings), int(time.time() * 1000))

@@ -3,7 +3,7 @@ import textwrap
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from brake import describe
-from routing import reserve_text
+from routing import no_five_hour, reserve_text
 from telemetry import coverage_note
 from settings import OPTIONS
 
@@ -73,7 +73,7 @@ def usage(data, *, width=80, color=False):
         add(account['label'] + ' · ' + status + (' · ' + reserve if reserve else '') + (' · reading from ' + source if source else ''), '1;' + code)
         age = duration((now - account['seenAt']) / 1000) + ' ago' if account['seenAt'] else 'unknown'
         add((account.get('plan') or '') + ' · checked ' + age, '90')
-        quota('5h', account.get('fiveHour'))
+        quota('5h', account.get('fiveHour'), 'no limit' if no_five_hour(account) else 'not reported')
         quota('Week', account.get('sevenDay'))
         weekly = account.get('quotaLimits', {}).get('sevenDay', {})
         if weekly.get('status') == 'rejected':
@@ -126,7 +126,7 @@ def usage(data, *, width=80, color=False):
         add('Unmeasured accounts/windows excluded.', '90')
     note = coverage_note(data['accounts'])
     if note: add(note, '33')
-    if any(a['status'] == 'ready' and not a.get('fiveHour') for a in data['accounts']):
+    if any(a['status'] == 'ready' and not a.get('fiveHour') and not no_five_hour(a) for a in data['accounts']):
         add('5h readings missing; capacity may run out sooner.', '33')
     add('All-model windows only. Fable weekly is separate.', '90')
     add(f"Current quota to {forecast.get('threshold', 95):g}% used; pace can change.", '90')
