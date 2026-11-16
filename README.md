@@ -65,7 +65,7 @@ Plugins, skills and MCP tools still run in Native Claude. Their own authenticati
 
 ## Quota readings are observations
 
-Usage bars show **percent used**. “Not reported” means the provider did not supply a reading; it means neither zero usage nor unlimited capacity. Confirmed weekly rejections are tracked separately even when the percentage is absent. Fable's weekly window is never substituted for all-model weekly capacity. The forecast is an estimate at recent pace, excludes unmeasured capacity and labels missing coverage.
+Usage bars show **percent used**. “Not reported” means the provider did not supply a reading; it means neither zero usage nor unlimited capacity. “No limit” on the 5h row means the account has a week reading and no five-hour window: Claude sets no five-hour limit for it, as for the largest Max plan since November 2026. Confirmed weekly rejections are tracked separately even when the percentage is absent. Fable's weekly window is never substituted for all-model weekly capacity. The forecast is an estimate at recent pace, excludes unmeasured capacity and labels missing coverage.
 
 ## Development
 

@@ -5,7 +5,7 @@ import json
 import math
 from datetime import datetime
 
-from routing import held, holds
+from routing import held, holds, no_five_hour
 
 
 def fable_windows(admin):
@@ -24,7 +24,7 @@ def fable_windows(admin):
 def missing_windows(accounts):
     return [{'name': a.get('name'), 'label': a['label'], 'window': key}
             for a in accounts if a['status'] == 'ready'
-            for key in ['fiveHour', 'sevenDay'] if not a.get(key)]
+            for key in ['fiveHour', 'sevenDay'] if not a.get(key) and not (key == 'fiveHour' and no_five_hour(a))]
 
 
 def coverage_note(accounts):

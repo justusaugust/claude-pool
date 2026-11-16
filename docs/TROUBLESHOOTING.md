@@ -30,6 +30,8 @@
 
 **Weekly usage is not reported.** This is a provider observation gap. It is not 0% used or proof of unlimited capacity. A confirmed weekly rejection is recorded separately and blocks that account until reset. Fable weekly is a separate bucket.
 
+**The 5h row says “no limit”, or an account shows “checked unknown” and “week reading stale” although it serves requests.** Claude sends the largest Max plan only weekly windows since November 2026. An account with a week reading and no five-hour window has no five-hour limit: the status says so, the forecast counts the account with its week alone, and no warning about a missing five-hour reading appears. “Checked unknown” on such an account means the backend is older than this change and does not report when the week was read; run `claude-pool update`, then restart the pool.
+
 **The monitor keeps changing but observations are old.** The UI refreshes more often than the provider cache. Look at checked/observation age. Offline readings are marked stale and retried; a changing clock does not mean a new quota reading.
 
 **The pool is unavailable.** Run `claude-pool doctor`. The launcher can start its own launchd or systemd user service, so this is not a passive process-only diagnostic. Check port conflicts, configuration, backend build and private-file permissions. This alpha refuses a differing service definition rather than replacing it. Do not kill unrelated listeners or restart active Native tasks.

@@ -12,6 +12,7 @@ import time
 from contextlib import closing
 from pathlib import Path
 from forecast import estimate
+from routing import no_five_hour
 
 WINDOWS = ('fiveHour', 'sevenDay')
 FRESH = 600000
@@ -108,6 +109,11 @@ def seed(folder, evidence):
         archive(folder, list(accounts.values()), estimate(list(accounts.values()), observations, now), now, source='replay')
 
 
+def present(account):
+    """The windows this account has; one without a five-hour limit (routing.no_five_hour) is complete with its week."""
+    return [key for key in WINDOWS if not (key == 'fiveHour' and no_five_hour(account))]
+
+
 def evaluate(rows, origins=None):
     chosen = rows if origins is None else [r for r in rows if origins[0] <= r["at"] < origins[1]]
     targets, seen = defaultdict(dict), set()
@@ -174,7 +180,7 @@ def evaluate(rows, origins=None):
         if any(a['status'] not in ('ready', 'limited') or not 0 <= origin['at'] - a['seenAt'] <= FRESH for a in accounts.values()):
             outcomes['incomplete readings'] += 1; continue
         previous_at, outcome = origin['at'], 'pending'
-        available = [a['seenAt'] for a in accounts.values() if all(a.get(key) and a[key]['pct'] < forecast['threshold'] for key in WINDOWS)]
+        available = [a['seenAt'] for a in accounts.values() if all(a.get(key) and a[key]['pct'] < forecast['threshold'] for key in present(a))]
         if not available:
             outcomes['incomplete readings'] += 1; continue
         available_at = max(available)
@@ -189,10 +195,10 @@ def evaluate(rows, origins=None):
             if any(abs(actual[name][key]['resetsAt'] - a[key]['resetsAt']) > 1000 or a[key]['pct'] - actual[name][key]['pct'] >= 2
                    for name, a in accounts.items() for key in WINDOWS if a.get(key) and actual[name].get(key) and a[key].get('resetsAt') and actual[name][key].get('resetsAt')):
                 outcome = 'quota correction'; break
-            if any(not a.get(key) for a in actual.values() for key in WINDOWS):
+            if any(not a.get(key) for a in actual.values() for key in present(a)):
                 outcome = 'incomplete readings'; break
             # Availability means quota below the switching threshold, not a pause/cooldown.
-            if all(any(a[key]['pct'] >= forecast['threshold'] for key in WINDOWS) for a in actual.values()):
+            if all(any(a[key]['pct'] >= forecast['threshold'] for key in present(a)) for a in actual.values()):
                 low = max(0, (available_at - origin['at']) / 1000)
                 high = max(0, (max(a['seenAt'] for a in actual.values()) - origin['at']) / 1000)
                 error = max(low - forecast['seconds'], forecast['seconds'] - high, 0)
@@ -200,7 +206,7 @@ def evaluate(rows, origins=None):
                                   'actualSecondsInterval': [low, high], 'errorSeconds': error})
                 outcome = 'observed depletion'; break
             previous_at = future['at']
-            available_at = max(a['seenAt'] for a in actual.values() if all(a[key]['pct'] < forecast['threshold'] for key in WINDOWS))
+            available_at = max(a['seenAt'] for a in actual.values() if all(a[key]['pct'] < forecast['threshold'] for key in present(a)))
         outcomes[outcome] += 1
     groups = [{'source': g[0], 'account': g[1], 'window': g[2], 'hours': g[3], 'crossedReset': g[4], 'samples': len(v),
                'maePoints': sum(e[0] for e in v) / len(v), 'withoutResetMaePoints': sum(e[1] for e in v) / len(v),
@@ -221,8 +227,8 @@ def evaluate(rows, origins=None):
             if set(original) != set(actual): continue
             for name, a in actual.items():
                 if name in span['uncertain'] or original[name]['status'] not in ('ready', 'limited') or a['status'] not in ('ready', 'limited'): continue
-                if not 0 <= future['at'] - a['seenAt'] <= FRESH or any(not a.get(k) for k in WINDOWS): continue
-                observed = all(a[k]['pct'] < origin['forecast']['threshold'] for k in WINDOWS)
+                if not 0 <= future['at'] - a['seenAt'] <= FRESH or any(not a.get(k) for k in present(a)): continue
+                observed = all(a[k]['pct'] < origin['forecast']['threshold'] for k in present(a))
                 predicted = name in span['available']
                 crossed = any(original[name].get(k) and original[name][k].get('resetsAt') and origin['at'] < original[name][k]['resetsAt'] <= target for k in WINDOWS)
                 renewal_checks.append({'originAt': origin['at'], 'account': a['label'], 'hours': hours,

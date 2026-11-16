@@ -18,7 +18,7 @@ from private_files import read_private, write_private
 import readings
 import registry
 from remote import NO_LAUNCHER, OUTDATED, Remote
-from routing import reserve_text
+from routing import no_five_hour, reserve_text
 import settings
 
 CHECK_FILE = 'device-check-cache.json'   # 0600, in settings.RUNTIME: the last device check result per device
@@ -321,9 +321,10 @@ class Board:
                 account[pct] = round(number, 1) if number is not None else None
                 reset = window.get('resetsAt') if window else None
                 account['resetsAt'][short] = int(reset) if readings.number(reset) else None
+            account['noFiveHour'] = no_five_hour(row)  # no five-hour limit to show, not a missing reading
             if sessions is not None: account['agents'] = sum(1 for session in sessions if session.get('account') == name)
             out.append({key: account[key] for key in ('name', 'label', 'alias', 'registryName', 'fiveHourPct', 'weekPct', 'fableWeekPct',
-                                                       'resetsAt', 'reserveAt', 'reserveHours', 'reserveTimezone', 'reserveSoft', 'reserveText',
+                                                       'noFiveHour', 'resetsAt', 'reserveAt', 'reserveHours', 'reserveTimezone', 'reserveSoft', 'reserveText',
                                                        'kind', 'expiresAt', 'status', 'agents') if key in account})
         return out
 
