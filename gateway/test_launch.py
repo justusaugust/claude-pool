@@ -322,8 +322,9 @@ class CommandTests(unittest.TestCase):
             with patch.object(launch,'process_command',return_value='/unrelated/user/process'),patch.object(launch.os,'kill') as kill:
                 self.assertFalse(launch.recover_orphan());kill.assert_not_called()
 
-    def stop(self, alive_checks, clock_step=1.0):
-        """Run `claude-pool --stop` with closed ports; the daemon and Shunt pids answer `ps` for `alive_checks` polls."""
+    def stop(self, alive_checks, clock_step=1.0, draining=0):
+        """Run `claude-pool --stop` with a closed gateway port; the daemon and Shunt pids answer `ps` for `alive_checks` polls.
+        Shunt's port stays open for the first `draining` looks: the daemon still finishes running requests."""
         shunt = f"{launch.HERE / 'bin/shunt'} --config {{}}/shunt.toml run"
         polls, now = [], [0.0]
         def ps(pid):
@@ -335,9 +336,12 @@ class CommandTests(unittest.TestCase):
         def request(client, method='GET', path='/health', body=None):
             if method == 'POST': return b'{}'
             raise ConnectionRefusedError
+        looks = []
         class Closed:
             def __init__(self, *a, **k): pass
-            def connect(self): raise ConnectionRefusedError
+            def connect(self):
+                looks.append(1)
+                if len(looks) > draining: raise ConnectionRefusedError
             def close(self): pass
         with tempfile.TemporaryDirectory() as folder, patch.object(launch, 'RUNTIME', Path(folder)), \
              patch.object(launch, 'STORES', Path(folder) / 'stores'), patch.object(launch, 'NATIVE_CLAUDE', __file__), \
@@ -362,6 +366,23 @@ class CommandTests(unittest.TestCase):
         out, error, polls = self.stop(alive_checks=10 ** 6, clock_step=5.0)
         self.assertNotIn('Local pool stopped.', out)
         self.assertIn('has not exited', str(error))
+
+    def test_stop_waits_while_the_pool_finishes_running_requests(self):
+        # A restart line `--stop && --start` met running requests. `--stop` gave up after 40 seconds, so the
+        # start never ran; the pool finished the requests, exited and stayed stopped behind its maintenance marker.
+        out, error, _ = self.stop(alive_checks=0, clock_step=.25, draining=600)
+        self.assertIsNone(error)
+        self.assertEqual(out.splitlines()[-1], 'Local pool stopped.')
+        self.assertEqual(out.count('Waiting for running requests'), 1, 'it says once what it waits for')
+
+    def test_a_quick_stop_says_nothing_about_waiting(self):
+        out, error, _ = self.stop(alive_checks=0, clock_step=.25, draining=8)
+        self.assertEqual((out, error), ('Local pool stopped.\n', None))
+
+    def test_stop_that_outwaits_the_requests_says_what_state_it_leaves(self):
+        out, error, _ = self.stop(alive_checks=0, clock_step=5.0, draining=10 ** 6)
+        self.assertNotIn('Local pool stopped.', out)
+        for part in ('takes no new requests', 'stays stopped', 'claude-pool --start'): self.assertIn(part, str(error))
 
 class TokenTests(unittest.TestCase):
     def test_private_token_is_stable_and_symlinks_are_refused(self):

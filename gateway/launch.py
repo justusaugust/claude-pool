@@ -328,6 +328,8 @@ def recover_orphan():
 
 
 STOP_EXIT_WAIT = 30  # seconds `--stop` waits for the daemon and Shunt to exit once the ports are closed
+STOP_DRAIN_WAIT = 30 * 60  # seconds `--stop` waits for the requests the pool still serves; it takes no new ones meanwhile
+STOP_QUIET = 10  # seconds of that wait before `--stop` says what it waits for
 
 
 def pool_processes():
@@ -672,7 +674,10 @@ def main():
             try: request(client, "POST", "/pool/shutdown")
             except OSError:
                 print('Local pool already stopped.'); return
-            for _ in range(160):
+            # The stop cannot be taken back: the pool refuses new requests from here on and exits after the running ones.
+            # Giving up early would leave it stopped behind the marker, and a following `&& claude-pool --start` unrun.
+            began, told = time.monotonic(), False
+            while True:
                 try:
                     request(client)
                 except OSError:
@@ -690,8 +695,14 @@ def main():
                         return
                     finally:
                         conn.close()
+                waited = time.monotonic() - began
+                if waited >= STOP_DRAIN_WAIT:
+                    raise RuntimeError(f"The pool is still finishing running requests after {STOP_DRAIN_WAIT // 60} minutes. It takes no new "
+                                       "requests, stops when they end and then stays stopped until you run claude-pool --start")
+                if waited >= STOP_QUIET and not told:
+                    print("Waiting for running requests to finish; the pool takes no new requests meanwhile.", flush=True)
+                    told = True
                 time.sleep(.25)
-            raise RuntimeError("Pool is still draining; retry after the active turn finishes")
     ensure_pool(client)
     if args.start:
         print("Local pool started.")

@@ -4,6 +4,8 @@
 
 **An update is installed but the backend is still old.** This is deliberate: the updater never restarts the live service or reloads Native sessions. New commands use the selected release. Gateway/backend changes activate at the next service start; loaded Mods keep their old files until you choose to reload or start another session. Early alpha launchd definitions may need a deliberate reload after tasks finish.
 
+**`claude-pool --stop` waits, or a restart left the pool stopped.** A stop cannot be taken back: from its first moment the pool takes no new requests, and it exits when the running requests end. `--stop` waits for that for up to 30 minutes and says so after ten seconds, so `claude-pool --stop && claude-pool --start` starts the pool again as soon as they end. If the wait runs out or you interrupt it, the pool still stops when the requests end and then stays stopped: commands answer “Pool deliberately stopped”. Run `claude-pool --start`.
+
 **Linux: `systemctl --user` says it cannot connect.** The pool needs a user service manager. Log in through a login that starts one (SSH with pam_systemd does), check `echo $XDG_RUNTIME_DIR` is set, and for a server that should keep serving after logout ask a root user for `loginctl enable-linger <user>` once. The installer never changes this.
 
 **Installation finds an existing launcher or directory it does not own.** It stops before replacing it. Use a separate `--prefix` and `--bin-dir` for an isolated test, or deliberately resolve ownership first. The private development wrapper is not a managed public installation.
