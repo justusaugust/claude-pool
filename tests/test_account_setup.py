@@ -333,6 +333,14 @@ with os.fdopen(fd,'w') as f:json.dump({'claudeAiOauth':{'accessToken':'a','refre
             with self.assertRaisesRegex(RuntimeError, 'keeps serving its long-lived token'): self.sign_in()
         self.assertEqual(store.read_bytes(), copy.read_bytes())
 
+    def test_a_sign_in_for_another_account_keeps_serving_the_long_lived_token(self):
+        store, copy = self.fell_back()
+        other = {'account': {'uuid': 'user-x', 'email': 'someone@example.test'}, 'organization': {'uuid': 'team-x', 'name': 'Other', 'organization_type': 'claude_team'}}
+        with self.answers(other), self.new_login():
+            with self.assertRaises(RuntimeError): self.sign_in()
+        self.assertEqual(store.read_bytes(), copy.read_bytes())
+        self.assertEqual(['fresh-access' in k.read_text() for k in (self.stores/'.retired').glob('operations-*.json')], [True])
+
     def test_a_long_lived_store_that_is_not_a_copy_of_the_saved_token_is_never_replaced(self):
         from fakes import fixture_token, long_lived_file
         store, copy = self.fell_back(); before = store.read_bytes()

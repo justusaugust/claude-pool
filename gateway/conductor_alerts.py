@@ -31,6 +31,7 @@ QUIET = 3600            # seconds between two wakes of the same episode (art, or
 BRAKE_HOLD = 600        # seconds brake stage 2 must last before it wakes: the forecast crosses the line for minutes at a time
 BRAKE_QUIET = 6 * 3600  # seconds between two brake wakes: the cause (too few accounts carry the load) does not change within hours
 EXPIRY_QUIET = 86400    # seconds between two wakes for the same stage of one running-out token
+FALLBACK_HOLD = 1200    # seconds a login that can fall back to its long-lived token may stay marked before it is reported
 RETRY = 300             # seconds between two tries to deliver a line to the Conductor device
 SEND_TIMEOUT = 20
 SENTENCE = 300
@@ -78,8 +79,9 @@ def note(line, wake_log):
 
 
 class Alerts:
-    def __init__(self, wake_log, state_path, clock=time.time, device=None, route=None, journal=None):
+    def __init__(self, wake_log, state_path, clock=time.time, device=None, route=None, journal=None, fallback=None):
         self.wake_log, self.state_path, self.clock = Path(wake_log), Path(state_path), clock
+        self.fallback = fallback  # () -> (accounts that serve their long-lived token since the login ended, accounts that could)
         self.device, self.route, self.journal = device or (lambda: None), route or (lambda: None), journal
         try: self.state = read_private(self.state_path)
         except (OSError, RuntimeError, ValueError): self.state = {}
@@ -128,18 +130,33 @@ class Alerts:
         try: write_private(self.state_path, json.dumps(self.state, sort_keys=True))
         except (OSError, RuntimeError): pass
 
-    def sign_ins(self, rows):
-        """One episode per account: it starts when the account needs a new login on this device and ends when it is valid again."""
+    def sign_ins(self, rows, fallback=(), possible=()):
+        """One episode per account: it starts when the account needs a new login on this device and ends when it is valid again.
+        On the usage owner an ended login is replaced by the account's long-lived token (fallback.py). An account that
+        serves its token that way (`fallback`) gets one line of its own until someone signs in again; a login that can
+        still fall back (`possible`) is reported only when the fallback did not come within FALLBACK_HOLD."""
         me, now = self.device(), {}
         for r in rows: now['anmeldung:' + str(r.get('name') or r['label'])] = r
         self.state.pop('anmeldung', None)   # the one episode for all accounts of earlier versions
+        dev = (' auf Gerät ' + me) if me else ''
         for key in sorted({*now, *(k for k in self.state if k.startswith('anmeldung:'))}):
             r, name = now.get(key), key.split(':', 1)[1]
             label, was = (r or {}).get('label') or name, bool((self.state.get(key) or {}).get('active'))
-            active, dev = bool(r) and r.get('status') == 'reauthenticate', (' auf Gerät ' + me) if me else ''
+            # After the fallback the backend's mark stays until the account served a request; the fallback line tells that story.
+            active = bool(r) and r.get('status') == 'reauthenticate' and name not in fallback
+            end = ('Konto ' + label + dev + ' entfernt' if r is None else
+                   'Konto ' + label + ' läuft' + dev + ' mit dem Jahres-Token weiter' if name in fallback else
+                   'Konto ' + label + dev + ' wieder angemeldet')
             self.update('anmeldung', active, 'Konto ' + label + ' braucht eine neue Anmeldung' + dev + ': claude-pool login ' + name
-                        + (' dort ausführen' if me else ' ausführen'), 'Konto ' + label + dev + ' wieder angemeldet', key)
+                        + (' dort ausführen' if me else ' ausführen'), end, key, hold=FALLBACK_HOLD if name in possible else 0)
             if active != was: self._record('account_needs_login' if active else 'account_login_valid', account=name)
+        labels = {str(r.get('name')): r.get('label') for r in rows}
+        for key in sorted({*('rueckfall:' + name for name in fallback), *(k for k in self.state if k.startswith('rueckfall:'))}):
+            name = key.split(':', 1)[1]
+            label = labels.get(name) or name
+            self.update('rueckfall', name in fallback, 'Konto ' + label + ' läuft' + dev + ' mit dem Jahres-Token weiter, weil Claude die '
+                        'Anmeldung beendet hat. Für die Verbrauchszahlen neu anmelden, eilt nicht: claude-pool login ' + name
+                        + (' dort ausführen' if me else ' ausführen'), 'Konto ' + label + dev + ' wieder angemeldet', key)
 
     def expiry(self, rows, labels=None):
         """Long-lived tokens that run out (`long_lived.expiring`): per account one wake when WARN_DAYS are left and one more
@@ -177,7 +194,9 @@ class Alerts:
             self.update('konten-limit', quota['state'] != 'ready',
                         waiting if quota['state'] == 'quota_wait' else 'Kein Konto verfügbar: pausiert oder Anmeldung nötig',
                         (', '.join(free) + ' wieder frei') if free else 'Konten wieder frei')
-            self.sign_ins(rows)
+            try: served, could = self.fallback() if self.fallback else ((), ())
+            except (OSError, RuntimeError, ValueError, KeyError, TypeError): served, could = (), ()
+            self.sign_ins(rows, served, could)
             blocked = dict(getattr(server, 'blocked', None) or {})
             if blocked:
                 name, row = min(blocked.items(), key=lambda item: item[1]['until'])

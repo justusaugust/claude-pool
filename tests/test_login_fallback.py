@@ -173,10 +173,28 @@ class AlertTests(unittest.TestCase):
         self.clock.now += 600
         self.alerts.sign_ins(marked, possible=['ops'])
         self.assertEqual(self.lines(), [])
-        self.clock.now += 300
+        self.clock.now += 700
         self.alerts.sign_ins(marked, possible=['ops'])
         self.assertEqual(len(self.lines()), 1)
         self.assertIn('pool anmeldung an conductor: Konto Ops braucht eine neue Anmeldung auf Gerät owner', self.lines()[0])
+
+    def test_the_regular_check_reads_the_fallback_state_it_was_given(self):
+        class Server:
+            health, last_accounts, blocked = {'failures': 0}, [row('ops')], {}
+            def brake_info(self): return {}
+        alerts = Alerts(self.wake, Path(self.tmp.name) / 'other.json', clock=self.clock, device=lambda: 'owner', fallback=lambda: (['ops'], []))
+        alerts.check(Server())
+        self.assertEqual([l.split(':')[0] for l in self.lines()], ['pool rueckfall an conductor'])
+
+    def test_the_mark_that_outlives_the_fallback_is_not_reported_as_a_missing_sign_in(self):
+        # The backend keeps "needs sign-in" until the account served a request with its token.
+        marked = [row('ops', 'reauthenticate')]
+        self.alerts.sign_ins(marked, possible=['ops'])
+        self.clock.now += 900
+        self.alerts.sign_ins(marked, fallback=['ops'])
+        self.clock.now += 3600
+        self.alerts.sign_ins(marked, fallback=['ops'])
+        self.assertEqual([l.split(':')[0] for l in self.lines()], ['pool rueckfall an conductor'])
 
     def test_a_login_without_a_fallback_is_reported_at_once_as_before(self):
         self.alerts.sign_ins([row('ops', 'reauthenticate')])

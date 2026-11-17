@@ -487,6 +487,25 @@ def renew_login(binary, stores, name, entry, email, error):
     return profile(Path(stores) / (name + '.json'))
 
 
+def fell_back_copy(store, copy, registry_path=None, self_path=None):
+    """The bytes of the long-lived token the usage owner serves for an account whose login ended, when the store file is
+    only a copy of the token in the long-lived folder. None on every other device and for every other store file."""
+    try:
+        owner = registry.owner(registry.load(registry_path))
+        if owner is None or owner['name'] != registry.self_name(self_path): return None
+        if store.is_symlink() or copy.is_symlink() or stored_kind(store) != 'long-lived' or stored_kind(copy) != 'long-lived': return None
+        if fingerprint(credential(store)) != fingerprint(credential(copy)): return None
+        return copy.read_bytes()
+    except (OSError, ValueError, RuntimeError): return None
+
+
+def keep_serving(stores, store, name, token):
+    """A sign-in over a fallback did not give this account a login: whatever it left moves into stores/.retired and the
+    copy of the long-lived token serves again."""
+    if store.exists() or store.is_symlink(): retire(stores, Path(stores) / '.retired', name)
+    write_private(store, token)
+
+
 def put_back(stores, name, before):
     """Undo a renewed sign-in that was refused: move the new login into stores/.retired and return the login that
     `renew_login` moved there (the one file that was not in `before`). Leaves everything as it is when that is not one file."""
@@ -1185,27 +1204,44 @@ def run_cli(argv, *, config, stores, binary, runtime, backend_source=None, backe
                                      backend_source=backend_source, backend_env=backend_env, overview=overview,
                                      directory=directory, registry_path=registry_path, self_path=self_path, lookup=lookup)
         path = stores / (name + '.json')
+        token = fell_back_copy(path, directory / (name + '.json'), registry_path, self_path)
+        if token is not None:
+            # The usage owner serves this account from its long-lived token since its login ended (fallback.py). The store
+            # holds only a copy of that token, so the new login takes its place; a sign-in that fails puts the copy back.
+            print(entry['label'] + ' serves its long-lived token since its login ended; signing in again.', flush=True)
+            path.unlink()
         saved = path.exists()
         print('1/4 · ' + ('Using saved login' if saved else 'Opening browser authorization'), flush=True)
-        if not saved and not path.is_symlink(): login(binary, stores, name, entry['label'] + ' — ' + email)
+        if not saved and not path.is_symlink():
+            try: login(binary, stores, name, entry['label'] + ' — ' + email)
+            except BaseException as failure:
+                if token is None: raise
+                keep_serving(stores, path, name, token)
+                if not isinstance(failure, RuntimeError): raise
+                raise RuntimeError(str(failure).rstrip('.') + '. ' + entry['label'] + ' keeps serving its long-lived token; rerun this command to sign in again.') from None
         print('2/4 · Verifying account and organization', flush=True)
         renewed = False
-        try: info = profile(path)
-        except Rejected as error:
-            if not saved: raise
-            before = set((stores / '.retired').glob(name + '-*.json'))
-            info, renewed = renew_login(binary, stores, name, entry, email, error), True
         try:
-            verify_expected(info, email, args.organization)
-            print(info['email'] + ' · ' + info['organization'] + ' · ' + info['plan'], flush=True)
-            entry['plan'] = info['plan']
-            print('3/4 · Registering account and shortcut', flush=True)
-            paths, env = local_paths_env(runtime, stores, backend_source, backend_env)
-            register(config, stores, binary, paths, entry, info, env)
+            try: info = profile(path)
+            except Rejected as error:
+                if not saved: raise
+                before = set((stores / '.retired').glob(name + '-*.json'))
+                info, renewed = renew_login(binary, stores, name, entry, email, error), True
+            try:
+                verify_expected(info, email, args.organization)
+                print(info['email'] + ' · ' + info['organization'] + ' · ' + info['plan'], flush=True)
+                entry['plan'] = info['plan']
+                print('3/4 · Registering account and shortcut', flush=True)
+                paths, env = local_paths_env(runtime, stores, backend_source, backend_env)
+                register(config, stores, binary, paths, entry, info, env)
+            except RuntimeError:
+                # The new sign-in was for another account, or for a subscription another name already serves: this name
+                # gets its own login back, and the refused one is kept aside like every other login.
+                if renewed: put_back(stores, name, before)
+                raise
         except RuntimeError:
-            # The new sign-in was for another account, or for a subscription another name already serves: this name
-            # gets its own login back, and the refused one is kept aside like every other login.
-            if renewed: put_back(stores, name, before)
+            # The same after a fallback: a sign-in that was not verified and registered never serves under this name.
+            if token is not None: keep_serving(stores, path, name, token)
             raise
         code = readiness(overview, entry, name, email, False)
         # The backend reads the store file on every request (no cache, no restart): the new login serves from the next one.

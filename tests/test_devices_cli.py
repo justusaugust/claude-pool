@@ -1644,10 +1644,10 @@ class FixRoundCheckTests(OrchestrationBase):
         # The owner's login for the account ended and it serves the long-lived token: the account still works, only its
         # usage readings are missing until someone signs in on the owner again.
         self.vps.shared_accounts = []
-        self.local.accounts = {'team': {'kind': 'long-lived', 'fingerprint': self.team_fp}}
+        self.local.accounts, self.local.refreshable = {'team': {'kind': 'long-lived', 'fingerprint': self.team_fp}}, set()
         code, out, _ = self.cli('check', 'vps')
-        self.assertRegex(out, r'\n  manual +readings +mac serves team from its long-lived token since its login ended; '
-                              r'its usage is read only while it is used.*\n      fix: .*account add team@x\.de --name team')
+        self.assertRegex(out, r'\n  manual +readings +mac serves team from the long-lived token since the login ended; '
+                              r'usage is read only while the account is used.*\n      fix: .*account add team@x\.de --name team')
         self.assertNotRegex(out, r'failed +readings')
 
     def test_a_daemon_on_an_older_program_is_stale_and_readings_wait_for_it(self):
