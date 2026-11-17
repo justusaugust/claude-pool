@@ -19,7 +19,7 @@ import device_sync
 import managed_block
 from device_report import Step, ready, render
 from fakes import FakeRemote
-from remote import Completed
+from remote import Completed, Local
 
 ANY = mock.ANY
 
@@ -186,6 +186,34 @@ class InstallTests(unittest.TestCase):
 
     def test_macos_skips_linger(self):
         self.assertEqual(device_install.check_linger(remote(lambda argv, stdin: answer(0, 'Darwin'))).status, 'skipped')
+
+
+class Here(Local):
+    """This device as its own check sees it: every probe answers "not set up"."""
+    def call(self, argv, **_): return answer(0, 'Linux' if argv[:1] == ['uname'] else 'no')
+    def device(self, *args, **_): return answer(1) if args[:1] == ('shell',) else answer(0, json.dumps({'service': 'stopped'}))
+    def pool(self, *args, **_): return answer(1, err='no')
+
+
+class OwnDeviceTests(unittest.TestCase):
+    """`device add` repairs another device and refuses the device it runs on. A device's own check printed
+    `claude-pool device add local` as the fix, which only looks for a machine called local over ssh."""
+    def test_the_fix_of_a_devices_own_check_is_a_command_that_works_on_it(self):
+        here = Here()
+        fixes = {step.name: step.fix for step in (device_install.check_shell(here), device_install.check_service(here), device_install.check_linger(here))}
+        self.assertEqual(fixes, {'shell': 'claude-pool device shell add', 'service': 'claude-pool --start', 'linger': 'loginctl enable-linger'})
+        self.assertEqual(device_install.add_shell(here).fix, 'claude-pool device shell add')
+
+    def test_no_step_of_a_devices_own_check_tells_it_to_add_local(self):
+        here = Here()
+        steps = [device_install.check_install(here), device_install.check_version(here, 'other'), device_install.check_shell(here),
+                 device_install.check_service(here), device_install.check_linger(here), device_install.add_shell(here)]
+        for step in steps:
+            self.assertNotIn('device add local', step.fix or '', step.name)
+
+    def test_another_device_is_still_repaired_with_device_add(self):
+        fake = remote(lambda argv, stdin: answer(1))
+        self.assertEqual(device_install.check_shell(fake).fix, 'claude-pool device add vps')
 
 
 class ShellTests(unittest.TestCase):

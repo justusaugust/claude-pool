@@ -13,7 +13,7 @@ import tarfile
 import device_sync
 import managed_block
 from device_report import Step
-from remote import redact, remote_command
+from remote import Local, redact, remote_command
 
 START, END = '# >>> claude-pool >>>', '# <<< claude-pool <<<'
 FUNCTION = 'claude() { command claude-pool exec "$@"; }'
@@ -96,8 +96,15 @@ if [ -L "$dir/current" ]; then cli="$dir/current/gateway/devices_cli.py"; else c
 exit 0'''
 
 
+def repair(remote, here=None):
+    """The command that repairs a step. `device add` repairs another device and refuses the device it runs on, so a
+    device's own check names `here`, the command that works on it."""
+    if isinstance(remote, Local): return here or 'claude-pool device add <ssh target of this device>, run on another device'
+    return 'claude-pool device add ' + remote.name
+
+
 def check_install(remote):
-    fix = 'claude-pool device add ' + remote.name
+    fix = repair(remote)
     done = remote.call(['sh', '-c', LAUNCHER_SCRIPT])
     if done.returncode == 10: return Step('install', 'missing', 'claude-pool is not installed', fix)
     if done.returncode == 11: return Step('install', 'missing', 'older claude-pool without device support', fix)
@@ -111,13 +118,13 @@ def check_version(remote, version):
     _done, value = _status(remote)
     have = value.get('version') if value else None
     if have == version: return Step('version', 'ok', str(version), None)
-    return Step('version', 'missing', f'{have or "unknown"} here, {version} wanted', 'claude-pool device add ' + remote.name)
+    return Step('version', 'missing', f'{have or "unknown"} here, {version} wanted', repair(remote))
 
 
 def install(remote, archive, native):
     done = remote.call(['sh', '-c', INSTALL_SCRIPT, 'install', native], stdin=archive, timeout=3600)
     if done.returncode == 3: return Step('install', 'failed', 'Python 3.11 or newer is missing', 'install Python 3.11 or newer on ' + remote.name)
-    if done.returncode: return Step('install', 'failed', 'install failed: ' + _tail(done), 'claude-pool device add ' + remote.name)
+    if done.returncode: return Step('install', 'failed', 'install failed: ' + _tail(done), repair(remote))
     return Step('install', 'ok', 'installed from this checkout', None)
 
 
@@ -138,7 +145,7 @@ def check_service(remote, target=None):
         return Step('service', 'failed', 'stale: launchd still runs the program from before the last update; restart the pool '
                     'when no task is running', restart_fix(target))
     if state == 'running': return Step('service', 'ok', 'running', None)
-    return Step('service', 'missing', 'service is ' + (state or 'unknown'), 'claude-pool device add ' + remote.name)
+    return Step('service', 'missing', 'service is ' + (state or 'unknown'), repair(remote, 'claude-pool --start'))
 
 
 def start_service(remote, target=None):
@@ -169,7 +176,7 @@ def check_linger(remote):
     if done.returncode: return Step('linger', 'skipped', 'no systemd login manager: ' + _tail(done), None)
     if value == 'yes': return Step('linger', 'ok', 'services survive logout', None)
     if value != 'no': return Step('linger', 'skipped', 'no systemd login manager', None)
-    return Step('linger', 'missing', 'services stop at logout', 'claude-pool device add ' + remote.name)
+    return Step('linger', 'missing', 'services stop at logout', repair(remote, 'loginctl enable-linger'))
 
 
 def enable_linger(remote):
@@ -214,12 +221,12 @@ def shell_remove(rc):
 
 def check_shell(remote):
     if remote.device('shell', 'check').returncode == 0: return Step('shell', 'ok', 'claude goes through the pool', None)
-    return Step('shell', 'missing', 'no claude function in the shell rc file', 'claude-pool device add ' + remote.name)
+    return Step('shell', 'missing', 'no claude function in the shell rc file', repair(remote, 'claude-pool device shell add'))
 
 
 def add_shell(remote):
     done = remote.device('shell', 'add')
-    if done.returncode: return Step('shell', 'failed', 'could not add it: ' + _tail(done), 'claude-pool device add ' + remote.name)
+    if done.returncode: return Step('shell', 'failed', 'could not add it: ' + _tail(done), repair(remote, 'claude-pool device shell add'))
     return check_shell(remote)
 
 
