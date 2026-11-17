@@ -34,6 +34,7 @@ from validation import render as validation_view
 import running_release
 from settings import HERE, RUNTIME, STORES, LONG_LIVED, NATIVE_CLAUDE, CONFIG, BASE_URL, GATEWAY_PORT, BACKEND_PORT, backend_config, connection_ts, SHARED_READINGS, LONG_LIVED_PROBES, ALIASES, private_directory, CONDUCTOR_HOME
 import backend_log
+import fallback
 from conductor_alerts import Alerts, conductor_route
 ROOT = HERE.parent
 HEALTH_INTERVAL = 10
@@ -218,8 +219,11 @@ def daemon(client, admin):
                     stop.wait(.25)
             raise RuntimeError("Shunt did not become ready")
         wait_ready(gateway)
+        def fallback_state():
+            value, me = registry.load(), registry.self_name()
+            return fallback.active(STORES, value, me), fallback.possible(STORES, LONG_LIVED, value, me, int(time.time() * 1000))
         alerts = Alerts(Path(CONDUCTOR_HOME).expanduser() / 'state' / 'wake.log', RUNTIME / 'conductor-alerts.json',
-                        device=registry.self_name, route=conductor_route(), journal=server.journal)
+                        device=registry.self_name, route=conductor_route(), journal=server.journal, fallback=fallback_state)
         def supervise():
             nonlocal gateway
             delay, next_probe, next_sample, next_alert, next_prune = .5, time.monotonic(), time.monotonic() + 30, time.monotonic() + 30, time.monotonic() + 600
@@ -244,6 +248,11 @@ def daemon(client, admin):
                     backend_log.trim(RUNTIME / 'backend.log')
                     next_prune = now + 3600
                 if now >= next_alert:
+                    # On the usage owner an account whose login Claude ended serves its long-lived token from here on.
+                    if server.health.get('failures', 0) < 3:
+                        try: fallback.run(server.last_accounts, STORES, LONG_LIVED, registry.load(), registry.self_name(), int(time.time() * 1000),
+                                          record=lambda name: server.journal.record('account_fell_back', account=name))
+                        except (OSError, RuntimeError, ValueError): pass
                     # Backend down, no account left, a login needed or brake stage 2: one line in the Conductor's wake.log.
                     try: alerts.check(server)
                     except (OSError, RuntimeError, ValueError, KeyError, TypeError, http.client.HTTPException): pass

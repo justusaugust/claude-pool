@@ -40,6 +40,7 @@ CODES = {
     'account_unblocked': 'A refused account was resumed for its next try',
     'account_needs_login': 'An account needs a new login on this device',
     'account_login_valid': 'An account that needed a new login is valid again',
+    'account_fell_back': 'An account whose login ended now serves its long-lived token',
     'alert_forward_failed': 'An alert line could not be delivered to the Conductor device; tried again later',
 }
 

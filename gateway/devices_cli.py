@@ -1065,6 +1065,11 @@ def check_readings(t):
         missing = [(row, there) for row, there in missing if (there or row['name']) not in covered]
         if missing:
             owners = (t.s.status_of(owner['name']) or {}).get('accounts') or {}
+            fix = owner_login_fix(owner, missing[0][0], registry.local_name(missing[0][0], owners))
+            if all((owners.get(registry.local_name(row, owners)) or {}).get('servingKind') == 'long-lived' for row, _ in missing):
+                # The owner's login for it ended and the owner serves the long-lived token (fallback.py): the account works.
+                return Step('readings', 'manual', owner['name'] + ' serves ' + ', '.join(registry.describe(*item) for item in missing) +
+                            ' from the long-lived token since the login ended; usage is read only while the account is used', fix)
             return Step('readings', 'failed', 'the usage readings from ' + owner['name'] + ' have no row for ' +
                         ', '.join(registry.describe(*item) for item in missing) + ' (the owner serves no refreshable login for it)',
                         owner_login_fix(owner, missing[0][0], registry.local_name(missing[0][0], owners)))
