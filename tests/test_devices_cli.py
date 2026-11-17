@@ -1640,6 +1640,16 @@ class FixRoundCheckTests(OrchestrationBase):
         self.assertEqual(code, 2)
         self.assertRegex(out, r'\n  failed +readings +the usage readings from mac have no row for team.*\n      fix: .*account add team@x\.de --name team')
 
+    def test_readings_need_a_sign_in_when_the_owner_serves_the_account_from_its_long_lived_token(self):
+        # The owner's login for the account ended and it serves the long-lived token: the account still works, only its
+        # usage readings are missing until someone signs in on the owner again.
+        self.vps.shared_accounts = []
+        self.local.accounts = {'team': {'kind': 'long-lived', 'fingerprint': self.team_fp}}
+        code, out, _ = self.cli('check', 'vps')
+        self.assertRegex(out, r'\n  manual +readings +mac serves team from its long-lived token since its login ended; '
+                              r'its usage is read only while it is used.*\n      fix: .*account add team@x\.de --name team')
+        self.assertNotRegex(out, r'failed +readings')
+
     def test_a_daemon_on_an_older_program_is_stale_and_readings_wait_for_it(self):
         # launchd still runs the program from before an update (no readings Puller); ssh is not the problem.
         self.vps.service_stale = True; self.vps.shared_at = int(time.time() * 1000) - 20 * 60_000

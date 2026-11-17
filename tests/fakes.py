@@ -24,8 +24,8 @@ def long_lived_file(directory, name, user='user-a', org='team-a', token=None, ex
     return _store(directory, name, {'claudeAiOauth': oauth, 'shuntAccountUuid': user, 'shuntOrganizationUuid': org})
 
 
-def refreshable_file(directory, name, user, org):
-    oauth = {'accessToken': fixture_token('r'), 'refreshToken': 'fixture-refresh-' + name, 'expiresAt': 4_000_000_000_000}
+def refreshable_file(directory, name, user, org, expires_ms=4_000_000_000_000):
+    oauth = {'accessToken': fixture_token('r'), 'refreshToken': 'fixture-refresh-' + name, 'expiresAt': expires_ms}
     return _store(directory, name, {'claudeAiOauth': oauth, 'shuntAccountUuid': user, 'shuntOrganizationUuid': org})
 
 

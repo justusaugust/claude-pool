@@ -301,6 +301,46 @@ with os.fdopen(fd,'w') as f:json.dump({'claudeAiOauth':{'accessToken':'a','refre
             with self.assertRaisesRegex(RuntimeError,r'\.retired.*(rerun|again)'):self.run_cli()
         self.assertEqual([k.read_bytes() for k in (self.stores/'.retired').glob('operations-*.json')],[old])
 
+    def fell_back(self):
+        """This device is the usage owner and serves the long-lived token because the login ended: the store holds a copy of it."""
+        import registry
+        from fakes import long_lived_file
+        self.reg, self.self_path, self.long = self.root/'registry.json', self.root/'device.json', self.root/'claude-long-lived'
+        registry.update(lambda value: value['devices'].append({'name': 'owner', 'platform': 'linux', 'roles': ['usage'], 'addedAt': 1}), self.reg)
+        registry.set_self('owner', self.self_path)
+        copy = long_lived_file(self.long, 'operations')
+        store = self.stores/'operations.json'; store.write_bytes(copy.read_bytes()); store.chmod(0o600)
+        return store, copy
+
+    def sign_in(self):
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = setup.cli(['add', 'operations@example.test', '--name', 'operations'], config=self.config, stores=self.stores, binary=self.binary,
+                             runtime=self.runtime, overview=None, long_lived=self.long, registry_path=self.reg, self_path=self.self_path)
+        return code, out.getvalue()
+
+    def test_a_sign_in_on_the_usage_owner_replaces_the_long_lived_token_it_fell_back_to(self):
+        store, copy = self.fell_back(); token = copy.read_bytes()
+        with self.answers(self.profile_body()), self.new_login() as login:
+            code, out = self.sign_in()
+        self.assertEqual(code, 0, out); login.assert_called_once()
+        self.assertIn('fresh-access', store.read_text())
+        self.assertEqual(copy.read_bytes(), token)             # the token stays for the next time the login ends
+        self.assertFalse((self.stores/'.retired').exists())    # the store held only a copy of it
+
+    def test_a_cancelled_sign_in_keeps_serving_the_long_lived_token(self):
+        store, copy = self.fell_back()
+        with patch.object(setup, 'login', side_effect=RuntimeError('Authorization did not complete.')):
+            with self.assertRaisesRegex(RuntimeError, 'keeps serving its long-lived token'): self.sign_in()
+        self.assertEqual(store.read_bytes(), copy.read_bytes())
+
+    def test_a_long_lived_store_that_is_not_a_copy_of_the_saved_token_is_never_replaced(self):
+        from fakes import fixture_token, long_lived_file
+        store, copy = self.fell_back(); before = store.read_bytes()
+        long_lived_file(self.long, 'operations', token=fixture_token('b'))
+        with self.new_login() as login:
+            with self.assertRaisesRegex(RuntimeError, 'refreshable OAuth login is required'): self.sign_in()
+        login.assert_not_called(); self.assertEqual(store.read_bytes(), before)
+
     def test_invalid_identity_and_credential_shapes_fail_cleanly(self):
         for data in ([], {'account':[], 'organization':{}}, {'account':{}, 'organization':None}):
             with self.subTest(data=data), self.assertRaises(RuntimeError): setup.identity(data, {})
