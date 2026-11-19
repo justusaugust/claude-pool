@@ -28,7 +28,8 @@ WANTED = 'src-1'
 MAC = {'name': 'mac', 'platform': 'darwin', 'roles': [], 'addedAt': 1}
 VPS = {'name': 'vps', 'ssh': 'alex@vps', 'platform': 'linux', 'roles': ['usage'], 'addedAt': 2}
 PI = {'name': 'pi', 'ssh': 'alex@pi', 'platform': 'linux', 'roles': [], 'addedAt': 3}
-MACHINE_KEYS = {'name', 'platform', 'self', 'reachable', 'poolRunning', 'versionMatches', 'light', 'code', 'reason', 'fix', 'checkedAt'}
+MACHINE_KEYS = {'name', 'platform', 'self', 'reachable', 'poolRunning', 'versionMatches', 'light', 'code', 'reason', 'fix', 'fixCommand', 'fixOn',
+                'checkedAt'}
 CODE = r'^(ok|unreachable|pool-stopped|version-mismatch|never-checked|not-checkable|(failed|missing|manual):[a-z-]+)$'
 ACCOUNT_KEYS = {'name', 'label', 'alias', 'registryName', 'fiveHourPct', 'weekPct', 'fableWeekPct', 'noFiveHour', 'resetsAt', 'reserveAt',
                 'reserveHours', 'reserveTimezone', 'reserveSoft', 'reserveText', 'kind', 'expiresAt', 'status'}
@@ -94,6 +95,96 @@ class BoardBase(ToolsBase):
 
     def checked(self, name, *steps, at=NOW):
         cb.record_checks({name: [Step(*step) for step in steps]}, now=at)
+
+
+class FixCommandTests(BoardBase):
+    """`fixCommand` is the fix when it is one line to paste into a terminal, `fixOn` the device whose terminal it is.
+    Both are empty when the fix is prose or the device is not known, so a reader never pastes a sentence."""
+    def setUp(self):
+        super().setUp()
+        self.devices(MAC, VPS)
+
+    def fields(self, row): return row['fixCommand'], row['fixOn']
+
+    def shared(self, name, fix, by=None, at=NOW):
+        entry = {'checkedAt': int(at * 1000), 'steps': [{'name': 'reachable', 'status': 'ok', 'detail': 'this device', 'fix': ''},
+                                                        {'name': 'shell', 'status': 'missing', 'detail': 'no claude function', 'fix': fix}]}
+        if by is not None: entry['by'] = by
+        return cb.merge_checks({'devices': {name: entry}}, now=at)
+
+    def test_one_command_is_copied_with_the_device_that_ran_the_check(self):
+        self.checked('vps', ('reachable', 'ok', 'ssh works'), ('doctor', 'failed', 'runs an older version', 'claude-pool device add alex@vps'))
+        row = self.machine(self.snap(), 'vps')
+        self.assertEqual((row['fix'], *self.fields(row)), ('claude-pool device add alex@vps', 'claude-pool device add alex@vps', 'mac'))
+
+    def test_a_shared_result_names_the_device_that_checked(self):
+        registry.set_self('vps', settings.SELF)
+        (settings.RUNTIME / cb.CHECK_FILE).unlink(missing_ok=True)
+        self.assertEqual(self.shared('mac', 'claude-pool device shell add', by='mac'), ['mac'])
+        self.assertEqual(self.fields(self.machine(self.snap(), 'mac')), ('claude-pool device shell add', 'mac'))
+
+    def test_a_result_from_an_older_device_names_no_terminal(self):
+        registry.set_self('vps', settings.SELF)
+        (settings.RUNTIME / cb.CHECK_FILE).unlink(missing_ok=True)
+        self.shared('mac', 'claude-pool device shell add')
+        row = self.machine(self.snap(), 'mac')
+        self.assertEqual((row['fix'], *self.fields(row)), ('claude-pool device shell add', '', ''))
+
+    def test_a_shared_result_with_an_invalid_checker_is_refused(self):
+        for bad in ('Mac Book', '', 7, 'a' * 41):
+            with self.subTest(bad=bad), self.assertRaises(ValueError): self.shared('mac', 'claude-pool device shell add', by=bad)
+
+    def test_the_boards_own_findings_run_on_this_device(self):
+        self.peers['alex@vps'].service = 'stopped'
+        self.assertEqual(self.fields(self.machine(self.snap(NOW + 700), 'vps')), ('claude-pool device add alex@vps', 'mac'))
+        self.service = 'stopped'
+        self.assertEqual(self.fields(self.machine(self.snap(NOW + 700), 'mac')), ('claude-pool --start', 'mac'))
+
+    def test_a_check_to_run_on_the_machine_itself_names_that_machine(self):
+        self.devices({'name': 'pi', 'platform': 'linux', 'roles': [], 'addedAt': 3})
+        row = self.machine(self.snap(), 'pi')
+        self.assertEqual((row['fix'], *self.fields(row)), ('claude-pool device check pi on that machine', 'claude-pool device check pi', 'pi'))
+
+    def test_prose_is_never_a_command(self):
+        self.peers['alex@vps'].code = 255
+        row = self.machine(self.snap(NOW + 700), 'vps')
+        self.assertEqual((row['code'], *self.fields(row)), ('unreachable', '', ''))
+        self.checked('vps', ('reachable', 'ok', 'ssh works'), ('app', 'manual', 'add the SSH environment', 'open the Claude app'))
+        self.peers['alex@vps'].code = 0
+        self.assertEqual(self.fields(self.machine(self.snap(NOW + 1400), 'vps')), ('', ''))
+
+    def test_green_has_neither(self):
+        self.checked('vps', ('reachable', 'ok', 'ssh works'))
+        self.checked('mac', ('reachable', 'ok', 'this device'))
+        for row in self.snap()['machines']: self.assertEqual((row['code'], *self.fields(row)), ('ok', '', ''), row)
+
+    def test_which_fix_texts_count_as_one_command(self):
+        names = {'mac', 'vps'}
+        for fix, want in (
+                ('claude-pool device shell add', ('claude-pool device shell add', None)),
+                ('claude-pool --stop && claude-pool --start', ('claude-pool --stop && claude-pool --start', None)),
+                ('claude-pool --stop && claude-pool --start && claude-pool device conductor install --restart',
+                 ('claude-pool --stop && claude-pool --start && claude-pool device conductor install --restart', None)),
+                ("ssh alex@vps '.local/bin/claude-pool --stop && .local/bin/claude-pool --start'",
+                 ("ssh alex@vps '.local/bin/claude-pool --stop && .local/bin/claude-pool --start'", None)),
+                ('ssh alex@vps .local/bin/claude-pool account add a@x.de --name team', ('ssh alex@vps .local/bin/claude-pool account add a@x.de --name team', None)),
+                ('claude-pool account add a@x.de --name team on vps', ('claude-pool account add a@x.de --name team', 'vps')),
+                ('claude-pool device check pi on that machine', ('claude-pool device check pi', 'that machine')),
+                ('claude-pool login team', ('claude-pool login team', None)),
+                ('loginctl enable-linger', ('loginctl enable-linger', None)),
+                ('claude-pool account add a@x.de --name team on laptop', ('', None)),                  # not a device of this pool
+                ('claude-pool device add <ssh target of this device>, run on another device', ('', None)),
+                ('ssh alex@vps true must work without a password prompt (BatchMode)', ('', None)),
+                ('claude-pool account add <email> --long-lived --replace --name team on the device that first enrolled it '
+                 '(it holds the old token and has a browser), then claude-pool device sync', ('', None)),
+                ('run ssh <device> .local/bin/claude-pool doctor and apply the fix it prints', ('', None)),
+                ('claude-pool doctor and apply the fix it prints', ('', None)),
+                ('claude-pool update then restart the pool', ('', None)),
+                ('curl -fsSL https://claude.ai/install.sh | bash', ('', None)),
+                ('sudo loginctl enable-linger alex', ('', None)),                                    # nothing with sudo is offered for pasting
+                ('claude-pool --start; rm -rf ~', ('', None)), ('claude-pool --start $(id)', ('', None)), ('claude-pool `id`', ('', None)),
+                ('chmod 600 store', ('', None)), ('open the Claude app', ('', None)), ('', ('', None))):
+            with self.subTest(fix=fix): self.assertEqual(cb.fix_command(fix, names), want)
 
 
 class ShapeTests(BoardBase):
