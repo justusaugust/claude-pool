@@ -183,6 +183,7 @@ class FixCommandTests(BoardBase):
                 ('curl -fsSL https://claude.ai/install.sh | bash', ('', None)),
                 ('sudo loginctl enable-linger alex', ('', None)),                                    # nothing with sudo is offered for pasting
                 ('claude-pool --start; rm -rf ~', ('', None)), ('claude-pool --start $(id)', ('', None)), ('claude-pool `id`', ('', None)),
+                ('claude-pool device add None', ('', None)),                                         # built around a missing ssh target
                 ('chmod 600 store', ('', None)), ('open the Claude app', ('', None)), ('', ('', None))):
             with self.subTest(fix=fix): self.assertEqual(cb.fix_command(fix, names), want)
 
