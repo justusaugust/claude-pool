@@ -5,7 +5,11 @@ cache that `device check` and `device add` write (record_checks) and that
 the newest result wins, so a device with no ssh back to the Mac still shows the Mac's own result), checks this machine's own pool locally, and asks another
 device for its `device status` at most once per PROBE_EVERY seconds, bounded by PROBE_TIMEOUT. A probe is cached whether
 or not the device answered, and a device check younger than PROBE_EVERY counts as one. Accounts come from the overview
-`claude-pool usage --once` reads (the local pool, which merges the usage owner's shared readings); no call per account."""
+`claude-pool usage --once` reads (the local pool, which merges the usage owner's shared readings); no call per account.
+
+A machine row carries its fix twice: `fix` is the text a person reads, `fixCommand` the same fix when it is exactly one
+line to paste into a terminal, and `fixOn` the device whose terminal that is (the device that ran the check, or the one
+the fix names). Both are empty together when the fix is prose or the device is not known."""
 import concurrent.futures
 import json
 import re
@@ -69,6 +73,35 @@ def _store(path, entries, newer=False, keep=None, cap=MAX_CHECKED_AT):
     return written
 
 
+_WORD = r'[A-Za-z0-9@._:/=+~-]+'
+_ONE = r'(?:\.local/bin/)?(?:claude-pool|loginctl)(?: ' + _WORD + r')*'
+_CHAIN = _ONE + r'(?: && ' + _ONE + r')*'
+COMMAND = re.compile(r"(?:" + _CHAIN + r"|ssh [A-Za-z0-9@._:-]+ (?:'" + _CHAIN + r"'|" + _ONE + r"))")
+PROSE = frozenset('a an and any apply after again before for from here if in is it its must of on once or run so that the then there this '
+                  'to when with you your none'.split())  # none: a fix built around a missing ssh target
+THAT_MACHINE = 'that machine'
+
+
+def fix_command(fix, names):
+    """(command, device) for a fix text: the command when the whole text is one line to paste into a terminal, else ''.
+    The device is the one a trailing `on <device>` names (a device in `names`, or THAT_MACHINE for `on that machine`),
+    else None. A fix is prose unless it is claude-pool or loginctl calls joined by &&, bare or behind one ssh; a sentence
+    after the command, a placeholder, sudo, a pipe or any other shell syntax makes it prose, so nothing unsafe is offered."""
+    text, on = ' '.join(str(fix or '').split()), None
+    if text.endswith(' on ' + THAT_MACHINE): text, on = text[:-len(' on ' + THAT_MACHINE)], THAT_MACHINE
+    else:
+        head, found, last = text.rpartition(' on ')
+        if found and last in names: text, on = head, last
+    if not COMMAND.fullmatch(text) or any(word.lower() in PROSE for word in text.replace("'", ' ').split()): return '', None
+    return text, on
+
+
+def _checker(entry):
+    """The device that ran the check of this entry, when the entry names one."""
+    by = entry.get('by') if isinstance(entry, dict) else None
+    return by if isinstance(by, str) and registry.NAME.fullmatch(by) else None
+
+
 def _step(name, status, detail, fix):
     return {'name': name, 'status': status, 'detail': clean(detail or '', 200), 'fix': clean(fix or '', 500)}
 
@@ -77,19 +110,22 @@ def record_checks(results, now=None):
     """Keep the last `device check` / `device add` result per device (redacted, 0600). A device this machine could only
     skip (no ssh target from here) keeps its previous entry. Never raises: the check's own output is what counts."""
     at = int((time.time() if now is None else now) * 1000)
+    me = registry.self_name()  # a fix line is written for the terminal of the device that ran the check
     entries = {}
     for name, steps in results.items():
         steps = [step for step in steps if step is not None]
         if not steps or all(step.status == 'skipped' for step in steps): continue
         entries[name] = {'checkedAt': at, 'steps': [_step(step.name, step.status, step.detail, step.fix) for step in steps]}
+        if me: entries[name]['by'] = me
     if not entries: return
     try: _store(_path(CHECK_FILE), entries)
     except (OSError, ValueError, RuntimeError): pass
 
 
 def checked_entries(value, now=None):
-    """The `{devices: {name: {checkedAt, steps}}}` another device shares, validated and redacted; ValueError otherwise.
-    checkedAt must be an integer from 0 to MAX_CHECKED_AT and is kept at most one day ahead of `now`."""
+    """The `{devices: {name: {checkedAt, steps, by?}}}` another device shares, validated and redacted; ValueError otherwise.
+    checkedAt must be an integer from 0 to MAX_CHECKED_AT and is kept at most one day ahead of `now`. `by` (the device
+    that ran the check; older devices send none) must be a device name."""
     ceiling = int((time.time() if now is None else now) * 1000) + DAY_MS
     devices = value.get('devices') if isinstance(value, dict) else None
     if not isinstance(devices, dict) or len(devices) > 64: raise ValueError('checks must be {"devices": {name: entry}}')
@@ -107,6 +143,9 @@ def checked_entries(value, now=None):
                 raise ValueError('invalid step in checks')
             rows.append(_step(step['name'], step['status'], step.get('detail'), step.get('fix')))
         out[name] = {'checkedAt': min(entry['checkedAt'], ceiling), 'steps': rows}
+        if 'by' in entry:
+            if _checker(entry) is None: raise ValueError('invalid device name in checks')
+            out[name]['by'] = entry['by']
     return out
 
 
@@ -230,11 +269,13 @@ class Board:
             try: _store(_path(PROBE_FILE), entries)
             except (OSError, ValueError, RuntimeError): pass
         entry = registry.conductor(value)
+        names = {row['name'] for row in value['devices']}
         return [self._machine(row, row['name'] == me, live.get(row['name']), checks.get(row['name']) or {},
-                              entry is not None and entry['device'] == row['name']) for row in value['devices']]
+                              entry is not None and entry['device'] == row['name'], here=me, names=names) for row in value['devices']]
 
-    def _machine(self, row, mine, live, check, conductor_here=False):
+    def _machine(self, row, mine, live, check, conductor_here=False, here=None, names=()):
         name, ssh = row['name'], row.get('ssh')
+        by = _checker(check)  # a step's fix is written for the device that ran the check, the board's own for this device
         checked = _checked_at(check)
         steps = [step for step in check.get('steps') or [] if isinstance(step, dict)]
         if live is None and checked is not None:
@@ -242,7 +283,7 @@ class Board:
         if live is not None and checked is not None and (mine or live.get('at') is None or live['at'] * 1000 >= checked):
             steps = [step for step in steps if step.get('name') not in LIVE_STEPS]
         live = live or {'reachable': None, 'poolRunning': None, 'versionMatches': None}
-        issues = []  # (light, code, reason, fix) in the order they are found; the worst light leads
+        issues = []  # (light, code, reason, fix[, device whose terminal the fix is for: this one unless given]); the worst light leads
         start_fix = 'claude-pool --start' if mine else 'claude-pool device add ' + str(ssh)
         if live.get('reachable') is False:
             issues.append(('red', 'unreachable', 'Not reachable over ssh.', 'ssh ' + str(ssh) + ' true must work without a password prompt (BatchMode)'))
@@ -260,19 +301,23 @@ class Board:
             status, label, detail, fix = step.get('status'), step.get('name', 'step'), step.get('detail') or '', step.get('fix') or ''
             if status in ('ok', 'skipped'): continue
             if label == 'native-login' and status == 'manual' and not conductor_here: continue  # older results: not needed here
-            if label == 'reachable' and status == 'unreachable': issues.append(('red', 'unreachable', 'Not reachable over ssh.', fix))
-            elif label == 'service': issues.append(('red', 'pool-stopped', 'The pool is not running: ' + detail, fix or start_fix))
-            elif label == 'version' and status == 'missing': issues.append(('amber', 'version-mismatch', 'It runs another claude-pool version: ' + detail, fix))
-            elif status in ('failed', 'unreachable'): issues.append(('red', 'failed:' + label, label + ' failed: ' + detail, fix))
-            elif status == 'missing': issues.append(('amber', 'missing:' + label, label + ' needs work: ' + detail, fix))
-            elif status == 'manual': issues.append(('amber', 'manual:' + label, label + ' needs you: ' + detail, fix))
+            if label == 'reachable' and status == 'unreachable': issues.append(('red', 'unreachable', 'Not reachable over ssh.', fix, by))
+            elif label == 'service': issues.append(('red', 'pool-stopped', 'The pool is not running: ' + detail, *((fix, by) if fix else (start_fix, here))))
+            elif label == 'version' and status == 'missing': issues.append(('amber', 'version-mismatch', 'It runs another claude-pool version: ' + detail, fix, by))
+            elif status in ('failed', 'unreachable'): issues.append(('red', 'failed:' + label, label + ' failed: ' + detail, fix, by))
+            elif status == 'missing': issues.append(('amber', 'missing:' + label, label + ' needs work: ' + detail, fix, by))
+            elif status == 'manual': issues.append(('amber', 'manual:' + label, label + ' needs you: ' + detail, fix, by))
         if checked is None and (mine or ssh):
             issues.append(('grey', 'never-checked', 'Never checked with claude-pool device check.', 'claude-pool device check ' + name))
         worst = min(issues, key=lambda issue: RANK[issue[0]], default=None)
+        fix = clean(worst[3], 500) if worst else ''
+        command, on = fix_command(fix, names)
+        where = name if on == THAT_MACHINE else on or (worst[4] if worst and len(worst) > 4 else here)
+        if not command or not where: command, where = '', ''  # a command without its terminal is no help: both or neither
         return {'name': name, 'platform': row.get('platform') or '', 'self': mine, 'reachable': live.get('reachable'),
                 'poolRunning': live.get('poolRunning'), 'versionMatches': live.get('versionMatches'),
                 'light': worst[0] if worst else 'green', 'code': worst[1] if worst else 'ok',
-                'reason': clean(worst[2], 200) if worst else '', 'fix': clean(worst[3], 500) if worst else '', 'checkedAt': checked}
+                'reason': clean(worst[2], 200) if worst else '', 'fix': fix, 'fixCommand': command, 'fixOn': where, 'checkedAt': checked}
 
     # accounts --------------------------------------------------------------------------------------------------------
 
