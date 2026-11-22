@@ -39,6 +39,20 @@ describe('background pool bootstrap', () => {
     await $.session.start(START)
     expect(requests).toEqual([account === null ? 'GET' : 'POST', 'GET'])
   })
+  test('a refused start says that a session keeps its Mods and needs a restart after a pool update', async ($, on) => {
+    on('env.get', () => ({ value: undefined }))
+    on('env.set', () => ({ value: undefined }))
+    mock.store(on)
+    on('session.id', () => ({ value: SESSION }))
+    on('fs.read', () => { throw new Error('Withheld') })
+    on('session.start', ($, e) => ({ cwd: e.cwd }))
+    await $.session.start(START)
+    let text = ''
+    for await (const chunk of $.turn.step({ turnId: 'qa', index: 0, model: 'fixture', messageCount: 0 })) if (chunk.kind === 'text') text += chunk.text
+    expect(text).toContain('Pool startup could not be confirmed. Run claude doctor')
+    expect(text).toContain('restart this session')
+    expect(text).toContain('claude --continue')
+  })
   // Native refuses a Mod's write to protected names; the launcher has already set them.
   const refuse = (env: Record<string, string | undefined>, on: Parameters<Parameters<typeof test>[1]>[1]) => {
     on('env.get', ($, e) => ({ value: env[e.name] }))
