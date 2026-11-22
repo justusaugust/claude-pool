@@ -98,7 +98,7 @@ describe('background pool bootstrap', () => {
       await $.session.start(START)
       const chunks: unknown[] = []
       for await (const chunk of $.turn.step({ turnId: 'qa', index: 0, model: 'fixture', messageCount: 0 })) chunks.push(chunk)
-      expect(chunks).toEqual([{ kind: 'text', index: 0, text: 'Pool startup could not be confirmed. Run claude doctor, then retry this session.' }])
+      expect(chunks).toEqual([{ kind: 'text', index: 0, text: 'Pool startup could not be confirmed. Run claude doctor, then retry. If a pool update fixed it, restart this session (claude --continue keeps the conversation): a running session keeps the Mods it started with.' }])
       expect(calls).toBe(0)
     })
   }
@@ -133,7 +133,7 @@ describe('background pool bootstrap', () => {
       const chunks: unknown[] = []
       for await (const chunk of $.turn.step({ turnId: 'qa', index: 0, model: 'fixture', messageCount: 0 })) chunks.push(chunk)
       expect(calls).toBe(0)
-      expect(chunks).toEqual([{ kind: 'text', index: 0, text: 'Pool startup could not be confirmed. Run claude doctor, then retry this session.' }])
+      expect(chunks).toEqual([{ kind: 'text', index: 0, text: 'Pool startup could not be confirmed. Run claude doctor, then retry. If a pool update fixed it, restart this session (claude --continue keeps the conversation): a running session keeps the Mods it started with.' }])
       broken = false
       for await (const chunk of $.turn.step({ turnId: 'qa', index: 1, model: 'fixture', messageCount: 0 })) void chunk
       expect(calls).toBe(1)

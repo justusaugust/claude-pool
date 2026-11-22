@@ -135,7 +135,7 @@ export const register: Register = on => {
         return { turnId: e.turnId, index: e.index, answer, toolUses: [], stopReason: 'end_turn', usage: null }
       }
     }
-    const answer = 'Pool startup could not be confirmed. Run claude doctor, then retry this session.'
+    const answer = 'Pool startup could not be confirmed. Run claude doctor, then retry. If a pool update fixed it, restart this session (claude --continue keeps the conversation): a running session keeps the Mods it started with.'
     yield { kind: 'text', index: 0, text: answer }
     return { turnId: e.turnId, index: e.index, answer, toolUses: [], stopReason: 'end_turn', usage: null }
   })
