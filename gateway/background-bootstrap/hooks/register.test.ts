@@ -170,6 +170,36 @@ describe('background pool bootstrap', () => {
     expect(statuses[0]).toContain('automatically continues')
     expect(statuses[statuses.length - 1]).toBeUndefined()
   })
+  // A bridge that restarts or drains cannot answer for a moment. Native retries such a request itself.
+  for (const scenario of ['offline', 'draining', 'unauthorized']) test('first quota check: ' + scenario, async ($, on) => {
+    on('env.get', () => ({ value: undefined })); on('env.set', () => ({ value: undefined })); mock.store(on)
+    on('session.id', () => ({ value: SESSION }))
+    on('fs.read', () => ({ value: 'x'.repeat(48) }))
+    on('session.start', ($, e) => ({ cwd: e.cwd }))
+    let checks = 0, calls = 0
+    on('http.fetch', ($, e) => {
+      if (!e.url.includes('/pool/capacity?')) return { value: { ok: true, status: 200, headers: {}, text: JSON.stringify({ mode: account ? 'pinned' : 'auto', pin: account, accounts: [] }) } }
+      checks++
+      expect(e.url).not.toContain('&wait=1')
+      if (scenario === 'offline') throw new Error('offline')
+      return { value: { ok: false, status: scenario === 'draining' ? 503 : 401, headers: {}, text: '{}' } }
+    })
+    on('turn.step', async function* ($, e) {
+      calls++
+      return { turnId: e.turnId, index: e.index, answer: 'MODEL', toolUses: [], stopReason: 'end_turn', usage: null }
+    })
+    await $.session.start(START)
+    const chunks: unknown[] = []
+    for await (const chunk of $.turn.step({ turnId: 'qa', index: 0, model: 'claude-opus-5-5', messageCount: 0 })) chunks.push(chunk)
+    expect(checks).toBe(1)
+    if (scenario === 'unauthorized') {
+      expect(calls).toBe(0)
+      expect(chunks).toEqual([{ kind: 'text', index: 0, text: 'Pool request stopped. Check claude doctor and the last step before retrying; no tools were replayed.' }])
+    } else {
+      expect(calls).toBe(1)
+      expect(chunks).toEqual([])
+    }
+  })
   test('cancelling the quota wait cannot start another request', async () => {
     const controller = new AbortController()
     const status: (string | undefined)[] = []

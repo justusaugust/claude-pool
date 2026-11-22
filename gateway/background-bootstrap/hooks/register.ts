@@ -52,6 +52,7 @@ async function connect($: EngineInterface, interactive: boolean): Promise<boolea
 }
 
 type Capacity = { state: 'ready' | 'quota_wait' | 'unavailable'; nextResetAt: number | null; message?: string }
+class Unreachable extends Error {}
 type QuotaEngine = { fs: { read(path: string): Promise<string> }; http: Pick<EngineInterface['http'], 'fetch'>; ui: Pick<EngineInterface['ui'], 'status'> }
 
 async function capacity($: QuotaEngine, model: string, wait: boolean, signal: AbortSignal): Promise<Capacity | null> {
@@ -68,9 +69,10 @@ async function capacity($: QuotaEngine, model: string, wait: boolean, signal: Ab
     // HTTP waits do not consume the SDK's 10s hook budget; clock.sleep does.
     const response = await Promise.race([$.http.fetch(baseURL + '/pool/capacity?model=' + encodeURIComponent(model) + (wait ? '&wait=1' : ''), {
       headers: { Authorization: 'Bearer ' + token },
-    }), cancelled])
+    }).catch(() => { throw new Unreachable('Pool quota availability could not be confirmed') }), cancelled])
     signal.throwIfAborted()
     if (response.status === 404) return null // Previous bridge: Native retains its normal error handling.
+    if (response.status >= 500) throw new Unreachable('Pool quota availability could not be confirmed')
     if (!response.ok) throw new Error('Pool quota availability could not be confirmed')
     const state = JSON.parse(response.text)
     if (!['ready', 'quota_wait', 'unavailable'].includes(state.state) ||
@@ -80,7 +82,12 @@ async function capacity($: QuotaEngine, model: string, wait: boolean, signal: Ab
 }
 
 export async function waitForQuota($: QuotaEngine, model: string, signal: AbortSignal, initial?: Capacity | null): Promise<boolean> {
-  let state = initial === undefined ? await capacity($, model, false, signal) : initial
+  let state = initial
+  if (state === undefined) {
+    // A restarting or draining bridge cannot answer. Nothing is known to be exhausted yet, so Native sends the request
+    // and retries it as usual. A wait that was confirmed still needs every later reading.
+    try { state = await capacity($, model, false, signal) } catch (error) { if (!(error instanceof Unreachable) || signal.aborted) throw error; state = null }
+  }
   let waited = false
   try {
     while (state?.state === 'quota_wait') {
