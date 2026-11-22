@@ -39,8 +39,58 @@ describe('background pool bootstrap', () => {
     await $.session.start(START)
     expect(requests).toEqual([account === null ? 'GET' : 'POST', 'GET'])
   })
+  // Native refuses a Mod's write to protected names; the launcher has already set them.
+  const refuse = (env: Record<string, string | undefined>, on: Parameters<Parameters<typeof test>[1]>[1]) => {
+    on('env.get', ($, e) => ({ value: env[e.name] }))
+    on('env.set', ($, e) => {
+      if (/^(ANTHROPIC_|CLAUDE_CODE_OAUTH_TOKEN$|CLAUDE_CODE_USE_)/.test(e.name)) throw new Error('env (managed): ' + e.name + ' is not for plugins outside policy to change')
+      env[e.name] = e.value
+      return { value: undefined }
+    })
+  }
+  const pool = (on: Parameters<Parameters<typeof test>[1]>[1], count: () => void) => {
+    mock.store(on)
+    on('session.id', () => ({ value: SESSION }))
+    on('fs.read', () => ({ value: 'x'.repeat(48) }))
+    on('session.start', ($, e) => ({ cwd: e.cwd }))
+    on('http.fetch', ($, e) => {
+      if (e.url.includes('/pool/capacity?')) return { value: { status: 404, ok: false, headers: {}, text: '{}' } }
+      const state = e.init?.method === 'POST' ? { mode: 'pinned', pin: account, accounts: [] } : { mode: 'auto', pin: null, accounts: [] }
+      return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify(state) } }
+    })
+    on('turn.step', async function* ($, e) {
+      count()
+      return { turnId: e.turnId, index: e.index, answer: 'MODEL', toolUses: [], stopReason: 'end_turn', usage: null }
+    })
+  }
+  test('starts when Native protects the names the launcher already set', async ($, on) => {
+    const env: Record<string, string | undefined> = { ANTHROPIC_BASE_URL: 'http://127.0.0.1:18341' }
+    let calls = 0
+    refuse(env, on)
+    pool(on, () => { calls++ })
+    await $.session.start(START)
+    const chunks: unknown[] = []
+    for await (const chunk of $.turn.step({ turnId: 'qa', index: 0, model: 'fixture', messageCount: 0 })) chunks.push(chunk)
+    expect(chunks).toEqual([])
+    expect(calls).toBe(1)
+    expect(env.COCKPIT_BASE_URL).toBe('http://127.0.0.1:18341')
+  })
+  for (const [name, value] of [['ANTHROPIC_BASE_URL', 'http://127.0.0.1:1'], ['ANTHROPIC_BASE_URL', undefined], ['ANTHROPIC_API_KEY', 'fixture'], ['CLAUDE_CODE_USE_VERTEX', '1']] as const) {
+    test('stays blocked when Native protects ' + name + ' and it is ' + (value === undefined ? 'missing' : 'wrong'), async ($, on) => {
+      const env: Record<string, string | undefined> = { ANTHROPIC_BASE_URL: 'http://127.0.0.1:18341', [name]: value }
+      let calls = 0
+      refuse(env, on)
+      pool(on, () => { calls++ })
+      await $.session.start(START)
+      const chunks: unknown[] = []
+      for await (const chunk of $.turn.step({ turnId: 'qa', index: 0, model: 'fixture', messageCount: 0 })) chunks.push(chunk)
+      expect(chunks).toEqual([{ kind: 'text', index: 0, text: 'Pool startup could not be confirmed. Run claude doctor, then retry this session.' }])
+      expect(calls).toBe(0)
+    })
+  }
   for (const failure of ['offline', 'unauthorized', 'malformed', 'wrong-pin', 'missing-token', 'short-token', 'store-failed', ...(origin ? ['source-store-failed'] : [])]) {
     test('blocks inference on ' + failure + ' and permits recovery', async ($, on) => {
+      on('env.get', () => ({ value: undefined }))
       on('env.set', () => ({ value: undefined }))
       let broken = true, calls = 0
       if (failure === 'store-failed' || failure === 'source-store-failed') {
@@ -76,7 +126,7 @@ describe('background pool bootstrap', () => {
     })
   }
   for (const scenario of ['reset', 'no-reset-time', 'offline', 'malformed']) test('quota wait: ' + scenario, async ($, on) => {
-    on('env.set', () => ({ value: undefined })); mock.store(on)
+    on('env.get', () => ({ value: undefined })); on('env.set', () => ({ value: undefined })); mock.store(on)
     on('session.id', () => ({ value: SESSION }))
     on('fs.read', () => ({ value: 'x'.repeat(48) }))
     on('session.start', ($, e) => ({ cwd: e.cwd }))
@@ -169,7 +219,7 @@ describe('background pool bootstrap', () => {
     expect(commands[3]).toBe('git status')
   })
   if (origin !== null) for (const selection of ['backup', null]) test('handoff copies current routing '+selection+'; respawn keeps a later unpin', async ($, on) => {
-    on('env.set', () => ({ value: undefined })); mock.store(on)
+    on('env.get', () => ({ value: undefined })); on('env.set', () => ({ value: undefined })); mock.store(on)
     on('fs.read', () => ({ value: 'x'.repeat(48) }))
     let session = SESSION, sourcePin = account
     const worker = '22334455-1122-4334-8122-112233445566'

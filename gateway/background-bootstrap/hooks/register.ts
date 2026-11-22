@@ -15,17 +15,19 @@ async function routing($: EngineInterface, token: string, session: string, body?
 }
 
 async function connect($: EngineInterface, interactive: boolean): Promise<boolean> {
-  await $.env.set('CLAUDE_POOL_CONFIG', configFile)
-  await $.env.set('ANTHROPIC_BASE_URL', baseURL)
-  await $.env.set('COCKPIT_BASE_URL', baseURL)
-  await $.env.set('COCKPIT_TOKEN_FILE', tokenFile)
-  await $.env.set('CLAUDE_CODE_GATEWAY_HINT_HEADERS', '1')
-  await $.env.set('ANTHROPIC_API_KEY', undefined)
-  await $.env.set('ANTHROPIC_AUTH_TOKEN', undefined)
-  await $.env.set('CLAUDE_CODE_OAUTH_TOKEN', undefined)
-  await $.env.set('CLAUDE_CODE_USE_BEDROCK', undefined)
-  await $.env.set('CLAUDE_CODE_USE_VERTEX', undefined)
-  await $.env.set('CLAUDE_CODE_USE_FOUNDRY', undefined)
+  // Native refuses a Mod's write to protected names such as ANTHROPIC_BASE_URL. The launcher sets them, so write only
+  // what differs: a wrong or missing value still fails here, and the session stays blocked.
+  if (await $.env.get('CLAUDE_POOL_CONFIG') !== configFile) await $.env.set('CLAUDE_POOL_CONFIG', configFile)
+  if (await $.env.get('ANTHROPIC_BASE_URL') !== baseURL) await $.env.set('ANTHROPIC_BASE_URL', baseURL)
+  if (await $.env.get('COCKPIT_BASE_URL') !== baseURL) await $.env.set('COCKPIT_BASE_URL', baseURL)
+  if (await $.env.get('COCKPIT_TOKEN_FILE') !== tokenFile) await $.env.set('COCKPIT_TOKEN_FILE', tokenFile)
+  if (await $.env.get('CLAUDE_CODE_GATEWAY_HINT_HEADERS') !== '1') await $.env.set('CLAUDE_CODE_GATEWAY_HINT_HEADERS', '1')
+  if (await $.env.get('ANTHROPIC_API_KEY') !== undefined) await $.env.set('ANTHROPIC_API_KEY', undefined)
+  if (await $.env.get('ANTHROPIC_AUTH_TOKEN') !== undefined) await $.env.set('ANTHROPIC_AUTH_TOKEN', undefined)
+  if (await $.env.get('CLAUDE_CODE_OAUTH_TOKEN') !== undefined) await $.env.set('CLAUDE_CODE_OAUTH_TOKEN', undefined)
+  if (await $.env.get('CLAUDE_CODE_USE_BEDROCK') !== undefined) await $.env.set('CLAUDE_CODE_USE_BEDROCK', undefined)
+  if (await $.env.get('CLAUDE_CODE_USE_VERTEX') !== undefined) await $.env.set('CLAUDE_CODE_USE_VERTEX', undefined)
+  if (await $.env.get('CLAUDE_CODE_USE_FOUNDRY') !== undefined) await $.env.set('CLAUDE_CODE_USE_FOUNDRY', undefined)
   const session = await $.session.id()
   if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(session)) return false
   const token = (await $.fs.read(tokenFile)).trim()
